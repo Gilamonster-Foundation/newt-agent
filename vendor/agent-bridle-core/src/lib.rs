@@ -59,6 +59,7 @@ mod spawn;
 mod step_up;
 mod tool;
 mod unbridle;
+mod xcselect;
 
 pub use admitted::{
     AdmittedFence, AdmittedFenceBody, AdmittedFenceId, BackendProjection, RuntimeClosure,
@@ -88,15 +89,16 @@ pub use provenance::{
 pub use registry::{Grant, Registry, RegistryBuilder};
 pub use report::{
     enforcement_report, fence_strength, unenforceable_axis, AxisEnforcement, ConfinementMechanism,
-    EnforcementFloor, EnforcementReport, ExecBoundary, StdioPosture, UnenforceableAxis,
+    EnforcementFloor, EnforcementReport, EnforcementWidening, ExecBoundary, StdioPosture,
+    UnenforceableAxis,
 };
 #[cfg(target_os = "linux")]
 pub use rootfs::{build_rootfs_plan, materialize_copy, RootfsCache, RootfsEntry, RootfsPlan};
 pub use sandbox::{
-    best_available_sandbox, effective_sandbox_kind, egress_proxy_plan, loopback_fenced_caveats,
-    mach_service_disclosure, mach_service_grants, net_egress_proxy_hosts,
-    seatbelt_mach_service_class, HeldReadRoot, MachServiceDisclosure, NoopSandbox, Sandbox,
-    SandboxKind, MACH_GRANT_PREFIX, MACH_SERVICE_CANDIDATES,
+    best_available_sandbox, effective_sandbox_kind, effective_sandbox_kind_with_policy,
+    egress_proxy_plan, loopback_fenced_caveats, mach_service_disclosure, mach_service_grants,
+    net_egress_proxy_hosts, seatbelt_mach_service_class, HeldReadRoot, MachServiceDisclosure,
+    NoopSandbox, Sandbox, SandboxKind, MACH_GRANT_PREFIX, MACH_SERVICE_CANDIDATES,
 };
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};

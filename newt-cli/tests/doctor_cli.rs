@@ -325,8 +325,7 @@ fn doctor_connects_lists_and_skips_mcp_servers() {
     // initialize, and list its tools end-to-end. A broken stdio entry must
     // surface as ERROR; an http entry must be reported as skipped.
     // This controlled transport fixture explicitly grants authority; it does
-    // not assert confinement. The restricted-spawn test below pins macOS's
-    // fail-closed default separately, including its diagnostic cause.
+    // not assert confinement. The default-authority test below does.
     let newt_bin = assert_cmd::cargo::cargo_bin("newt");
     let config = write_config(&format!(
         r#"
@@ -373,12 +372,12 @@ url = "http://127.0.0.1:1/mcp"
         ));
 }
 
-/// Grounds doctor's error rendering in a real confined spawn: current macOS
-/// backends cannot establish the default restricted network grant, so admission
-/// must refuse and the diagnostic must expose the cause, not just spawn context.
-#[cfg(target_os = "macos")]
+/// Under DEFAULT authority (no preset, so the stdio child gets `net: none`)
+/// doctor still spawns and lists a configured stdio server. macOS refused this
+/// spawn until #3042 declared the child's stdio by name; this test asserted
+/// that refusal and went stale, because no CI job ran it on macOS.
 #[test]
-fn doctor_reports_the_cause_of_a_confined_mcp_spawn_failure() {
+fn doctor_lists_a_stdio_mcp_server_under_default_authority() {
     let newt_bin = assert_cmd::cargo::cargo_bin("newt");
     let config = write_config(&format!(
         r#"
@@ -400,8 +399,6 @@ args = ["mcp"]
     doctor(&config, &home)
         .assert()
         .success()
-        .stdout(predicate::str::contains("restricted [stdio] — ERROR:"))
-        .stdout(predicate::str::contains("refusing to spawn:"))
-        .stdout(predicate::str::contains("L3 BOUND"))
-        .stdout(predicate::str::contains("restricted [stdio] — OK").not());
+        .stdout(predicate::str::contains("restricted [stdio] — OK"))
+        .stdout(predicate::str::contains("read_file"));
 }
