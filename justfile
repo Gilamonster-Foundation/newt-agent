@@ -47,20 +47,17 @@ build-agent-stack AGENT_BRIDLE_BRANCH="main" AGENT_MESH_BRANCH="main":
 # Run cargo, falling back to a plain local build when the sccache wrapper
 # can't start (its startup check fails when the remote cache is unreachable
 # or answers 5xx, and cargo would otherwise abort the whole build).
+# Only RUSTC_WRAPPER / CARGO_BUILD_RUSTC_WRAPPER are detected. Cargo config-only
+# wrappers are out of scope; bypass those with `RUSTC_WRAPPER= just install`.
 [positional-arguments]
 _cargo *args:
     #!/usr/bin/env bash
     set -euo pipefail
     # Unset and explicitly empty overrides have different Cargo semantics.
-    wrapper=${RUSTC_WRAPPER-${CARGO_BUILD_RUSTC_WRAPPER-$(python3 scripts/cargo_wrapper.py)}}
-    if [ "${wrapper##*/}" = sccache ]; then
-        if ! "$wrapper" "${RUSTC:-rustc}" -vV >/dev/null 2>&1; then
-            echo "sccache is unavailable; building without the cache" >&2
-            export RUSTC_WRAPPER=
-        fi
-        export SCCACHE_IGNORE_SERVER_IO_ERROR=1
+    if [ -n "${RUSTC_WRAPPER-${CARGO_BUILD_RUSTC_WRAPPER-}}" ]; then
+        exec python3 scripts/cargo_wrapper.py "$@"
     fi
-    cargo "$@"
+    exec cargo "$@"
 
 # Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
 # The rich TTY inline surface (issue #416) is a DEFAULT feature, so plain

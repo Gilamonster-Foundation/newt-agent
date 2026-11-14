@@ -117,7 +117,8 @@ jobs:
         run: |
           python3 scripts/test_publish_order.py
           cargo metadata --no-deps --format-version 1 | python3 scripts/check_publish_order.py -
-      # Local parity: also runs in `just check`.
+      # HOOK PARITY: CI-only pure regression, named in .githooks/pre-push.
+      # Also available locally through `just check`; the hook does not run it.
       - name: install Cargo wrapper fallback regression
         if: always()
         run: python3 scripts/test_cargo_fallback.py

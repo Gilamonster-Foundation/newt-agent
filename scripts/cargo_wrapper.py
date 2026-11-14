@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
-"""Read build.rustc-wrapper without requiring nightly `cargo config get`.
-
-Environment precedence is handled by _cargo. Cargo searches from the working
-directory upwards, then CARGO_HOME; extensionless config wins over config.toml.
-Only the selected scalar is needed, so no general config merge is implemented.
-"""
+"""Environment-selected sccache fallback; Cargo config discovery is out of scope."""
 import os
-from pathlib import Path
-import tomllib
+import subprocess
+import sys
 
 
-def configured_wrapper():
-    cwd = Path.cwd()
-    directories = [p / ".cargo" for p in (cwd, *cwd.parents)]
-    directories.append(Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo")))
-    for directory in directories:
-        for name in ("config", "config.toml"):
-            path = directory / name
-            if not path.is_file():
-                continue
-            with path.open("rb") as stream:
-                wrapper = tomllib.load(stream).get("build", {}).get("rustc-wrapper")
-            if wrapper is not None:
-                # Cargo resolves paths containing separators from the directory
-                # containing .cargo (including for CARGO_HOME configuration).
-                if "/" in wrapper and not Path(wrapper).is_absolute():
-                    wrapper = str(directory.parent / wrapper)
-                return wrapper
-            break
-    return ""
+def selected_wrapper(env):
+    return env.get("RUSTC_WRAPPER", env.get("CARGO_BUILD_RUSTC_WRAPPER", ""))
+
+
+def cargo_env(env, probe_ok):
+    result = dict(env)
+    if os.path.basename(selected_wrapper(env)) == "sccache":
+        result["SCCACHE_IGNORE_SERVER_IO_ERROR"] = "1"
+        if not probe_ok:
+            result["RUSTC_WRAPPER"] = ""
+    return result
 
 
 if __name__ == "__main__":
-    print(configured_wrapper())
+    probe_ok = True
+    if os.path.basename(selected_wrapper(os.environ)) == "sccache":
+        try:
+            probe_ok = subprocess.call(
+                [selected_wrapper(os.environ), os.environ.get("RUSTC") or "rustc", "-vV"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+        except OSError:
+            probe_ok = False
+    if not probe_ok:
+        print("sccache is unavailable; building without the cache", file=sys.stderr)
+    os.execvpe("cargo", ["cargo"] + sys.argv[1:], cargo_env(os.environ, probe_ok))

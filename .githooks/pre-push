@@ -43,6 +43,8 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - environment-selected Cargo fallback: scripts/test_cargo_fallback.py in
+#     ci.yml's lint job (pure dict/bool decisions; also in local `just check`).
 #   - GitHub Pages deploy and site entry-point check, .github/workflows/pages.yml
 #     (deployment/validation only; site-only pushes skip tests here).
 #   - hosted-model live eval, .github/workflows/eval-hosted.yml (weekly +
