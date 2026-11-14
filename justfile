@@ -44,6 +44,21 @@ release:
 build-agent-stack AGENT_BRIDLE_BRANCH="main" AGENT_MESH_BRANCH="main":
     python3 scripts/build_agent_stack.py --agent-bridle-branch="{{AGENT_BRIDLE_BRANCH}}" --agent-mesh-branch="{{AGENT_MESH_BRANCH}}" "{{justfile_directory()}}"
 
+# Run cargo, falling back to a plain local build when the sccache wrapper
+# can't start (its startup check fails when the remote cache is unreachable
+# or answers 5xx, and cargo would otherwise abort the whole build).
+# Only RUSTC_WRAPPER / CARGO_BUILD_RUSTC_WRAPPER are detected. Cargo config-only
+# wrappers are out of scope; bypass those with `RUSTC_WRAPPER= just install`.
+[positional-arguments]
+_cargo *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Unset and explicitly empty overrides have different Cargo semantics.
+    if [ -n "${RUSTC_WRAPPER-${CARGO_BUILD_RUSTC_WRAPPER-}}" ]; then
+        exec python3 scripts/cargo_wrapper.py "$@"
+    fi
+    exec cargo "$@"
+
 # Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
 # The rich TTY inline surface (issue #416) is a DEFAULT feature, so plain
 # `just install` already gives you the rich editor — no flag needed.
@@ -51,7 +66,7 @@ build-agent-stack AGENT_BRIDLE_BRANCH="main" AGENT_MESH_BRANCH="main":
 # Extra features:          just install ~/bin some-crate/some-feature
 # Lean / strip-down build: just install-lean   (lean crossterm box, wyvern tier)
 install dest=`echo $HOME/bin` features="":
-    cargo build --release --bin newt --bin newt-mcp-server {{ if features == "" { "" } else { "--features " + features } }}
+    @just _cargo build --release --bin newt --bin newt-mcp-server {{ if features == "" { "" } else { "--features " + features } }}
     @just _place-binaries {{dest}}
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
@@ -64,7 +79,7 @@ install dest=`echo $HOME/bin` features="":
 # manifest/lock, and its target dir is resolved the same
 # honor-configured-target-dir way `_place-binaries` does.
 install-web dest=`echo $HOME/bin`:
-    cargo build --release --manifest-path newt-web/Cargo.toml
+    @just _cargo build --release --manifest-path newt-web/Cargo.toml
     mkdir -p {{dest}}
     rm -f {{dest}}/newt-web
     target_dir="$(cargo metadata --no-deps --manifest-path newt-web/Cargo.toml --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"; \
@@ -77,7 +92,7 @@ install-web dest=`echo $HOME/bin`:
 # surface) — the wyvern/headless tier. Same as `just install` but with
 # `--no-default-features`.
 install-lean dest=`echo $HOME/bin`:
-    cargo build --release --no-default-features --bin newt --bin newt-mcp-server
+    @just _cargo build --release --no-default-features --bin newt --bin newt-mcp-server
     @just _place-binaries {{dest}}
     @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
     @just _warn-if-shadowed newt {{dest}}
@@ -198,6 +213,7 @@ check:
     set -uo pipefail
     rc=0
     npm --prefix npm test || rc=1
+    python3 scripts/test_cargo_fallback.py || rc=1
     python3 scripts/test_pre_push.py || rc=1
     python3 scripts/test_changed_scope.py || rc=1
     python3 scripts/test_commit_identity.py || rc=1
