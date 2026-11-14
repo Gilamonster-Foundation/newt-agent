@@ -40,21 +40,121 @@ pub(super) fn preflight(
     )
 }
 
-pub(super) fn needs_commit_broker(source: &str) -> bool {
-    fn contains(inspection: &ShellInspection) -> bool {
-        inspection.commands.iter().any(|command| {
-            command.program.as_deref().is_some_and(is_git)
-                && invocation(&command.argv)
-                    .ok()
-                    .and_then(|(verb, _, _)| literal(verb))
-                    .as_deref()
-                    == Some("commit")
-        }) || inspection
-            .constructs
+/// The first `git` verb in `verbs` that `source` invokes anywhere, nested
+/// constructs included. A loose trigger: text that merely mentions Git is not
+/// an invocation, and a source Bridle cannot inspect names none.
+fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
+    fn find(inspection: &ShellInspection, verbs: &[&str]) -> Option<String> {
+        inspection
+            .commands
             .iter()
-            .any(|construct| construct.inspection.as_deref().is_some_and(contains))
+            .find_map(|command| {
+                command
+                    .program
+                    .as_deref()
+                    .filter(|program| is_git(program))?;
+                let verb = invocation(&command.argv)
+                    .ok()
+                    .and_then(|(verb, _, _)| literal(verb))?;
+                verbs.contains(&verb.as_str()).then_some(verb)
+            })
+            .or_else(|| {
+                inspection
+                    .constructs
+                    .iter()
+                    .find_map(|construct| find(construct.inspection.as_deref()?, verbs))
+            })
     }
-    inspect_shell(source).is_ok_and(|inspection| contains(&inspection))
+    find(&inspect_shell(source).ok()?, verbs)
+}
+
+pub(super) fn needs_commit_broker(source: &str) -> bool {
+    git_verb_in(source, &["commit"]).is_some()
+}
+
+/// Git verbs that read from a remote. Pure data: a three-Cs candidate for the
+/// tooling packs once a second forge CLI needs the same prompt.
+const NETWORK_READ_VERBS: &[&str] = &["fetch", "pull", "clone", "ls-remote"];
+
+/// Git's own http(s) transport helpers, from the exec-path the host git
+/// reports, each passing the broker's trust predicate (never model-writable).
+/// Empty when git, its exec-path, or a helper cannot be established.
+fn http_transport_helpers(caveats: &Caveats) -> Vec<String> {
+    crate::git_staging::TrustContext::bind(&caveats.fs_write)
+        .and_then(crate::git_staging::TrustedTools::authenticate)
+        .map(|tools| tools.http_transport_helpers())
+        .unwrap_or_default()
+}
+
+/// A confined shell child has no network unless the session's `net` is `All`:
+/// a host allowlist cannot be bound to a spawn (`caveats::spawn_net_scope`),
+/// and the kernel's refusal is not a structured denial, so nothing prompts
+/// and the model sees only Git's own transport error. For a command that runs
+/// a [`NETWORK_READ_VERBS`] verb, ask the operator for this ONE command's
+/// egress up front and return the caveats to dispatch it under.
+///
+/// `Ok(None)` leaves the dispatch unchanged: `net` is already `All`, the
+/// command reads no remote, or no operator is present (headless runs as
+/// before). A declined prompt refuses the command rather than running it into
+/// the fence.
+pub(super) fn approve_network_read(
+    source: &str,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+) -> Result<Option<Caveats>, String> {
+    approve_network_read_with(source, caveats, gate, || http_transport_helpers(caveats))
+}
+
+fn approve_network_read_with(
+    source: &str,
+    caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+    helpers: impl FnOnce() -> Vec<String>,
+) -> Result<Option<Caveats>, String> {
+    if caveats.net == crate::Scope::All {
+        return Ok(None);
+    }
+    let (Some(verb), Some(gate)) = (git_verb_in(source, NETWORK_READ_VERBS), gate.as_deref_mut())
+    else {
+        return Ok(None);
+    };
+    let mut prepared = Caveats {
+        net: crate::Scope::All,
+        ..caveats.clone()
+    };
+    let request = PermissionRequest {
+        tool: "run_command".into(),
+        kind: DenialKind::Net,
+        target: format!("all destinations for one git {verb}"),
+        reason: format!(
+            "Run `{source}` once with network access. A shell command cannot be held to a host \
+             allowlist: this ONE command gets unrestricted network egress and may run Git's own \
+             http(s) transport helper, with every other limit unchanged. SSH remotes stay \
+             disabled. This does NOT grant network access to later commands or the session."
+        ),
+        harness_bound: true,
+    };
+    match gate.ask_dependency_fetch(&prepared, &request) {
+        PermissionDecision::Allow(granted) if prepared.leq(&granted) => {
+            // Only consent can reach discovery's host subprocess, and discovery
+            // authenticates Git before its first exec. The prompt covers Git's
+            // http(s) helpers; SSH hardening is unchanged.
+            if let crate::Scope::Only(exec) = &mut prepared.exec {
+                exec.extend(helpers());
+                // The exact helper paths were unknown before consent. Reuse the
+                // non-interactive gate refresh to enforce preset/delegation bounds
+                // on them, retaining only this invocation's prepared authority.
+                if !matches!(gate.refresh_caveats(&prepared), PermissionDecision::Allow(bounded) if prepared.leq(&bounded)) {
+                    return Err("denied: Git transport helpers exceed the session's authority ceiling. No network command ran.".into());
+                }
+            }
+            Ok(Some(prepared))
+        },
+        _ => Err(format!(
+            "denied: the operator declined network access for this `git {verb}`, or the session's \
+             authority ceiling forbids it. No command ran. Do not retry it; take a different approach."
+        )),
+    }
 }
 
 fn unresolved(detail: &str) -> String {
@@ -73,20 +173,7 @@ fn is_gh(program: &str) -> bool {
 /// check and refuses anything this loose scan admits but the broker cannot
 /// safely execute. Harmless output wrappers are interpreted in-process (#2719).
 pub(super) fn needs_push_broker(source: &str) -> bool {
-    fn contains(inspection: &ShellInspection) -> bool {
-        inspection.commands.iter().any(|command| {
-            command.program.as_deref().is_some_and(is_git)
-                && invocation(&command.argv)
-                    .ok()
-                    .and_then(|(verb, _, _)| literal(verb))
-                    .as_deref()
-                    == Some("push")
-        }) || inspection
-            .constructs
-            .iter()
-            .any(|construct| construct.inspection.as_deref().is_some_and(contains))
-    }
-    inspect_shell(source).is_ok_and(|inspection| contains(&inspection))
+    git_verb_in(source, &["push"]).is_some()
 }
 
 /// issue-1188 amendment A4: is `source` a `gh pr create` invocation anywhere
@@ -1222,6 +1309,203 @@ mod tests {
     };
     use super::*;
     use crate::agentic::{NoMcp, PromptDisposition};
+
+    /// Answers the one-operation egress prompt and records what it was shown.
+    #[derive(Default)]
+    pub(super) struct EgressGate {
+        pub(super) allow: bool,
+        pub(super) seen: Vec<PermissionRequest>,
+        pub(super) exec_ceiling: Option<crate::Scope<String>>,
+    }
+
+    impl PermissionGate for EgressGate {
+        fn refresh_caveats(&mut self, baseline: &Caveats) -> PermissionDecision {
+            let mut allowed = baseline.clone();
+            if let Some(exec) = &self.exec_ceiling {
+                allowed.exec = exec.clone();
+            }
+            PermissionDecision::Allow(allowed)
+        }
+
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            panic!("a network read must use the one-operation prompt, never a host grant")
+        }
+        fn ask_dependency_fetch(
+            &mut self,
+            prepared: &Caveats,
+            request: &PermissionRequest,
+        ) -> PermissionDecision {
+            self.seen.push(request.clone());
+            if self.allow {
+                PermissionDecision::Allow(prepared.clone())
+            } else {
+                PermissionDecision::Deny
+            }
+        }
+        fn ask_question(&mut self, _: &str) -> crate::agentic::HumanQuestionOutcome {
+            crate::agentic::HumanQuestionOutcome::Unavailable
+        }
+    }
+
+    fn approve(
+        source: &str,
+        net: crate::Scope<String>,
+        gate: Option<&mut EgressGate>,
+    ) -> Result<Option<Caveats>, String> {
+        let caveats = Caveats {
+            net,
+            ..Caveats::top()
+        };
+        let mut gate = gate.map(|gate| gate as &mut dyn PermissionGate);
+        approve_network_read(source, &caveats, &mut gate)
+    }
+
+    /// The live transcript: `git fetch` and `git ls-remote` wrapped in a
+    /// pipeline died at the fence with no prompt. Each now asks once, names
+    /// the whole command, and dispatches with `net: All` for that command.
+    #[test]
+    fn a_git_network_read_asks_for_one_commands_egress() {
+        let hosts = || crate::Scope::only(["lms.example.com".to_string()]);
+        for (source, verb) in [
+            (
+                "git fetch --prune --quiet 2>&1 | head -20; echo \"EXIT=$?\"",
+                "fetch",
+            ),
+            (
+                "git remote -v; git ls-remote --heads origin 2>&1 | head -5",
+                "ls-remote",
+            ),
+            ("git pull --ff-only", "pull"),
+            ("git clone https://example.invalid/r.git", "clone"),
+        ] {
+            for net in [crate::Scope::none(), hosts()] {
+                let mut gate = EgressGate {
+                    allow: true,
+                    ..Default::default()
+                };
+                let approved = approve(source, net, Some(&mut gate)).unwrap().unwrap();
+                assert_eq!(approved.net, crate::Scope::All, "{source}");
+                let [request] = gate.seen.as_slice() else {
+                    panic!("{source}: expected one prompt, saw {:?}", gate.seen)
+                };
+                assert!(request.operation_egress(), "{source}");
+                assert_eq!(
+                    request.target,
+                    format!("all destinations for one git {verb}")
+                );
+                assert!(request.reason.contains(source), "{}", request.reason);
+            }
+        }
+    }
+
+    /// Denial (including a ceiling veto) must precede helper discovery: its
+    /// production implementation authenticates Git and then spawns it on the host.
+    #[test]
+    fn a_declined_network_read_with_empty_exec_never_discovers_helpers() {
+        let caveats = Caveats {
+            net: crate::Scope::none(),
+            exec: crate::Scope::none(),
+            ..Caveats::top()
+        };
+        let mut gate = EgressGate {
+            allow: false,
+            ..Default::default()
+        };
+        let mut spawned = false;
+        let result = approve_network_read_with(
+            "git ls-remote origin",
+            &caveats,
+            &mut Some(&mut gate),
+            || {
+                spawned = true;
+                Vec::new()
+            },
+        );
+        assert!(
+            !spawned,
+            "declined approval with empty exec scope reached host helper discovery"
+        );
+        assert!(result.unwrap_err().contains("No command ran"));
+        assert_eq!(gate.seen.len(), 1);
+    }
+
+    /// The transport helper grant remains bounded after discovery, and a gate
+    /// returning broader standing authority cannot widen unrelated limits.
+    #[test]
+    fn discovered_network_helpers_must_fit_the_exec_ceiling() {
+        let helper = "/trusted/git-remote-http".to_string();
+        let caveats = Caveats {
+            net: crate::Scope::none(),
+            exec: crate::Scope::none(),
+            ..Caveats::top()
+        };
+        for ceiling in [
+            crate::Scope::none(),
+            crate::Scope::only([helper.clone()]),
+            crate::Scope::All,
+        ] {
+            let mut gate = EgressGate {
+                allow: true,
+                exec_ceiling: Some(ceiling.clone()),
+                ..Default::default()
+            };
+            let result = approve_network_read_with(
+                "git fetch origin",
+                &caveats,
+                &mut Some(&mut gate),
+                || vec![helper.clone()],
+            );
+            if ceiling == crate::Scope::none() {
+                assert!(
+                    result.is_err(),
+                    "discovered helpers bypassed the exec ceiling"
+                );
+            } else {
+                let approved = result.unwrap().unwrap();
+                assert_eq!(approved.exec, crate::Scope::only([helper.clone()]));
+                assert_eq!(approved.net, crate::Scope::All);
+                assert_eq!(approved.fs_write, caveats.fs_write);
+            }
+            assert_eq!(gate.seen.len(), 1, "only one operator prompt");
+        }
+    }
+
+    #[test]
+    fn a_declined_network_read_runs_nothing_and_says_so() {
+        let mut gate = EgressGate {
+            allow: false,
+            ..Default::default()
+        };
+        let refusal =
+            approve("git fetch origin", crate::Scope::none(), Some(&mut gate)).unwrap_err();
+        assert!(
+            refusal.starts_with("denied: the operator declined"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("No command ran"), "{refusal}");
+    }
+
+    /// No prompt where none can help: the session already has the network,
+    /// the command reads no remote, or nobody is there to answer.
+    #[test]
+    fn a_network_read_prompt_is_not_raised_needlessly() {
+        let mut gate = EgressGate {
+            allow: true,
+            ..Default::default()
+        };
+        for (source, net) in [
+            ("git fetch origin", crate::Scope::All),
+            ("git status && git branch -a", crate::Scope::none()),
+            ("python -c 'print(\"git fetch\")'", crate::Scope::none()),
+        ] {
+            assert_eq!(approve(source, net, Some(&mut gate)), Ok(None), "{source}");
+        }
+        assert!(gate.seen.is_empty(), "{:?}", gate.seen);
+        assert_eq!(
+            approve("git fetch origin", crate::Scope::none(), None),
+            Ok(None)
+        );
+    }
 
     #[test]
     fn python_text_mentioning_git_keeps_the_existing_execution_path() {
@@ -3129,6 +3413,92 @@ mod governed_push_tests {
 
     fn refs(repo: &Path) -> String {
         git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// Grounds `a_declined_network_read_with_empty_exec_never_discovers_helpers`:
+    /// a real executable planted first on PATH must never run before denial,
+    /// nor after consent when the authenticated-Git boundary rejects its write root.
+    #[test]
+    #[ignore = "real hostile PATH and filesystem; weekly/release real-resource tier"]
+    fn a_hostile_path_git_never_runs_during_network_read_approval() {
+        let env = BrokerEnv::new();
+        let marker = env.bin.path().join("spawned");
+        let planted = env.bin.path().join("git");
+        std::fs::write(
+            &planted,
+            format!(
+                "#!/bin/sh\n: > {}\n",
+                crate::mcp::shell_quote_arg(&marker.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let caveats = Caveats {
+            net: Scope::none(),
+            exec: Scope::none(),
+            fs_write: Scope::only([env.bin.path().to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        };
+        for allow in [false, true] {
+            let mut gate = super::tests::EgressGate {
+                allow,
+                ..Default::default()
+            };
+            let result =
+                approve_network_read("git ls-remote origin", &caveats, &mut Some(&mut gate));
+            assert!(!marker.exists(), "hostile Git ran with allow={allow}");
+            assert_eq!(gate.seen.len(), 1);
+            if allow {
+                assert_eq!(result.unwrap().unwrap().exec, Scope::none());
+            } else {
+                assert!(result.unwrap_err().contains("No command ran"));
+            }
+        }
+    }
+
+    /// Grounds `a_git_network_read_asks_for_one_commands_egress`: that mocked test
+    /// was green while a live fetch still failed, because approving the network did
+    /// not let Git run its own transport helper under a restricted exec scope. Here
+    /// the real confined shell, with only `git` and `head` granted and no network,
+    /// must reach a loopback HTTP remote once the operator approves, and must not
+    /// dial at all when the operator declines.
+    #[test]
+    #[ignore = "real Git, sandbox and HTTP; weekly/release real-resource tier"]
+    fn an_approved_network_read_dials_an_http_remote_from_the_confined_shell() {
+        if !fence() {
+            return;
+        }
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let caveats = Caveats {
+            exec: Scope::only(["git".to_string(), "head".to_string()]),
+            ..with_net(Scope::only([]))
+        };
+        for allow in [true, false] {
+            let (port, endpoint) = receive_pack_endpoint(false);
+            let command = format!("git ls-remote http://127.0.0.1:{port}/o/r.git 2>&1 | head -3");
+            let (output, _) = dispatch_run_command_with_gate(
+                repo.path(),
+                &command,
+                &caveats,
+                Some(&mut super::tests::EgressGate {
+                    allow,
+                    ..Default::default()
+                }),
+            );
+            let seen = stop(port, endpoint);
+            let dialed = seen
+                .requests
+                .iter()
+                .any(|line| line.contains("/o/r.git/info/refs?service=git-upload-pack"));
+            assert_eq!(dialed, allow, "allow={allow}: {output} / {seen:?}");
+            if !allow {
+                assert!(
+                    output.contains("operator declined network access"),
+                    "{output}"
+                );
+            }
+        }
     }
 
     /// #2719: the actual run_command path folds a worktree cd, intercepts

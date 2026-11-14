@@ -735,6 +735,17 @@ impl TrustedTools {
         &self.git
     }
 
+    /// Git's own HTTP transports, using the exec-path and trust context from
+    /// authentication. No helper supplied from a model-writable tree is granted.
+    pub(crate) fn http_transport_helpers(&self) -> Vec<String> {
+        ["git-remote-https", "git-remote-http"]
+            .iter()
+            .map(|name| self.exec_path.join(name))
+            .filter(|helper| helper.is_file() && trust_check(helper, &self.ctx).is_ok())
+            .map(|helper| helper.to_string_lossy().into_owned())
+            .collect()
+    }
+
     /// The trust context bound for this broker call.
     #[must_use]
     pub fn ctx(&self) -> &TrustContext {

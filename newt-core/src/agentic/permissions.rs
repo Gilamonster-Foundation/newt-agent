@@ -237,6 +237,19 @@ pub struct PermissionRequest {
     pub harness_bound: bool,
 }
 
+impl PermissionRequest {
+    /// Whether this asks for ONE operation's unrestricted egress rather than a
+    /// host grant: the harness's own dependency fetch, or a `run_command` the
+    /// harness itself bound to the prompt. A gate offers allow-once or deny
+    /// for it and never records the answer, because a spawned child cannot be
+    /// held to a host allowlist (`caveats::spawn_net_scope`).
+    #[must_use]
+    pub fn operation_egress(&self) -> bool {
+        self.kind == DenialKind::Net
+            && (self.tool == "lifecycle" || (self.tool == "run_command" && self.harness_bound))
+    }
+}
+
 /// #2636 (round1 finding 4): prefix marking a `request_permissions` reason
 /// as HARNESS-authored (it discloses the exact command a #2628 replay is
 /// about to run), not the model-supplied text. `reason_is_model_authored`
