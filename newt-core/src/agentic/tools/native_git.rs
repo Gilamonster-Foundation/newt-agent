@@ -1675,6 +1675,9 @@ mod tests {
         let _full = EnvVar::unset("NEWT_FULL_ACCESS");
         let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
         let repo = repository();
+        // Model a non-elevated user's repository, not an admin-owned CI fixture.
+        #[cfg(windows)]
+        crate::git_hardening::own_git_test_fixture(repo.path());
         let workspace = repo.path().canonicalize().unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
         std::fs::write(repo.path().join("pending.txt"), "pending work\n").unwrap();

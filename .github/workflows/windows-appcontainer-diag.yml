@@ -65,11 +65,15 @@ jobs:
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher
           ./scripts/windows/Enable-AppContainerDosPaths.ps1
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
+      - name: Probe DOS paths on the direct diagnostic's scratch drive
+        shell: pwsh
+        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
 
       # Isolates the launcher from the Rust test harness entirely: does the
       # child process even start under AppContainer, for progressively more
       # git-like targets, before ever touching a repository.
       - name: Direct AppContainer child-process isolation (no test harness)
+        if: always()
         shell: pwsh
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
@@ -79,6 +83,7 @@ jobs:
           New-Item -ItemType Directory -Force $work | Out-Null
           Set-Location $work
           git init -q -b main
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/windows/Set-GitFixtureOwner.ps1') -Repository $work
           "original`n" | Out-File tracked.txt -NoNewline
           git add tracked.txt
           git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
@@ -91,7 +96,7 @@ jobs:
             Write-Output ""
           }
 
-          Run-Diag "cmd.exe (echo)" "cmd" @("/c", "echo hello")
+          Run-Diag "cmd.exe (cwd and granted directory control)" "cmd" @("/c", "cd & dir /b")
           Run-Diag "whoami.exe (System32, no unusual deps)" "$env:WINDIR\System32\whoami.exe" @()
           Run-Diag "git --version" (Get-Command git.exe).Source @("--version")
           Run-Diag "git status (real repo)" (Get-Command git.exe).Source @("status")

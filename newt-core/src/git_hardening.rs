@@ -52,6 +52,28 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Real Windows Git fixtures model a non-elevated user's own repository.
+/// An elevated CI runner otherwise creates Administrators-owned directories,
+/// which Git correctly rejects once that group is disabled by AppContainer.
+/// This changes only fixture ownership, not the DACL or production Git policy.
+#[cfg(all(test, windows))]
+pub(crate) fn own_git_test_fixture(repo: &Path) {
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../scripts/windows/Set-GitFixtureOwner.ps1"),
+        )
+        .arg("-Repository")
+        .arg(repo)
+        .output()
+        .expect("set Git test fixture owner");
+    assert!(
+        output.status.success(),
+        "Git fixture ownership setup: {output:?}"
+    );
+}
+
 /// Filesystem grants for the session workspace's **own** git metadata (F32,
 /// #2537): the extra read/write roots that let the model commit and move the
 /// ref of the branch it has checked out, without needing to reach outside the

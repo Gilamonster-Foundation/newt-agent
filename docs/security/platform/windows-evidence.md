@@ -40,6 +40,10 @@ Current native Git tests additionally require the explicit elevated
 once per boot. CI runs those existing bounded DACL updates before ordinary tests; it is not performed by
 the sandbox launcher or by Newt at runtime. The historical evidence below
 predates this prerequisite and is not itself proof of native Git effects.
+The native Git fixtures represent user-owned repositories: elevated CI gives
+their repository and `.git` directories to the invoking user SID without
+changing either DACL. Administrators-owned repositories remain subject to Git's
+dubious-ownership refusal inside AppContainer; production applies no bypass.
 
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing

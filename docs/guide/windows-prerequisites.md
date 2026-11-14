@@ -31,6 +31,15 @@ launcher fixes those rights within the granted workspace. Newt therefore sends
 literal `git status` and `git add` through the ordinary confined exec path,
 including the exec gate and filesystem grants, without a host fallback.
 
+The native Git effect tests use repositories owned by the invoking user SID,
+matching a non-elevated user's repository. An elevated terminal can instead
+create an `Administrators`-owned repository: Git accepts that ownership outside
+the container, but can report **dubious ownership** after AppContainer disables
+that group. Newt does not bypass this Git check or add a `safe.directory`
+exception. The Windows test fixture helper changes only the temporary
+repository and `.git` owners, verifies the DACLs are unchanged, and is never
+called in production.
+
 ## Prepare the null device once per boot
 
 Windows resets the `\Device\Null` security descriptor on reboot. Its default
