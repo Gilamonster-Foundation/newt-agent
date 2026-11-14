@@ -142,10 +142,12 @@ The register checker embeds sources with `include_str!`, so it does no runtime
 filesystem I/O. It checks names and tier markers, not whether a ground ran.
 
 The fetch broker's ignored real-resource grounds (#3099) run in the same
-`mcp-import-real.yml` weekly/release lane with `--test-threads=1`. Linux checks
-seed/dial/delivery and an independently locked destination ref. Linux and macOS
-both check declined dispatch, hostile-PATH fallback, and hostile repository URL
-rewrites, with unfenced negative controls proving the rewrites are active.
-Current macOS admission refuses the required deny-all network floor before the
-copy can spawn; that refusal is asserted, not counted as a successful transfer.
-The per-PR dispatch, network-floor and failure-reporting guards remain in memory.
+`mcp-import-real.yml` weekly/release lane with `--test-threads=1`. Linux and macOS
+check successful seed/dial/delivery, declined dispatch, hostile-PATH fallback,
+and hostile repository URL rewrites. Unfenced negative controls prove the
+rewrites are active; confined Git must reject the HTTP and executable transports.
+Linux additionally checks an independently locked destination ref.
+On macOS, audited pipe/null stdio and an unprivileged Seatbelt launch can supply
+the required kernel network witness. Missing backend or witness refuses before
+the copy spawns. The per-PR pure policy guards cover both admission and refusal;
+dispatch, network-floor and failure-reporting guards also remain in memory.

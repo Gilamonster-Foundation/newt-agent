@@ -3627,8 +3627,9 @@ mod governed_push_tests {
 
     /// Grounds the deny-all policy guard with malicious repository URL config.
     /// The unfenced negative control reaches the loopback server, proving that
-    /// the configured rewrite applies. The production copy never reaches it;
-    /// native macOS must refuse admission while its deny-all floor is unavailable.
+    /// the configured rewrite applies. Under an admitted deny-all fence on
+    /// Linux or macOS, Git rejects the transport before reaching either target.
+    /// Also grounds `seatbelt_deny_all_policy_requires_a_kernel_witness`.
     #[test]
     #[ignore = "real Git, HTTP and native fence; weekly/release real-resource tier"]
     fn fetch_broker_delivery_refuses_hostile_url_rewriting() {
@@ -3675,14 +3676,14 @@ mod governed_push_tests {
             seen.requests.is_empty(),
             "delivery reached a rewritten host: {seen:?}"
         );
+        let output = result.expect("the audited, unprivileged copy must be admitted");
         assert!(
-            !result.as_ref().is_ok_and(|out| out.success),
-            "hostile source must not succeed: {result:?}"
+            !output.success,
+            "hostile source must not succeed: {output:?}"
         );
-        #[cfg(target_os = "macos")]
         assert!(
-            result.is_err(),
-            "macOS must fail closed before spawning: {result:?}"
+            String::from_utf8_lossy(&output.stderr).contains("transport 'http' not allowed"),
+            "Git must reject the rewritten transport: {output:?}"
         );
         assert_eq!(refs(repo.path()), before);
 
@@ -3750,7 +3751,15 @@ mod governed_push_tests {
             !marker.exists(),
             "repository-selected executable ran: {result:?}"
         );
-        assert!(!result.as_ref().is_ok_and(|out| out.success));
+        let output = result.expect("the audited, unprivileged copy must be admitted");
+        assert!(
+            !output.success,
+            "executable transport succeeded: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("transport 'ext' not allowed"),
+            "Git must reject the executable transport: {output:?}"
+        );
         let _ = tools
             .git(args)
             .current_dir(staging.path())
@@ -3817,8 +3826,8 @@ mod governed_push_tests {
     /// this runs one for real. The seed and deliver steps run in the kernel
     /// fence, the dial fetches a real repository, and the workspace ends up
     /// with the remote's new branch and its objects, and without the branch
-    /// the remote deleted. A local repository stands in for the forge.
-    #[cfg(target_os = "linux")]
+    /// the remote deleted. A local repository stands in for the forge. On macOS
+    /// this also grounds the admitted arm of the pure deny-all witness policy.
     #[test]
     #[ignore = "real Git and native fence; weekly/release real-resource tier"]
     fn a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace() {

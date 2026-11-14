@@ -212,9 +212,9 @@ jobs:
           -p newt-core --lib a_hostile_path_git_never_runs_during_network_read_approval
           -- --ignored --test-threads=1
 
-      # PR #3099: both copy phases require DenyAll. Current macOS admission
-      # refuses that floor, so transfer success/partial-ref grounds are Linux;
-      # hostile rewriting and declined dispatch run on both native platforms.
+      # PR #3099: both copies require DenyAll. Linux and audited, unprivileged
+      # macOS launches exercise successful transfer and hostile rewrites;
+      # Linux additionally exercises the independently locked destination ref.
       - name: Build fetch copy network guard
         if: runner.os == 'Linux'
         run: cargo build -p newt-core --bin newt-net-guard
@@ -238,7 +238,7 @@ jobs:
           -- --ignored --test-threads=1
 
       - name: Run fetch broker transfer grounding
-        if: runner.os == 'Linux'
+        if: runner.os != 'Windows'
         shell: bash
         run: >-
           bash .github/scripts/cargo-test-nonempty.sh

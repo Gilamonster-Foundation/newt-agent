@@ -33,8 +33,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   refused. The TUI writes no run trace yet (#3069).
 - `git fetch` in a confined session runs through a host-side broker (#3099): the host's
   git downloads with your credentials or SSH agent, and confined copies require a
-  deny-all network fence. The broker refuses where that fence cannot be enforced
-  (including current macOS admission), before downloading. It asks for the remote's
+  deny-all network fence. macOS admits audited, unprivileged Seatbelt launches
+  with a kernel network witness; without that fence the copy refuses before spawn
+  and before downloading. It asks for the remote's
   host, so a session grant covers later fetches; SSH works where the copy fence is
   available. A failed delivery reports that repository refs or objects may have changed. With unrestricted network (`--ambient`) git
   fetches directly as before. When a host tool fails its trust check the broker steps

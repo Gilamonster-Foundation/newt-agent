@@ -1343,8 +1343,9 @@ fn confined_beside_staging(
 
 /// A confined git for the fetch broker: reads the held roots plus staging,
 /// writes only `fs_write`, and requires the executor's deny-all network floor.
-/// Refuses before spawn where that floor is unavailable, including current
-/// macOS admission. Repository transport configuration cannot relax the floor.
+/// macOS admits audited, unprivileged Seatbelt launches with a kernel network
+/// witness; absent that witness, the executor refuses before the copy spawns.
+/// Repository transport configuration cannot relax the floor.
 ///
 /// # Errors
 /// As [`confined_fetch`].

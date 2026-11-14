@@ -16,8 +16,8 @@
 //!    staging into the workspace's `refs/remotes/<remote>/*`.
 //!
 //! Both copy steps require the executor's deny-all network floor. Platforms
-//! that cannot enforce it (including current macOS admission) refuse the seed
-//! before dialing. Failed delivery can leave refs, objects or FETCH_HEAD changed;
+//! that cannot establish a kernel witness refuse the seed before dialing.
+//! macOS admits audited, unprivileged Seatbelt launches with that witness. Failed delivery can leave refs, objects or FETCH_HEAD changed;
 //! the broker reports that uncertainty rather than promising a rollback.
 //!
 //! **It gets out of the way.** [`wanted`] is false under unrestricted `net`
