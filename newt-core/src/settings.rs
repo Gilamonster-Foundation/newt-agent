@@ -448,10 +448,30 @@ pub fn update_at(
         std::fs::create_dir_all(dir)?;
     }
     let path = crate::atomic_fs::ResolvedPath::resolve(path)?;
-    let _lock = crate::atomic_fs::acquire_lock(&path.lock_path())?;
-    let mut doc = read_doc(path.as_path());
+    update_with(
+        project,
+        choice,
+        default_provider,
+        || crate::atomic_fs::acquire_lock(&path.lock_path()),
+        || read_doc(path.as_path()),
+        |doc| write_doc(&path, doc),
+    )
+}
+
+/// Inject lock and document I/O so the update contract can be checked in memory.
+/// The returned lock guard covers both callbacks.
+fn update_with<L>(
+    project: &str,
+    choice: Choice<'_>,
+    default_provider: Option<&str>,
+    lock: impl FnOnce() -> anyhow::Result<L>,
+    read: impl FnOnce() -> toml::Table,
+    write: impl FnOnce(&toml::Table) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let _lock = lock()?;
+    let mut doc = read();
     apply_project_choice(&mut doc, project, choice, default_provider);
-    write_doc(&path, &doc)
+    write(&doc)
 }
 
 /// Persist the provider chosen via `/backends <name>` for this project,
@@ -729,6 +749,49 @@ mod tests {
         switch(&mut d, "/inside", Choice::Model("m"));
         let t = d["projects"].as_table().expect("projects table");
         assert!(t.contains_key("/outside") && t.contains_key("/inside"));
+    }
+
+    /// In-memory read/write callbacks ground the update contract without a
+    /// filesystem, threads or sleeps. The ignored settings_update_fs test
+    /// checks that the real adapter also serializes concurrent updates.
+    #[test]
+    fn update_preserves_prior_projects_and_unknown_content() {
+        let lock = std::sync::Mutex::new(());
+        let file = std::cell::RefCell::new(
+            "keep = true\n[projects.\"/outside\"]\nmodel = \"outside-m\"\n".to_string(),
+        );
+        for project in ["/inside", "/another"] {
+            update_with(
+                project,
+                Choice::Model("m"),
+                Some("dflt"),
+                || Ok(lock.try_lock().expect("uncontended in-memory lock")),
+                || {
+                    assert!(lock.try_lock().is_err(), "read must hold the lock");
+                    doc(&file.borrow())
+                },
+                |updated| {
+                    assert!(lock.try_lock().is_err(), "write must hold the lock");
+                    *file.borrow_mut() = to_toml_string(updated)?;
+                    Ok(())
+                },
+            )
+            .expect("update in-memory settings");
+            assert!(lock.try_lock().is_ok(), "update must release the lock");
+        }
+        let saved = doc(&file.borrow());
+        assert_eq!(saved["keep"].as_bool(), Some(true));
+        for (project, model) in [
+            ("/outside", "outside-m"),
+            ("/inside", "m"),
+            ("/another", "m"),
+        ] {
+            assert_eq!(
+                Session::for_project(&saved, project).model.as_deref(),
+                Some(model),
+                "lost {project}"
+            );
+        }
     }
 
     /// (f): ephemeral sessions write nothing (the gate the callers use).

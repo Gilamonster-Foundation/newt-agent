@@ -1,6 +1,8 @@
 //! Real-filesystem tier for `settings::update_at` (#3090). Grounds the pure
 //! `apply_project_choice` unit tests: they cannot see two processes racing
 //! on the one shared `~/.newt/settings.toml`.
+//! Also grounds `settings::tests::update_preserves_prior_projects_and_unknown_content`:
+//! its injected I/O preserves prior writes; this test checks the real lock.
 
 use newt_core::settings::{update_at, Choice, Session};
 use std::sync::{Arc, Barrier};
@@ -9,6 +11,7 @@ use std::sync::{Arc, Barrier};
 /// helpers switching `/model` at the same moment overwrote each other's
 /// project entries. Every concurrent write must persist.
 #[test]
+#[ignore = "real filesystem/concurrency; serial weekly/release tier in mcp-import-real.yml"]
 fn concurrent_updates_for_different_projects_all_persist() {
     const N: usize = 4;
     let dir = tempfile::tempdir().expect("tempdir");
