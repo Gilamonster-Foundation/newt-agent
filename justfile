@@ -47,16 +47,20 @@ build-agent-stack AGENT_BRIDLE_BRANCH="main" AGENT_MESH_BRANCH="main":
 # Run cargo, falling back to a plain local build when the sccache wrapper
 # can't start (its startup check fails when the remote cache is unreachable
 # or answers 5xx, and cargo would otherwise abort the whole build).
+[positional-arguments]
 _cargo *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -n "${RUSTC_WRAPPER:-}" ] && [ "$(basename "$RUSTC_WRAPPER")" = sccache ] \
-        && ! "$RUSTC_WRAPPER" rustc -vV >/dev/null 2>&1; then
-        echo "sccache is unavailable; building without the cache" >&2
-        export RUSTC_WRAPPER=
+    # Unset and explicitly empty overrides have different Cargo semantics.
+    wrapper=${RUSTC_WRAPPER-${CARGO_BUILD_RUSTC_WRAPPER-$(python3 scripts/cargo_wrapper.py)}}
+    if [ "${wrapper##*/}" = sccache ]; then
+        if ! "$wrapper" "${RUSTC:-rustc}" -vV >/dev/null 2>&1; then
+            echo "sccache is unavailable; building without the cache" >&2
+            export RUSTC_WRAPPER=
+        fi
+        export SCCACHE_IGNORE_SERVER_IO_ERROR=1
     fi
-    export SCCACHE_IGNORE_SERVER_IO_ERROR=1
-    cargo {{args}}
+    cargo "$@"
 
 # Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
 # The rich TTY inline surface (issue #416) is a DEFAULT feature, so plain
@@ -212,6 +216,7 @@ check:
     set -uo pipefail
     rc=0
     npm --prefix npm test || rc=1
+    python3 scripts/test_cargo_fallback.py || rc=1
     python3 scripts/test_pre_push.py || rc=1
     python3 scripts/test_changed_scope.py || rc=1
     python3 scripts/test_commit_identity.py || rc=1
