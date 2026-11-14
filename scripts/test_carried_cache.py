@@ -58,6 +58,11 @@ class CarriedCacheTests(unittest.TestCase):
                     else f"https://github.com/BurntSushi/ripgrep/releases/download/{version}/ripgrep-{version}-x86_64-pc-windows-msvc.zip"
                 )
                 self.assertIn(upstream, download)
+                if tool == "busybox":  # upstream 403s runners; mirror fallback
+                    self.assertIn(
+                        f"https://github.com/Gilamonster-Foundation/newt-agent/releases/download/mirror-busybox-{version}/busybox-w64u-{version}.exe",
+                        download,
+                    )
                 self.assertIn(
                     f'--output "$env:RUNNER_TEMP/carried-downloads/{filename}"',
                     download,

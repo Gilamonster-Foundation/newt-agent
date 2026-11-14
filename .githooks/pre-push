@@ -43,13 +43,17 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - environment-selected Cargo fallback: scripts/test_cargo_fallback.py in
+#     ci.yml's lint job (pure dict/bool decisions; also in local `just check`).
 #   - GitHub Pages deploy and site entry-point check, .github/workflows/pages.yml
 #     (deployment/validation only; site-only pushes skip tests here).
 #   - hosted-model live eval, .github/workflows/eval-hosted.yml (weekly +
 #     release/**; needs EVAL_BASE_URL/EVAL_API_KEY, skips when unconfigured).
 #   - MCP import real-resource tier, .github/workflows/mcp-import-real.yml
 #     (weekly + release): --ignored subprocess/filesystem acceptance on all OSes,
-#     including the macOS-only stdio MCP net:none Seatbelt admission grounding
+#     including PR #3097's ignored Git network-read and tmux regression grounds
+#     (mocked guards remain in this hook), and the macOS-only stdio MCP net:none
+#     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
 #   - linked-worktree build metadata reads and hostile-env fixture (#2835),

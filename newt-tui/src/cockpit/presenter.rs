@@ -329,7 +329,13 @@ struct Screen<W: Write = File> {
     /// resize that narrows the terminal reflows any row wider than the new
     /// width onto extra rows, lifting the old block's top above `top`.
     painted_widths: Vec<usize>,
+    /// The last [`TAIL_ROWS`] rows inserted into the transcript, oldest first. A terminal
+    /// cannot scroll back down, so this is what [`reveal_bytes`] repaints from.
+    tail: VecDeque<Row>,
 }
+
+/// Transcript rows kept for [`reveal_bytes`]: more than any screen is tall.
+const TAIL_ROWS: usize = 512;
 
 /// The block's rows, as the arbiter names them.
 fn block_region(top: u16, block_h: u16) -> newt_core::tty::Region {
@@ -428,7 +434,9 @@ impl Screen {
         }
         Ok((size.ws_col.max(1), size.ws_row.max(1)))
     }
+}
 
+impl<W: Write> Screen<W> {
     fn viewport_rect(&self) -> Rect {
         Rect::new(
             0,
@@ -452,17 +460,9 @@ impl Screen {
 
     fn rebuild_term(&mut self) -> io::Result<()> {
         self.moved_cursor();
-        let backend = CaretBackend {
-            inner: CrosstermBackend::new(self.tty.fenced_clone()?),
-            caret: Arc::clone(&self.caret),
-        };
-        self.term = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(self.viewport_rect()),
-            },
-        )?;
-        self.term.clear()
+        // Fixed viewports can resize their existing backend, including an
+        // in-memory writer. resize also clears the new viewport and buffers.
+        self.term.resize(self.viewport_rect())
     }
 
     /// Give the blocking window the composer's rows. Erase the editor first,
@@ -531,6 +531,9 @@ impl Screen {
         if phys.is_empty() || phys.len() > u16::MAX as usize {
             return Ok(());
         }
+        self.tail.extend(rows);
+        let excess = self.tail.len().saturating_sub(TAIL_ROWS);
+        self.tail.drain(..excess);
         let (buf, plan) = render_insert(self.top, self.block_h, self.rows, &phys)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -551,7 +554,8 @@ impl Screen {
     }
 
     /// Change the block's height (the editor grew, the status row appeared…).
-    /// Scrolls the transcript up if the taller block would not fit below it.
+    /// Scrolls the transcript up if the taller block would not fit below it, and
+    /// slides it back down when a block on the bottom row gets shorter.
     fn relayout(&mut self, editor_rows: u16, status_rows: u16) -> io::Result<()> {
         self.moved_cursor();
         let new_h = (editor_rows + status_rows).clamp(1, self.rows.max(1));
@@ -565,6 +569,14 @@ impl Screen {
             queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
             buf.extend(std::iter::repeat_n(b'\n', d as usize));
             self.top = self.rows - new_h;
+        } else if new_h < self.block_h && self.top + self.block_h == self.rows {
+            // A block on the bottom row stays there when it gets shorter (the palette
+            // closed, the editor emptied): slide the transcript down onto the rows it gave
+            // up. Left where it was, the prompt sat mid-screen over blank rows.
+            let d = self.block_h - new_h;
+            queue!(buf, crossterm::terminal::ScrollDown(d))?;
+            self.top += d;
+            buf.extend(reveal_bytes(&self.tail, self.cols, self.top, self.top - d)?);
         }
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
@@ -639,9 +651,40 @@ impl Screen {
         // one (#4). Whichever top is higher, nothing but block chrome sits below
         // it (the block never moves past its own old or new position), so this
         // wipes every stale status/editor row without losing transcript.
-        let erase_from = resize_erase_from(old_top, self.top, self.rows);
+        //
+        // A block that no longer fits where the terminal left it moves UP, and the rows
+        // it moves onto are transcript, not chrome: tmux shrinks by keeping the caret's
+        // row on screen, which leaves a block with a row under the caret one row too
+        // low. Erasing from the new top deleted the last transcript row. Erase the old
+        // block only and scroll the screen up by the difference, as `relayout` does for
+        // a block that grew.
+        let lift = if old_top < self.rows {
+            old_top.saturating_sub(self.top)
+        } else {
+            0
+        };
+        let erase_from = if lift > 0 {
+            old_top
+        } else {
+            resize_erase_from(old_top, self.top, self.rows)
+        };
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, erase_from), Clear(ClearType::FromCursorDown))?;
+        if lift > 0 {
+            queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
+            buf.extend(std::iter::repeat_n(b'\n', usize::from(lift)));
+        }
+        // A block that moved DOWN left blank rows between the transcript and itself.
+        // Slide the transcript down onto them, so the blanks sit at the top of the screen
+        // instead. A later shrink scrolls the top rows away: with the gap under the
+        // transcript that was transcript, one row per row shrunk, until a drag of the pane
+        // edge down and back left the screen empty above the prompt. Every row from
+        // `erase_from` down is blank by now, so the rows this pushes off the bottom are too.
+        let gap = self.top.saturating_sub(old_top);
+        if gap > 0 {
+            queue!(buf, crossterm::terminal::ScrollDown(gap))?;
+            buf.extend(reveal_bytes(&self.tail, self.cols, self.top, old_top)?);
+        }
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.rebuild_term()
@@ -851,8 +894,9 @@ fn restore_terminal_modes() {
 /// **A terminal that GROWS pins the block to the new bottom** (maintainer decision on
 /// #3014 item 2). Terminals disagree on what a grow does to the transcript (some add rows
 /// below it, some pull it down), but the prompt stays where the operator's eyes and the
-/// keyboard are, the bottom row; the gap a bottom-adding terminal leaves above it is the
-/// accepted cost. This reverses the #2632 "stay under the content" rule for grows only.
+/// keyboard are, the bottom row. The rows a bottom-adding terminal leaves blank above it
+/// are moved to the top of the screen by `resize`, which slides the transcript down with
+/// the block. This reverses the #2632 "stay under the content" rule for grows only.
 ///
 /// Every other resize (same size, or a shrink) leaves the transcript where it was, so
 /// `old_top` is still ground truth there. Move the block only when it no longer fits at
@@ -884,6 +928,35 @@ fn caret_row_wrap(x: u16, width: usize, cols: u16) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// The bytes that fill the rows a slide down left blank at the top of the screen.
+///
+/// `shown` transcript rows were above the block before the slide, and `top` rows are
+/// above it now. A terminal moves rows into its scrollback and never back, so the rows
+/// a shrink (or an opening menu) scrolled away are repainted from `tail`: its last `top`
+/// rows, ending on the row above the block. Empty when `tail` holds no more than was
+/// already on screen, so rows this screen did not write (the shell's, before the
+/// session) are never painted over. The repainted rows are in scrollback as well.
+fn reveal_bytes(tail: &VecDeque<Row>, cols: u16, top: u16, shown: u16) -> io::Result<Vec<u8>> {
+    let mut phys: Vec<Row> = Vec::new();
+    for row in tail.iter().rev() {
+        if phys.len() >= usize::from(top) {
+            break;
+        }
+        phys.extend(wrap_row(row, usize::from(cols)).into_iter().rev());
+    }
+    phys.truncate(usize::from(top));
+    let mut buf = Vec::new();
+    if phys.len() <= usize::from(shown) {
+        return Ok(buf);
+    }
+    for (above, row) in (1u16..).zip(&phys) {
+        queue!(buf, MoveTo(0, top - above), Clear(ClearType::CurrentLine))?;
+        buf.extend_from_slice(row);
+        buf.extend_from_slice(b"\x1b[0m");
+    }
+    Ok(buf)
 }
 
 /// The row `resize` clears downward from so the OLD cockpit region cannot
@@ -1146,6 +1219,7 @@ impl Presenter {
             queued: 0,
             region,
             painted_widths: Vec::new(),
+            tail: VecDeque::new(),
         };
         screen.term.clear()?;
         let ephemeral: Arc<dyn newt_core::tty::Ephemeral> = Arc::new(NoOpEphemeral);
@@ -2066,6 +2140,9 @@ pub(crate) fn supported() -> bool {
         && std::env::var_os("NEWT_NO_COCKPIT").is_none()
 }
 
+// Test screens lease the process-global arbiter until they drop. Keep the whole
+// module on its existing serial lane, including future callers of the helpers.
+#[cfg_attr(test, serial_test::serial(tty_arbiter))]
 #[cfg(test)]
 mod tests {
     /// **The presenter USES the guard** (#1925), which the PTY tests cannot
@@ -2236,8 +2313,8 @@ mod tests {
         assert_eq!(block_top_from_reply(0, 3), None);
     }
 
-    /// A screen over a scratch file with a painted block, for driving `resize` and
-    /// reading the bytes it wrote.
+    /// A screen over the in-memory writer with a painted block, for driving
+    /// `resize` and reading the bytes it wrote.
     fn screen_with_block(
         cols: u16,
         rows: u16,
@@ -2245,13 +2322,42 @@ mod tests {
         block_h: u16,
         widths: &[usize],
         (caret_x, caret_y): (u16, u16),
-    ) -> (Screen, std::fs::File) {
-        let file = tempfile::tempfile().unwrap();
-        let reader = file.try_clone().unwrap();
+    ) -> (Screen<Boundaries>, Boundaries) {
+        let log = Boundaries::default();
+        let screen = screen_on(
+            (log.clone(), log.clone()),
+            cols,
+            rows,
+            top,
+            block_h,
+            widths,
+            (caret_x, caret_y),
+        );
+        (screen, log)
+    }
+
+    /// The same painted-block screen with two writers to one sink. Grounding
+    /// tests use terminal handles; unit guards use the in-memory writer.
+    fn screen_on<W: Write>(
+        (file, backend_file): (W, W),
+        cols: u16,
+        rows: u16,
+        top: u16,
+        block_h: u16,
+        widths: &[usize],
+        (caret_x, caret_y): (u16, u16),
+    ) -> Screen<W> {
+        assert!(
+            serial_test::is_locked_serially(Some("tty_arbiter")),
+            "test screens require the tty_arbiter lock for their entire lifetime"
+        );
         let tty = WrapFence::new(file);
         let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
         let backend = CaretBackend {
-            inner: CrosstermBackend::new(tty.fenced_clone().unwrap()),
+            inner: CrosstermBackend::new(WrapFence {
+                file: backend_file,
+                state: Arc::clone(&tty.state),
+            }),
             caret: Arc::clone(&caret),
         };
         let term = Terminal::with_options(
@@ -2266,7 +2372,7 @@ mod tests {
             newt_core::tty::OnCollision::Refuse,
         )
         .expect("the test owns these rows");
-        let screen = Screen {
+        Screen {
             tty,
             term,
             caret,
@@ -2288,17 +2394,293 @@ mod tests {
             queued: 0,
             region,
             painted_widths: widths.to_vec(),
+            tail: VecDeque::new(),
+        }
+    }
+
+    /// A real terminal for grounding the mocked resize and relayout tests: a detached
+    /// tmux server on its own socket and no config, one 80x24 pane running `sleep`.
+    /// The screen under test writes straight to the pane's tty, tmux resizes it, and
+    /// `capture-pane` reads back what an operator would see.
+    struct RealTerminal {
+        socket: String,
+    }
+
+    impl RealTerminal {
+        /// `None` (the test skips) where tmux is not installed.
+        fn open() -> Option<Self> {
+            let socket = format!("newt-presenter-{}", std::process::id());
+            let term = Self { socket };
+            let started = std::process::Command::new("tmux")
+                .args(["-L", &term.socket, "-f", "/dev/null", "new-session", "-d"])
+                .args(["-x", "80", "-y", "24", "sleep", "600"])
+                .status();
+            match started {
+                Ok(status) if status.success() => Some(term),
+                _ => {
+                    eprintln!("skip: tmux is not available");
+                    None
+                }
+            }
+        }
+
+        fn tmux(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("tmux")
+                .args(["-L", &self.socket])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "tmux {args:?}: {output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        fn tty(&self) -> std::fs::File {
+            let path = self.tmux(&["display-message", "-p", "#{pane_tty}"]);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.trim())
+                .unwrap()
+        }
+
+        /// Write `bytes` and wait until tmux has parsed them: a marker cursor move
+        /// sent last is visible in `cursor_x` only once everything before it is.
+        fn write(&self, bytes: &str) {
+            use std::io::Write as _;
+            let mut tty = self.tty();
+            tty.write_all(bytes.as_bytes()).unwrap();
+            tty.flush().unwrap();
+        }
+
+        fn rows(&self, rows: u16) {
+            self.tmux(&["resize-window", "-y", &rows.to_string()]);
+        }
+
+        fn cursor_row(&self) -> u16 {
+            self.tmux(&["display-message", "-p", "#{cursor_y}"])
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        /// The visible rows, top to bottom, once `ready` holds (tmux parses pane
+        /// output on its own thread, so a capture can race the write before it).
+        fn screen(&self, ready: impl Fn(&[String]) -> bool) -> Vec<String> {
+            let mut rows = Vec::new();
+            for _ in 0..200 {
+                rows = self
+                    .tmux(&["capture-pane", "-p"])
+                    .lines()
+                    .map(|row| row.trim_end().to_string())
+                    .collect();
+                if ready(&rows) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            rows
+        }
+
+        /// 21 transcript rows `T00`..`T20`, then a 3-row block on the bottom rows of
+        /// an 80x24 screen with the caret on its middle row, as the cockpit leaves it.
+        fn paint_transcript_and_block(&self) {
+            let transcript: String = (0..21).map(|n| format!("T{n:02}\r\n")).collect();
+            self.write(&format!("\x1b[H\x1b[J{transcript}"));
+            self.paint_block(21, 3);
+        }
+
+        fn paint_block(&self, top: u16, height: u16) {
+            let rows: String = (0..height)
+                .map(|n| format!("\x1b[{};1HB{n}", top + n + 1))
+                .collect();
+            self.write(&format!("{rows}\x1b[{};3H", top + 2));
+        }
+    }
+
+    impl Drop for RealTerminal {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .output();
+        }
+    }
+
+    fn transcript_rows(screen: &[String]) -> Vec<&str> {
+        screen
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.starts_with('T'))
+            .collect()
+    }
+
+    /// Grounds `a_grow_slides_the_transcript_down_with_the_block`, which only checks
+    /// the bytes written. Here a real terminal grows by 8 rows and shrinks back, as a
+    /// dragged pane edge does. Every transcript row must still be on screen, ending on
+    /// the row above the block. Before the slide, the shrink scrolled 8 of them away
+    /// and left 8 blank rows in their place.
+    #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
+    fn a_real_terminal_keeps_the_transcript_through_a_grow_and_shrink() {
+        let Some(term) = RealTerminal::open() else {
+            return;
         };
-        (screen, reader)
+        term.paint_transcript_and_block();
+        term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 21, 3, &[2, 2, 2], (2, 22));
+
+        term.rows(32);
+        let measured = term.cursor_row() - 1;
+        screen.resize(80, 32, 2, 1, Some(measured)).unwrap();
+        assert_eq!(screen.top, 29, "the block is pinned to the new bottom");
+        term.paint_block(screen.top, 3);
+        let grown = term.screen(|rows| rows.get(31).is_some_and(|row| row == "B2"));
+        assert_eq!(
+            grown[28], "T20",
+            "the transcript ends above the block: {grown:#?}"
+        );
+
+        screen.caret_frame = Some(CaretFrame {
+            top: 29,
+            block_h: 3,
+            cols: 80,
+            rows: 32,
+            y: 30,
+            x: 2,
+        });
+        term.rows(24);
+        let measured = term.cursor_row() - 1;
+        screen.resize(80, 24, 2, 1, Some(measured)).unwrap();
+        term.paint_block(screen.top, 3);
+        let shrunk = term.screen(|rows| rows.len() == 24 && rows[23] == "B2");
+        assert_eq!(screen.top, 21);
+        assert_eq!(
+            transcript_rows(&shrunk).len(),
+            21,
+            "transcript lost: {shrunk:#?}"
+        );
+        assert_eq!(shrunk[20], "T20", "{shrunk:#?}");
+    }
+
+    /// Grounds `a_grow_repaints_the_rows_a_shrink_scrolled_away`, which only checks the
+    /// bytes written. Here a real terminal holding 30 transcript rows shrinks from 24
+    /// rows to 10 and grows back, as a pane edge dragged up and down does. tmux pulls its
+    /// history back down on a grow and the recorded terminal does not, so the history is
+    /// cleared after the shrink: tmux then adds the new rows at the bottom, and without
+    /// the repaint the 14 rows above `T23` stay blank (the live recording of 2026-11-13).
+    #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
+    fn a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow() {
+        let Some(term) = RealTerminal::open() else {
+            return;
+        };
+        term.write("\x1b[H\x1b[J");
+        term.paint_block(0, 3);
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        screen.insert_rows(transcript).unwrap();
+        assert_eq!(screen.top, 21);
+        term.paint_block(screen.top, 3);
+        let full = term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+        assert_eq!((full[0].as_str(), full[20].as_str()), ("T09", "T29"));
+
+        for rows in [10, 24] {
+            screen.painted_widths = vec![2, 2, 2];
+            screen.caret_frame = Some(CaretFrame {
+                top: screen.top,
+                block_h: 3,
+                cols: 80,
+                rows: screen.rows,
+                y: screen.top + 1,
+                x: 2,
+            });
+            term.rows(rows);
+            let measured = term.cursor_row() - 1;
+            screen.resize(80, rows, 2, 1, Some(measured)).unwrap();
+            term.paint_block(screen.top, 3);
+            term.tmux(&["clear-history"]);
+        }
+        let back = term.screen(|rows| rows.len() == 24 && rows[23] == "B2");
+        let expected: Vec<String> = (9..30).map(|n| format!("T{n:02}")).collect();
+        assert_eq!(back[..21], expected, "{back:#?}");
+    }
+
+    /// The live recording of 2026-11-13: a pane dragged small and then large again came
+    /// back with only the rows that fit the small pane, under blank rows. The rows the
+    /// shrink scrolled away are repainted from the transcript this screen inserted.
+    #[test]
+    fn a_grow_repaints_the_rows_a_shrink_scrolled_away() {
+        let tail: VecDeque<Row> = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        // 7 rows were on screen above the block; 21 are above it after the grow.
+        let bytes = reveal_bytes(&tail, 80, 21, 7).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\x1b[21;1H\x1b[2KT29"), "{text:?}");
+        assert!(text.contains("\x1b[1;1H\x1b[2KT09"), "{text:?}");
+        assert!(!text.contains("T08"), "only the rows that fit: {text:?}");
+        // A row wider than the screen takes the rows it wraps onto.
+        let wide: VecDeque<Row> = [b"T00".to_vec(), b"abcdef".to_vec()].into();
+        let text = String::from_utf8_lossy(&reveal_bytes(&wide, 4, 3, 0).unwrap()).into_owned();
+        for row in [
+            "\x1b[1;1H\x1b[2KT00",
+            "\x1b[2;1H\x1b[2Kabcd",
+            "\x1b[3;1H\x1b[2Kef",
+        ] {
+            assert!(text.contains(row), "{row:?} in {text:?}");
+        }
+        // Nothing this screen wrote is hidden: rows it did not write are left alone.
+        assert!(reveal_bytes(&tail, 80, 21, 30).unwrap().is_empty());
+        assert!(reveal_bytes(&VecDeque::new(), 80, 21, 7)
+            .unwrap()
+            .is_empty());
+
+        // Through `resize`: 30 rows inserted on a 24-row screen, shrunk to 10, grown back.
+        let (mut screen, log) = screen_with_block(80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        screen.insert_rows(transcript).unwrap();
+        screen.resize(80, 10, 2, 1, None).unwrap();
+        assert_eq!(screen.top, 7);
+        let before = log.text().len();
+        screen.resize(80, 24, 2, 1, Some(7)).unwrap();
+        let text = log.text()[before..].to_string();
+        let slide = text.find("\x1b[14T").expect("the transcript slides down");
+        let repaint = text
+            .find("\x1b[1;1H\x1b[2KT09")
+            .expect("the top row is repainted");
+        assert!(slide < repaint, "a repaint before the slide is pushed down");
+    }
+
+    /// Grounds `a_shrinking_block_on_the_bottom_row_stays_there`. The command palette
+    /// makes the block 7 rows taller on a full screen and then closes. On a real
+    /// terminal the block must be back on the bottom rows with the transcript ending
+    /// right above it. Before the slide it stayed 7 rows up, over blank rows.
+    #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
+    fn a_real_terminal_returns_the_block_to_the_bottom_when_a_menu_closes() {
+        let Some(term) = RealTerminal::open() else {
+            return;
+        };
+        term.paint_transcript_and_block();
+        term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 21, 3, &[2, 2, 2], (2, 22));
+
+        screen.relayout(9, 1).unwrap();
+        assert_eq!(screen.top, 14, "the palette lifts the block 7 rows");
+        term.paint_block(screen.top, 10);
+        let open = term.screen(|rows| rows.get(23).is_some_and(|row| row == "B9"));
+        assert_eq!(open[13], "T20", "{open:#?}");
+
+        screen.relayout(2, 1).unwrap();
+        assert_eq!(screen.top, 21, "the block is back on the bottom rows");
+        term.paint_block(screen.top, 3);
+        let closed = term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+        assert_eq!(
+            closed[20], "T20",
+            "the transcript ends above the block: {closed:#?}"
+        );
+        assert_eq!(closed[21..], ["B0", "B1", "B2"], "{closed:#?}");
     }
 
     /// The first row (zero-based) the resize erased downward from.
-    fn first_erase_row(mut written: std::fs::File) -> u16 {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-        let mut bytes = Vec::new();
-        written.seek(SeekFrom::Start(0)).unwrap();
-        written.read_to_end(&mut bytes).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
+    fn first_erase_row(written: Boundaries) -> u16 {
+        let text = written.text();
         let at = text.find("\x1b[J").expect("resize erases downward");
         let (row, _) = text[..at]
             .rsplit_once("\x1b[")
@@ -2309,12 +2691,8 @@ mod tests {
     }
 
     /// Every row (zero-based) the screen erased downward from, in order.
-    fn erase_rows(mut written: std::fs::File) -> Vec<u16> {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-        let mut bytes = Vec::new();
-        written.seek(SeekFrom::Start(0)).unwrap();
-        written.read_to_end(&mut bytes).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
+    fn erase_rows(written: Boundaries) -> Vec<u16> {
+        let text = written.text();
         // The last cursor move before each erase; the wrap fence's own escapes interleave.
         text.match_indices("\x1b[J")
             .map(|(at, _)| {
@@ -2330,7 +2708,6 @@ mod tests {
     /// #3041: split (narrow), draw, close the split (widen), draw. A screen part-filled
     /// with transcript keeps the block where it is through both reflows, so no erase may
     /// start above row 10: rows 0..10 are transcript.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_narrow_then_widen_resize_never_erases_above_the_block() {
         let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (60, 11));
@@ -2357,10 +2734,68 @@ mod tests {
         );
     }
 
+    /// The live recording: the `/` palette opened on a bottom-row block and scrolled the
+    /// transcript up 7 rows; closing it left the prompt 7 rows above the bottom. A block
+    /// on the bottom row keeps it when it shrinks; one under short content does not move.
+    #[test]
+    fn a_shrinking_block_on_the_bottom_row_stays_there() {
+        let (mut screen, log) = screen_with_block(80, 24, 14, 10, &[40; 10], (2, 22));
+        screen.relayout(2, 1).unwrap();
+        assert_eq!((screen.top, screen.block_h), (21, 3));
+        let text = log.text();
+        let erase = text.find("\x1b[J").expect("the tall block is erased");
+        let slide = text
+            .find("\x1b[7T")
+            .expect("the transcript slides down 7 rows");
+        assert!(
+            erase < slide,
+            "slide before erase would push block chrome down"
+        );
+        drop(screen);
+
+        let (mut screen, log) = screen_with_block(80, 24, 5, 10, &[40; 10], (2, 13));
+        screen.relayout(2, 1).unwrap();
+        assert_eq!((screen.top, screen.block_h), (5, 3));
+        assert!(
+            !log.text().contains('T'),
+            "a block under short content stays put"
+        );
+    }
+
+    /// The live recording: a pane edge dragged down left blank rows between the transcript
+    /// and the pinned block, and dragging it back scrolled transcript off the top while
+    /// those rows stayed. A grow whose block moves down now slides the transcript with it.
+    #[test]
+    fn a_grow_slides_the_transcript_down_with_the_block() {
+        // The terminal added 8 rows below a 3-row block at the bottom of 24 rows.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[40, 40, 10], (2, 22));
+        screen.resize(80, 32, 2, 1, Some(21)).unwrap();
+        assert_eq!(screen.top, 29, "the block is pinned to the new bottom");
+        let text = log.text();
+        let erase = text.find("\x1b[J").expect("the old block is erased");
+        let slide = text
+            .find("\x1b[8T")
+            .expect("the transcript slides down 8 rows");
+        assert!(
+            erase < slide,
+            "slide before erase would push block chrome down"
+        );
+
+        // The terminal pulled 8 rows of scrollback down instead: the block is already at
+        // the bottom, so nothing is left blank and nothing slides.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[40, 40, 10], (2, 22));
+        screen.resize(80, 32, 2, 1, Some(29)).unwrap();
+        assert_eq!(screen.top, 29);
+        // A shrink never slides either.
+        screen.caret_frame = None;
+        screen.resize(80, 24, 2, 1, None).unwrap();
+        let text = log.text();
+        assert!(!text.contains('T'), "nothing slid: {text:?}");
+    }
+
     /// #3021 review: a width shrink whose footer wraps BELOW the caret. The terminal's
     /// reply already includes the scroll that reflow caused (block top 20), so erasing
     /// from `20 - growth` deleted the last transcript row above the block.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_does_not_erase_transcript_above_the_block() {
         // 80x24, three-row block at row 21, caret on row 22; shrink to 40 wraps the
@@ -2372,7 +2807,6 @@ mod tests {
 
     /// The other side: a row ABOVE the caret wraps, pushing the caret down past the
     /// block's own offset, so the measured top reads one row too low.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_with_a_wrapped_row_above_the_caret_erases_the_whole_block() {
         // Header (70 cols) wraps to two rows: the block now starts at 20 with the
@@ -2389,7 +2823,6 @@ mod tests {
     /// #3021 review, round 3: the caret's OWN row wraps before the caret. The input row
     /// (70 cols, caret at column 60) splits at 40, carrying the caret one row further down,
     /// so the reply reads one row lower than the header's wrap alone explains.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_with_the_caret_row_wrapped_before_the_caret_erases_the_whole_block()
     {
@@ -2402,7 +2835,6 @@ mod tests {
 
     /// The control: the caret sits in the first fragment of its row, so only the header's
     /// wrap moved it.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_measured_width_shrink_with_the_caret_before_its_rows_wrap_point_erases_the_block() {
         let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 70, 10], (10, 11));
@@ -2412,7 +2844,6 @@ mod tests {
 
     /// The caret past its row's text, beyond the new width: terminals disagree on where
     /// reflow puts it, so the reply is not trusted and the unmeasured guess stands.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_caret_past_its_rows_text_beyond_the_new_width_falls_back_to_the_guess() {
         let (mut screen, log) = screen_with_block(80, 24, 10, 3, &[80, 50, 10], (60, 11));
@@ -2422,7 +2853,6 @@ mod tests {
     }
 
     /// Unmeasured, the guess still subtracts the whole reflow.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn an_unmeasured_width_shrink_still_lifts_by_the_whole_reflow() {
         let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[10, 10, 70], (5, 22));
@@ -2436,7 +2866,6 @@ mod tests {
     /// width: its caret sits past its row's text, so the measurement is refused. Seen in tmux
     /// and in a libghostty-vt terminal multiplexer; both kept the block's bottom row and lifted
     /// it by its reflow.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn an_unmeasured_narrow_puts_the_block_where_the_reflow_lifted_it_3041() {
         let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 98, 75], (98, 38));
@@ -2461,7 +2890,6 @@ mod tests {
     /// draw, or a `!` command holding the terminal) lifted the erase by the widths of a block
     /// no longer on screen and wiped committed rows. Live: narrowing during `! seq` lost the
     /// command's last output line.
-    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn an_unmeasured_narrow_after_the_block_was_erased_lifts_nothing_3041() {
         let (mut screen, log) = screen_with_block(120, 40, 37, 3, &[11, 70, 75], (2, 38));
@@ -2669,6 +3097,21 @@ mod tests {
     #[derive(Clone, Default)]
     struct Boundaries(Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>);
 
+    impl Boundaries {
+        fn text(&self) -> String {
+            let bytes: Vec<u8> = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
     impl Write for Boundaries {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().push(Some(buf.to_vec()));
@@ -2689,45 +3132,9 @@ mod tests {
     /// writes, fails here; the fence unit test above cannot see either.
     #[test]
     fn a_production_draw_reaches_the_writer_as_one_synchronized_write() {
-        let log = Boundaries::default();
-        let tty = WrapFence::new(log.clone());
-        let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
-        let backend = CaretBackend {
-            inner: CrosstermBackend::new(WrapFence {
-                file: log.clone(),
-                state: Arc::clone(&tty.state),
-            }),
-            caret: Arc::clone(&caret),
-        };
-        let (cols, top, block_h) = (40, 2, 4);
-        let term = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
-            },
-        )
-        .unwrap();
-        let region = newt_core::tty::Terminal::lease_region(
-            block_region(top, block_h),
-            newt_core::tty::OnCollision::Refuse,
-        )
-        .expect("the test owns these rows");
-        let mut screen = Screen {
-            tty,
-            term,
-            caret,
-            caret_frame: None,
-            can_query_cursor: true,
-            cols,
-            rows: 10,
-            top,
-            block_h,
-            status_rows: 1,
-            status: b"working".to_vec(),
-            queued: 0,
-            region,
-            painted_widths: Vec::new(),
-        };
+        let (mut screen, log) = screen_with_block(40, 10, 2, 4, &[], (0, 0));
+        screen.caret_frame = None;
+        screen.status = b"working".to_vec();
         let editor = MountedEditor::new(crate::rich_input::Edit::Emacs, None, Vec::new(), "hi");
         let chrome = crate::rich_input::Chrome {
             model: "m",

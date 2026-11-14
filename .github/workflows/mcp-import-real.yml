@@ -179,4 +179,46 @@ jobs:
           -p newt-tui mcp::
           -- --include-ignored --test-threads=1
 
+      # PR #3097: real-resource grounds for the in-memory regression guards.
+      # This existing lane is weekly + release only, never the push/unit tier.
+      - name: Install tmux for regression grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if ! command -v tmux >/dev/null; then
+            if [[ "$RUNNER_OS" == Linux ]]; then
+              sudo apt-get update && sudo apt-get install -y tmux
+            else
+              brew install tmux
+            fi
+          fi
+
+      - name: Run Git network-read grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test an_approved_network_read_dials_an_http_remote_from_the_confined_shell
+          -p newt-core --lib
+          an_approved_network_read_dials_an_http_remote_from_the_confined_shell
+          -- --ignored --test-threads=1
+
+      - name: Run hostile-PATH Git approval grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test a_hostile_path_git_never_runs_during_network_read_approval
+          -p newt-core --lib a_hostile_path_git_never_runs_during_network_read_approval
+          -- --ignored --test-threads=1
+
+      - name: Run presenter regression grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test a_real_terminal_keeps_the_transcript_through_a_grow_and_shrink
+          -p newt-tui --features rich-tui --lib cockpit::presenter::tests::a_real_terminal_
+          -- --ignored --test-threads=1
+
 # Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 16:43 EDT | Date: 2026-08-13

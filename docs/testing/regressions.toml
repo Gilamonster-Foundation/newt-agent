@@ -1,0 +1,57 @@
+# Regression register.
+#
+# One entry per regression an operator saw in a live run. Each names the two
+# tests that keep it fixed:
+#
+#   guard   the fast mocked test that gates every PR
+#   ground  the real-resource test that proves the mock describes reality
+#
+# Both are required. A mocked test alone was green while the first entry
+# below was still broken in a live session, because the mock encoded a belief
+# about the sandbox that was false.
+#
+# `newt-core/tests/regression_register.rs` enforces this file: every named
+# test must exist and be a test; guards are enabled, grounds are #[ignore]d
+# for the weekly/release tier documented in bat-uat.md. The entry count only rises. To add an entry, write both tests, add it here, and raise
+# `REGISTERED` in that test.
+
+[[regression]]
+id = "git-network-read"
+seen = "2026-11-12"
+symptom = """
+`git fetch` in a confined session failed at the sandbox with no permission \
+prompt. Once a prompt existed and was allowed, the fetch still failed: Git \
+could not run its own http(s) transport helper under a restricted exec scope."""
+guard = { file = "newt-core/src/agentic/tools/native_git.rs", test = "a_git_network_read_asks_for_one_commands_egress" }
+ground = { file = "newt-core/src/agentic/tools/native_git.rs", test = "an_approved_network_read_dials_an_http_remote_from_the_confined_shell" }
+
+[[regression]]
+id = "resize-drag-blanks-transcript"
+seen = "2026-11-12"
+symptom = """
+Dragging a pane edge down and back up left the screen blank above the prompt. \
+A grow left blank rows under the transcript, and each shrink scrolled \
+transcript away instead of those rows. A shrink could also erase the last \
+transcript row when the block no longer fit where the terminal left it."""
+guard = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_grow_slides_the_transcript_down_with_the_block" }
+ground = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_real_terminal_keeps_the_transcript_through_a_grow_and_shrink" }
+
+[[regression]]
+id = "menu-close-strands-prompt"
+seen = "2026-11-12"
+symptom = """
+Opening the `/` command palette on a full screen scrolled the transcript up; \
+closing it left the prompt mid-screen with blank rows beneath it."""
+guard = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_shrinking_block_on_the_bottom_row_stays_there" }
+ground = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_real_terminal_returns_the_block_to_the_bottom_when_a_menu_closes" }
+
+[[regression]]
+id = "resize-shrink-then-grow-blanks-transcript"
+seen = "2026-11-13"
+symptom = """
+Dragging a pane edge up and back down left blank rows above the few \
+transcript rows that had fit the small pane. The shrink scrolled the rest \
+into scrollback, and a terminal that adds rows at the bottom on a grow does \
+not bring them back."""
+guard = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_grow_repaints_the_rows_a_shrink_scrolled_away" }
+ground = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow" }

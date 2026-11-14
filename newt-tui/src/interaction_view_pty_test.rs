@@ -1024,6 +1024,8 @@ pub(crate) fn drive_cockpit_panel_close() {
 /// `rows=N top=M` out of the last `marker` line on the screen.
 fn marker_numbers(screen: &str, marker: &str) -> Option<(u16, u16)> {
     let line = screen.lines().rev().find(|l| l.contains(marker))?;
+    // A repaint after a resize puts earlier rows on the same line: read from the marker.
+    let line = &line[line.rfind(marker)?..];
     // The marker row is followed by a style reset: read the digits only.
     let field = |name: &str| -> Option<u16> {
         let tail = line.split(name).nth(1)?;
