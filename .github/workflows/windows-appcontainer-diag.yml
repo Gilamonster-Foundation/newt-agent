@@ -22,8 +22,7 @@ on:
     inputs:
       ref:
         description: "Branch/ref to check out and build"
-        required: true
-        default: "step-27.13-workspace-settings"
+        required: false
 
 jobs:
   diag:
@@ -31,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Show OS/runner identity
         shell: pwsh
@@ -106,15 +105,18 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           New-Item -ItemType Directory -Force target\debug\deps | Out-Null
           Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
           $tests = @(
             'agentic::tools::disable_ocap_tests::native_git_status_requires_exec_and_reads_the_actual_repository',
             'agentic::tools::disable_ocap_tests::state_modifying_git_add_is_not_routed',
+            'agentic::tools::disable_ocap_tests::native_git_exec_grant_retry_stages_under_appcontainer',
             'agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants'
           )
           foreach ($t in $tests) {
             Write-Output "===== cargo test $t ====="
             cargo test -p newt-core --lib --features windows-appcontainer $t -- --test-threads=1 --nocapture
             Write-Output "EXIT=$LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { throw "Native Git evidence failed: $t" }
           }

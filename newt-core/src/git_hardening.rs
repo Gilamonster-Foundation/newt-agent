@@ -1906,9 +1906,8 @@ pub fn trusted_gh_program(path: Option<&OsStr>) -> io::Result<PathBuf> {
 ///
 /// Windows keeps the pre-existing bare-name behavior: `CreateProcess`'s
 /// executable search does not repeat Unix's cwd-relative-PATH-entry gadget
-/// the same way, and the Windows AppContainer refusal already covers the
-/// dominant native-Git host-execution risk on that platform
-/// (`windows_appcontainer_native_git_refusal`).
+/// the same way. Confined native Git follows the ordinary AppContainer exec
+/// and filesystem checks; it has no host fallback.
 #[cfg(unix)]
 pub(crate) fn resolve_trusted_program(
     cwd: &Path,

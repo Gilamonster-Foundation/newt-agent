@@ -1,10 +1,35 @@
 # Windows host prerequisites
 
 Confined native commands require the trusted `agent-bridle-aclaunch.exe`
-AppContainer launcher. Install it with
-`cargo install agent-bridle-aclaunch --version 0.7.10 --locked` and keep the
-launcher beside `newt.exe` in the same installation directory. An arbitrary
-`PATH` entry is not trusted.
+AppContainer launcher. Use the **v0.8.0-rc.7 release archive**, not the old
+crates.io launcher:
+
+- [agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64.tar.gz](https://github.com/Gilamonster-Foundation/agent-bridle/releases/download/v0.8.0-rc.7/agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64.tar.gz)
+- SHA256: `6ca23258e1bf8c3eb7881d0836c8186039c176e6f472cfe9d948acf313c4816d`
+- Member: `agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64/agent-bridle-aclaunch.exe`
+
+From the repository root, the shared installer downloads with bounded retries,
+checks the SHA256 **before extraction**, and copies only the launcher:
+
+```powershell
+./scripts/windows/Install-AppContainerLauncher.ps1 -Destination (Split-Path (Get-Command newt.exe).Source)
+```
+
+An offline installation may pass `-Archive` with the same pinned archive; its
+checksum is still checked. Keep the launcher beside `newt.exe` in the same
+installation directory. An arbitrary `PATH` entry is not trusted. CI installs
+into the Cargo bin directory, then explicitly stages the verified executable
+beside the test binaries. The archive omits `ab-netprobe.exe`; CI installs that
+evidence helper separately with
+`cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked`.
+This installs only the probe, not a replacement launcher.
+
+The older launcher's workspace write grant omitted traverse and delete rights.
+That caused Git's work-tree lookup and index-lock cleanup failures; the earlier
+claim that Git needed access to profile ancestors was incorrect. The rc.7
+launcher fixes those rights within the granted workspace. Newt therefore sends
+literal `git status` and `git add` through the ordinary confined exec path,
+including the exec gate and filesystem grants, without a host fallback.
 
 ## Prepare the null device once per boot
 
