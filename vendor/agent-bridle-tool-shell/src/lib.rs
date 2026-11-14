@@ -157,8 +157,9 @@ pub const fn brush_private_control_supported() -> bool {
 }
 #[cfg(feature = "brush")]
 pub use shell_inspect::{
-    inspect_shell, DescendantExec, InspectedCommand, InspectedConstruct, InspectedRedirect,
-    RedirectOperation, ShellConstructKind, ShellInspection, ShellInspectionError,
+    inspect_shell, literal_shell_word, DescendantExec, InspectedCommand, InspectedConstruct,
+    InspectedRedirect, RedirectOperation, ShellConstructKind, ShellInspection,
+    ShellInspectionError,
 };
 
 /// Private Brush-worker dispatch. An embedder's binary calls

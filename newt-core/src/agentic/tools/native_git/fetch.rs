@@ -127,7 +127,7 @@ pub(super) fn execute_with(
         return None;
     }
     // The LITERAL url, as for a push: what the operator approves is dialed.
-    let url = staging::literal_remote_url(&tools, &common_dir, &fetch.remote, &held).ok()?;
+    let url = staging::literal_remote_url(&common_dir, &fetch.remote, &held).ok()?;
     let host = dialable_host(&url)?;
 
     // From here the broker owns the command: it answers, it never falls back.

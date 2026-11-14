@@ -113,6 +113,8 @@ crossterm.workspace = true
 newt-interaction.workspace = true
 newt-skills.workspace = true
 reqwest.workspace = true
+# Already in reqwest's dependency graph; bounded HTTP/1.1 over the gh socket.
+httparse = "1.10.1"
 tokio.workspace = true
 # `host-shell` = the sandboxed-host engine (`/bin/sh -c` in the L3 jail, ADR 0019)
 # selectable via `[shell] engine = "host"`; `os-sandbox` enables every OS L3

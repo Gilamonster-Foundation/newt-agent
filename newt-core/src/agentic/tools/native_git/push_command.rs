@@ -110,12 +110,18 @@ impl GovernedCommand {
     /// The broker exposes a success/failure status, not raw Git diagnostics.
     /// A head pipeline succeeds like the shell utility even if push failed.
     pub fn render(&self, output: String, success: bool) -> String {
+        self.render_status(output, i32::from(!success))
+    }
+
+    /// Read commands such as `gh pr checks` have meaningful nonzero statuses.
+    /// Preserve those for `$?`; a head pipeline still reports head's success.
+    pub fn render_status(&self, output: String, status: i32) -> String {
         let mut output = match self.head {
             Some(count) => output.lines().take(count).collect::<Vec<_>>().join("\n"),
             None => output,
         };
         if !self.echo.is_empty() {
-            let status = i32::from(!success && self.head.is_none());
+            let status = if self.head.is_some() { 0 } else { status };
             let echo = self
                 .echo
                 .iter()

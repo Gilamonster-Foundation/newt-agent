@@ -3712,6 +3712,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        #[cfg(test)]
+                        command_probe: None,
                         command_budget,
                         shell_dialect,
                         read_history: Some(&mut read_history),
@@ -9005,6 +9007,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        #[cfg(test)]
+                        command_probe: None,
                         command_budget,
                         shell_dialect,
                         read_history: Some(&mut read_history),
@@ -11845,6 +11849,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        #[cfg(test)]
+                        command_probe: None,
                         command_budget,
                         shell_dialect,
                         read_history: Some(&mut read_history),
@@ -13833,6 +13839,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        #[cfg(test)]
+                        command_probe: None,
                         command_budget,
                         shell_dialect,
                         read_history: Some(&mut read_history),

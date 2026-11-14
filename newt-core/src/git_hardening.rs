@@ -1852,10 +1852,14 @@ pub fn push_url_host(url: &str) -> Result<String, String> {
 /// refuses the PR broker in that case rather than guessing).
 #[must_use]
 pub fn github_owner_repo(url: &str) -> Option<(String, String)> {
+    let (host, owner, name) = forge_owner_repo(url)?;
+    (host == "github.com").then_some((owner, name))
+}
+
+/// The literal forge destination shared by the PR-create and read brokers.
+/// It does not apply Git URL rewrites or consult any resource.
+pub(crate) fn forge_owner_repo(url: &str) -> Option<(String, String, String)> {
     let host = push_url_host(url).ok()?;
-    if host != "github.com" {
-        return None;
-    }
     let path = if let Some(rest) = url.strip_prefix("https://") {
         rest.split_once('/')?.1
     } else if let Some(rest) = url.strip_prefix("ssh://") {
@@ -1865,7 +1869,7 @@ pub fn github_owner_repo(url: &str) -> Option<(String, String)> {
     };
     let path = path.trim_end_matches('/').trim_end_matches(".git");
     let (owner, name) = path.split_once('/')?;
-    (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
+    (!owner.is_empty() && !name.is_empty()).then(|| (host, owner.to_string(), name.to_string()))
 }
 
 fn git_program(cwd: &Path, path: Option<&OsStr>) -> io::Result<PathBuf> {

@@ -131,3 +131,6 @@
 "newt-core/src/agentic/tools_tests/git_fixture.rs" = { count = 2, class = "test", note = "Shared isolated Git fixture extracted from helper_git_shell_grant.rs; no production spawn" }
 
 "newt-cli/src/doctor/durable_grants_tests.rs" = { count = 1, class = "test", note = "#2842 Windows-only signed-name drift fixture: cmd.exe /d /c mklink /J creates a junction between two owned temporary paths. Fixed operation, disabled AutoRun, no model input; no production spawn. Uses a real alias without requiring symlink privilege." }
+
+"newt-core/src/agentic/tools/native_git/gh_read.rs" = { count = 2, class = "git-helper", note = "#3093 read broker: command type in pure environment pinning plus a test-only unexecuted Command builder. Actual children use TrustedTools after host/API consent, fixed allowlisted argv, isolated staging HOME/config, selected-host credentials, captured output and bounded model rendering. No model shell source executes." }
+"newt-core/src/agentic/tools/native_git/gh_http_ground.rs" = { count = 1, class = "test", note = "#3093 ignored serial redirect ground: real gh when installed, fixed read argv and cleared environment, private Unix-socket config, local stand-in upstreams. Proves an unapproved redirect never reaches the second listener; no live forge." }

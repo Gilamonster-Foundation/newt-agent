@@ -19,6 +19,7 @@ impl Environment {
             "NEWT_UNSAFE_HOST_EXEC",
             "NEWT_READ_PATHS",
             "NEWT_WRITE_PATHS",
+            "NEWT_NET_HOSTS",
             "NEWT_EXEC_PATHS",
             "NEWT_VENV",
         ];

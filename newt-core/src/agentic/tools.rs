@@ -3,6 +3,8 @@
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:15 EDT | Date: 2026-08-12
 
+#[cfg(test)]
+mod gh_read_tests;
 mod worktree;
 use worktree::execute as execute_tool_inner;
 
@@ -3813,6 +3815,8 @@ async fn execute_authorized_tool(
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         command_budget,
+        #[cfg(test)]
+        command_probe,
         shell_dialect,
         read_history,
         default_command_cwd,
@@ -4714,7 +4718,12 @@ async fn execute_authorized_tool(
             // `cwd` arg — it's the more specific, in-command intent).
             let command_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
             let run_cwd = resolve_exec_cwd(&command_cwd, cd_path.as_deref());
-            if let Err((error, outcome)) = shell::existing_exec_cwd(std::path::Path::new(&run_cwd)) {
+            let check_cwd = || shell::existing_exec_cwd(std::path::Path::new(&run_cwd));
+            #[cfg(test)]
+            let cwd_result = command_probe.map_or_else(check_cwd, |_| Ok(std::path::PathBuf::from(&run_cwd)));
+            #[cfg(not(test))]
+            let cwd_result = check_cwd();
+            if let Err((error, outcome)) = cwd_result {
                 let task_root = worktree_session.and_then(|session| session.task_root(std::path::Path::new(workspace)));
                 let previous = task_root.as_deref().or(default_command_cwd).unwrap_or_else(|| std::path::Path::new(workspace));
                 return host_return(executed((
@@ -4751,6 +4760,16 @@ async fn execute_authorized_tool(
                     caveats,
                     &mut permission_gate,
                     governed_pr,
+                ));
+            }
+            if governed_git && native_git::gh_read::recognizes(cmd) {
+                return host_return(native_git::gh_read::execute(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                    #[cfg(test)]
+                    command_probe,
                 ));
             }
             if governed_git {
@@ -4942,6 +4961,11 @@ async fn execute_authorized_tool(
                 commit_policy.as_deref(),
             )
             .await;
+            #[cfg(test)]
+            if let Some(probe) = command_probe {
+                probe.confined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return "confined child has no host-network authority".into();
+            }
             let (mut exec_text, mut exec_outcome) = shell::exec_confined_command_with_broker(
                 cmd,
                 &run_cwd,

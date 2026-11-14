@@ -58,6 +58,10 @@
 #     (mocked guards remain in this hook), plus PR #3099's ignored fetch broker
 #     fallback, hostile-rewrite, partial-ref and transfer grounds (serial;
 #     Linux and macOS check hostile rewrites and successful confined transfer),
+#     #3093 gh read broker grounding
+#     (gh_read_real_dispatch_pins_host_and_isolates_config; stand-in gh, no live forge),
+#     and gh_http_real_redirect_never_reaches_ungranted_listener (real HTTP and
+#     real gh when installed; local stand-in upstreams; serial Linux/macOS),
 #     and the macOS-only stdio MCP net:none
 #     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;

@@ -55,3 +55,21 @@ into scrollback, and a terminal that adds rows at the bottom on a grow does \
 not bring them back."""
 guard = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_grow_repaints_the_rows_a_shrink_scrolled_away" }
 ground = { file = "newt-tui/src/cockpit/presenter.rs", test = "a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow" }
+
+[[regression]]
+id = "launch-granted-gh-read"
+seen = "2026-11-14"
+symptom = """
+Launch grants for the forge and API hosts were recorded, but gh issue view
+still entered the confined child with deny-all networking and failed."""
+guard = { file = "newt-core/src/agentic/tools/gh_read_tests.rs", test = "launch_granted_gh_issue_view_uses_host_broker_without_prompts" }
+ground = { file = "newt-core/src/agentic/tools/native_git/gh_read_ground.rs", test = "gh_read_real_dispatch_pins_host_and_isolates_config" }
+
+[[regression]]
+id = "gh-read-redirect-authority"
+seen = "2026-11-14"
+symptom = """
+The read broker approved the initial forge but the host gh client could
+follow a redirect to an ungranted destination without another decision."""
+guard = { file = "newt-core/src/agentic/tools/native_git/gh_http.rs", test = "gh_http_only_approved_destinations_reach_upstream" }
+ground = { file = "newt-core/src/agentic/tools/native_git/gh_http_ground.rs", test = "gh_http_real_redirect_never_reaches_ungranted_listener" }
