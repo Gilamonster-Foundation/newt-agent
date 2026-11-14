@@ -4762,6 +4762,16 @@ async fn execute_authorized_tool(
                     governed_pr,
                 ));
             }
+            if governed_git && native_git::gh_read::recognizes(cmd) {
+                return host_return(native_git::gh_read::execute(
+                    cmd,
+                    std::path::Path::new(&run_cwd),
+                    caveats,
+                    &mut permission_gate,
+                    #[cfg(test)]
+                    command_probe,
+                ));
+            }
             if governed_git {
                 if let Err(reason) = native_git::preflight(
                     cmd,

@@ -211,6 +211,15 @@ jobs:
             fi
           fi
 
+      - name: Run gh read broker grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test gh_read_real_dispatch_pins_host_and_isolates_config
+          -p newt-core --lib gh_read_real_dispatch_pins_host_and_isolates_config
+          -- --ignored --test-threads=1
+
       - name: Run Git network-read grounding
         if: runner.os != 'Windows'
         shell: bash

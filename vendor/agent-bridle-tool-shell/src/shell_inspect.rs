@@ -172,6 +172,38 @@ pub fn inspect_shell(cmd: &str) -> Result<ShellInspection, ShellInspectionError>
     inspect_shell_at_depth(cmd, 0)
 }
 
+/// Resolve exactly one literal argument with the inspector's existing word
+/// parser, without classifying that argument as an executable (e.g. `o/r`).
+///
+/// # Errors
+/// Rejects multiple words, shell syntax, globbing and runtime expansion.
+pub fn literal_shell_word(source: &str) -> Result<String, ShellInspectionError> {
+    let probe = format!("literal-word-probe {source}");
+    let inspection = inspect_shell(&probe)?;
+    let command = inspection
+        .commands
+        .first()
+        .ok_or_else(|| ShellInspectionError::new("missing literal word"))?;
+    if inspection.commands.len() != 1
+        || !inspection.constructs.is_empty()
+        || command.source != probe
+        || command.argv.len() != 2
+        || command.argv[1] != source
+        || !command.redirects.is_empty()
+    {
+        return Err(ShellInspectionError::new(
+            "expected exactly one literal argument",
+        ));
+    }
+    static_shell_word(
+        &Word {
+            value: source.to_owned(),
+            loc: None,
+        },
+        &ParserOptions::default(),
+    )
+}
+
 fn inspect_shell_at_depth(
     source: &str,
     depth: usize,
@@ -1338,6 +1370,7 @@ fn source_between_words(first: &Word, last: &Word, source: &str) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     const COMPOUND_EXAMPLE: &str = r#"ls -1 $(find . -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | sort -nr | head -10)"#;

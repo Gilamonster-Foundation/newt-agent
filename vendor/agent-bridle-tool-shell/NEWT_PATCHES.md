@@ -10,6 +10,11 @@ temporary dependency override, not a second shell implementation.
 
 Integration changes:
 
+- #3093: expose the existing static word parser through a source-bound
+  single-argument helper. Broker arguments such as `owner/r` and `done` are
+  data, not standalone executable commands; expansion/globs/control syntax
+  still refuse. Newt's PR-create and read brokers share this helper.
+
 - #2796: Unix Brush and POSIX host entrypoints supply `which` through the
   existing `command -v` builtin, so discovery works without an external which.
   The same wrapper is shared with Newt's ambient Bash/sh route; PATH lookup

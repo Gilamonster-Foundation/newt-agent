@@ -3,6 +3,7 @@
 //! destructive-operation confirmations while the command interface migrates.
 
 pub(super) mod fetch;
+pub(super) mod gh_read;
 pub(super) mod publication;
 pub(super) mod push_command;
 mod push_failure;
@@ -478,7 +479,7 @@ fn plan_governed_push(
 
     // The LITERAL `remote.<name>.url` (never `git remote get-url`, which
     // applies insteadOf): what the operator approves is what staging dials.
-    let url = staging::literal_remote_url(&tools, &common_dir, &request.remote, held)?;
+    let url = staging::literal_remote_url(&common_dir, &request.remote, held)?;
     let host = crate::git_hardening::push_url_host(&url)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(format!(
@@ -834,7 +835,7 @@ fn plan_governed_pr_create(
 
     // The `gh` dial runs from a fresh staging directory (Phase 4), so a
     // repo-local config gadget has nothing to reach.
-    let url = staging::literal_remote_url(&tools, &common_dir, "origin", held)?;
+    let url = staging::literal_remote_url(&common_dir, "origin", held)?;
     let Some((owner, name)) = crate::git_hardening::github_owner_repo(&url) else {
         return Err(syntax_refusal(
             "gh pr create requires a github.com origin remote",
@@ -1028,18 +1029,10 @@ pub(super) fn windows_appcontainer_native_git_refusal(
     }
 }
 
-/// Reuse Bridle's static executable-word resolution for a single literal
-/// argument. No shell is run; expansions, multiple words, and redirects fail.
+/// Resolve a single argument with Bridle's word parser. Argument data is not
+/// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
 pub(super) fn literal(word: &str) -> Option<String> {
-    let parsed = inspect_shell(word).ok()?;
-    let command = parsed.commands.first()?;
-    (parsed.commands.len() == 1
-        && parsed.constructs.is_empty()
-        && command.argv.len() == 1
-        && command.redirects.is_empty()
-        && command.descendant_execs.is_empty())
-    .then(|| command.program.clone())
-    .flatten()
+    agent_bridle_tool_shell::literal_shell_word(word).ok()
 }
 
 /// Find the native verb without translating argv. Repository/config selectors
@@ -4093,6 +4086,7 @@ mod governed_push_tests {
     }
 
     include!("native_git/pr_create_tests.rs");
+    include!("native_git/gh_read_ground.rs");
 
     // -- gh pr create planning ----------------------------------------------
 

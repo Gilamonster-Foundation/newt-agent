@@ -20,6 +20,14 @@ use std::collections::BTreeSet;
 // Embedded at compile time: checking the register performs no filesystem I/O.
 const SOURCES: &[(&str, &str)] = &[
     (
+        "newt-core/src/agentic/tools/gh_read_tests.rs",
+        include_str!("../src/agentic/tools/gh_read_tests.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools/native_git/gh_read_ground.rs",
+        include_str!("../src/agentic/tools/native_git/gh_read_ground.rs"),
+    ),
+    (
         "newt-core/src/agentic/tools/native_git.rs",
         include_str!("../src/agentic/tools/native_git.rs"),
     ),
@@ -31,7 +39,7 @@ const SOURCES: &[(&str, &str)] = &[
 
 /// Entries in the register. Raise it in the PR that adds an entry; it never
 /// goes down.
-const REGISTERED: usize = 4;
+const REGISTERED: usize = 5;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

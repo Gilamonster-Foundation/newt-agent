@@ -1047,52 +1047,38 @@ pub(crate) fn is_hex_oid(s: &str) -> bool {
 }
 
 /// The literal, undecoded value of `remote.<name>.url` from the repository's
-/// own config file — NOT `git remote get-url`, which applies `url.*
-/// .insteadOf`/`pushInsteadOf` rewrites (DESIGN-r4 probe P1). Read with the
-/// CHECKED git and allowlist env, `--file /dev/stdin` fed from the bytes
-/// already read via `O_NOFOLLOW` — race-resistant because the content is in
-/// memory before git's stdin is written. This literal string is BOTH the value
-/// shown in the approval prompt and the exact string later dialed from staging
-/// (which has no `url.*` keys to rewrite it).
+/// own config file — NOT `git remote get-url`, which applies URL rewrites.
+/// Only bytes read beneath the held root are parsed; includes are not loaded.
+/// No subprocess is started, so callers can resolve the destination before
+/// requesting network authority or authenticating executables.
 ///
 /// # Errors
-/// When the config file is a symlink, outside the read roots, git cannot
-/// run, or the key has no value.
+/// When config is unreadable, malformed, or the literal key has no value.
 pub fn literal_remote_url(
-    tools: &TrustedTools,
     common_dir: &Path,
     remote: &str,
     held: &HeldRoots,
 ) -> Result<String, Refusal> {
-    use std::io::Write;
     let key = format!("remote.{remote}.url");
-    // Beneath the held root: a model-planted symlink anywhere on the way to
-    // `config` is refused.
     let config_text = held
         .read_to_string(common_dir, Path::new("config"))?
-        .ok_or_else(|| format!("refused: no local '{key}' — is '{remote}' configured?"))?;
-    let mut cmd = tools.git([
-        OsStr::new("config"),
-        OsStr::new("--file"),
-        OsStr::new("/dev/stdin"),
-        OsStr::new("--get"),
-        OsStr::new(&key),
-    ]);
-    cmd.stdin(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("refused: trusted git could not run ({e})"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(config_text.as_bytes());
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("refused: trusted git could not run ({e})"))?;
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() || url.is_empty() {
-        return Err(format!("refused: no local '{key}' — is '{remote}' configured?").into());
-    }
-    Ok(url)
+        .ok_or_else(|| "refused: no repository config".to_string())?;
+    literal_remote_from_config(&config_text, &key)
+}
+
+// Parse only these already-authorized bytes. ConfigFile::parse does not load
+// includes, ambient config, or URL rewrites, and starts no discovery child.
+pub(crate) fn literal_remote_from_config(text: &str, key: &str) -> Result<String, Refusal> {
+    use grit_lib::config::{ConfigFile, ConfigScope};
+    ConfigFile::parse(Path::new("config"), text, ConfigScope::Local)
+        .ok()
+        .and_then(|config| config.get(key))
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| {
+            "refused: no literal repository remote URL"
+                .to_string()
+                .into()
+        })
 }
 
 // ---------------------------------------------------------------------------

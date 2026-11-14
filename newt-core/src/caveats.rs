@@ -145,6 +145,14 @@ pub fn lock_fs_to_workspace(
 /// so a Windows drive-letter grant (`C:\…`) is not shattered into a bare `"C"`
 /// root that would prefix-match the whole drive.
 pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
+    apply_cli_grants_with(caveats, workspace, crate::git_hardening::own_gitdir_grants);
+}
+
+fn apply_cli_grants_with(
+    caveats: &mut Caveats,
+    workspace: &str,
+    discover: impl FnOnce(&std::path::Path) -> crate::git_hardening::OwnGitGrant,
+) {
     let parse = |var: &str| -> Vec<String> {
         std::env::var_os(var)
             .map(|s| {
@@ -168,7 +176,7 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
     // check); folding it into the SHELL lane's kernel fence is deliberately
     // out of scope here — that is an operator decision, not this function's
     // to make.
-    let own_git = crate::git_hardening::own_gitdir_grants(std::path::Path::new(workspace));
+    let own_git = discover(std::path::Path::new(workspace));
     let mut read = parse("NEWT_READ_PATHS");
     read.extend(own_git.read);
     let write = parse("NEWT_WRITE_PATHS");
@@ -592,7 +600,7 @@ mod tests {
             net: Scope::none(),
             ..Caveats::top()
         };
-        apply_cli_fs_grants(&mut c, "/ws");
+        apply_cli_grants_with(&mut c, "/ws", |_| Default::default());
         crate::process_env::remove_var(NEWT_NET_HOSTS_ENV);
         assert!(c.permits_net("github.com"));
         assert!(c.permits_net("doi.org"));
