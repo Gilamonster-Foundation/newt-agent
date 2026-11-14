@@ -4,6 +4,9 @@ Status: proposed; the monitor and rule editor described here are not implemented
 The operator selected a native signed Network Extension for macOS, and requires
 feature parity across native Linux, macOS, and Windows implementations.
 
+Amended 2026-11-14 with the operator's [decisions](#operator-decisions-2026-11-14)
+and a code [inventory](#inventory-2026-11-14).
+
 ## Operator contract
 
 Newt needs a network console combining IPTraf-ng's live traffic views with a
@@ -36,10 +39,39 @@ tables, sorting, filtering, and detail views. Its packet-display filters are not
 authorization. Newt's display filter must likewise never change access policy.
 Source: [IPTraf-ng README and manual](https://github.com/iptraf-ng/iptraf-ng).
 
+## Operator decisions (2026-11-14)
+
+1. **Selecting an inference backend is the grant for its endpoint.** There is
+   no prompt and no new gate; the traffic is still recorded like any other
+   flow. This extends to every inference path the position the crew loop
+   already documents (`newt-scheduler/src/crew.rs`). The grant covers backends
+   the operator configured or selected, auxiliary ones included; a model
+   instruction cannot add one. An explicit deny and an inherited ceiling still
+   win. A redirect to another host is not covered. The sovereign-only pin
+   ([#2927](https://github.com/Gilamonster-Foundation/newt-agent/issues/2927))
+   stays a separate policy.
+2. **Observation ships first.** Step 2 below lands before any new grant or
+   boundary, and adds no prompt and no allow or deny rule. Work starts after
+   the v0.8.6 release.
+3. **The Linux child boundary is undecided.** A spike compares two
+   network-namespace shapes: the routed fence of
+   [agent-bridle#276](https://github.com/Gilamonster-Foundation/agent-bridle/issues/276),
+   and an empty namespace whose only way out is a Unix socket to the session
+   proxy (see the inventory).
+
 ## One console, four views
 
-Proposed entry: `/network`, using the existing TUI panel host. No model tool is
-added. The panel remains usable while inference is pending or disconnected.
+Proposed entry: `/net`, extending the read-only traffic panel of
+[#2657](https://github.com/Gilamonster-Foundation/newt-agent/issues/2657),
+which takes its records from
+[agent-bridle#413](https://github.com/Gilamonster-Foundation/agent-bridle/issues/413)
+and renders with newtui#41. No model tool is added. Activity stays usable while
+a turn is running or inference is disconnected. The existing panel host does not
+provide that: it parks the cockpit presenter and runs on the session thread
+(`newt-tui/src/panel.rs`, `session_worker.rs`). The nearest mechanism is the F4
+inspector, where the presenter thread reads a bounded shared archive
+(`newt-tui/src/cockpit/presenter.rs`, `newt-tui/src/completed_spill.rs`). F4
+shows one snapshot; a live table is new work.
 
 ```text
 Network    [Activity] [Requests] [Rules] [Inference]
@@ -65,8 +97,9 @@ Requests shows destination, scheme/port, path where inspectable, requesting
 tool/process, purpose, and the scope of each decision. Repeated requests for the
 same destination/purpose share one pending decision. Denial and timeout return a
 clear tool result; neither silently permits nor leaves an unbounded queue.
-Inference bootstrap approvals use local controls, never an inference request to
-the provider whose connection is awaiting approval.
+An approval for an inference endpoint the operator did not select, such as a
+redirect target, uses local controls, never an inference request to the provider
+whose connection is awaiting approval.
 
 Rules uses the screenshot's editable site list: pattern, allow/deny, session or
 permanent, purpose, provenance, last match, and enable/remove controls. A global
@@ -178,11 +211,11 @@ traffic when a requested feature is unavailable.
 | Layer | Shared contract | Linux implementation direction | macOS implementation direction | Windows implementation direction |
 | --- | --- | --- | --- | --- |
 | Permissions | Same matcher, actions, inherited ceilings, expiry, revocation | Shared Rust policy and broker | Shared Rust policy and broker | Shared Rust policy and broker |
-| Child boundary | Direct egress cannot bypass the decision point | Network namespace plus routing/firewall rules; existing Landlock/seccomp filesystem/process boundary | Signed Network Extension content filter plus Seatbelt filesystem boundary | WFP application/flow authorization plus existing AppContainer filesystem/process boundary |
+| Child boundary | Direct egress cannot bypass the decision point | Network namespace, shape undecided (decision 3); existing Landlock/seccomp filesystem/process boundary | Signed Network Extension content filter plus Seatbelt filesystem boundary | WFP application/flow authorization plus existing AppContainer filesystem/process boundary |
 | Observation | Same flow lifecycle, units, ownership and loss indicators | Namespace/broker accounting; kernel events where required | Filter flow/report callbacks; application and process audit-token attribution | WFP flow/accounting facilities and service; validated process/application attribution |
 | URL rules | Same HTTP semantics, redirects and TLS validation | Shared HTTP-aware broker/client | Shared HTTP-aware broker/client | Shared HTTP-aware broker/client |
 | Inference | Same attempt identities, destinations, roles and reported usage | Existing inference send/settle hooks | Existing inference send/settle hooks | Existing inference send/settle hooks |
-| Controls | Same four TUI views and signed rule history | Existing Newt panel host | Existing Newt panel host | Existing Newt panel host |
+| Controls | Same four TUI views and signed rule history | Existing Newt panel host; a live table for Activity | Existing Newt panel host; a live table for Activity | Existing Newt panel host; a live table for Activity |
 
 These are implementation directions, not claims of current support. In
 particular, a kernel flow filter does not make encrypted URL paths visible on
@@ -240,6 +273,81 @@ Platform references:
 [WFP ALE](https://learn.microsoft.com/en-us/windows/win32/fwp/application-layer-enforcement--ale-),
 [WFP implementation guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/callout-driver-programming-considerations).
 
+## Inventory (2026-11-14)
+
+Read from newt-agent source at `397df65e` and from agent-bridle's ADRs. Nothing
+was measured by running the harness. The Linux items marked measured were run
+with OS tools on one Ubuntu 24.04 host (kernel 6.8). macOS and Windows facts are
+from documentation.
+
+| Traffic | Grant today | Record today |
+| --- | --- | --- |
+| `web_fetch`; MCP over HTTP and its OAuth hops; git push and git fetch brokers | Exact host, checked before the dial. An unrestricted scope admits every host; MCP admits loopback without a grant | Prompted allow and deny decisions (permission log); denials when the denial journal is armed. No flow record |
+| `gh pr create` broker | `github.com` is checked before `gh` starts; the API host and redirect hops are not ([#3104](https://github.com/Gilamonster-Foundation/newt-agent/issues/3104)) | As above |
+| cargo dependency fetch | The two crates.io hosts are checked before cargo is spawned (on macOS, a one-time approval for all destinations); cargo's own connections are not host-checked | As above |
+| `git pull`, `clone`, `ls-remote` and fetch forms the broker does not handle | A one-command approval for all destinations | The decision only |
+| Primary inference | Backend selection | Per attempt: model, configured backend URL, request digest and reported tokens, in memory and written only with `--events`. Per turn: endpoint, elapsed time and tokens in the usage log. No contacted address, bytes or per-attempt timing |
+| Auxiliary inference | Configuration | Summarizer and embeddings: none. Smart-harness judge: its requests, replies and endpoint. Crew: backend name and usage per role |
+| Backend discovery, probes and warm-up; GPU telemetry polling; model downloads and provider model-list fetches; newt-web dock calls; Jupyter kernel; DNS | None | No flow record |
+| Mesh peers | Admitted by mesh keys; no net-scope grant | No flow record |
+| Confined children (shell, builds, stdio MCP) | Deny-all or allow-all; a host list is narrowed to deny-all at spawn | No flow record |
+| Host-side children (provider plugins, ssh, browser, secret commands, full-access shell) | None | No flow record |
+| Listeners: Prometheus endpoint (all interfaces when enabled), OAuth callback, newt-web, mesh bus, Bridle's loopback proxy | None | None |
+
+- Production code has about 45 `reqwest::Client` construction sites in eight
+  crates (`git grep`, test modules excluded) and no shared constructor. At that
+  snapshot the two gated ones were in `newt-mcp-client`. newt-web also dials
+  with `ureq`.
+- Only primary inference passes `attempt_capture::send`. `AttemptRecord` holds
+  the configured backend URL, not the destination actually contacted. The
+  inference clients use `reqwest` defaults, so they follow redirects and honour
+  proxy environment variables.
+- newt starts Bridle's proxy through `start_egress_proxy`, which uses the null
+  audit sink, so no session writes proxy audit events. Bridle's public
+  `net_proxy::start` takes a sink, so switching audit on is a newt change.
+- Grants live in five places: the config net list, `approve.toml`, the signed
+  and encrypted permanent store, in-memory session grants, and launch flags.
+  The permission log records each prompted decision with its host.
+- [#3093](https://github.com/Gilamonster-Foundation/newt-agent/pull/3093),
+  merged after this inventory, adds launch grants (`--net <host>`), a
+  per-request host check for brokered `gh` reads, and with it a third gated
+  client.
+
+Child boundary, per platform:
+
+- **Linux.** Landlock network rules match ports, not addresses, and TCP only on
+  kernel 6.8. Ubuntu 24.04 restricts unprivileged user namespaces through
+  AppArmor by default (measured: `unshare -U true` succeeds, `unshare -Urn true`
+  fails writing `uid_map`), so the routed fence of agent-bridle#276 needs an
+  installed AppArmor profile or a privileged helper there. An empty namespace
+  needs neither (measured: under `unshare -Un` a child has no TCP or UDP route,
+  loopback included, and still connects to a pathname Unix socket held by its
+  parent). Only clients that can reach a proxy over a Unix socket can use it.
+- **macOS.** Seatbelt can restrict a child's own sockets to loopback, and by
+  port, without privilege (Bridle ADR 0015 reports native `sandbox-exec`
+  measurements; not rerun here). It does not cover OS services acting for the
+  child, so Bridle does not admit a proxy-fenced shape (ADRs 0015/0016).
+  `sandbox-exec` is deprecated.
+- **Windows.** An AppContainer reaches a loopback proxy only after a loopback
+  exemption. That needs elevation, opens every loopback port, and is documented
+  as a debugging facility.
+
+Socket observer, per platform:
+
+- **Linux.** `sock_diag` lists TCP sockets with peer address and byte counters
+  to an unprivileged process (measured with `ss -tinp`). It lists every user's
+  sockets in the network namespace, so the console filters to its own process
+  tree. It does not see inside a child's own network namespace, and it is
+  polled, so a short connection can be missed. UDP sockets show no byte
+  counters (measured with `ss -uainp`).
+- **Windows.** `GetExtendedTcpTable` lists TCP peers with the owning process.
+  Per-connection byte counts need administrator rights.
+- **macOS.** Not established. `nettop` reports per-process bytes through a
+  private framework.
+
+So byte counts come from the points that own the sockets: the harness's clients
+and the proxy. The OS socket list is a cross-check, not an accounting source.
+
 ## Existing machinery to extend
 
 Inventory before introducing records or another permission system:
@@ -272,6 +380,15 @@ Inventory before introducing records or another permission system:
   `RawContentId` addresses opaque request bytes; `MerkleNode` links causal
   history. Use the published content-addressable implementation, not new hashes,
   UUID identity, or another JSONL chain implementation.
+- `newt-core/src/grant_tree.rs`: a typed `Grant` with a net target and
+  session/durable provenance, not yet wired. Base for a granted-destination row.
+- `newt-mcp-client` (`net_policy.rs`, `build_pinned_client`): pre-dial host
+  check, DNS pinning and a typed grant-required error. The pattern for a shared
+  client constructor.
+- `scripts/spawn_inventory.py` with `docs/security/spawn-inventory.toml`: a
+  per-file call-site ratchet. Copy it for network call sites.
+- `newt-core/tests/content_addressable_ratchet.rs` pins the number of
+  unaddressed journals, so a flow record is a payload on `event_journal`.
 
 Provenance-audit findings: attempt keys already derive content identity
 (`attempts.rs`, `AttemptKey::canonical_form`), and observations are linked by
@@ -291,6 +408,12 @@ audit write that fails blocks a new grant/dial; allow-all mode must pause on los
 of required audit rather than silently become blind. Storage bounds/retention
 are explicit; pruning leaves a verified retention event and head anchor.
 
+The chained journals (event, denial, permission) are best-effort today, sync on
+every line and have no writer lock across threads or processes. Blocking a dial
+on audit loss is therefore new behaviour. Step 2 requires no audit write, so it
+records without blocking. Step 3 decides which writes are required; the rule
+above then applies to them.
+
 ## Delivery and acceptance
 
 Current cancellation coverage also needs a platform gate: Linux build execution
@@ -308,14 +431,31 @@ that every descendant has stopped.
    existing journals and a read-only Activity/Inference view. Require native
    positive controls and display every collection gap. Audit stays on in all
    access modes, panel closed, and after model/backend changes.
+   - One flow record shape, shared with agent-bridle#413.
+   - Inference: the requested URL at the send; the final URL, bytes and timing
+     at settle.
+   - The other in-process clients move onto a shared client constructor, with a
+     network call-site ratchet whose count only falls.
+   - Bridle's proxy audit switched on wherever newt starts the proxy.
+   - `web_fetch` and the brokers emit the same record.
+   - On Linux, the socket-list cross-check for the harness and the children in
+     its network namespace.
+   - Shown as gaps, not covered: confined children under allow-all, host-side
+     children, listeners.
 3. Add shared structured matching, pre-dial pending decisions, session denials,
    and signed rule management. Ship URL rules only on channels whose HTTP
    requests can actually be mediated. Test redirects, DNS label boundaries,
    ports, encoded paths, denied-over-allowed overlaps, expiry and revocation.
+   Decide grants for the harness traffic that has none today, whether an
+   inference redirect to another host is refused, and which audit writes are
+   required. The grant record gains port, scheme and purpose, matched
+   through the decision point of
+   [agent-bridle#152](https://github.com/Gilamonster-Foundation/agent-bridle/issues/152).
 4. Enable destination-constrained native subprocesses per platform only after
    adversarial bypass tests prove the selected boundary. Cover DNS, TCP, UDP,
    raw/direct sockets, OS deputies, subprocess trees, collector failure, and
    abrupt session exit. Keep unsupported platforms explicit and fail-closed.
+   The Linux spike (decision 3) comes first.
 
 End-to-end acceptance: an unknown destination is visible pending with zero
 origin bytes; deny never resolves/dials it; session allow repeats without a
