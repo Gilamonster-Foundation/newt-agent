@@ -159,13 +159,18 @@ fn escape_error(rel: &Path) -> anyhow::Error {
 }
 
 /// Object-bound atomic write of `content` to `rel` beneath `workspace` — the one
-/// owner of the applier backends' write step. On Linux the target is resolved
-/// through the workspace root fd (`openat2 RESOLVE_BENEATH`), so a symlink *under*
-/// the workspace cannot redirect the write outside it — closing the residual the
-/// lexical [`is_workspace_contained`] leaves open (#522). Missing parents are
-/// created; a sibling temp is written then renamed (partial-write safety). The
-/// non-Linux fallback keeps the lexical-gate + `std::fs` temp-then-rename path.
-#[cfg(target_os = "linux")]
+/// owner of the applier backends' write step. On Linux and macOS the target is
+/// resolved through the workspace root fd ([`WorkspaceDir`]: `openat2
+/// RESOLVE_BENEATH` on Linux, a descriptor-relative no-follow walk on macOS), so
+/// a symlink *under* the workspace cannot redirect the write outside it — closing
+/// the residual the lexical [`is_workspace_contained`] leaves open (#522). macOS
+/// refuses every symlinked component, including one that stays in the tree.
+/// Missing parents are created; a sibling temp is written then renamed
+/// (partial-write safety). Other platforms keep the lexical-gate + `std::fs`
+/// temp-then-rename path.
+///
+/// [`WorkspaceDir`]: newt_core::fs_cap::WorkspaceDir
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Result<()> {
     use newt_core::fs_cap::WorkspaceDir;
     use std::io::Write;
@@ -185,7 +190,7 @@ fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Resul
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Result<()> {
     let abs = workspace.join(rel);
     if let Some(parent) = abs.parent() {
@@ -199,9 +204,9 @@ fn write_contained(workspace: &Path, rel: &str, content: &[u8]) -> anyhow::Resul
 
 /// Object-bound read of `rel`'s current contents beneath `workspace` for a
 /// patch/whole-file apply — `None` if the file does not exist (a fresh create).
-/// A symlink-escape path is refused (not silently read from outside). Linux-only
-/// object-binding; non-Linux keeps `std::fs`.
-#[cfg(target_os = "linux")]
+/// A symlink-escape path is refused (not silently read from outside). Object-bound
+/// on Linux and macOS; other platforms keep `std::fs`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<String>> {
     use newt_core::fs_cap::WorkspaceDir;
     use std::io::Read;
@@ -217,7 +222,7 @@ fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<Stri
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<String>> {
     let abs = workspace.join(rel);
     if abs.exists() {
@@ -229,7 +234,7 @@ fn read_contained_opt(workspace: &Path, rel: &str) -> anyhow::Result<Option<Stri
 
 /// A sibling temp path in the *same* parent as `rel` (so the atomic rename stays
 /// within one contained directory): `<parent>/<name>.newt-tmp`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sibling_tmp(rel: &Path) -> std::path::PathBuf {
     let mut name = rel
         .file_name()
@@ -805,8 +810,11 @@ mod tests {
         assert!(ws.join("sub/ok.rs").exists());
     }
 
+    /// Grounds the in-memory `is_workspace_contained_rejects_escapes` guard:
+    /// a lexically admitted path still needs the kernel's symlink boundary.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn apply_whole_files_denies_symlink_escape_object_bound() {
         // step-52.7 (#522 CLOSURE): a symlink UNDER the workspace pointing outside
         // must not let the applier write through it — even though the lexical
@@ -815,6 +823,10 @@ mod tests {
         // This is the escape `is_workspace_contained` cannot see (the #522 residual),
         // now closed. Verified red→green (neuter the resolve flags → the write lands
         // outside).
+        //
+        // macOS regression: `write_contained` was object-bound on Linux only, so on
+        // macOS this exact write landed in `outside/evil.rs`. It failed there until
+        // the macOS branch moved onto `WorkspaceDir`.
         let ws = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("evil.rs"), "original\n").unwrap();
@@ -830,6 +842,80 @@ mod tests {
             "original\n",
             "the outside file must be UNCHANGED — the write never escaped"
         );
+    }
+
+    /// Grounds the lexical guard's admitted relative paths against real symlinks.
+    /// There is no injected filesystem seam in `read_contained_opt`; an in-memory
+    /// path check cannot prove the kernel refuses an escaping link.
+    #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn read_contained_opt_denies_symlink_escape_object_bound() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(ws.path().join("ordinary.txt"), "ordinary\n").unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        assert_eq!(
+            read_contained_opt(ws.path(), "ordinary.txt").unwrap(),
+            Some("ordinary\n".to_owned())
+        );
+        assert_eq!(read_contained_opt(ws.path(), "missing.txt").unwrap(), None);
+        let result = read_contained_opt(ws.path(), "link/secret.txt");
+        assert!(
+            result.is_err(),
+            "an escaping read must be refused: {result:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_patch_read_containment(applier: &dyn PatchApplier) {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(ws.path().join("ordinary.txt"), "original\n").unwrap();
+        fs::write(outside.path().join("secret.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+        let diff = "--- a/ordinary.txt\n+++ b/ordinary.txt\n@@ -1 +1 @@\n-original\n+updated\n";
+        applier.apply(ws.path(), diff).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join("ordinary.txt")).unwrap(),
+            "updated\n"
+        );
+
+        // Deliberately mismatching context distinguishes read refusal from a
+        // later hunk/write refusal. Reverting only the read cfg yields a patch
+        // error here, not the required I/O error, even with safe writes intact.
+        let escaping = diff.replace("ordinary.txt", "link/secret.txt");
+        let err = applier.apply(ws.path(), &escaping).unwrap_err();
+        assert!(
+            err.downcast_ref::<std::io::Error>().is_some(),
+            "{} must refuse the read before hunk application: {err}",
+            applier.name()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "outside\n"
+        );
+    }
+
+    /// Grounds the in-memory lexical guard and fuzzy hunk tests at the read boundary.
+    #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fuzzy_patch_denies_symlink_escape_object_bound() {
+        assert_patch_read_containment(&FuzzyApplier);
+    }
+
+    /// Grounds the same lexical guard through the optional strict patch backend.
+    #[test]
+    #[ignore = "real filesystem containment; weekly/release tier"]
+    #[cfg(all(
+        feature = "applier-diffy",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn diffy_patch_denies_symlink_escape_object_bound() {
+        assert_patch_read_containment(&DiffyApplier);
     }
 
     #[test]
@@ -859,6 +945,9 @@ mod tests {
     #[test]
     fn is_workspace_contained_rejects_escapes() {
         // Pure component check — the load-bearing predicate, no fs.
+        // A lexical guard admits this shape; only the real-resource tests can
+        // tell whether `link` resolves outside the workspace.
+        assert!(is_workspace_contained(Path::new("link/secret.txt")));
         assert!(is_workspace_contained(Path::new("a/b.rs")));
         assert!(is_workspace_contained(Path::new("./a.rs")));
         assert!(is_workspace_contained(Path::new("sub/dir/file.txt")));
