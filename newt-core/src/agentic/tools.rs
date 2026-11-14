@@ -4767,12 +4767,11 @@ async fn execute_authorized_tool(
                     return host_return(reason);
                 }
             }
-            // A git network read gets its one command's egress approved up
-            // front; every later use of `caveats` in this arm is that dispatch.
+            // Broker and fallback share one consent-first dispatch boundary.
             let network_read = if governed_git {
-                match native_git::approve_network_read(cmd, caveats, &mut permission_gate) {
-                    Ok(approved) => approved,
-                    Err(reason) => return host_return(reason),
+                match native_git::dispatch_network_read(cmd, std::path::Path::new(&run_cwd), caveats, &mut permission_gate) {
+                    std::ops::ControlFlow::Continue(approved) => approved,
+                    std::ops::ControlFlow::Break(result) => return host_return(result),
                 }
             } else {
                 None
