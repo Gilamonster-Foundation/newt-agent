@@ -3,6 +3,11 @@
 use super::*;
 use crate::git_staging as staging;
 
+pub(in crate::agentic::tools) struct ReadOutcome {
+    pub stdout: String,
+    pub code: Option<i32>,
+}
+
 fn read_verb(kind: &str, verb: &str) -> bool {
     matches!(
         (kind, verb),
@@ -176,7 +181,7 @@ pub(in crate::agentic::tools) fn execute(
         Ok(command) => command,
         Err(reason) => return format!("refused: {reason}"),
     };
-    let mut run = || -> Result<String, String> {
+    let mut run = || -> Result<ReadOutcome, String> {
         let (mut argv, repo) = arguments(&command.argv).map_err(str::to_owned)?;
         if !caveats.permits_exec("gh")
             || !crate::caveats::permits_path(&caveats.fs_read, &cwd.to_string_lossy())
@@ -191,9 +196,12 @@ pub(in crate::agentic::tools) fn execute(
         let resolve = || probe.map_or_else(resolve, |p| Ok(p.remote.clone()));
         let repo = repo.map_or_else(resolve, Ok)?;
         let (host, repo) = repository(&repo).map_err(str::to_owned)?;
+        let mut approved = vec![host.clone()];
         ensure_net_granted(caveats, gate, &host, "read forge metadata")?;
         if cloud_host(&host) {
-            ensure_net_granted(caveats, gate, &format!("api.{host}"), "read forge metadata")?;
+            let api = format!("api.{host}");
+            ensure_net_granted(caveats, gate, &api, "read forge metadata")?;
+            approved.push(api);
         }
         argv.extend(["--repo".into(), repo]);
         // FIRST executable discovery/spawn is after every network decision.
@@ -201,63 +209,115 @@ pub(in crate::agentic::tools) fn execute(
         if let Some(probe) = probe {
             return probe.run(&host, &argv);
         }
-        run_staged_read(&argv, &host, caveats).map_err(|_| {
-            "host gh read failed; check trusted gh credentials and read grants".to_string()
-        })
+        run_staged_read(&argv, &host, &approved, caveats)
     };
-    let (output, success) = match run() {
-        Ok(text) => (text, true),
-        Err(reason) => (format!("refused: {reason}"), false),
-    };
-    super::super::output_budget::cap_model_output(&command.render(output, success), 4096)
+    match run() {
+        Ok(outcome) => {
+            let stdout = if outcome.stdout.is_empty() && outcome.code != Some(0) {
+                "refused: gh read returned no output".into()
+            } else {
+                outcome.stdout
+            };
+            let mut rendered = super::super::output_budget::cap_model_output(
+                &command.render_status(
+                    stdout.trim_end_matches('\n').into(),
+                    outcome.code.unwrap_or(1),
+                ),
+                4064,
+            );
+            match outcome.code {
+                Some(0) => {}
+                Some(code) => rendered.push_str(&format!("\n(exit {code})")),
+                None => rendered.push_str("\n(terminated without an exit code)"),
+            }
+            rendered
+        }
+        Err(reason) => super::super::output_budget::cap_model_output(
+            &command.render(
+                format!(
+                    "refused: {}",
+                    reason.strip_prefix("refused: ").unwrap_or(&reason)
+                ),
+                false,
+            ),
+            4096,
+        ),
+    }
 }
 
+#[cfg(unix)]
 fn run_staged_read(
     argv: &[String],
     host: &str,
+    approved: &[String],
     caveats: &Caveats,
-) -> Result<String, staging::Refusal> {
-    staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
-    let tools =
-        staging::TrustedTools::authenticate(staging::TrustContext::bind(&caveats.fs_write)?)?;
-    let dir = crate::config::Config::user_config_dir()
-        .ok_or_else(|| "missing state directory".to_string())?
-        .join("staging");
-    let staging = staging::StagingRepo::create(&dir, tools.ctx())?;
-    let mut child = tools.gh(argv)?;
-    pin_environment(&mut child, staging.path(), host);
-    if let Some(dir) = staging::trusted_gh_config_dir(tools.ctx())? {
-        let held = staging::HeldRoots::bind(&caveats.fs_read)?;
-        let file = dir.join("hosts.yml");
-        if file.exists() {
-            staging::trust_check(&file, tools.ctx())?;
-            let text = held
-                .read_to_string(&dir, Path::new("hosts.yml"))?
-                .unwrap_or_default();
-            let config: serde_yaml::Value =
-                serde_yaml::from_str(&text).map_err(|_| "invalid gh credentials".to_string())?;
-            // Copy only the selected host's token, never configuration/aliases.
-            if let Some(token) = config
-                .get(host)
-                .and_then(|h| h.get("oauth_token"))
-                .and_then(serde_yaml::Value::as_str)
-            {
-                child.env(
-                    if cloud_host(host) {
-                        "GH_TOKEN"
-                    } else {
-                        "GH_ENTERPRISE_TOKEN"
-                    },
-                    token,
-                );
+) -> Result<ReadOutcome, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let prepare = || -> Result<_, staging::Refusal> {
+        staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
+        let tools =
+            staging::TrustedTools::authenticate(staging::TrustContext::bind(&caveats.fs_write)?)?;
+        // A short owner-only parent keeps the socket below macOS's 104-byte limit.
+        // StagingRepo still authenticates it against the bound model-write roots.
+        let short = tempfile::Builder::new()
+            .prefix("ngh-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .map_err(|e| e.to_string())?;
+        let staging = staging::StagingRepo::create(&short.path().join("s"), tools.ctx())?;
+        let mut child = tools.gh(argv)?;
+        pin_environment(&mut child, staging.path(), host);
+        if let Some(dir) = staging::trusted_gh_config_dir(tools.ctx())? {
+            let held = staging::HeldRoots::bind(&caveats.fs_read)?;
+            let file = dir.join("hosts.yml");
+            if file.exists() {
+                staging::trust_check(&file, tools.ctx())?;
+                let text = held
+                    .read_to_string(&dir, Path::new("hosts.yml"))?
+                    .unwrap_or_default();
+                let config: serde_yaml::Value = serde_yaml::from_str(&text)
+                    .map_err(|_| "invalid gh credentials".to_string())?;
+                // Copy only the selected host's token, never configuration/aliases.
+                if let Some(token) = config
+                    .get(host)
+                    .and_then(|h| h.get("oauth_token"))
+                    .and_then(serde_yaml::Value::as_str)
+                {
+                    child.env(
+                        if cloud_host(host) {
+                            "GH_TOKEN"
+                        } else {
+                            "GH_ENTERPRISE_TOKEN"
+                        },
+                        token,
+                    );
+                }
             }
         }
-    }
-    let output = child.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err("gh read failed".to_string().into());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok((short, staging, child))
+    };
+    let (_short, staging, mut child) = prepare().map_err(|_| {
+        "host gh read unavailable; check executable trust and read grants".to_string()
+    })?;
+    super::gh_http::with_approved_http(staging.path(), approved, || {
+        let output = child
+            .output()
+            .map_err(|_| "could not start host gh read".to_string())?;
+        Ok(ReadOutcome {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            code: output.status.code(),
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn run_staged_read(
+    _: &[String],
+    _: &str,
+    _: &[String],
+    _: &Caveats,
+) -> Result<ReadOutcome, String> {
+    Err("host gh reads require the Unix socket request boundary on this platform".into())
 }
 
 // gh's public/cloud instances have an api.<host> endpoint; GHES uses the
@@ -268,6 +328,7 @@ fn cloud_host(host: &str) -> bool {
 
 // Pure command construction; TrustedTools already supplies env_clear and the
 // authenticated PATH. Never forward ambient tokens or repository selectors.
+#[cfg(any(unix, test))]
 fn pin_environment(child: &mut std::process::Command, dir: &Path, host: &str) {
     child
         .current_dir(dir)

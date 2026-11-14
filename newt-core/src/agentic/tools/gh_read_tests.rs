@@ -28,17 +28,16 @@ impl Probe {
         &self,
         host: &str,
         argv: &[String],
-    ) -> Result<String, String> {
+    ) -> Result<native_git::gh_read::ReadOutcome, String> {
         self.host.fetch_add(1, Ordering::SeqCst);
         self.calls
             .lock()
             .unwrap()
             .push((host.into(), argv.to_vec()));
-        // Mirror the current real child's outcome boundary, including its bug.
-        if self.exit_code != 0 {
-            return Err("host gh read failed; check trusted gh credentials and read grants".into());
-        }
-        Ok(self.output.clone())
+        Ok(native_git::gh_read::ReadOutcome {
+            stdout: self.output.clone(),
+            code: Some(self.exit_code),
+        })
     }
 }
 
@@ -490,4 +489,29 @@ async fn gh_read_decline_has_one_refused_prefix() {
     )
     .await;
     assert_eq!(out.matches("refused:").count(), 1, "{out}");
+}
+
+#[tokio::test]
+async fn gh_read_empty_failures_do_not_blame_credentials_and_large_failures_keep_status() {
+    for output in [String::new(), "check pending\n".repeat(10000)] {
+        let probe = Probe {
+            output,
+            exit_code: 8,
+            ..Default::default()
+        };
+        let out = dispatch(
+            "gh pr checks 1 -R o/r",
+            &granted(),
+            &probe,
+            &mut Gate::default(),
+        )
+        .await;
+        assert!(out.ends_with("(exit 8)"), "{out}");
+        assert!(!out.contains("credentials"));
+        if probe.output.is_empty() {
+            assert!(out.contains("refused: gh read returned no output"));
+        } else {
+            assert!(out.len() < 25000, "unbounded read result");
+        }
+    }
 }

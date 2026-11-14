@@ -4744,6 +4744,7 @@ dependencies = [
  "grep-searcher",
  "grit-lib",
  "http",
+ "httparse",
  "ignore",
  "libc",
  "markdown-table-formatter",

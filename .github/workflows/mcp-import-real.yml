@@ -229,6 +229,15 @@ jobs:
           -p newt-core --lib gh_read_real_dispatch_pins_host_and_isolates_config
           -- --ignored --test-threads=1
 
+      - name: Run gh HTTP redirect grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test gh_http_real_redirect_never_reaches_ungranted_listener
+          -p newt-core --lib gh_http_real_redirect_never_reaches_ungranted_listener
+          -- --ignored --test-threads=1 --nocapture
+
       - name: Run Git network-read grounding
         if: runner.os != 'Windows'
         shell: bash

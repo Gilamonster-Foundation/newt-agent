@@ -38,7 +38,8 @@ fn gh_read_real_dispatch_pins_host_and_isolates_config() {
 [ -z "$GH_ENTERPRISE_TOKEN" ] || exit 23
 [ "$HOME" = "$PWD" ] || exit 24
 [ "$GH_CONFIG_DIR" = "$PWD" ] || exit 25
-[ ! -e "$GH_CONFIG_DIR/config.yml" ] || exit 26
+[ -S "$GH_CONFIG_DIR/http.sock" ] || exit 26
+[ "$(cat "$GH_CONFIG_DIR/config.yml")" = "http_unix_socket: $GH_CONFIG_DIR/http.sock" ] || exit 28
 [ -z "$GH_REPO" ] || exit 27
 printf '%s\n' "$@" > '{}'
 echo 'issue 1'
@@ -95,6 +96,40 @@ echo '{}' >&2
     assert!(!out.contains(CANARY) && !terminal.contains(CANARY));
     assert_eq!(std::fs::read_to_string(&record).unwrap(), "executed");
     std::fs::remove_file(&record).unwrap();
+    for code in [1, 8] {
+        std::fs::write(
+            env.gh(),
+            format!(
+            "#!/bin/sh\nprintf 'build pending\\nlint failed\\n'\necho '{CANARY}' >&2\nexit {code}\n"
+        ),
+        )
+        .unwrap();
+        for (wrapper, expected) in [
+            ("", "build pending\nlint failed".to_string()),
+            ("; echo status=$?", format!("status={code}")),
+            (
+                " | head -1; echo status=$?",
+                "build pending\nstatus=0".into(),
+            ),
+        ] {
+            let (out, terminal) = dispatch_run_command_with_gate(
+                repo.path(),
+                &format!("gh pr checks 1 -R o/r{wrapper}"),
+                &caveats,
+                Some(&mut gate),
+            );
+            assert!(out.contains(&expected), "{out}");
+            assert!(out.contains(&format!("(exit {code})")), "{out}");
+            assert!(!out.contains(CANARY) && !terminal.contains(CANARY));
+            assert!(!out.contains("credentials"), "{out}");
+        }
+    }
+    // Restore a marker-writing child before the writable-executable refusal.
+    std::fs::write(
+        env.gh(),
+        format!("#!/bin/sh\nprintf executed > '{}'\n", record.display()),
+    )
+    .unwrap();
     // Resolver sees a real executable in a model-writable directory and refuses.
     let caveats = Caveats {
         fs_write: Scope::only([env.bin.path().to_string_lossy().into_owned()]),
