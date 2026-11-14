@@ -1421,31 +1421,28 @@ async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     caveats.net = Scope::All;
     let denied = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
     assert!(denied.contains("capability denied"), "{denied}");
-    assert!(
-        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
-    );
     caveats.exec = Scope::All;
     let out = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
-    #[cfg(target_os = "windows")]
-    {
-        assert!(
-            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-            "restricted AppContainer must refuse before native Git runs: {out}"
-        );
-        assert!(!out.contains("routed:"), "{out}");
-        assert!(!ws.path().join(".git/index").exists());
-    }
-    #[cfg(not(target_os = "windows"))]
+    assert!(
+        super::tool_result_ok(&out),
+        "confined git status must succeed: {out}"
+    );
     assert!(
         out.contains("native-only.txt"),
-        "native Git must report the actual untracked file: {out}"
+        "native Git must read the actual repository: {out}"
     );
-    #[cfg(not(target_os = "windows"))]
-    {
-        assert!(!out.contains("routed:"), "{out}");
-        assert!(!ws.path().join(".git/index").exists());
-    }
+    assert!(!out.contains("routed:"), "{out}");
+    assert!(!ws.path().join(".git/index").exists());
+    assert!(!ws.path().join(".git/index.lock").exists());
+    let host = crate::git_hardening::hardened_git(ws.path(), &["status", "--short"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(
+        host.status.success(),
+        "later unconfined Git must still work: {host:?}"
+    );
+    assert!(String::from_utf8_lossy(&host.stdout).contains("native-only.txt"));
 }
 
 /// The documented operator-controlled host route is intentionally distinct
@@ -1468,10 +1465,7 @@ async fn windows_disable_ocap_keeps_native_git_available() {
     let out =
         run_command_with_legacy_git("git status", ws.path(), &caveats_no_exec(ws.path())).await;
     assert!(out.contains("native-only.txt"), "{out}");
-    assert!(
-        !out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the explicit host route must not take the AppContainer refusal: {out}"
-    );
+    assert!(super::tool_result_ok(&out), "{out}");
     assert!(!out.contains("routed:"), "{out}");
 }
 
@@ -1500,8 +1494,8 @@ async fn routed_rm_dispatches_through_delete_file() {
 }
 
 /// The same exec boundary governs mutations: denial creates no index. On
-/// Windows, restricted AppContainer reports the documented pre-spawn native
-/// Git incompatibility; other platforms stage the real file.
+/// Windows, this grounds the exec gate with a real AppContainer child and
+/// verifies that its temporary index lock does not break later host Git.
 #[tokio::test]
 async fn state_modifying_git_add_is_not_routed() {
     let _l = env_lock().await;
@@ -1529,10 +1523,6 @@ async fn state_modifying_git_add_is_not_routed() {
     caveats.net = Scope::All;
     let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
     assert!(denied.contains("capability denied"), "{denied}");
-    assert!(
-        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
-    );
     assert!(!ws.path().join(".git/index").exists());
     caveats.exec = Scope::All;
     let out = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
@@ -1555,20 +1545,14 @@ async fn state_modifying_git_add_is_not_routed() {
         cmd.output().unwrap()
     };
     assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
-    #[cfg(target_os = "windows")]
-    {
-        assert!(
-            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-            "restricted AppContainer must refuse before native Git runs: {out}"
-        );
-        assert!(!ws.path().join(".git/index").exists());
-        assert_eq!(
-            String::from_utf8(staged.stdout).unwrap().trim(),
-            "",
-            "the unavailable command must not stage the file: {out}"
-        );
-    }
-    #[cfg(not(target_os = "windows"))]
+    assert!(
+        super::tool_result_ok(&out),
+        "confined git add must succeed: {out}"
+    );
+    assert!(
+        !ws.path().join(".git/index.lock").exists(),
+        "git add left a stale lock: {out}"
+    );
     assert_eq!(
         String::from_utf8(staged.stdout).unwrap().trim(),
         "stage-me.txt",
@@ -1577,10 +1561,10 @@ async fn state_modifying_git_add_is_not_routed() {
 }
 
 /// An interactive exec grant retries once with the freshly minted caveats. On
-/// Windows that retry must still fail before native Git reaches AppContainer.
+/// Windows that retry must run native Git under AppContainer and stage the file.
 #[cfg(target_os = "windows")]
 #[tokio::test]
-async fn native_git_exec_grant_retry_is_refused_before_spawn() {
+async fn native_git_exec_grant_retry_stages_under_appcontainer() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -1623,15 +1607,26 @@ async fn native_git_exec_grant_retry_is_refused_before_spawn() {
     )
     .await;
     assert!(
-        out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the post-grant retry must be refused before native Git runs: {out}"
+        super::tool_result_ok(&out),
+        "the post-grant retry must succeed: {out}"
     );
     assert_eq!(gate.requests.len(), 1, "{out}");
     assert_eq!(gate.requests[0].kind, super::DenialKind::Exec, "{out}");
     assert_eq!(gate.requests[0].target, "git", "{out}");
+    assert!(!ws.path().join(".git/index.lock").exists(), "{out}");
+    let staged =
+        crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .output()
+            .unwrap();
     assert!(
-        !ws.path().join(".git/index").exists(),
-        "the refused retry must not stage a file: {out}"
+        staged.status.success(),
+        "later host Git must still work: {staged:?}"
+    );
+    assert_eq!(
+        String::from_utf8(staged.stdout).unwrap().trim(),
+        "retry-me.txt",
+        "{out}"
     );
 }
 

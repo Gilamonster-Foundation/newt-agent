@@ -1893,24 +1893,14 @@ mod tests {
             .unwrap()
             .unwrap();
             let staged = git(repo.path(), &["diff", "--cached", "--name-only"]);
-            #[cfg(target_os = "windows")]
-            {
-                if allowed {
-                    assert!(
-                        out.contains(WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-                        "the recalled filesystem grant must reach the pre-spawn Windows guard: {out}"
-                    );
-                } else {
-                    assert!(out.contains("capability denied"), "{out}");
-                    assert!(
-                        !out.contains(WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-                        "a denied filesystem declaration must win before the Windows guard: {out}"
-                    );
-                }
-                assert_eq!(staged.trim(), "", "{out}");
-            }
-            #[cfg(not(target_os = "windows"))]
             assert_eq!(staged.trim(), "pending.txt", "{out}");
+            assert!(!repo.path().join(".git/index.lock").exists(), "{out}");
+            if allowed {
+                assert!(
+                    super::super::tool_result_ok(&out),
+                    "confined git add must succeed: {out}"
+                );
+            }
             assert_eq!(gate.refreshes, 1, "allowed={allowed}: {out}");
             if allowed {
                 assert!(gate.requests.is_empty(), "recalled grant must be reused");
