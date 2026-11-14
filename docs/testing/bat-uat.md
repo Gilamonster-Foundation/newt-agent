@@ -127,6 +127,16 @@ real-resource test that grounds that mock. Both are required: a mocked guard
 alone was green while its regression was still live.
 
 `newt-core/tests/regression_register.rs` enforces the register. Every named
-test must exist, be a test and not be ignored, and the entry count may only go
-up. When a live run shows a regression, fix it, write both tests, add the
-entry, and raise `REGISTERED` in that test.
+test must exist in the embedded source and carry a test attribute. Guards must
+be enabled in the unit tier; grounds must use `#[ignore]`. The entry count may
+only go up. When a live run shows a regression, fix it, write both tests, add
+the entry (and its source to `SOURCES` if new), and raise `REGISTERED`.
+
+The registered Git/HTTP and tmux grounds run single-threaded in the existing
+`mcp-import-real.yml` weekly/release workflow, using `--ignored --test-threads=1`.
+That lane also runs the hostile-PATH Git approval ground. The cockpit's broader
+PTY workflow excludes `a_real_terminal_` so these tmux grounds remain in the
+weekly/release tier. They are CI-only exceptions in `.githooks/pre-push`;
+per-PR guards capture presenter bytes in memory and inject helper discovery.
+The register checker embeds sources with `include_str!`, so it does no runtime
+filesystem I/O. It checks names and tier markers, not whether a ground ran.

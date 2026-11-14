@@ -49,7 +49,9 @@
 #     release/**; needs EVAL_BASE_URL/EVAL_API_KEY, skips when unconfigured).
 #   - MCP import real-resource tier, .github/workflows/mcp-import-real.yml
 #     (weekly + release): --ignored subprocess/filesystem acceptance on all OSes,
-#     including the macOS-only stdio MCP net:none Seatbelt admission grounding
+#     including PR #3097's ignored Git network-read and tmux regression grounds
+#     (mocked guards remain in this hook), and the macOS-only stdio MCP net:none
+#     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
 #   - linked-worktree build metadata reads and hostile-env fixture (#2835),

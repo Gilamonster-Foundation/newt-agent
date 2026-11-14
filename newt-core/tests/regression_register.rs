@@ -4,9 +4,8 @@
 //! test that guards it on every PR and the real-resource test that grounds
 //! that mock. This test keeps the register honest:
 //!
-//! - every named test exists in the named file, carries a test attribute, and
-//!   is not `#[ignore]`d, so a guard cannot be deleted, renamed away, or
-//!   switched off while its entry still claims it;
+//! - every named test exists and carries a test attribute; guards are enabled
+//!   in the unit tier and grounds are `#[ignore]`d for the weekly/release tier;
 //! - `guard` and `ground` are different tests, so one test cannot stand in for
 //!   both tiers;
 //! - the entry count may only go UP ([`REGISTERED`]), so an entry cannot be
@@ -18,13 +17,17 @@
 
 use std::collections::BTreeSet;
 
-/// The workspace root: this crate's parent directory.
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("newt-core has a parent workspace directory")
-        .to_path_buf()
-}
+// Embedded at compile time: checking the register performs no filesystem I/O.
+const SOURCES: &[(&str, &str)] = &[
+    (
+        "newt-core/src/agentic/tools/native_git.rs",
+        include_str!("../src/agentic/tools/native_git.rs"),
+    ),
+    (
+        "newt-tui/src/cockpit/presenter.rs",
+        include_str!("../../newt-tui/src/cockpit/presenter.rs"),
+    ),
+];
 
 /// Entries in the register. Raise it in the PR that adds an entry; it never
 /// goes down.
@@ -56,7 +59,7 @@ struct TestRef {
 /// Why `test` in `source` is not a live test, or `None` when it is one. The
 /// attributes are read from the lines directly above the `fn`, up to the
 /// previous blank line or closing brace.
-fn not_a_live_test(source: &str, test: &str) -> Option<&'static str> {
+fn not_a_live_test(source: &str, test: &str, ground: bool) -> Option<&'static str> {
     let lines: Vec<&str> = source.lines().collect();
     let needles = [format!("fn {test}("), format!("async fn {test}(")];
     let Some(at) = lines.iter().position(|line| {
@@ -71,8 +74,13 @@ fn not_a_live_test(source: &str, test: &str) -> Option<&'static str> {
         .map(|line| line.trim())
         .take_while(|line| line.starts_with("#[") || line.starts_with("///"))
         .collect();
-    if attributes.iter().any(|line| line.starts_with("#[ignore")) {
-        return Some("it is #[ignore]d");
+    let ignored = attributes.iter().any(|line| line.starts_with("#[ignore"));
+    if ignored != ground {
+        return Some(if ground {
+            "ground must be #[ignore]d for the real-resource tier"
+        } else {
+            "guard is #[ignore]d"
+        });
     }
     let is_test = |line: &&str| *line == "#[test]" || line.starts_with("#[tokio::test");
     (!attributes.iter().any(is_test)).then_some("it has no test attribute")
@@ -80,10 +88,8 @@ fn not_a_live_test(source: &str, test: &str) -> Option<&'static str> {
 
 #[test]
 fn every_registered_regression_names_a_live_guard_and_a_live_ground() {
-    let root = workspace_root();
-    let path = root.join("docs/testing/regressions.toml");
-    let text = std::fs::read_to_string(&path).expect("the regression register is readable");
-    let register: Register = toml::from_str(&text).expect("the regression register parses");
+    let register: Register = toml::from_str(include_str!("../../docs/testing/regressions.toml"))
+        .expect("the regression register parses");
 
     let mut problems = Vec::new();
     let mut ids = BTreeSet::new();
@@ -98,9 +104,9 @@ fn every_registered_regression_names_a_live_guard_and_a_live_ground() {
             problems.push(format!("{}: guard and ground are the same test", entry.id));
         }
         for (tier, test) in [("guard", &entry.guard), ("ground", &entry.ground)] {
-            let found = match std::fs::read_to_string(root.join(&test.file)) {
-                Ok(source) => not_a_live_test(&source, &test.test),
-                Err(_) => Some("the file is missing"),
+            let found = match SOURCES.iter().find(|(file, _)| *file == test.file) {
+                Some((_, source)) => not_a_live_test(source, &test.test, tier == "ground"),
+                None => Some("the source must be embedded in SOURCES"),
             };
             if let Some(why) = found {
                 problems.push(format!(
@@ -140,15 +146,24 @@ fn switched_off() {}
 
 fn helper() {}
 ";
-    assert_eq!(not_a_live_test(source, "live"), None);
-    assert_eq!(not_a_live_test(source, "live_async"), None);
-    assert_eq!(not_a_live_test(source, "absent"), Some("no such fn"));
+    assert_eq!(not_a_live_test(source, "switched_off", true), None);
     assert_eq!(
-        not_a_live_test(source, "switched_off"),
-        Some("it is #[ignore]d")
+        not_a_live_test(source, "live", true),
+        Some("ground must be #[ignore]d for the real-resource tier")
     );
     assert_eq!(
-        not_a_live_test(source, "helper"),
+        not_a_live_test(source, "helper", true),
+        Some("ground must be #[ignore]d for the real-resource tier")
+    );
+    assert_eq!(not_a_live_test(source, "live", false), None);
+    assert_eq!(not_a_live_test(source, "live_async", false), None);
+    assert_eq!(not_a_live_test(source, "absent", false), Some("no such fn"));
+    assert_eq!(
+        not_a_live_test(source, "switched_off", false),
+        Some("guard is #[ignore]d")
+    );
+    assert_eq!(
+        not_a_live_test(source, "helper", false),
         Some("it has no test attribute")
     );
 }

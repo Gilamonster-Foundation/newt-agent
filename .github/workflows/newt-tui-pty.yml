@@ -19,7 +19,9 @@ name: newt-tui real-PTY tier (#1520, #1677)
 # COVERAGE (every `#[ignore]`d real-PTY test in newt-tui runs in exactly one
 # place): prompt_visibility_test, transcript_pager_pty_test,
 # panel_raw_mode_pty_test, rich_input_pty_test, interaction_view_pty_test and
-# `cockpit::` run HERE. esc_ladder_pty_test, settings_form_pty_test,
+# `cockpit::` run HERE (except presenter::tests::a_real_terminal_, whose
+# tmux regression grounds run weekly/release in mcp-import-real.yml).
+# esc_ladder_pty_test, settings_form_pty_test,
 # interrupt_ack_pty_test, compaction_progress_tests and live_spill's PTY test
 # are deliberately NOT `#[ignore]`d (their parents are the per-PR guards), so
 # they run in ci.yml's workspace unit tier, not here; only their child
@@ -190,7 +192,7 @@ jobs:
       - name: Run cockpit terminal-ownership acceptance
         run: |
           cargo test -p newt-tui --features rich-tui,live-spill cockpit:: \
-            -- --include-ignored --test-threads=1
+            -- --include-ignored --test-threads=1 --skip a_real_terminal_
 
       # #3005/#3024: the host-shell child must start in its own session or an
       # interactive `--ambient` login shell is stopped by SIGTTIN under a
@@ -258,7 +260,7 @@ jobs:
       - name: Run cockpit terminal-ownership acceptance
         run: |
           cargo test -p newt-tui --features rich-tui,live-spill cockpit:: \
-            -- --include-ignored --test-threads=1
+            -- --include-ignored --test-threads=1 --skip a_real_terminal_
 
       - name: Run CLI exit and editor-resize real-PTY tests
         run: |
