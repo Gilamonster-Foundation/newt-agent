@@ -9,6 +9,14 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed
+
+- On macOS, the headless coder's file apply (`apply_whole_files` and `apply_patch`) could
+  write outside the workspace through a symlinked directory inside it. Those writes and the
+  reads before them now resolve beneath the workspace root, as they already did on Linux.
+  macOS refuses any path that passes through a symlink, including one that stays inside
+  the workspace.
+
 ## [0.8.6] — 2026-11-03
 
 ### Added
