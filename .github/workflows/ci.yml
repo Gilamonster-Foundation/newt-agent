@@ -638,7 +638,15 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/carried-downloads" | Out-Null
           # curl's default retry delay doubles (1, 2, 4, 8 seconds).
-          curl.exe --fail --location --retry 4 --retry-all-errors --retry-max-time 180 --connect-timeout 20 --max-time 60 --output "$env:RUNNER_TEMP/carried-downloads/busybox.exe" "https://frippery.org/files/busybox/busybox-w64u-FRP-6075-g169694ebd.exe"
+          # Upstream intermittently answers hosted runners with 403, so fall
+          # back to this repo's mirror release. The installer checks the SHA256.
+          foreach ($url in @(
+            "https://frippery.org/files/busybox/busybox-w64u-FRP-6075-g169694ebd.exe",
+            "https://github.com/Gilamonster-Foundation/newt-agent/releases/download/mirror-busybox-FRP-6075-g169694ebd/busybox-w64u-FRP-6075-g169694ebd.exe"
+          )) {
+            curl.exe --fail --location --retry 4 --retry-all-errors --retry-max-time 180 --connect-timeout 20 --max-time 60 --output "$env:RUNNER_TEMP/carried-downloads/busybox.exe" $url
+            if ($LASTEXITCODE -eq 0) { break }
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Pinned BusyBox download failed after bounded retries' }
       - name: Download ripgrep on cache miss
         if: steps.ripgrep-cache.outputs.cache-hit != 'true'
