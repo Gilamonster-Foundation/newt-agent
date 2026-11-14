@@ -434,7 +434,9 @@ impl Screen {
         }
         Ok((size.ws_col.max(1), size.ws_row.max(1)))
     }
+}
 
+impl<W: Write> Screen<W> {
     fn viewport_rect(&self) -> Rect {
         Rect::new(
             0,
@@ -458,17 +460,9 @@ impl Screen {
 
     fn rebuild_term(&mut self) -> io::Result<()> {
         self.moved_cursor();
-        let backend = CaretBackend {
-            inner: CrosstermBackend::new(self.tty.fenced_clone()?),
-            caret: Arc::clone(&self.caret),
-        };
-        self.term = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(self.viewport_rect()),
-            },
-        )?;
-        self.term.clear()
+        // Fixed viewports can resize their existing backend, including an
+        // in-memory writer. resize also clears the new viewport and buffers.
+        self.term.resize(self.viewport_rect())
     }
 
     /// Give the blocking window the composer's rows. Erase the editor first,
@@ -2316,8 +2310,8 @@ mod tests {
         assert_eq!(block_top_from_reply(0, 3), None);
     }
 
-    /// A screen over a scratch file with a painted block, for driving `resize` and
-    /// reading the bytes it wrote.
+    /// A screen over the in-memory writer with a painted block, for driving
+    /// `resize` and reading the bytes it wrote.
     fn screen_with_block(
         cols: u16,
         rows: u16,
@@ -2325,28 +2319,38 @@ mod tests {
         block_h: u16,
         widths: &[usize],
         (caret_x, caret_y): (u16, u16),
-    ) -> (Screen, std::fs::File) {
-        let file = tempfile::tempfile().unwrap();
-        let reader = file.try_clone().unwrap();
-        let screen = screen_on(file, cols, rows, top, block_h, widths, (caret_x, caret_y));
-        (screen, reader)
+    ) -> (Screen<Boundaries>, Boundaries) {
+        let log = Boundaries::default();
+        let screen = screen_on(
+            (log.clone(), log.clone()),
+            cols,
+            rows,
+            top,
+            block_h,
+            widths,
+            (caret_x, caret_y),
+        );
+        (screen, log)
     }
 
-    /// The same painted-block screen writing to `file`, which a grounding test
-    /// points at a real terminal.
-    fn screen_on(
-        file: std::fs::File,
+    /// The same painted-block screen with two writers to one sink. Grounding
+    /// tests use terminal handles; unit guards use the in-memory writer.
+    fn screen_on<W: Write>(
+        (file, backend_file): (W, W),
         cols: u16,
         rows: u16,
         top: u16,
         block_h: u16,
         widths: &[usize],
         (caret_x, caret_y): (u16, u16),
-    ) -> Screen {
+    ) -> Screen<W> {
         let tty = WrapFence::new(file);
         let caret = CaretCell::new(std::sync::atomic::AtomicU32::new(NO_CARET));
         let backend = CaretBackend {
-            inner: CrosstermBackend::new(tty.fenced_clone().unwrap()),
+            inner: CrosstermBackend::new(WrapFence {
+                file: backend_file,
+                state: Arc::clone(&tty.state),
+            }),
             caret: Arc::clone(&caret),
         };
         let term = Terminal::with_options(
@@ -2508,13 +2512,14 @@ mod tests {
     /// and left 8 blank rows in their place.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
     fn a_real_terminal_keeps_the_transcript_through_a_grow_and_shrink() {
         let Some(term) = RealTerminal::open() else {
             return;
         };
         term.paint_transcript_and_block();
         term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
-        let mut screen = screen_on(term.tty(), 80, 24, 21, 3, &[2, 2, 2], (2, 22));
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 21, 3, &[2, 2, 2], (2, 22));
 
         term.rows(32);
         let measured = term.cursor_row() - 1;
@@ -2557,13 +2562,14 @@ mod tests {
     /// the repaint the 14 rows above `T23` stay blank (the live recording of 2026-11-13).
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
     fn a_real_terminal_shows_the_transcript_again_after_a_shrink_and_grow() {
         let Some(term) = RealTerminal::open() else {
             return;
         };
         term.write("\x1b[H\x1b[J");
         term.paint_block(0, 3);
-        let mut screen = screen_on(term.tty(), 80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 0, 3, &[2, 2, 2], (2, 1));
         let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
         screen.insert_rows(transcript).unwrap();
         assert_eq!(screen.top, 21);
@@ -2598,13 +2604,6 @@ mod tests {
     #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_grow_repaints_the_rows_a_shrink_scrolled_away() {
-        fn written(mut file: std::fs::File) -> String {
-            use std::io::{Read as _, Seek as _, SeekFrom};
-            let mut bytes = Vec::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_end(&mut bytes).unwrap();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
         let tail: VecDeque<Row> = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
         // 7 rows were on screen above the block; 21 are above it after the grow.
         let bytes = reveal_bytes(&tail, 80, 21, 7).unwrap();
@@ -2634,9 +2633,9 @@ mod tests {
         screen.insert_rows(transcript).unwrap();
         screen.resize(80, 10, 2, 1, None).unwrap();
         assert_eq!(screen.top, 7);
-        let before = written(log.try_clone().unwrap()).len();
+        let before = log.text().len();
         screen.resize(80, 24, 2, 1, Some(7)).unwrap();
-        let text = written(log)[before..].to_string();
+        let text = log.text()[before..].to_string();
         let slide = text.find("\x1b[14T").expect("the transcript slides down");
         let repaint = text
             .find("\x1b[1;1H\x1b[2KT09")
@@ -2650,13 +2649,14 @@ mod tests {
     /// right above it. Before the slide it stayed 7 rows up, over blank rows.
     #[serial_test::serial(tty_arbiter)]
     #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
     fn a_real_terminal_returns_the_block_to_the_bottom_when_a_menu_closes() {
         let Some(term) = RealTerminal::open() else {
             return;
         };
         term.paint_transcript_and_block();
         term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
-        let mut screen = screen_on(term.tty(), 80, 24, 21, 3, &[2, 2, 2], (2, 22));
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 21, 3, &[2, 2, 2], (2, 22));
 
         screen.relayout(9, 1).unwrap();
         assert_eq!(screen.top, 14, "the palette lifts the block 7 rows");
@@ -2676,12 +2676,8 @@ mod tests {
     }
 
     /// The first row (zero-based) the resize erased downward from.
-    fn first_erase_row(mut written: std::fs::File) -> u16 {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-        let mut bytes = Vec::new();
-        written.seek(SeekFrom::Start(0)).unwrap();
-        written.read_to_end(&mut bytes).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
+    fn first_erase_row(written: Boundaries) -> u16 {
+        let text = written.text();
         let at = text.find("\x1b[J").expect("resize erases downward");
         let (row, _) = text[..at]
             .rsplit_once("\x1b[")
@@ -2692,12 +2688,8 @@ mod tests {
     }
 
     /// Every row (zero-based) the screen erased downward from, in order.
-    fn erase_rows(mut written: std::fs::File) -> Vec<u16> {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-        let mut bytes = Vec::new();
-        written.seek(SeekFrom::Start(0)).unwrap();
-        written.read_to_end(&mut bytes).unwrap();
-        let text = String::from_utf8_lossy(&bytes);
+    fn erase_rows(written: Boundaries) -> Vec<u16> {
+        let text = written.text();
         // The last cursor move before each erase; the wrap fence's own escapes interleave.
         text.match_indices("\x1b[J")
             .map(|(at, _)| {
@@ -2746,17 +2738,10 @@ mod tests {
     #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_shrinking_block_on_the_bottom_row_stays_there() {
-        fn written(mut file: std::fs::File) -> String {
-            use std::io::{Read as _, Seek as _, SeekFrom};
-            let mut bytes = Vec::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_end(&mut bytes).unwrap();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
         let (mut screen, log) = screen_with_block(80, 24, 14, 10, &[40; 10], (2, 22));
         screen.relayout(2, 1).unwrap();
         assert_eq!((screen.top, screen.block_h), (21, 3));
-        let text = written(log);
+        let text = log.text();
         let erase = text.find("\x1b[J").expect("the tall block is erased");
         let slide = text
             .find("\x1b[7T")
@@ -2771,7 +2756,7 @@ mod tests {
         screen.relayout(2, 1).unwrap();
         assert_eq!((screen.top, screen.block_h), (5, 3));
         assert!(
-            !written(log).contains('T'),
+            !log.text().contains('T'),
             "a block under short content stays put"
         );
     }
@@ -2782,18 +2767,11 @@ mod tests {
     #[serial_test::serial(tty_arbiter)]
     #[test]
     fn a_grow_slides_the_transcript_down_with_the_block() {
-        fn written(mut file: std::fs::File) -> String {
-            use std::io::{Read as _, Seek as _, SeekFrom};
-            let mut bytes = Vec::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_end(&mut bytes).unwrap();
-            String::from_utf8_lossy(&bytes).into_owned()
-        }
         // The terminal added 8 rows below a 3-row block at the bottom of 24 rows.
         let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[40, 40, 10], (2, 22));
         screen.resize(80, 32, 2, 1, Some(21)).unwrap();
         assert_eq!(screen.top, 29, "the block is pinned to the new bottom");
-        let text = written(log);
+        let text = log.text();
         let erase = text.find("\x1b[J").expect("the old block is erased");
         let slide = text
             .find("\x1b[8T")
@@ -2811,7 +2789,7 @@ mod tests {
         // A shrink never slides either.
         screen.caret_frame = None;
         screen.resize(80, 24, 2, 1, None).unwrap();
-        let text = written(log);
+        let text = log.text();
         assert!(!text.contains('T'), "nothing slid: {text:?}");
     }
 
@@ -3126,6 +3104,21 @@ mod tests {
     /// from a thousand), and each `flush` as a marker.
     #[derive(Clone, Default)]
     struct Boundaries(Arc<std::sync::Mutex<Vec<Option<Vec<u8>>>>>);
+
+    impl Boundaries {
+        fn text(&self) -> String {
+            let bytes: Vec<u8> = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
 
     impl Write for Boundaries {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {

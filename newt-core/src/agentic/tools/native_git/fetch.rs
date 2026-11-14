@@ -15,6 +15,11 @@
 //! 3. **Deliver** — a confined git, with no network authority, fetches from
 //!    staging into the workspace's `refs/remotes/<remote>/*`.
 //!
+//! Both copy steps require the executor's deny-all network floor. Platforms
+//! that cannot enforce it (including current macOS admission) refuse the seed
+//! before dialing. Failed delivery can leave refs, objects or FETCH_HEAD changed;
+//! the broker reports that uncertainty rather than promising a rollback.
+//!
 //! **It gets out of the way.** [`wanted`] is false under unrestricted `net`
 //! (ambient mode), where the shell's own git can dial. [`execute`] returns
 //! `None`, and the command runs in the shell exactly as before, for any form
@@ -80,8 +85,8 @@ pub(in crate::agentic::tools) fn wanted(source: &str, caveats: &Caveats) -> bool
         && GovernedCommand::parse(source).is_ok_and(|command| parse(&command.argv).is_some())
 }
 
-/// Run a brokered fetch. `None` means "not handled here": nothing was asked
-/// and nothing ran, and the caller dispatches the command as it always did.
+/// Run a brokered fetch. `None` means "not handled here": no transfer or
+/// approval occurred, and the caller uses the consent-first fallback.
 pub(in crate::agentic::tools) fn execute(
     source: &str,
     cwd: &Path,
@@ -201,6 +206,8 @@ fn run(plan: &Plan, caveats: &Caveats, held: &staging::HeldRoots) -> Result<Stri
             "-C",
             &staging_dir,
             "fetch",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
             "--no-tags",
             "--no-write-fetch-head",
             &workspace,
@@ -254,25 +261,38 @@ fn run(plan: &Plan, caveats: &Caveats, held: &staging::HeldRoots) -> Result<Stri
         "-C",
         &workspace,
         "fetch",
+        "--no-recurse-submodules",
+        "--no-auto-maintenance",
     ];
     if plan.fetch.prune {
         deliver.push("--prune");
     }
     deliver.extend([staging_dir.as_str(), tracking.as_str()]);
-    let delivered = staging::confined_git(
-        plan.tools,
-        &repo,
-        &deliver,
-        Scope::only(plan.writable.iter().cloned()),
-        caveats,
-        held,
+    delivery_result(
+        staging::confined_git(
+            plan.tools,
+            &repo,
+            &deliver,
+            Scope::only(plan.writable.iter().cloned()),
+            caveats,
+            held,
+        ),
+        &staging_dir,
+        plan.url,
     )
-    .ok()
+}
+
+fn delivery_result(
+    result: Result<crate::confined_exec::ConfinedOutput, staging::Refusal>,
+    staging_dir: &str,
+    url: &str,
+) -> Result<String, String> {
+    let delivered = result.ok()
     .filter(|out| out.success)
-    .ok_or_else(|| failed("write the fetched refs into the repository"))?;
+    .ok_or_else(|| "failed: `git fetch` could not complete delivery. Repository refs, objects or FETCH_HEAD may have changed. Inspect the repository before retrying.".to_string())?;
     // Git names the source it fetched from; that is staging, so say the remote.
     Ok(String::from_utf8_lossy(&delivered.stderr)
-        .replace(&staging_dir, plan.url)
+        .replace(staging_dir, url)
         .trim_end()
         .to_string())
 }
@@ -280,6 +300,38 @@ fn run(plan: &Plan, caveats: &Caveats, held: &staging::HeldRoots) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed ref lock does not undo another ref's successful update. The
+    /// ignored real Git test supplies this mixed outcome from actual refs.
+    #[test]
+    fn failed_delivery_does_not_claim_the_repository_is_unchanged() {
+        let output = crate::confined_exec::ConfinedOutput {
+            success: false,
+            code: Some(1),
+            stdout: Vec::new(),
+            stderr:
+                b"* [new branch] good -> origin/good\n! [rejected] locked -> origin/locked\nPRIVATE"
+                    .to_vec(),
+            sandbox_kind: agent_bridle::SandboxKind::Landlock,
+            timed_out: false,
+        };
+        for result in [
+            Ok(output),
+            Err(staging::Refusal::from("PRIVATE".to_string())),
+        ] {
+            let error =
+                delivery_result(result, "/staging", "https://example.invalid/repo").unwrap_err();
+            assert!(
+                !error.contains("Nothing in the repository changed"),
+                "delivery failure falsely claimed no changes: {error}"
+            );
+            assert!(error.contains("may have changed"), "{error}");
+            assert!(
+                !error.contains("PRIVATE"),
+                "raw failure output leaked: {error}"
+            );
+        }
+    }
 
     fn argv(command: &str) -> Vec<String> {
         command.split(' ').map(str::to_string).collect()

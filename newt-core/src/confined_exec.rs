@@ -2157,6 +2157,52 @@ mod tests {
         assert_eq!(deny_all_net(&narrowed), narrowed);
     }
 
+    /// Pure policy guard for the fetch broker; real rewrite refusal grounds it
+    /// in the ignored weekly/release tier, including native macOS admission.
+    #[test]
+    fn fetch_copy_requires_deny_all_even_with_ambient_session_network() {
+        let baseline = Caveats {
+            net: Scope::All,
+            ..workspace_confined_caveats(Path::new("/ws"))
+        };
+        let request = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            "git",
+            ["fetch"],
+            "/ws",
+            baseline.clone(),
+        );
+        let request = crate::git_staging::fetch_copy_request(request);
+        assert_eq!(
+            request.net_grant,
+            NetGrant::DenyAll,
+            "fetch copy lacks a fail-closed network floor"
+        );
+        assert_eq!(request.caveats.fs_read, baseline.fs_read);
+        assert_eq!(request.caveats.fs_write, baseline.fs_write);
+        assert_eq!(request.caveats.exec, baseline.exec);
+        assert!(request
+            .env_grants()
+            .iter()
+            .any(|(k, v)| k == "GIT_ALLOW_PROTOCOL" && v == "file"));
+        for (key, value) in [
+            ("core.hooksPath", "/dev/null"),
+            ("core.fsmonitor", ""),
+            ("protocol.ext.allow", "never"),
+        ] {
+            let (env_key, _) = request
+                .env_grants()
+                .iter()
+                .find(|(k, v)| k.starts_with("GIT_CONFIG_KEY_") && v == key)
+                .unwrap();
+            let value_key = env_key.replace("_KEY_", "_VALUE_");
+            assert!(request
+                .env_grants()
+                .iter()
+                .any(|(k, v)| k == &value_key && v == value));
+        }
+    }
+
     #[test]
     fn request_env_is_exactly_the_grants_nothing_inherited() {
         // #8: the child's environment is the explicit grants only — there is no

@@ -11,8 +11,8 @@
 # about the sandbox that was false.
 #
 # `newt-core/tests/regression_register.rs` enforces this file: every named
-# test must exist, be a test, and not be ignored, and the number of entries
-# may only go up. To add an entry, write both tests, add it here, and raise
+# test must exist and be a test; guards are enabled, grounds are #[ignore]d
+# for the weekly/release tier documented in bat-uat.md. The entry count only rises. To add an entry, write both tests, add it here, and raise
 # `REGISTERED` in that test.
 
 [[regression]]

@@ -32,9 +32,11 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   `newt --disable-ocap --full-access` in tmux, with switches only `newt headless` has
   refused. The TUI writes no run trace yet (#3069).
 - `git fetch` in a confined session runs through a host-side broker (#3099): the host's
-  git downloads with your credentials or SSH agent, and a confined git with no network
-  copies the result into the repository. It asks for the remote's host, so a session grant
-  covers later fetches, and SSH remotes work. With unrestricted network (`--ambient`) git
+  git downloads with your credentials or SSH agent, and confined copies require a
+  deny-all network fence. The broker refuses where that fence cannot be enforced
+  (including current macOS admission), before downloading. It asks for the remote's
+  host, so a session grant covers later fetches; SSH works where the copy fence is
+  available. A failed delivery reports that repository refs or objects may have changed. With unrestricted network (`--ambient`) git
   fetches directly as before. When a host tool fails its trust check the broker steps
   aside, and a notice names the `chmod` fix.
 
