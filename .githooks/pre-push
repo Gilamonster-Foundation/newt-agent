@@ -67,6 +67,8 @@
 #     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
+#   - temporary weekly-red-diag.yml: macOS shell config-reader control under
+#     the authenticated PATH; no production authority change.
 #   - patch read/write symlink containment, mcp-import-real.yml (weekly +
 #     release, Linux/macOS): newt-tools patch::tests::{apply_whole_files,
 #     read_contained_opt,fuzzy_patch,diffy_patch}_denies_symlink_escape_object_bound,

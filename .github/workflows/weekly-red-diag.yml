@@ -1,0 +1,38 @@
+name: Weekly shell fixture diagnosis (temporary)
+
+# HOOK PARITY: temporary CI-only diagnosis, inventoried in .githooks/pre-push.
+on:
+  push:
+    branches: [fix/weekly-lane-red]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  shell-fixture:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prove the stand-in config reader under the authenticated PATH
+        shell: bash
+        run: |
+          fixture_dir=$(mktemp -d)
+          trap 'rm -rf "$fixture_dir"' EXIT
+          mkdir "$fixture_dir/bin"
+          printf 'http_unix_socket: %s/http.sock\n' "$fixture_dir" > "$fixture_dir/config.yml"
+          export GH_CONFIG_DIR="$fixture_dir"
+          export PATH="$fixture_dir/bin:/usr/bin"
+          if command -v cat >/dev/null 2>&1; then
+            echo 'bare_cat_available=true'
+          else
+            echo 'bare_cat_available=false'
+          fi
+          if [ -x /bin/cat ]; then echo 'bin_cat_executable=true'; fi
+          set +e
+          /bin/sh -c '[ "$(cat "$GH_CONFIG_DIR/config.yml" 2>/dev/null)" = "http_unix_socket: $GH_CONFIG_DIR/http.sock" ] || exit 28'
+          original=$?
+          /bin/sh -c '[ "$(/bin/cat "$GH_CONFIG_DIR/config.yml")" = "http_unix_socket: $GH_CONFIG_DIR/http.sock" ] || exit 28'
+          explicit=$?
+          set -e
+          printf 'original_fixture_exit=%s\nexplicit_reader_exit=%s\n' "$original" "$explicit"
+          test "$original" -eq 28
+          test "$explicit" -eq 0
