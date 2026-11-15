@@ -43,7 +43,11 @@ predates this prerequisite and is not itself proof of native Git effects.
 The native Git fixtures represent user-owned repositories: elevated CI gives
 their repository and `.git` directories to the invoking user SID without
 changing either DACL. Administrators-owned repositories remain subject to Git's
-dubious-ownership refusal inside AppContainer; production applies no bypass.
+dubious-ownership refusal inside AppContainer; production applies no bypass. Newt's existing Git environment ignores global
+and system Git configuration (`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point
+to `/dev/null`), so a global `safe.directory` entry does not resolve that refusal,
+even if its file is readable. Explicit config-file access still needs the
+corresponding filesystem read grant.
 
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing

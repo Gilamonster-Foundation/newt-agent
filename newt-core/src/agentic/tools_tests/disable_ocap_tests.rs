@@ -1462,13 +1462,12 @@ async fn windows_disable_ocap_keeps_native_git_available() {
     assert!(!out.contains("routed:"), "{out}");
 }
 
-/// Grounds the filesystem read gate with Git's real global-config lookup.
-/// A host safe.directory entry is not implicitly readable by a confined child;
-/// an explicit grant for that one config file makes it readable. This probes
-/// configuration visibility, not an ownership bypass or production env override.
+/// Grounds sandbox_git_env's global-config suppression and the fs read gate.
+/// A global safe.directory entry stays ignored even with a file read grant;
+/// explicit --file access needs that grant. No ownership bypass is installed.
 #[cfg(windows)]
 #[tokio::test]
-async fn run_command_windows_global_git_config_needs_a_read_grant() {
+async fn run_command_windows_global_git_config_stays_ignored() {
     let _lock = env_lock().await;
     let _route = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -1512,15 +1511,24 @@ async fn run_command_windows_global_git_config_needs_a_read_grant() {
     let denied = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
     assert!(!super::tool_result_ok(&denied), "{denied}");
     assert!(
-        denied.contains("Permission denied") && denied.contains(".gitconfig"),
+        denied.contains("command exited 1") && !denied.contains(root),
         "{denied}"
     );
+    let explicit = format!("git config --file \"{config_path}\" --get safe.directory");
+    let denied_file = run_command_with_legacy_git(&explicit, workspace.path(), &caveats).await;
+    assert!(!super::tool_result_ok(&denied_file), "{denied_file}");
+    assert!(denied_file.contains("Permission denied"), "{denied_file}");
     caveats.fs_read = Scope::only([root.to_owned(), config_path.to_owned()]);
-    let granted = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
+    let granted = run_command_with_legacy_git(&explicit, workspace.path(), &caveats).await;
     assert!(super::tool_result_ok(&granted), "{granted}");
     assert!(granted.contains(root), "{granted}");
+    let global = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
+    assert!(
+        global.contains("command exited 1") && !global.contains(root),
+        "{global}"
+    );
     eprintln!(
-        "global safe.directory: denied without config read grant; exact-file grant allowed read"
+        "global safe.directory: ignored even with file grant; explicit file read needs grant"
     );
 }
 

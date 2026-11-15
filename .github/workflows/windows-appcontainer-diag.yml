@@ -84,12 +84,13 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: |
           $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
+          $script:failedProbes = @()
           function Run-Diag($label, $exe, $argv, [switch]$Required) {
             Write-Output "== $label =="
             & $launcher --fs-write $work $exe @argv
             $code = $LASTEXITCODE
             Write-Output "EXIT=$code"
-            if ($Required -and $code -ne 0) { throw "Required direct probe failed: $label ($code)" }
+            if ($Required -and $code -ne 0) { $script:failedProbes += "$label ($code)" }
           }
 
           # Preserve the original scratch-drive case as a report-only control:
@@ -99,8 +100,13 @@ jobs:
           New-Item -ItemType Directory -Force $work | Out-Null
           Set-Location $work
           git init -q -b main
+          "original`n" | Out-File tracked.txt -NoNewline
+          git add tracked.txt
+          git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
+          "stage me`n" | Out-File pending.txt -NoNewline
           Run-Diag "original scratch fixture: cwd/listing" "cmd" @("/c", "cd & dir /b /a")
           Run-Diag "original scratch fixture: git status" (Get-Command git.exe).Source @("status")
+          Run-Diag "original scratch fixture: git add" (Get-Command git.exe).Source @("add", "--", "pending.txt")
 
           # Match Rust tempfile fixtures: the invoking user's temp directory.
           # The RUNNER_TEMP owner change failed the unchanged-DACL guard.
@@ -114,11 +120,12 @@ jobs:
           git add tracked.txt
           git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
           "stage me`n" | Out-File pending.txt -NoNewline
-          Run-Diag "cmd.exe (cwd and granted directory control)" "cmd" @("/c", "cd & dir /b") -Required
+          Run-Diag "cmd.exe (cwd and granted file control)" "cmd" @("/c", "cd & type tracked.txt") -Required
           Run-Diag "whoami.exe (System32, no unusual deps)" "$env:WINDIR\System32\whoami.exe" @() -Required
           Run-Diag "git --version" (Get-Command git.exe).Source @("--version") -Required
           Run-Diag "git status (real repo)" (Get-Command git.exe).Source @("status") -Required
           Run-Diag "git add pending.txt" (Get-Command git.exe).Source @("add", "--", "pending.txt") -Required
+          if ($script:failedProbes.Count) { throw "Required direct probes failed: $($script:failedProbes -join ', ')" }
           if (Test-Path .git/index.lock) { throw 'Confined Git left an index lock.' }
           $staged = git diff --cached --name-only
           if ($LASTEXITCODE -ne 0 -or $staged -cne 'pending.txt') { throw 'Later host Git did not see the staged file.' }
@@ -138,7 +145,7 @@ jobs:
             'agentic::tools::disable_ocap_tests::native_git_status_requires_exec_and_reads_the_actual_repository',
             'agentic::tools::disable_ocap_tests::state_modifying_git_add_is_not_routed',
             'agentic::tools::disable_ocap_tests::native_git_exec_grant_retry_stages_under_appcontainer',
-            'agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_needs_a_read_grant',
+            'agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_stays_ignored',
             'agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants'
           )
           # One build and test invocation; all selected tests still run if one fails.
