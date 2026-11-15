@@ -53,6 +53,9 @@ scripts below are for hosts where confined Git fails without them, as measured
 on the GitHub Windows Server runner image. On a Windows 11 Pro desktop, both
 bare-launcher Git and all five through-Newt Git tests passed in an interactive,
 non-elevated session with neither script run.
+The manual diagnostic still checks all five: four existing effects plus the
+ignored global-config ground, which also runs in the weekly/release Windows lane;
+ordinary per-PR CI leaves that ground to those lanes.
 
 ### Prepare the null device
 

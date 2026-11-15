@@ -45,6 +45,16 @@ proves global `safe.directory` stays ignored even with a file read grant:
 `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point to the null device. Explicit
 `git config --file` is denied without its file grant and succeeds with it.
 
+The config probe `run_command_windows_global_git_config_stays_ignored` is an
+ignored real-resource ground. The Windows leg of `mcp-import-real.yml` selects
+its exact full name with the nonempty wrapper, `--ignored` and `--test-threads=1`
+on weekly/release runs; the manual diagnostic does the same alongside four
+existing Git effects whose passing count is asserted. Ordinary per-PR CI
+intentionally skips the ignored ground, including its `run_command_windows_`
+evidence filter. The pure `sandbox_git_env_tests::ambient_config_is_ignored`
+guard asserts both global and system config point at the null device; the pair
+is registered in `docs/testing/regressions.toml`.
+
 At f8f1e620, three diagnostic runs
 ([43666516120](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43666516120),
 [43667425578](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43667425578),

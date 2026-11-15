@@ -2080,6 +2080,7 @@ mod sandbox_git_env_tests {
     fn ambient_config_is_ignored() {
         let env = sandbox_git_env(("newt-agent", "a@b"), &Default::default());
         assert!(env.contains(&("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())));
+        assert!(env.contains(&("GIT_CONFIG_SYSTEM".into(), "/dev/null".into())));
         assert!(env.contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into())));
     }
 

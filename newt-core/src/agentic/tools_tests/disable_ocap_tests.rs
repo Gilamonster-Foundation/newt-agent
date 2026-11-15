@@ -1462,11 +1462,12 @@ async fn windows_disable_ocap_keeps_native_git_available() {
     assert!(!out.contains("routed:"), "{out}");
 }
 
-/// Grounds sandbox_git_env's global-config suppression and the fs read gate.
+/// Grounds ambient_config_is_ignored's confined Git policy and the fs read gate.
 /// A global safe.directory entry stays ignored even with a file read grant;
 /// explicit --file access needs that grant. No ownership bypass is installed.
 #[cfg(windows)]
 #[tokio::test]
+#[ignore = "weekly/release real-resource tier; requires Windows AppContainer"]
 async fn run_command_windows_global_git_config_stays_ignored() {
     let _lock = env_lock().await;
     let _route = EnvVar::unset("NEWT_NO_ROUTE");

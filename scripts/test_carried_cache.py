@@ -79,7 +79,7 @@ class CarriedCacheTests(unittest.TestCase):
         installer = (ROOT / "scripts/windows/Install-AppContainerLauncher.ps1").read_text()
         helper = (ROOT / "scripts/windows/Get-PinnedArtifact.ps1").read_text()
         carried = (ROOT / "scripts/windows/Install-CarriedTools.ps1").read_text()
-        for workflow_name in ["ci.yml", "windows-appcontainer-diag.yml"]:
+        for workflow_name in ["ci.yml", "windows-appcontainer-diag.yml", "mcp-import-real.yml"]:
             workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
             self.assertIn("./scripts/windows/Install-AppContainerLauncher.ps1", workflow)
             self.assertNotIn("cargo install agent-bridle-aclaunch --version", workflow)
