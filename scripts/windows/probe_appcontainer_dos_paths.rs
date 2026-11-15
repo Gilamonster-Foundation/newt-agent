@@ -5,6 +5,7 @@ use std::ffi::OsString;
 
 struct Arguments {
     require_dos: bool,
+    trace_dos: bool,
     allowed: OsString,
     denied: OsString,
 }
@@ -16,11 +17,18 @@ fn arguments() -> Option<Arguments> {
         "--require-dos" => true,
         _ => return None,
     };
-    let parsed = Arguments {
+    let mut parsed = Arguments {
         require_dos,
+        trace_dos: false,
         allowed: args.next()?,
         denied: args.next()?,
     };
+    if let Some(option) = args.next() {
+        if option != "--trace-dos" {
+            return None;
+        }
+        parsed.trace_dos = true;
+    }
     args.next().is_none().then_some(parsed)
 }
 
@@ -33,7 +41,7 @@ fn main() {
     std::process::exit(i32::from(!windows::run(&args)));
     #[cfg(not(windows))]
     {
-        let _ = (args.require_dos, args.allowed, args.denied);
+        let _ = (args.require_dos, args.trace_dos, args.allowed, args.denied);
         eprintln!("platform error=50"); // ERROR_NOT_SUPPORTED
         std::process::exit(50);
     }
@@ -68,6 +76,13 @@ mod windows {
             flags: u32,
         ) -> u32;
         fn GetLongPathNameW(path: *const u16, buffer: *mut u16, size: u32) -> u32;
+        fn QueryDosDeviceW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
+        fn GetVolumePathNamesForVolumeNameW(
+            volume: *const u16,
+            buffer: *mut u16,
+            size: u32,
+            returned: *mut u32,
+        ) -> i32;
         fn GetLastError() -> u32;
         fn CloseHandle(handle: Handle) -> i32;
     }
@@ -101,6 +116,56 @@ mod windows {
         }
         buffer.truncate(length as usize + 1);
         Ok(buffer)
+    }
+
+    // Supplemental read-only queries, AFTER every original observation. Never
+    // substitute a later successful lookup for the original DOS gate result.
+    fn trace_dos_mapping(handle: &OwnedHandle) {
+        let guid = wide_path(|buffer, size| unsafe {
+            GetFinalPathNameByHandleW(handle.0, buffer, size, 1)
+        });
+        report("GetFinalPathNameByHandleW(GUID)", &guid);
+        let opened = wide_path(|buffer, size| unsafe {
+            GetFinalPathNameByHandleW(handle.0, buffer, size, 8)
+        });
+        report("GetFinalPathNameByHandleW(DOS, opened)", &opened);
+        for drive in ['C', 'D'] {
+            let name = [drive as u16, ':' as u16, 0];
+            let lookup =
+                wide_path(|buffer, size| unsafe { QueryDosDeviceW(name.as_ptr(), buffer, size) });
+            report(&format!("QueryDosDeviceW({drive}:)"), &lookup);
+        }
+        let devices = wide_path(|buffer, size| unsafe { QueryDosDeviceW(null(), buffer, size) });
+        report("QueryDosDeviceW(enumerate)", &devices);
+        if let Ok(guid) = guid {
+            if let Some(end) = guid.iter().position(|value| *value == '}' as u16) {
+                if guid.get(end + 1) == Some(&('\\' as u16)) {
+                    let mut volume = guid[..end + 2].to_vec();
+                    volume.push(0);
+                    let mut paths = vec![0; 32_768];
+                    let mut returned = 0;
+                    // SAFETY: volume is terminated and both output pointers are valid.
+                    let ok = unsafe {
+                        GetVolumePathNamesForVolumeNameW(
+                            volume.as_ptr(),
+                            paths.as_mut_ptr(),
+                            paths.len() as u32,
+                            &mut returned,
+                        )
+                    };
+                    let result = if ok == 0 {
+                        Err(unsafe { GetLastError() })
+                    } else {
+                        Ok(())
+                    };
+                    report("GetVolumePathNamesForVolumeNameW(cwd volume)", &result);
+                }
+            }
+        }
+        let after = wide_path(|buffer, size| unsafe {
+            GetFinalPathNameByHandleW(handle.0, buffer, size, 0)
+        });
+        report("GetFinalPathNameByHandleW(DOS, after queries)", &after);
     }
 
     pub(super) fn run(args: &Arguments) -> bool {
@@ -185,6 +250,9 @@ mod windows {
         let manager_read = open_manager(0x8000_0000); // GENERIC_READ includes data access.
         report("CreateFileW(mount-manager-read)", &manager_read);
         let manager_denied = matches!(manager_read, Err(5));
+        if args.trace_dos {
+            trace_dos_mapping(&handle);
+        }
         nt_ok
             && read_ok
             && contents

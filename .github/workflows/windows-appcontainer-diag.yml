@@ -78,7 +78,7 @@ jobs:
 
       - name: Probe DOS paths on the direct diagnostic's scratch drive
         shell: pwsh
-        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
+        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP -TraceDos
 
       - name: Scratch Git control after D-drive read probe (report-only)
         if: always() && matrix.order == 'original-first'
@@ -90,7 +90,7 @@ jobs:
       - name: Compare DOS paths under a write-root grant
         if: always()
         shell: pwsh
-        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -WriteGrant -ScratchParent $env:RUNNER_TEMP
+        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -WriteGrant -ScratchParent $env:RUNNER_TEMP -TraceDos
 
       - name: Scratch Git control after D-drive write probe (report-only)
         if: always()
@@ -104,7 +104,7 @@ jobs:
       - name: DOS paths after scratch cmd directory-listing control
         if: always()
         shell: pwsh
-        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
+        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP -TraceDos
 
       # Isolates the launcher from the Rust test harness entirely: does the
       # child process even start under AppContainer, for progressively more
