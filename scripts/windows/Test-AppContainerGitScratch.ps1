@@ -3,7 +3,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$LauncherPath,
-    [Parameter(Mandatory)][ValidateSet('BeforeDosProbes', 'AfterReadProbe', 'AfterWriteProbe')][string]$Phase
+    [Parameter(Mandatory)][ValidateSet('BeforeDosProbes', 'AfterReadProbe', 'AfterWriteProbe')][string]$Phase,
+    [switch]$ListingFirst
 )
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
@@ -12,7 +13,8 @@ $git = (Get-Command git.exe).Source
 New-Item -ItemType Directory -Force $work | Out-Null
 Push-Location $work
 try {
-    if (-not (Test-Path .git)) {
+    $freshFixture = -not (Test-Path .git)
+    if ($freshFixture) {
         & $git init -q -b main
         if ($LASTEXITCODE -ne 0) { throw 'Scratch control init failed.' }
         "original`n" | Out-File tracked.txt -NoNewline
@@ -23,7 +25,7 @@ try {
         "stage me`n" | Out-File pending.txt -NoNewline
     }
     function Show-Snapshot($label) {
-        foreach ($entry in @(@('scratch-parent', $env:RUNNER_TEMP), @('repository', $work), @('git-dir', (Join-Path $work '.git')))) {
+        foreach ($entry in @(@('drive-root', [IO.Path]::GetPathRoot($work)), @('scratch-grandparent', (Split-Path $env:RUNNER_TEMP)), @('scratch-parent', $env:RUNNER_TEMP), @('repository', $work), @('git-dir', (Join-Path $work '.git')))) {
             $acl = Get-Acl -LiteralPath $entry[1]
             $sddl = $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]'Access, Owner')
             # Keep masks, inheritance flags, ACE ordering and well-known SIDs;
@@ -38,12 +40,16 @@ try {
         & $LauncherPath --fs-write $work $exe @argv
         Write-Output "CONTROL EXIT=$LASTEXITCODE"
     }
-    # The first sequence exactly preserves the old launch order, without an
+    # By default the first sequence preserves the old launch order, without an
     # extra cwd/listing command or ACL query before its Git operations.
-    if ($Phase -ne 'BeforeDosProbes') { Show-Snapshot 'before-launches' }
-    Probe 'old-order cmd echo' cmd @('/c', 'echo hello')
-    Probe 'old-order whoami' "$env:WINDIR\System32\whoami.exe" @()
-    Probe 'old-order git version' $git @('--version')
+    if (-not $freshFixture) { Show-Snapshot 'before-launches' }
+    if ($ListingFirst) {
+        Probe 'listing-first cmd cwd/listing' cmd @('/c', 'cd & dir /b /a')
+    } else {
+        Probe 'old-order cmd echo' cmd @('/c', 'echo hello')
+        Probe 'old-order whoami' "$env:WINDIR\System32\whoami.exe" @()
+        Probe 'old-order git version' $git @('--version')
+    }
     Probe 'old-order git status' $git @('status')
     Probe 'old-order git add' $git @('add', '--', 'pending.txt')
     Show-Snapshot 'after-launches'

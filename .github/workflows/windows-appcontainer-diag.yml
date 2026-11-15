@@ -27,6 +27,10 @@ on:
 jobs:
   diag:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [original-first, dos-first, listing-first]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +70,7 @@ jobs:
           ./scripts/windows/Enable-AppContainerDosPaths.ps1
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
       - name: Scratch Git control before D-drive DOS probes (report-only)
+        if: matrix.order == 'original-first'
         shell: pwsh
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
@@ -76,7 +81,7 @@ jobs:
         run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
 
       - name: Scratch Git control after D-drive read probe (report-only)
-        if: always()
+        if: always() && matrix.order == 'original-first'
         shell: pwsh
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
@@ -92,7 +97,9 @@ jobs:
         shell: pwsh
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
-        run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterWriteProbe
+        run: |
+          $listingFirst = '${{ matrix.order }}' -eq 'listing-first'
+          ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterWriteProbe -ListingFirst:$listingFirst
 
       - name: DOS paths after scratch cmd directory-listing control
         if: always()
@@ -141,7 +148,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $staged -cne 'pending.txt') { throw 'Later host Git did not see the staged file.' }
 
       - name: Stage launcher next to test binaries and run the actual failing test
-        if: always()
+        if: always() && matrix.order == 'original-first'
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
           BRIDLE_REQUIRE_UNC_CONTROL: "1"
@@ -161,3 +168,8 @@ jobs:
           # One build and test invocation; all selected tests still run if one fails.
           cargo test -p newt-core --lib --features windows-appcontainer -- @tests --test-threads=1 --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Native Git evidence failed.' }
+
+      - name: Report filesystem types after all controls
+        if: always()
+        shell: pwsh
+        run: Get-Volume | Where-Object DriveLetter -In @('C', 'D') | Select-Object DriveLetter, FileSystemType | Format-Table -AutoSize
