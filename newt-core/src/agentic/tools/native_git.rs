@@ -3790,6 +3790,15 @@ mod governed_push_tests {
                 "HEAD:refs/heads/locked",
             ],
         );
+        // Git 2.56 updates matching tracking refs even when push names a URL.
+        // Remove that setup side effect so delivery must really update both refs.
+        for name in ["good", "locked"] {
+            git(
+                repo.path(),
+                &["update-ref", "-d", &format!("refs/remotes/origin/{name}")],
+            );
+        }
+        assert!(!refs(repo.path()).contains("refs/remotes/origin/"));
         let refs_dir = repo.path().join(".git/refs/remotes/origin");
         std::fs::create_dir_all(&refs_dir).unwrap();
         std::fs::write(refs_dir.join("locked.lock"), "independent writer").unwrap();
