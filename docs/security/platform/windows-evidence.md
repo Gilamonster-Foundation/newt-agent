@@ -52,8 +52,7 @@ on weekly/release runs; the manual diagnostic does the same alongside four
 existing Git effects whose passing count is asserted. Ordinary per-PR CI
 intentionally skips the ignored ground, including its `run_command_windows_`
 evidence filter. The pure `sandbox_git_env_tests::ambient_config_is_ignored`
-guard asserts both global and system config point at the null device; the pair
-is registered in `docs/testing/regressions.toml`.
+guard asserts both global and system config point at the null device.
 
 At f8f1e620, three diagnostic runs
 ([43666516120](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43666516120),

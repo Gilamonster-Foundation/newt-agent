@@ -3,6 +3,7 @@ name: Windows AppContainer diagnostic (manual)
 # Manual diagnostic: gates host preparation, required system-drive probes,
 # and through-Newt Git tests. Second-drive probes only report known limits.
 # Never runs on push or pull requests.
+# HOOK PARITY: manual and CI-only; named in .githooks/pre-push's CI-only list. Keep that list in step when editing.
 on:
   workflow_dispatch:
     inputs:
@@ -141,8 +142,9 @@ jobs:
             'agentic::tools::disable_ocap_tests::native_git_exec_grant_retry_stages_under_appcontainer',
             'agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants'
           )
-          # Four existing effects stay in their current tier; the new config
-          # ground is selected separately with --ignored and an exact-name guard.
+          # Four existing effects stay in their current tier; their per-PR
+          # placement is migration debt tracked in #514. The new config ground
+          # is selected separately with --ignored and an exact-name guard.
           cargo test -p newt-core --lib --features windows-appcontainer -- @tests --test-threads=1 --nocapture --color never | Tee-Object -Variable results
           if ($LASTEXITCODE -ne 0 -or -not ($results -match '^test result: ok\. 4 passed; 0 failed; 0 ignored;')) {
             throw 'Expected all four native Git effects to pass.'

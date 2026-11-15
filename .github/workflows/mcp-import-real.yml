@@ -52,36 +52,6 @@ jobs:
         shell: bash
         run: bash .github/scripts/test-cargo-test-nonempty.sh
 
-      # PR #3108: same bounded host preparation as the ordinary Windows job.
-      - name: Prepare Windows confined Git grounding
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          ./scripts/windows/Install-AppContainerLauncher.ps1
-          $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
-          ./scripts/windows/Enable-AppContainerNull.ps1 -SelfTest
-          ./scripts/windows/Enable-AppContainerNull.ps1
-          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -SelfTest
-          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -NamespaceOnly
-          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher
-          ./scripts/windows/Enable-AppContainerDosPaths.ps1
-          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
-          New-Item -ItemType Directory -Force target\debug\deps | Out-Null
-          Copy-Item $launcher target\debug\deps\
-
-      - name: Run Windows confined Git global-config grounding
-        if: runner.os == 'Windows'
-        env:
-          BRIDLE_REQUIRE_APPCONTAINER: "1"
-        shell: bash
-        run: >-
-          bash .github/scripts/cargo-test-nonempty.sh
-          --require-test agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_stays_ignored
-          -p newt-core --features windows-appcontainer --lib
-          agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_stays_ignored
-          -- --exact --ignored --test-threads=1 --nocapture
-
       # Patch containment needs native filesystem semantics; keep it out of
       # the unit tier and require every regression, including optional diffy.
       - name: Run patch read/write symlink containment grounding
@@ -329,5 +299,37 @@ jobs:
           --require-test a_real_terminal_keeps_the_transcript_through_a_grow_and_shrink
           -p newt-tui --features rich-tui --lib cockpit::presenter::tests::a_real_terminal_
           -- --ignored --test-threads=1
+
+      # PR #3108: keep host-wide AppContainer preparation last so the preceding
+      # Windows grounds retain their unprepared host and run even if launcher
+      # acquisition fails. Use the same bounded preparation as ordinary CI.
+      - name: Prepare Windows confined Git grounding
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/windows/Install-AppContainerLauncher.ps1
+          $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
+          ./scripts/windows/Enable-AppContainerNull.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerNull.ps1
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -SelfTest
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1 -NamespaceOnly
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher
+          ./scripts/windows/Enable-AppContainerDosPaths.ps1
+          ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
+          New-Item -ItemType Directory -Force target\debug\deps | Out-Null
+          Copy-Item $launcher target\debug\deps\
+
+      - name: Run Windows confined Git global-config grounding
+        if: runner.os == 'Windows'
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_stays_ignored
+          -p newt-core --features windows-appcontainer --lib
+          agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_stays_ignored
+          -- --exact --ignored --test-threads=1 --nocapture
 
 # Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 16:43 EDT | Date: 2026-08-13

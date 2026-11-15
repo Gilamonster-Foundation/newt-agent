@@ -1462,9 +1462,11 @@ async fn windows_disable_ocap_keeps_native_git_available() {
     assert!(!out.contains("routed:"), "{out}");
 }
 
-/// Grounds ambient_config_is_ignored's confined Git policy and the fs read gate.
-/// A global safe.directory entry stays ignored even with a file read grant;
-/// explicit --file access needs that grant. No ownership bypass is installed.
+/// Grounds `sandbox_git_env_tests::ambient_config_is_ignored`: global and system
+/// config point at the null device, even with a read grant for the global file.
+/// Separately measures the AppContainer file-read boundary: explicit `--file`
+/// access is denied without its read grant and allowed with one. No pure per-PR
+/// guard in newt-core covers that AppContainer boundary. No ownership bypass.
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "weekly/release real-resource tier; requires Windows AppContainer"]

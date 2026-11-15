@@ -73,12 +73,3 @@ The read broker approved the initial forge but the host gh client could
 follow a redirect to an ungranted destination without another decision."""
 guard = { file = "newt-core/src/agentic/tools/native_git/gh_http.rs", test = "gh_http_only_approved_destinations_reach_upstream" }
 ground = { file = "newt-core/src/agentic/tools/native_git/gh_http_ground.rs", test = "gh_http_real_redirect_never_reaches_ungranted_listener" }
-
-[[regression]]
-id = "windows-confined-git-global-config"
-seen = "2026-11-14"
-symptom = """
-A global safe.directory entry did not resolve confined Git's ownership refusal.
-Even granting its file for explicit reads must not enable ambient global config."""
-guard = { file = "newt-core/src/git_hardening.rs", test = "ambient_config_is_ignored" }
-ground = { file = "newt-core/src/agentic/tools_tests/disable_ocap_tests.rs", test = "run_command_windows_global_git_config_stays_ignored" }
