@@ -119,8 +119,8 @@ source changes do not establish the two live acceptance tasks or platform
 parity by themselves.
 
 On Windows, native status and staging use the ordinary AppContainer executor
-with the pinned agent-bridle v0.8.0-rc.7 launcher and the explicit
-[host prerequisites](../guide/windows-prerequisites.md). The old launcher's
+with the pinned agent-bridle v0.8.0-rc.7 launcher and, where needed, explicit
+[host preparation](../guide/windows-prerequisites.md). The old launcher's
 workspace grant lacked traverse/delete rights; the previous diagnosis that
 Git required profile-ancestor access was incorrect. Newt no longer refuses a
 literal Git invocation before spawn. Ordinary filesystem and exec checks still

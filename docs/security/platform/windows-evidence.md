@@ -1,7 +1,6 @@
 # Windows OCAP Evidence - AppContainer
 
 **Owner:** Windows agent. **Coordinator:** cross-platform OCAP closure.
-**Board card:** `knowledge/board/2026-08-08_ocap-windows-appcontainer-evidence-AGENT-BRIEF.md`.
 
 This page records real-resource evidence gathered on Windows for PR #1633. It
 does not promote an AppContainer binary's existence into a guarantee: every
@@ -26,40 +25,74 @@ AppContainer suite passed 14/14. The positive loopback-exemption control was
 classified as `UNSUPPORTED_FAIL_CLOSED` on the local non-elevated token; default
 loopback denial was still proved.
 
-Required local tools:
+## Native Git evidence
 
-- `agent-bridle-aclaunch.exe` from the [v0.8.0-rc.7 release archive](https://github.com/Gilamonster-Foundation/agent-bridle/releases/download/v0.8.0-rc.7/agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64.tar.gz),
-  SHA256 `6ca23258e1bf8c3eb7881d0836c8186039c176e6f472cfe9d948acf313c4816d`.
-  `scripts/windows/Install-AppContainerLauncher.ps1` verifies it before extracting
-  `agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64/agent-bridle-aclaunch.exe`.
-- `ab-netprobe.exe`, absent from that archive: install only this evidence helper
-  with `cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked`.
+Installation and conditional host preparation are described in the
+[Windows prerequisites](../../guide/windows-prerequisites.md). The pinned rc.7
+launcher restores traverse and delete rights within its workspace write grant;
+the old ancestry-access diagnosis was incorrect. Newt adds no Git-specific host
+fallback or ownership bypass.
 
-Current native Git tests additionally require the explicit elevated
-[NUL and bounded DOS-path host preparation](../../guide/windows-prerequisites.md)
-once per boot. CI runs those existing bounded DACL updates before ordinary tests; it is not performed by
-the sandbox launcher or by Newt at runtime. The historical evidence below
-predates this prerequisite and is not itself proof of native Git effects.
-The native Git fixtures represent user-owned repositories: elevated CI gives
-their repository and `.git` directories to the invoking user SID without
-changing either DACL. Administrators-owned repositories remain subject to Git's
-dubious-ownership refusal inside AppContainer; production applies no bypass. Newt's existing Git environment ignores global
-and system Git configuration (`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point
-to `/dev/null`), so a global `safe.directory` entry does not resolve that refusal,
-even if its file is readable. Explicit config-file access still needs the
-corresponding filesystem read grant.
+### Windows Server CI
 
-The current native Git success evidence uses user-owned fixtures on the system
-drive. Separate scratch-drive controls reproduce Git's cwd permission denial and
-`GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` error 5 despite successful NT-name
-lookup and granted-file reads. Neither preceding DOS probes nor a directory
-listing repaired the failure; a fresh-run comparison also diverged before the
-differing launch sequence. The underlying host-dependent cause remains open;
-[diagnostic controls](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43664803228)
-do not establish general second-drive support. A user-owned second-drive fixture
-through Newt is unmeasured because its owner change failed the unchanged-DACL
-guard. Newt-confined workspace `dir` is also unmeasured; bare-launcher listing
-controls were denied on both drives.
+[Windows CI 43659855982](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43659855982/job/132646509759)
+and [diagnostic 43659882248](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43659882248)
+passed real Git status, add, exec-grant retry and refreshed-workspace-grant
+effects, no stale index lock, and subsequent host Git. CI runs the existing NUL
+and bounded DOS-path preparation; elevated fixtures set repository/.git owner
+to the invoking user SID and assert unchanged DACLs. A separate config probe
+proves global `safe.directory` stays ignored even with a file read grant:
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point to the null device. Explicit
+`git config --file` is denied without its file grant and succeeds with it.
+
+At f8f1e620, three diagnostic runs
+([43666516120](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43666516120),
+[43667425578](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43667425578),
+[43667427725](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43667427725))
+measured **3 failures in 9 jobs** on D: through the bare launcher. Each launch
+order failed once; original-first also passed twice, refuting an order-specific
+cause. System-drive required probes and through-Newt tests passed throughout.
+Failing scratch probes resolved NT names and read granted files but returned
+error 5 for DOS/GUID names; the underlying host-dependent cause is unresolved.
+The operator accepted this second-drive limit for v0.8.6: the single-job manual
+diagnostic now retains scratch Git/DOS observations as report-only, while host
+preparation, system-drive required effects and through-Newt tests remain gates.
+Through-Newt second-drive Git is unmeasured because changing the scratch fixture
+owner failed the unchanged-DACL guard. Bare-launcher `dir` was denied on both
+CI drives; Newt-confined workspace `dir` is unmeasured.
+
+### Windows 11 Pro desktop (build 26200)
+
+Shepherd measurements used one NTFS system drive, Git for Windows
+2.53.0.windows.1, the checksum-verified rc.7 launcher, no system/global
+`safe.directory`, and **no NUL or DOS-path host preparation**. Each bare-launcher
+probe granted only a fresh repository containing a committed tracked file and
+an untracked `pending.txt`, with that repository as cwd.
+
+| Probe | Interactive, non-elevated; user-owned repo | Interactive, elevated; Administrators-owned repo | ssh, session 0, elevated |
+|---|---|---|---|
+| `cmd /c echo hello` | exit 0 | exit 0 | exit 0 |
+| `cmd /c "cd & type tracked.txt"` | exit 0; cwd and file printed | exit 0 | exit 0 |
+| `cmd /c "dir /b /a"` | Access is denied; exit 1 | Access is denied; exit 1 | Access is denied; exit 1 |
+| `whoami.exe` | exit 0 | exit 0 | `0xC0000142` |
+| `git --version` | exit 0 | exit 0 | `0xC0000142` |
+| `git status --short` | exit 0; `?? pending.txt` | dubious ownership; exit 128 | `0xC0000142` |
+| `git add -- pending.txt` | exit 0 | dubious ownership; exit 128 | `0xC0000142` |
+| Stale `.git/index.lock` afterward | none | none | none |
+| Later host `git diff --cached --name-only` | `pending.txt` | empty | empty |
+
+The non-elevated Git commands warned that the profile's `.config/git/ignore`
+was unreadable but still succeeded. The table measures the bare launcher.
+
+On the same desktop at f8f1e620, the shepherd also ran all five diagnostic tests
+through Newt in an interactive, non-elevated session, with the verified launcher
+staged by `Install-AppContainerLauncher.ps1` and **neither host-preparation script
+run**. Status, add, exec-grant retry, refreshed workspace grants and global-config
+isolation passed: **5 passed, 0 failed, 0 ignored**, in 8.87 seconds. The tests
+required AppContainer (`BRIDLE_REQUIRE_APPCONTAINER=1`) and ran serially with the
+`windows-appcontainer` feature. Through-Newt tests elevated or over ssh, the
+interactive TUI, a second desktop drive and a Windows Server desktop remain
+unmeasured.
 
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing

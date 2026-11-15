@@ -1,22 +1,8 @@
 name: Windows AppContainer diagnostic (manual)
 
-# Narrow, manually-triggered diagnostic for PR #2614's Windows CI failure
-# (agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants
-# and the two disable_ocap_tests siblings: `fatal: detected dubious ownership`).
-#
-# This does NOT run on push/PR — it never affects the ordinary CI gate. It
-# exists because that failure could not be reproduced locally: the only
-# native Windows box available (Caster) is a Windows 10/11 Pro client, not
-# the Server 2022 image `windows-latest` runs, and on Caster even a bare
-# `whoami.exe` launched through `agent-bridle-aclaunch.exe` crashes with
-# STATUS_DLL_INIT_FAILED before reaching git at all — a different, more
-# fundamental failure than CI's, most likely an OS-family difference. This
-# workflow runs the same isolation steps on the real CI OS so a human/agent
-# can see which failure (if either) actually reproduces there, without
-# waiting on a full `cargo test --workspace` cycle each time.
-#
-# See knowledge/board/newt-agent/2026-09-28_newt-pr2614-pipeline-repair-HANDOFF.md
-# for the full investigation history.
+# Manual diagnostic: gates host preparation, required system-drive probes,
+# and through-Newt Git tests. Second-drive probes only report known limits.
+# Never runs on push or pull requests.
 on:
   workflow_dispatch:
     inputs:
@@ -27,20 +13,15 @@ on:
 jobs:
   diag:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        order: [original-first, dos-first, listing-first]
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Show OS/runner identity
+      - name: Show OS and elevation
         shell: pwsh
         run: |
           Get-ComputerInfo | Select-Object WindowsProductName, OsBuildNumber, WindowsVersion, OsHardwareAbstractionLayer
-          Write-Output "Current identity: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
           Write-Output "Is elevated: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator))"
 
       - uses: dtolnay/rust-toolchain@stable
@@ -69,42 +50,38 @@ jobs:
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher
           ./scripts/windows/Enable-AppContainerDosPaths.ps1
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
-      - name: Scratch Git control before D-drive DOS probes (report-only)
-        if: matrix.order == 'original-first'
-        shell: pwsh
-        env:
-          BRIDLE_REQUIRE_APPCONTAINER: "1"
-        run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase BeforeDosProbes
-
-      - name: Probe DOS paths on the direct diagnostic's scratch drive
-        shell: pwsh
-        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP -TraceDos
-
-      - name: Scratch Git control after D-drive read probe (report-only)
-        if: always() && matrix.order == 'original-first'
-        shell: pwsh
-        env:
-          BRIDLE_REQUIRE_APPCONTAINER: "1"
-        run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterReadProbe
-
-      - name: Compare DOS paths under a write-root grant
+      # Second-drive name resolution fails on some hosts; tracked upstream in agent-bridle.
+      - name: Scratch-drive Git and DOS paths (report-only)
         if: always()
+        continue-on-error: true
         shell: pwsh
-        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -WriteGrant -ScratchParent $env:RUNNER_TEMP -TraceDos
-
-      - name: Scratch Git control after D-drive write probe (report-only)
-        if: always()
-        shell: pwsh
-        env:
-          BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: |
-          $listingFirst = '${{ matrix.order }}' -eq 'listing-first'
-          ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterWriteProbe -ListingFirst:$listingFirst
-
-      - name: DOS paths after scratch cmd directory-listing control
-        if: always()
-        shell: pwsh
-        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP -TraceDos
+          $PSNativeCommandUseErrorActionPreference = $false
+          $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
+          $git = (Get-Command git.exe).Source
+          $work = Join-Path $env:RUNNER_TEMP 'actest'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Push-Location $work
+          try {
+            & $git init -q -b main
+            if ($LASTEXITCODE -ne 0) { throw 'Scratch control init failed.' }
+            "original`n" | Out-File tracked.txt -NoNewline
+            & $git add tracked.txt
+            if ($LASTEXITCODE -ne 0) { throw 'Scratch control host add failed.' }
+            & $git -c user.name=diag -c user.email=diag@example.invalid commit -qm init
+            if ($LASTEXITCODE -ne 0) { throw 'Scratch control host commit failed.' }
+            "stage me`n" | Out-File pending.txt -NoNewline
+            & $launcher --fs-write $work $git status --short
+            Write-Output "Scratch git status EXIT=$LASTEXITCODE"
+            & $launcher --fs-write $work $git add -- pending.txt
+            Write-Output "Scratch git add EXIT=$LASTEXITCODE"
+            & $launcher --fs-write $work cmd /c "cd & dir /b /a"
+            Write-Output "Scratch cmd dir EXIT=$LASTEXITCODE"
+          } finally { Pop-Location }
+          try {
+            ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos -WriteGrant -ScratchParent $env:RUNNER_TEMP
+          } catch { Write-Warning "Scratch DOS control: $_" }
+          exit 0
 
       # Isolates the launcher from the Rust test harness entirely: does the
       # child process even start under AppContainer, for progressively more
@@ -147,8 +124,8 @@ jobs:
           $staged = git diff --cached --name-only
           if ($LASTEXITCODE -ne 0 -or $staged -cne 'pending.txt') { throw 'Later host Git did not see the staged file.' }
 
-      - name: Stage launcher next to test binaries and run the actual failing test
-        if: always() && matrix.order == 'original-first'
+      - name: Run through-Newt Git evidence
+        if: always()
         env:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
           BRIDLE_REQUIRE_UNC_CONTROL: "1"
@@ -168,8 +145,3 @@ jobs:
           # One build and test invocation; all selected tests still run if one fails.
           cargo test -p newt-core --lib --features windows-appcontainer -- @tests --test-threads=1 --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Native Git evidence failed.' }
-
-      - name: Report filesystem types after all controls
-        if: always()
-        shell: pwsh
-        run: Get-Volume | Where-Object DriveLetter -In @('C', 'D') | Select-Object DriveLetter, FileSystemType | Format-Table -AutoSize

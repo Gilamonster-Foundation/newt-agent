@@ -15,8 +15,6 @@ MountPointManager device open to succeed.
 .PARAMETER WriteGrant
 Use the launcher's write-root grant instead of its read-root grant for the same
 workspace; probe operations and denial controls remain identical.
-.PARAMETER TraceDos
-Report read-only volume/name lookup results after the original gate observations.
 .PARAMETER ScratchParent
 Parent of the fresh probe directory; defaults to the user temp directory.
 Set to RUNNER_TEMP to exercise the direct diagnostic's separate scratch drive.
@@ -26,7 +24,6 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherPath,
     [switch]$RequireDos,
     [switch]$WriteGrant,
-    [switch]$TraceDos,
     # Probe the diagnostic's scratch drive as well as the default user temp.
     [string]$ScratchParent = ([IO.Path]::GetTempPath())
 )
@@ -63,8 +60,7 @@ try {
     Push-Location -LiteralPath $workspace
     try {
         $access = if ($WriteGrant) { '--fs-write' } else { '--fs-read' }
-        [string[]]$traceArgs = if ($TraceDos) { @('--trace-dos') } else { @() }
-        & $launcher --name "newt-dos-probe-$tag" --no-child-process $access $workspace --fs-read $exe $exe $mode $allowed $denied @traceArgs
+        & $launcher --name "newt-dos-probe-$tag" --no-child-process $access $workspace --fs-read $exe $exe $mode $allowed $denied
         $result = $LASTEXITCODE
     } finally { Pop-Location }
 } finally {
