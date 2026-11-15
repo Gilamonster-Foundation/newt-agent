@@ -220,6 +220,12 @@ jobs:
             fi
           fi
 
+      # Match macos-confined-contract.yml: versioned Xcode bundles need a
+      # non-group-writable ancestor to satisfy the unchanged executable trust policy.
+      - name: Make the system Git ancestor non-group-writable
+        if: runner.os == 'macOS'
+        run: sudo chmod g-w /Applications
+
       - name: Run gh read broker grounding
         if: runner.os != 'Windows'
         shell: bash

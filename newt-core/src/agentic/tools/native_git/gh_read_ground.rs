@@ -36,8 +36,9 @@ fn gh_read_real_dispatch_pins_host_and_isolates_config() {
 [ "$GH_HOST" = github.com ] || exit 21
 [ "$GH_TOKEN" = fixture-token ] || exit 22
 [ -z "$GH_ENTERPRISE_TOKEN" ] || exit 23
-[ "$HOME" = "$PWD" ] || exit 24
-[ "$GH_CONFIG_DIR" = "$PWD" ] || exit 25
+# macOS /tmp aliases can spell the same directory differently.
+[ "$HOME" -ef "$PWD" ] || exit 24
+[ "$GH_CONFIG_DIR" -ef "$PWD" ] || exit 25
 [ -S "$GH_CONFIG_DIR/http.sock" ] || exit 26
 [ "$(cat "$GH_CONFIG_DIR/config.yml")" = "http_unix_socket: $GH_CONFIG_DIR/http.sock" ] || exit 28
 [ -z "$GH_REPO" ] || exit 27
@@ -58,35 +59,6 @@ echo '{}' >&2
         net: Scope::only(["github.com".into(), "api.github.com".into()]),
         ..read_only(&[repo.path(), config.as_path()])
     };
-    // TEMPORARY weekly-red diagnosis: remove before the final lane head.
-    fn checked<T>(stage: &str, result: Result<T, crate::git_staging::Refusal>) -> T {
-        result.unwrap_or_else(|error| {
-            let detail = error.to_string();
-            let kinds: Vec<_> = ["group- or other-writable", "model-writable", "symlink",
-                "outside this session", "cannot bind", "cannot be inspected",
-                "cannot be resolved", "exec-path", "trusted git", "gh executable"]
-                .into_iter().filter(|kind| detail.contains(kind)).collect();
-            let modes: Vec<_> = error.hints().iter().map(|hint| hint.mode & 0o7777).collect();
-            eprintln!("weekly-red preparation stage={stage}; kinds={kinds:?}; modes={modes:?}; safe_reason={:?}", error.safe_reason);
-            panic!("weekly-red preparation failed at {stage}");
-        })
-    }
-    eprintln!("weekly-red aliases: home={} bin={} config={}",
-        env.home.path() != env.home.path().canonicalize().unwrap(),
-        env.bin.path() != env.bin.path().canonicalize().unwrap(),
-        config != config.canonicalize().unwrap());
-    let context = checked("bind writes", crate::git_staging::TrustContext::bind(&caveats.fs_write));
-    let tools = checked("authenticate tools", crate::git_staging::TrustedTools::authenticate(context));
-    let dir = checked("config trust", crate::git_staging::trusted_gh_config_dir(tools.ctx())).unwrap();
-    let held = checked("bind reads", crate::git_staging::HeldRoots::bind(&caveats.fs_read));
-    checked("credential file trust", crate::git_staging::trust_check(&dir.join("hosts.yml"), tools.ctx()));
-    checked("credential file read", held.read_to_string(&dir, Path::new("hosts.yml")));
-    let short = tempfile::Builder::new().prefix("ngh-")
-        .permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in("/tmp").unwrap();
-    let staging = checked("staging create", crate::git_staging::StagingRepo::create(&short.path().join("s"), tools.ctx()));
-    assert!(tools.gh(["issue", "view", "1"]).is_ok(), "weekly-red gh command resolution");
-    drop(staging);
-    eprintln!("weekly-red preparation checks all passed");
     let (out, terminal) =
         dispatch_run_command_with_gate(repo.path(), "gh issue view 1", &caveats, Some(&mut gate));
     assert!(out.contains("issue 1"), "{out}");

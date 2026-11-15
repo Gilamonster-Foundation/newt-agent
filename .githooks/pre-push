@@ -59,15 +59,14 @@
 #     fallback, hostile-rewrite, partial-ref and transfer grounds (serial;
 #     Linux and macOS check hostile rewrites and successful confined transfer),
 #     #3093 gh read broker grounding
-#     (gh_read_real_dispatch_pins_host_and_isolates_config; stand-in gh, no live forge),
+#     (gh_read_real_dispatch_pins_host_and_isolates_config; stand-in gh, no live forge;
+#     macOS narrows the system Git ancestor permissions before broker grounds),
 #     and gh_http_real_redirect_never_reaches_ungranted_listener (real HTTP and
 #     real gh when installed; local stand-in upstreams; serial Linux/macOS),
 #     and the macOS-only stdio MCP net:none
 #     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
-#   - temporary weekly-red-diag.yml: exact ignored gh read ground on macOS,
-#     serial; diagnoses preparation without changing production authority.
 #   - patch read/write symlink containment, mcp-import-real.yml (weekly +
 #     release, Linux/macOS): newt-tools patch::tests::{apply_whole_files,
 #     read_contained_opt,fuzzy_patch,diffy_patch}_denies_symlink_escape_object_bound,
