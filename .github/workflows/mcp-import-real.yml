@@ -30,10 +30,10 @@ env:
 jobs:
   real-resource-tier:
     name: MCP import real subprocess and filesystem tier
-    # Windows needs ~44.5 min (each step relinks its test target); 45 timed out
-    # a fully green run on 2026-10-12.
-    # ponytail: headroom, not speed; share one test build across steps if it grows.
-    timeout-minutes: 75
+    # Windows needs ~48 min. macOS took ~57 min to reach gh read grounding
+    # on 2026-11-15, with seven later grounds still to run and relink.
+    # Allow the complete real-resource suite to finish on all platforms.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix:
