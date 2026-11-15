@@ -63,7 +63,7 @@ try {
     Push-Location -LiteralPath $workspace
     try {
         $access = if ($WriteGrant) { '--fs-write' } else { '--fs-read' }
-        $traceArgs = if ($TraceDos) { @('--trace-dos') } else { @() }
+        [string[]]$traceArgs = if ($TraceDos) { @('--trace-dos') } else { @() }
         & $launcher --name "newt-dos-probe-$tag" --no-child-process $access $workspace --fs-read $exe $exe $mode $allowed $denied @traceArgs
         $result = $LASTEXITCODE
     } finally { Pop-Location }
