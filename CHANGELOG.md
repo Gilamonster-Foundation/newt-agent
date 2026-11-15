@@ -9,15 +9,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
-### Fixed
-
-- On macOS, the headless coder's file apply (`apply_whole_files` and `apply_patch`) could
-  write outside the workspace through a symlinked directory inside it. Those writes and the
-  reads before them now resolve beneath the workspace root, as they already did on Linux.
-  macOS refuses any path that passes through a symlink, including one that stays inside
-  the workspace.
-
-## [0.8.6] — 2026-11-03
+## [0.8.6] — 2026-11-15
 
 ### Added
 
@@ -29,6 +21,16 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   or a fifo, socket or device, and every tree on a platform that cannot detect hard links.
 - The flight recorder (`$NEWT_FLIGHT_RECORDER`) records each MCP connect and auth outcome
   on a new `mcp` axis. `ocap propose` never turns it into policy (#3037, #3049).
+- `--net <host>` grants a network host for the session at launch, and may be repeated, as
+  `--read` and `--write` do for paths (#3089, #3093). A granted host skips the prompt; any
+  other host still asks.
+- In a confined session, read-only `gh` commands run through a host-side broker (#3093):
+  `gh issue view|list|status` and `gh pr view|list|status|diff|checks`. The forge and its
+  API host must both be granted or approved, and every request `gh` makes is checked
+  against them. Other `gh` verbs, apart from `gh pr create`, still have no network in a
+  confined session (#905). The broker reads the token from `gh`'s `hosts.yml`, which must
+  be inside a `--read` grant; a keyring-only login is not supported. It does not run on
+  Windows and is not measured on macOS.
 
 ### Changed
 
@@ -82,11 +84,33 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   transcript rows the shrink scrolled away (#3097).
 - Closing the `/` command palette on a full screen returns the prompt to the bottom rows
   instead of leaving it mid-screen (#3097).
+- On macOS, the headless coder's file apply (`apply_whole_files` and `apply_patch`) could
+  write outside the workspace through a symlinked directory inside it. Those writes and the
+  reads before them now resolve beneath the workspace root, as they already did on Linux.
+  macOS refuses any path that passes through a symlink, including one that stays inside
+  the workspace (#3095).
+- `/model` in a confined session no longer drops other projects' saved models from
+  `settings.toml`. Settings saves now hold a file lock, so concurrent saves keep each
+  other's entries (#3090, #3094).
+- On Windows, `git` in a confined session runs instead of being refused before it starts
+  (#3108). `git status`, `git add` and `git config --get` are the commands tested. It needs
+  the AppContainer launcher from agent-bridle 0.8.0-rc.7;
+  `docs/guide/windows-prerequisites.md` covers the install and four known limits. Two of
+  them: Git reports "dubious ownership" for a repository owned by the Administrators
+  group, as an elevated process creates (#3107), and on some hosts Git cannot read its
+  working directory on a second drive. Use a repository owned by your own account, on the
+  system drive.
+- `just install` builds without sccache when the sccache set through `RUSTC_WRAPPER`
+  cannot start (#3088).
 
 ### Security
 
 - RUSTSEC-2026-0429 (zip 1.1.4, via candle-core 0.8.4) is accepted: candle reads and
   writes zip archives in memory and never calls the affected `extract()` (#3071).
+- rusqlite 0.41 bundles a SQLite with the fix for RUSTSEC-2026-0459 (#3092).
+- agent-bridle 0.8.0-rc.7 brings hickory 0.26.3, clearing the open hickory advisories
+  (#3096).
+- quinn-udp 0.5.16 fixes RUSTSEC-2026-0538 (#3100).
 
 ## [0.8.5] — 2026-10-27
 

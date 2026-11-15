@@ -12,11 +12,20 @@ Literal path to the trusted agent-bridle-aclaunch executable.
 .PARAMETER RequireDos
 Also require GetFinalPathNameByHandleW with VOLUME_NAME_DOS and the metadata-only
 MountPointManager device open to succeed.
+.PARAMETER WriteGrant
+Use the launcher's write-root grant instead of its read-root grant for the same
+workspace; probe operations and denial controls remain identical.
+.PARAMETER ScratchParent
+Parent of the fresh probe directory; defaults to the user temp directory.
+Set to RUNNER_TEMP to exercise the direct diagnostic's separate scratch drive.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherPath,
-    [switch]$RequireDos
+    [switch]$RequireDos,
+    [switch]$WriteGrant,
+    # Probe the diagnostic's scratch drive as well as the default user temp.
+    [string]$ScratchParent = ([IO.Path]::GetTempPath())
 )
 
 Set-StrictMode -Version Latest
@@ -26,7 +35,7 @@ if (-not $IsWindows) { throw 'This diagnostic requires Windows.' }
 $launcher = (Resolve-Path -LiteralPath $LauncherPath).ProviderPath
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { throw 'Launcher must be a file.' }
 $tag = [Guid]::NewGuid().ToString('N')
-$root = Join-Path ([IO.Path]::GetTempPath()) "newt-ac-dos-$tag"
+$root = Join-Path $ScratchParent "newt-ac-dos-$tag"
 $workspace = Join-Path $root 'workspace'
 $outside = Join-Path $root 'outside'
 $allowed = Join-Path $workspace 'marker.txt'
@@ -50,7 +59,8 @@ try {
     $mode = if ($RequireDos) { '--require-dos' } else { '--report-only' }
     Push-Location -LiteralPath $workspace
     try {
-        & $launcher --name "newt-dos-probe-$tag" --no-child-process --fs-read $workspace --fs-read $exe $exe $mode $allowed $denied
+        $access = if ($WriteGrant) { '--fs-write' } else { '--fs-read' }
+        & $launcher --name "newt-dos-probe-$tag" --no-child-process $access $workspace --fs-read $exe $exe $mode $allowed $denied
         $result = $LASTEXITCODE
     } finally { Pop-Location }
 } finally {

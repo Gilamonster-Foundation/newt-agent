@@ -1,12 +1,60 @@
 # Windows host prerequisites
 
 Confined native commands require the trusted `agent-bridle-aclaunch.exe`
-AppContainer launcher. Install it with
-`cargo install agent-bridle-aclaunch --version 0.7.10 --locked` and keep the
-launcher beside `newt.exe` in the same installation directory. An arbitrary
-`PATH` entry is not trusted.
+AppContainer launcher. Use the **v0.8.0-rc.7 release archive**, not the old
+crates.io launcher:
 
-## Prepare the null device once per boot
+- [agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64.tar.gz](https://github.com/Gilamonster-Foundation/agent-bridle/releases/download/v0.8.0-rc.7/agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64.tar.gz)
+- SHA256: `6ca23258e1bf8c3eb7881d0836c8186039c176e6f472cfe9d948acf313c4816d`
+- Member: `agent-bridle-mcp-v0.8.0-rc.7-windows-x86_64/agent-bridle-aclaunch.exe`
+
+From the repository root, the shared installer downloads with bounded retries,
+checks the SHA256 **before extraction**, and copies only the launcher:
+
+```powershell
+./scripts/windows/Install-AppContainerLauncher.ps1 -Destination (Split-Path (Get-Command newt.exe).Source)
+```
+
+An offline installation may pass `-Archive` with the same pinned archive; its
+checksum is still checked. Keep the launcher beside `newt.exe` in the same
+installation directory. An arbitrary `PATH` entry is not trusted. CI installs
+into the Cargo bin directory, then explicitly stages the verified executable
+beside the test binaries. The archive omits `ab-netprobe.exe`; CI installs that
+evidence helper separately with
+`cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked`.
+This installs only the probe, not a replacement launcher.
+
+Newt sends literal `git status` and `git add` through ordinary confined exec,
+including the exec gate and filesystem grants, without a host fallback.
+
+## Known limits
+
+- **Administrators-owned repositories:** Git reports `dubious ownership`; use a
+  repository owned by your own account, for example cloned non-elevated.
+  A global `safe.directory` does not help because Newt ignores global and system
+  Git configuration.
+- **Second-drive workspaces:** on some hosts Git reports `Unable to read current
+  working directory: Permission denied`; keep the workspace on the system drive.
+  This affected 3 of 9 CI jobs on the runner's D: drive through the bare launcher;
+  through Newt on a second drive is unmeasured.
+- **Sessions without an interactive desktop**, for example over ssh: measured
+  programs other than `cmd` (`whoami` and Git) failed to start with `0xC0000142`
+  on a Windows 11 desktop. Use an interactive desktop session.
+- **Directory listings:** `dir` in a granted directory is denied under the bare
+  launcher on every host measured. Through Newt it is unmeasured.
+
+See the [Windows evidence](../security/platform/windows-evidence.md#native-git-evidence)
+for CI runs and the desktop measurements.
+
+## Host preparation when needed
+
+On a desktop, try confined Git before adding host-wide grants. The elevated
+scripts below are for hosts where confined Git fails without them, as measured
+on the GitHub Windows Server runner image. On a Windows 11 Pro desktop, both
+bare-launcher Git and all five through-Newt Git tests passed in an interactive,
+non-elevated session with neither script run.
+
+### Prepare the null device
 
 Windows resets the `\Device\Null` security descriptor on reboot. Its default
 permissions can prevent AppContainer processes from opening `NUL`. Native Git
@@ -14,7 +62,8 @@ opens this device during startup, even when its standard streams are already
 connected; a denial can therefore prevent ordinary status and staging commands.
 
 From the repository root, run these commands explicitly in **PowerShell 7 opened
-as Administrator**, after each boot and before starting confined tools:
+as Administrator** only when this host needs NUL access prepared; repeat after
+a reboot:
 
 ```powershell
 ./scripts/windows/Enable-AppContainerNull.ps1 -SelfTest
@@ -43,7 +92,7 @@ security administration must be coordinated separately; Windows does not offer
 an atomic compare-and-swap for a DACL. The script rereads before writing and
 verifies the resulting DACL. It never restores a stale full descriptor.
 
-This is an explicit operator or installation prerequisite. Newt does not run
+On hosts that need it, this is explicit operator setup. Newt does not run
 this script, request elevation, or expose it as a model tool. An administrator
 may arrange the explicit boot-time setup under the machine's own management
 policy. CI performs it visibly before ordinary confined tests; actual native
@@ -58,7 +107,7 @@ descriptor or libuv's other test-launcher grants.
 The comparison accounts for the NUL mask mapping documented in
 [MXC's kernel descriptor implementation](https://github.com/microsoft/mxc/blob/715942607f210c300667ba01605b564ae7253c98/src/host/wxc_host_prep/src/null_device/sd.rs#L232).
 
-## Verify confined DOS-path lookup
+### Verify confined DOS-path lookup
 
 Git for Windows normalizes its working directory using
 `GetFinalPathNameByHandleW` with DOS-volume output. AppContainer can deny that
@@ -68,7 +117,8 @@ namespace and MountPointManager permissions as a cause. This section describes
 a bounded compatibility setting. Each host must pass the confined probe;
 installing the prerequisite alone is not evidence that path lookup works.
 
-The separate elevated script accepts no path, SID, or access-mask arguments:
+If confined DOS-path lookup fails on this host, the separate elevated script
+accepts no path, SID, or access-mask arguments:
 
 ```powershell
 ./scripts/windows/Enable-AppContainerDosPaths.ps1 -SelfTest
@@ -121,6 +171,6 @@ metadata-only setup. The final probe must prove DOS-path lookup, an allowed file
 read, a denied outside-file read, a successful fixed MountPointManager
 `0x00120088` open, and denial of a `GENERIC_READ` open on that same device
 without issuing a state-changing IOCTL. A repeated apply
-must report no change. The three ordinary native Git effect tests remain
+must report no change. The system-drive native Git effect tests remain
 required. Until those controls pass, this setting is not evidence that
 confined native Git works on the target Windows host.

@@ -149,7 +149,7 @@ try {
     $refused = $false
     try {
         & (Join-Path $PSScriptRoot 'Install-CarriedTools.ps1') -BinaryPath (Join-Path $tools 'newt-carried-tools.exe') -NewtDirectory $fixture -BusyboxArchive $badArchive | Out-Null
-    } catch { $refused = $_.Exception.Message -match 'busybox-w32.*SHA256 mismatch' }
+    } catch { $refused = $_.Exception.Message -match 'Pinned artifact SHA256 mismatch' }
     if (!$refused -or (Test-Path (Join-Path $fixture 'tools'))) { throw 'corrupt BusyBox was not refused cleanly' }
     $script:checks++
     Write-Output "PASS: $script:checks packaged native command checks"

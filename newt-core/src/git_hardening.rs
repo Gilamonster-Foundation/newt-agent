@@ -52,6 +52,28 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Real Windows Git fixtures model a non-elevated user's own repository.
+/// An elevated CI runner otherwise creates Administrators-owned directories,
+/// which Git correctly rejects once that group is disabled by AppContainer.
+/// This changes only fixture ownership, not the DACL or production Git policy.
+#[cfg(all(test, windows))]
+pub(crate) fn own_git_test_fixture(repo: &Path) {
+    let output = Command::new("pwsh.exe")
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../scripts/windows/Set-GitFixtureOwner.ps1"),
+        )
+        .arg("-Repository")
+        .arg(repo)
+        .output()
+        .expect("set Git test fixture owner");
+    assert!(
+        output.status.success(),
+        "Git fixture ownership setup: {output:?}"
+    );
+}
+
 /// Filesystem grants for the session workspace's **own** git metadata (F32,
 /// #2537): the extra read/write roots that let the model commit and move the
 /// ref of the branch it has checked out, without needing to reach outside the
@@ -1906,9 +1928,8 @@ pub fn trusted_gh_program(path: Option<&OsStr>) -> io::Result<PathBuf> {
 ///
 /// Windows keeps the pre-existing bare-name behavior: `CreateProcess`'s
 /// executable search does not repeat Unix's cwd-relative-PATH-entry gadget
-/// the same way, and the Windows AppContainer refusal already covers the
-/// dominant native-Git host-execution risk on that platform
-/// (`windows_appcontainer_native_git_refusal`).
+/// the same way. Confined native Git follows the ordinary AppContainer exec
+/// and filesystem checks; it has no host fallback.
 #[cfg(unix)]
 pub(crate) fn resolve_trusted_program(
     cwd: &Path,
@@ -2059,6 +2080,7 @@ mod sandbox_git_env_tests {
     fn ambient_config_is_ignored() {
         let env = sandbox_git_env(("newt-agent", "a@b"), &Default::default());
         assert!(env.contains(&("GIT_CONFIG_GLOBAL".into(), "/dev/null".into())));
+        assert!(env.contains(&("GIT_CONFIG_SYSTEM".into(), "/dev/null".into())));
         assert!(env.contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into())));
     }
 

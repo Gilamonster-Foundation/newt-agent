@@ -118,15 +118,14 @@ repositories, explicit grants, and the absence of embedded dispatch. These
 source changes do not establish the two live acceptance tasks or platform
 parity by themselves.
 
-On Windows, the restricted AppContainer backend is a declared exception to
-native Git availability. After the ordinary filesystem and executable-authority
-checks succeed, a single literal direct Git program is refused before it is
-spawned when that backend is selected: Git for Windows resolves the current
-directory through ancestors outside the admitted roots. The result names the
-unavailable backend and confirms that no command ran; Newt neither widens those
-roots nor retries on the host. Compound or dynamic shell source retains its
-existing confined-executor semantics, and an operator can deliberately choose
-the existing non-AppContainer route with `--disable-ocap` or `--full-access`.
+On Windows, native status and staging use the ordinary AppContainer executor
+with the pinned agent-bridle v0.8.0-rc.7 launcher and, where needed, explicit
+[host preparation](../guide/windows-prerequisites.md). The old launcher's
+workspace grant lacked traverse/delete rights; the previous diagnosis that
+Git required profile-ancestor access was incorrect. Newt no longer refuses a
+literal Git invocation before spawn. Ordinary filesystem and exec checks still
+apply, including after a permission retry, and there is no automatic host
+fallback. The operator's `--disable-ocap` / `--full-access` lane stays explicit.
 
 The embedded schema is absent from both the default advertisement and
 `tool_search`. Its engine and dispatch arm remain internal dependencies.
