@@ -151,3 +151,7 @@ On macOS, audited pipe/null stdio and an unprivileged Seatbelt launch can supply
 the required kernel network witness. Missing backend or witness refuses before
 the copy spawns. The per-PR pure policy guards cover both admission and refusal;
 dispatch, network-floor and failure-reporting guards also remain in memory.
+
+The Windows global-config ground (#3108) runs in the same workflow's Windows
+leg, after the pinned launcher install and NUL/DOS preparation, selected by
+exact name with `--ignored --test-threads=1`.

@@ -1400,52 +1400,42 @@ async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
     let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let ws = tempfile::TempDir::new().unwrap();
-    let init = {
-        let mut cmd = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"]).unwrap();
-        // Windows CI: temp fixture owned by a different principal. Inject safe.directory
-        // only for this test fixture, not in production hardened_git.
-        #[cfg(windows)]
-        if let Ok(canonical) = ws.path().canonicalize() {
-            if let Some(dir) = canonical.to_str() {
-                cmd.env("GIT_CONFIG_COUNT", "1")
-                    .env("GIT_CONFIG_KEY_0", "safe.directory")
-                    .env("GIT_CONFIG_VALUE_0", dir);
-            }
-        }
-        cmd.output().unwrap()
-    };
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
     assert!(init.status.success(), "{init:?}");
+    // Measure a user-owned repository; preserve the confined exec/fs gates.
+    #[cfg(windows)]
+    crate::git_hardening::own_git_test_fixture(ws.path());
     std::fs::write(ws.path().join("native-only.txt"), "native evidence\n").unwrap();
     let mut caveats = caveats_no_exec(ws.path());
     caveats.fs_write = Scope::none();
     caveats.net = Scope::All;
     let denied = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
     assert!(denied.contains("capability denied"), "{denied}");
-    assert!(
-        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
-    );
     caveats.exec = Scope::All;
     let out = run_command_with_legacy_git("git status", ws.path(), &caveats).await;
-    #[cfg(target_os = "windows")]
-    {
-        assert!(
-            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-            "restricted AppContainer must refuse before native Git runs: {out}"
-        );
-        assert!(!out.contains("routed:"), "{out}");
-        assert!(!ws.path().join(".git/index").exists());
-    }
-    #[cfg(not(target_os = "windows"))]
+    assert!(
+        super::tool_result_ok(&out),
+        "confined git status must succeed: {out}"
+    );
     assert!(
         out.contains("native-only.txt"),
-        "native Git must report the actual untracked file: {out}"
+        "native Git must read the actual repository: {out}"
     );
-    #[cfg(not(target_os = "windows"))]
-    {
-        assert!(!out.contains("routed:"), "{out}");
-        assert!(!ws.path().join(".git/index").exists());
-    }
+    assert!(!out.contains("routed:"), "{out}");
+    assert!(!ws.path().join(".git/index").exists());
+    assert!(!ws.path().join(".git/index.lock").exists());
+    let host = crate::git_hardening::hardened_git(ws.path(), &["status", "--short"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(
+        host.status.success(),
+        "later unconfined Git must still work: {host:?}"
+    );
+    assert!(String::from_utf8_lossy(&host.stdout).contains("native-only.txt"));
 }
 
 /// The documented operator-controlled host route is intentionally distinct
@@ -1468,11 +1458,81 @@ async fn windows_disable_ocap_keeps_native_git_available() {
     let out =
         run_command_with_legacy_git("git status", ws.path(), &caveats_no_exec(ws.path())).await;
     assert!(out.contains("native-only.txt"), "{out}");
-    assert!(
-        !out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the explicit host route must not take the AppContainer refusal: {out}"
-    );
+    assert!(super::tool_result_ok(&out), "{out}");
     assert!(!out.contains("routed:"), "{out}");
+}
+
+/// Grounds `sandbox_git_env_tests::ambient_config_is_ignored`: global and system
+/// config point at the null device, even with a read grant for the global file.
+/// Separately measures the AppContainer file-read boundary: explicit `--file`
+/// access is denied without its read grant and allowed with one. No pure per-PR
+/// guard in newt-core covers that AppContainer boundary. No ownership bypass.
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "weekly/release real-resource tier; requires Windows AppContainer"]
+async fn run_command_windows_global_git_config_stays_ignored() {
+    let _lock = env_lock().await;
+    let _route = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let workspace = tempfile::tempdir().unwrap();
+    let init = crate::git_hardening::hardened_git(workspace.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    crate::git_hardening::own_git_test_fixture(workspace.path());
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".gitconfig");
+    let config_path = config.to_str().unwrap();
+    let root = workspace.path().to_str().unwrap();
+    let write = crate::git_hardening::hardened_git(
+        workspace.path(),
+        &["config", "--file", config_path, "safe.directory", root],
+    )
+    .unwrap()
+    .output()
+    .unwrap();
+    assert!(write.status.success(), "{write:?}");
+    let host = crate::git_hardening::hardened_git(
+        workspace.path(),
+        &["config", "--file", config_path, "--get", "safe.directory"],
+    )
+    .unwrap()
+    .output()
+    .unwrap();
+    assert!(host.status.success(), "{host:?}");
+    assert_eq!(String::from_utf8(host.stdout).unwrap().trim(), root);
+    let _home = EnvVar::set("HOME", home.path().to_str().unwrap());
+    let _passthrough = EnvVar::set("NEWT_SHELL_ENV_PASSTHROUGH", "HOME");
+    let mut caveats = caveats_no_exec(workspace.path());
+    caveats.exec = Scope::All;
+    caveats.net = Scope::All;
+    caveats.fs_write = Scope::none();
+    let command = "git config --global --get safe.directory";
+    let denied = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
+    assert!(!super::tool_result_ok(&denied), "{denied}");
+    assert!(
+        denied.contains("command exited 1") && !denied.contains(root),
+        "{denied}"
+    );
+    let explicit = format!("git config --file \"{config_path}\" --get safe.directory");
+    let denied_file = run_command_with_legacy_git(&explicit, workspace.path(), &caveats).await;
+    assert!(!super::tool_result_ok(&denied_file), "{denied_file}");
+    assert!(denied_file.contains("Permission denied"), "{denied_file}");
+    caveats.fs_read = Scope::only([root.to_owned(), config_path.to_owned()]);
+    let granted = run_command_with_legacy_git(&explicit, workspace.path(), &caveats).await;
+    assert!(super::tool_result_ok(&granted), "{granted}");
+    assert!(granted.contains(root), "{granted}");
+    let global = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
+    assert!(
+        global.contains("command exited 1") && !global.contains(root),
+        "{global}"
+    );
+    eprintln!(
+        "global safe.directory: ignored even with file grant; explicit file read needs grant"
+    );
 }
 
 /// #1022: `run_command("rm file")` routes to the governed delete_file arm,
@@ -1500,87 +1560,10 @@ async fn routed_rm_dispatches_through_delete_file() {
 }
 
 /// The same exec boundary governs mutations: denial creates no index. On
-/// Windows, restricted AppContainer reports the documented pre-spawn native
-/// Git incompatibility; other platforms stage the real file.
+/// Windows, this grounds the exec gate with a real AppContainer child and
+/// verifies that its temporary index lock does not break later host Git.
 #[tokio::test]
 async fn state_modifying_git_add_is_not_routed() {
-    let _l = env_lock().await;
-    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
-    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
-    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
-    let ws = tempfile::TempDir::new().unwrap();
-    let init = {
-        let mut cmd = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"]).unwrap();
-        // Windows CI: temp fixture owned by a different principal. Inject safe.directory
-        // only for this test fixture, not in production hardened_git.
-        #[cfg(windows)]
-        if let Ok(canonical) = ws.path().canonicalize() {
-            if let Some(dir) = canonical.to_str() {
-                cmd.env("GIT_CONFIG_COUNT", "1")
-                    .env("GIT_CONFIG_KEY_0", "safe.directory")
-                    .env("GIT_CONFIG_VALUE_0", dir);
-            }
-        }
-        cmd.output().unwrap()
-    };
-    assert!(init.status.success(), "{init:?}");
-    std::fs::write(ws.path().join("stage-me.txt"), "stage this file\n").unwrap();
-    let mut caveats = caveats_no_exec(ws.path());
-    caveats.net = Scope::All;
-    let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
-    assert!(denied.contains("capability denied"), "{denied}");
-    assert!(
-        !denied.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the ordinary exec denial must win before the Windows compatibility guard: {denied}"
-    );
-    assert!(!ws.path().join(".git/index").exists());
-    caveats.exec = Scope::All;
-    let out = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
-    assert!(
-        !out.contains("routed"),
-        "git add must NOT route to the git built-in; got: {out}"
-    );
-    let staged = {
-        let mut cmd =
-            crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
-                .unwrap();
-        #[cfg(windows)]
-        if let Ok(canonical) = ws.path().canonicalize() {
-            if let Some(dir) = canonical.to_str() {
-                cmd.env("GIT_CONFIG_COUNT", "1")
-                    .env("GIT_CONFIG_KEY_0", "safe.directory")
-                    .env("GIT_CONFIG_VALUE_0", dir);
-            }
-        }
-        cmd.output().unwrap()
-    };
-    assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
-    #[cfg(target_os = "windows")]
-    {
-        assert!(
-            out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-            "restricted AppContainer must refuse before native Git runs: {out}"
-        );
-        assert!(!ws.path().join(".git/index").exists());
-        assert_eq!(
-            String::from_utf8(staged.stdout).unwrap().trim(),
-            "",
-            "the unavailable command must not stage the file: {out}"
-        );
-    }
-    #[cfg(not(target_os = "windows"))]
-    assert_eq!(
-        String::from_utf8(staged.stdout).unwrap().trim(),
-        "stage-me.txt",
-        "native dispatch must actually stage the file: {out}"
-    );
-}
-
-/// An interactive exec grant retries once with the freshly minted caveats. On
-/// Windows that retry must still fail before native Git reaches AppContainer.
-#[cfg(target_os = "windows")]
-#[tokio::test]
-async fn native_git_exec_grant_retry_is_refused_before_spawn() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -1591,6 +1574,60 @@ async fn native_git_exec_grant_retry_is_refused_before_spawn() {
         .output()
         .unwrap();
     assert!(init.status.success(), "{init:?}");
+    // Measure a user-owned repository; preserve the confined exec/fs gates.
+    #[cfg(windows)]
+    crate::git_hardening::own_git_test_fixture(ws.path());
+    std::fs::write(ws.path().join("stage-me.txt"), "stage this file\n").unwrap();
+    let mut caveats = caveats_no_exec(ws.path());
+    caveats.net = Scope::All;
+    let denied = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
+    assert!(denied.contains("capability denied"), "{denied}");
+    assert!(!ws.path().join(".git/index").exists());
+    caveats.exec = Scope::All;
+    let out = run_command_with_legacy_git("git add stage-me.txt", ws.path(), &caveats).await;
+    assert!(
+        !out.contains("routed"),
+        "git add must NOT route to the git built-in; got: {out}"
+    );
+    let staged =
+        crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .output()
+            .unwrap();
+    assert!(staged.status.success(), "{staged:?}; dispatch: {out}");
+    assert!(
+        super::tool_result_ok(&out),
+        "confined git add must succeed: {out}"
+    );
+    assert!(
+        !ws.path().join(".git/index.lock").exists(),
+        "git add left a stale lock: {out}"
+    );
+    assert_eq!(
+        String::from_utf8(staged.stdout).unwrap().trim(),
+        "stage-me.txt",
+        "native dispatch must actually stage the file: {out}"
+    );
+}
+
+/// An interactive exec grant retries once with the freshly minted caveats. On
+/// Windows that retry must run native Git under AppContainer and stage the file.
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn native_git_exec_grant_retry_stages_under_appcontainer() {
+    let _l = env_lock().await;
+    let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _eng = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let ws = tempfile::TempDir::new().unwrap();
+    let init = crate::git_hardening::hardened_git(ws.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    // Measure a user-owned repository; preserve the confined exec/fs gates.
+    #[cfg(windows)]
+    crate::git_hardening::own_git_test_fixture(ws.path());
     std::fs::write(ws.path().join("retry-me.txt"), "retry evidence\n").unwrap();
 
     struct GrantExecGate {
@@ -1623,15 +1660,26 @@ async fn native_git_exec_grant_retry_is_refused_before_spawn() {
     )
     .await;
     assert!(
-        out.contains(super::native_git::WINDOWS_APPCONTAINER_GIT_UNAVAILABLE),
-        "the post-grant retry must be refused before native Git runs: {out}"
+        super::tool_result_ok(&out),
+        "the post-grant retry must succeed: {out}"
     );
     assert_eq!(gate.requests.len(), 1, "{out}");
     assert_eq!(gate.requests[0].kind, super::DenialKind::Exec, "{out}");
     assert_eq!(gate.requests[0].target, "git", "{out}");
+    assert!(!ws.path().join(".git/index.lock").exists(), "{out}");
+    let staged =
+        crate::git_hardening::hardened_git(ws.path(), &["diff", "--cached", "--name-only"])
+            .unwrap()
+            .output()
+            .unwrap();
     assert!(
-        !ws.path().join(".git/index").exists(),
-        "the refused retry must not stage a file: {out}"
+        staged.status.success(),
+        "later host Git must still work: {staged:?}"
+    );
+    assert_eq!(
+        String::from_utf8(staged.stdout).unwrap().trim(),
+        "retry-me.txt",
+        "{out}"
     );
 }
 

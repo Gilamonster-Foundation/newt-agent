@@ -619,7 +619,11 @@ jobs:
         with:
           key: windows
       - name: Install AppContainer launcher
-        run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
+        run: ./scripts/windows/Install-AppContainerLauncher.ps1
+      # The release archive omits the network evidence helper. Install ONLY
+      # that binary from crates.io; never replace the verified rc.7 launcher.
+      - name: Install AppContainer network probe
+        run: cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
       # HOOK PARITY: CI-only artifact caches and bounded downloads (#2817);
@@ -763,5 +767,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test -p newt-core --features windows-appcontainer --lib --test windows_appcontainer_adversarial --no-run
           Copy-Item (Get-Command agent-bridle-aclaunch.exe).Source target\debug\deps\
+          # The ignored global-config ground runs only in weekly/release and
+          # manual diagnostics; this per-PR selection deliberately omits it.
           cargo test -p newt-core --features windows-appcontainer --lib run_command_windows_ -- --test-threads=1
+          cargo test -p newt-core --features windows-appcontainer --lib -- native_git_status_requires_exec_and_reads_the_actual_repository state_modifying_git_add_is_not_routed native_git_exec_grant_retry_stages_under_appcontainer native_staging_uses_current_workspace_grants windows_disable_ocap_keeps_native_git_available --test-threads=1 --nocapture
           cargo test -p newt-core --features windows-appcontainer --test windows_appcontainer_adversarial -- --ignored --test-threads=1

@@ -108,6 +108,23 @@ mod windows {
         let cwd = wide_path(|buffer, size| unsafe { GetCurrentDirectoryW(size, buffer) });
         report("GetCurrentDirectoryW", &cwd);
         let Ok(cwd) = cwd else { return false };
+        let cwd_drive = cwd
+            .first()
+            .and_then(|value| char::from_u32(u32::from(*value)))
+            .unwrap_or('?')
+            .to_ascii_uppercase();
+        let workspace_drive = args
+            .allowed
+            .to_string_lossy()
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_ascii_uppercase();
+        println!("cwd-drive={cwd_drive} workspace-drive={workspace_drive}");
+        if cwd_drive != workspace_drive {
+            eprintln!("cwd-workspace-drive mismatch");
+            return false;
+        }
         // SAFETY: cwd is NUL-terminated; no security/template pointers are used.
         // Zero desired access still permits querying a directory's final name.
         let handle = unsafe { CreateFileW(cwd.as_ptr(), 0, 7, null(), 3, 0x0200_0000, null_mut()) };

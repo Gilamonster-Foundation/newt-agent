@@ -1,7 +1,6 @@
 # Windows OCAP Evidence - AppContainer
 
 **Owner:** Windows agent. **Coordinator:** cross-platform OCAP closure.
-**Board card:** `knowledge/board/2026-08-08_ocap-windows-appcontainer-evidence-AGENT-BRIEF.md`.
 
 This page records real-resource evidence gathered on Windows for PR #1633. It
 does not promote an AppContainer binary's existence into a guarantee: every
@@ -26,16 +25,84 @@ AppContainer suite passed 14/14. The positive loopback-exemption control was
 classified as `UNSUPPORTED_FAIL_CLOSED` on the local non-elevated token; default
 loopback denial was still proved.
 
-Required local tools:
+## Native Git evidence
 
-- `agent-bridle-aclaunch.exe` from `cargo install agent-bridle-aclaunch --version 0.7.10 --locked`
-- `ab-netprobe.exe`, installed by the same package
+Installation and conditional host preparation are described in the
+[Windows prerequisites](../../guide/windows-prerequisites.md). The pinned rc.7
+launcher restores traverse and delete rights within its workspace write grant;
+the old ancestry-access diagnosis was incorrect. Newt adds no Git-specific host
+fallback or ownership bypass.
 
-Current native Git tests additionally require the explicit elevated
-[NUL host preparation](../../guide/windows-prerequisites.md) once per boot.
-CI runs that bounded DACL update before ordinary tests; it is not performed by
-the sandbox launcher or by Newt at runtime. The historical evidence below
-predates this prerequisite and is not itself proof of native Git effects.
+### Windows Server CI
+
+[Windows CI 43659855982](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43659855982/job/132646509759)
+and [diagnostic 43659882248](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43659882248)
+passed real Git status, add, exec-grant retry and refreshed-workspace-grant
+effects, no stale index lock, and subsequent host Git. CI runs the existing NUL
+and bounded DOS-path preparation; elevated fixtures set repository/.git owner
+to the invoking user SID and assert unchanged DACLs. A separate config probe
+proves global `safe.directory` stays ignored even with a file read grant:
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point to the null device. Explicit
+`git config --file` is denied without its file grant and succeeds with it.
+
+The config probe `run_command_windows_global_git_config_stays_ignored` is an
+ignored real-resource ground. The Windows leg of `mcp-import-real.yml` selects
+its exact full name with the nonempty wrapper, `--ignored` and `--test-threads=1`
+on weekly/release runs; the manual diagnostic does the same alongside four
+existing Git effects whose passing count is asserted. Ordinary per-PR CI
+intentionally skips the ignored ground, including its `run_command_windows_`
+evidence filter. The pure `sandbox_git_env_tests::ambient_config_is_ignored`
+guard asserts both global and system config point at the null device.
+
+At f8f1e620, three diagnostic runs
+([43666516120](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43666516120),
+[43667425578](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43667425578),
+[43667427725](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43667427725))
+measured **3 failures in 9 jobs** on D: through the bare launcher. Each launch
+order failed once; original-first also passed twice, refuting an order-specific
+cause. System-drive required probes passed in all nine; the through-Newt tests
+ran in three of them and passed.
+Failing scratch probes resolved NT names and read granted files but returned
+error 5 for DOS/GUID names; the underlying host-dependent cause is unresolved.
+v0.8.6 ships with this second-drive limit: the single-job manual
+diagnostic now retains scratch Git/DOS observations as report-only, while host
+preparation, system-drive required effects and through-Newt tests remain gates.
+Through-Newt second-drive Git is unmeasured because changing the scratch fixture
+owner failed the unchanged-DACL guard. Bare-launcher `dir` was denied on both
+CI drives; Newt-confined workspace `dir` is unmeasured.
+
+### Windows 11 Pro desktop (build 26200)
+
+The measurements used one NTFS system drive, Git for Windows
+2.53.0.windows.1, the checksum-verified rc.7 launcher, no system/global
+`safe.directory`, and **no NUL or DOS-path host preparation**. Each bare-launcher
+probe granted only a fresh repository containing a committed tracked file and
+an untracked `pending.txt`, with that repository as cwd.
+
+| Probe | Interactive, non-elevated; user-owned repo | Interactive, elevated; Administrators-owned repo | ssh, session 0, elevated |
+|---|---|---|---|
+| `cmd /c echo hello` | exit 0 | exit 0 | exit 0 |
+| `cmd /c "cd & type tracked.txt"` | exit 0; cwd and file printed | exit 0 | exit 0 |
+| `cmd /c "dir /b /a"` | Access is denied; exit 1 | Access is denied; exit 1 | Access is denied; exit 1 |
+| `whoami.exe` | exit 0 | exit 0 | `0xC0000142` |
+| `git --version` | exit 0 | exit 0 | `0xC0000142` |
+| `git status --short` | exit 0; `?? pending.txt` | dubious ownership; exit 128 | `0xC0000142` |
+| `git add -- pending.txt` | exit 0 | dubious ownership; exit 128 | `0xC0000142` |
+| Stale `.git/index.lock` afterward | none | none | none |
+| Later host `git diff --cached --name-only` | `pending.txt` | empty | empty |
+
+The non-elevated Git commands warned that the profile's `.config/git/ignore`
+was unreadable but still succeeded. The table measures the bare launcher.
+
+On the same desktop at f8f1e620, all five diagnostic tests also ran
+through Newt in an interactive, non-elevated session, with the verified launcher
+staged by `Install-AppContainerLauncher.ps1` and **neither host-preparation script
+run**. Status, add, exec-grant retry, refreshed workspace grants and global-config
+isolation passed: **5 passed, 0 failed, 0 ignored**, in 8.87 seconds. The tests
+required AppContainer (`BRIDLE_REQUIRE_APPCONTAINER=1`) and ran serially with the
+`windows-appcontainer` feature. Through-Newt tests elevated or over ssh, the
+interactive TUI, a second desktop drive and a Windows Server desktop remain
+unmeasured.
 
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing
@@ -108,7 +175,7 @@ the stable two-generation AppContainer signal: both child and grandchild report
 | crew execution | Routed through the `ConstrainedExecutor` seam for attacker-influenced normalize/test commands; non-attacker git/gh helpers remain classified separately in `docs/security/spawn-inventory.toml` | Same executor boundary as above | Same executor boundary as above | Same executor boundary as above | Same executor refusal as above |
 | MCP stdio worker | NOT confined on Windows: `ConfinedCommand::spawn_tokio` is Unix-only, so `newt-mcp-client` spawns a raw `tokio::process::Command` and records `SandboxKind::None` (advisory); a workspace-protected session refuses this transport | OPEN: no AppContainer boundary on this route | OPEN: no kernel net boundary on this route | `env_clear()` plus the explicit stdio-MCP env allow-list | OPEN: no AppContainer launcher path for stdio MCP |
 | ACP worker | ACP/headless uses the same `run_command` and `ConstrainedExecutor` seams for attacker-exec | Covered where it dispatches `run_command` or `ConstrainedExecutor`; no distinct worker process proof here | Covered where it dispatches `run_command` or `ConstrainedExecutor`; no distinct worker process proof here | Covered at the invoked seam; inherits the `run_command` ACTIVE env residual when it calls that route | Not separately exercised in this PR |
-| git/helper subprocess | AppContainer follows a staged workspace `.exe`; a `git.exe --version` helper probe is evidence-only because installed Git DACLs vary by host (`appcontainer_follows_shells_and_helpers`) | CLOSED for staged workspace helper; Git helpers are also hardened by `newt-core/src/git_hardening.rs` | Not a network proof | Inherits the invoked seam's env policy | Not separately exercised for Git |
+| git/helper subprocess | Native Git uses the ordinary AppContainer exec route with the pinned rc.7 launcher; CI explicitly runs status, add, exec-grant retry and refreshed-workspace-grant tests | Required effects: actual repository output and staged file, no stale index lock, later host Git success; ungranted exec and filesystem declarations remain denied. Installed Git DACLs remain host-specific. | Not a network proof | Inherits the invoked seam's env policy | Ordinary confined dispatch refuses a missing backend; no Git-specific host fallback |
 | PowerShell/cmd shell path | AppContainer wraps `cmd.exe`, `powershell.exe`, and grandchildren (`appcontainer_descendants_stay_in_the_same_token`, `appcontainer_follows_shells_and_helpers`) | CLOSED by direct fs tests and route fs proof | CLOSED for direct TCP/UDP/default loopback denial | CLOSED on `ConstrainedExecutor`; ACTIVE on `run_command` until agent-bridle clears Windows ambient env | N/A outside the Newt route tests |
 
 ## Adversarial Matrix
@@ -126,7 +193,7 @@ the stable two-generation AppContainer signal: both child and grandchild report
 | named-pipe / local IPC deputy | ACTIVE residual: `appcontainer_named_pipe_deputy` proves an AppContainer child can connect to an `ALL APPLICATION PACKAGES` named pipe and cause a host deputy to relay over loopback. |
 | inheritable HANDLE inheritance | ACTIVE residual on this Windows host: `appcontainer_inheritable_handle_inheritance` deliberately creates an inheritable parent file handle and records whether the AppContainer child can use it. The local host produced `HANDLE-LEAK`; GitHub-hosted runner behavior may close this specific raw handle, but the platform row remains ACTIVE until the shared Windows spawn path proves arbitrary inheritable handles are blocked on every supported launcher chain. |
 | child/grandchild token escape | DENIED: `appcontainer_descendants_stay_in_the_same_token` shows cmd and PowerShell descendants report low/restricted token evidence at two generations. |
-| shell/helper follows process tree | DENIED for tested helpers: cmd, PowerShell, and staged workspace `.exe` stay under AppContainer. Git is evidence-only because installed Git ACLs vary. |
+| shell/helper follows process tree | DENIED for tested helpers: cmd, PowerShell, and staged workspace `.exe` stay under AppContainer. Native Git status/staging is required by the CI effect tests above; desktop Git ACLs remain host-specific. |
 | timeout/cancellation cleanup | BOUNDED cleanup, not authority: `appcontainer_timeout_cleanup_is_distinct_from_authority` proves a fast `cmd.exe` AppContainer child captures stdout and a CPU-only timed child returns promptly on the deadline. This is implemented with a Windows Job Object plus immediate-child kill fallback. |
 | missing-backend fallback | CLOSED for the `windows-appcontainer` feature path: both run_command and `ConstrainedExecutor` refuse when `agent-bridle-aclaunch.exe` is hidden from PATH. |
 | repo-controlled sandbox downgrade | CLOSED by existing config-plane stripping plus route-level missing-backend refusal; this PR adds no repo-controlled switch that can disable AppContainer. |

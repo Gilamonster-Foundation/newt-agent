@@ -1493,11 +1493,6 @@ pub(super) async fn exec_confined_command_with_broker(
     };
     let caveats = admitted.as_ref().unwrap_or(caveats);
 
-    if let Some(refusal) = super::native_git::windows_appcontainer_native_git_refusal(cmd, caveats)
-    {
-        return (format!("error: {refusal}"), ExecOutcome::Unavailable);
-    }
-
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let mut dispatch_args = confined_dispatch_args(cmd, cwd);
@@ -1645,13 +1640,6 @@ pub(super) async fn exec_confined_command_with_broker(
                                     cwd,
                                     None,
                                 );
-                            }
-                            if let Some(refusal) =
-                                super::native_git::windows_appcontainer_native_git_refusal(
-                                    cmd, &widened,
-                                )
-                            {
-                                return (format!("error: {refusal}"), ExecOutcome::Unavailable);
                             }
                             // Preserve both the broker policy and recovery lease on
                             // retry: approval does not remove either ownership boundary.
