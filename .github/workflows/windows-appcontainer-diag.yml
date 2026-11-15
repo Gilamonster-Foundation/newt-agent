@@ -65,14 +65,34 @@ jobs:
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher
           ./scripts/windows/Enable-AppContainerDosPaths.ps1
           ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath $launcher -RequireDos
+      - name: Scratch Git control before D-drive DOS probes (report-only)
+        shell: pwsh
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase BeforeDosProbes
+
       - name: Probe DOS paths on the direct diagnostic's scratch drive
         shell: pwsh
         run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
+
+      - name: Scratch Git control after D-drive read probe (report-only)
+        if: always()
+        shell: pwsh
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterReadProbe
 
       - name: Compare DOS paths under a write-root grant
         if: always()
         shell: pwsh
         run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -WriteGrant -ScratchParent $env:RUNNER_TEMP
+
+      - name: Scratch Git control after D-drive write probe (report-only)
+        if: always()
+        shell: pwsh
+        env:
+          BRIDLE_REQUIRE_APPCONTAINER: "1"
+        run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterWriteProbe
 
       # Isolates the launcher from the Rust test harness entirely: does the
       # child process even start under AppContainer, for progressively more
@@ -92,21 +112,6 @@ jobs:
             Write-Output "EXIT=$code"
             if ($Required -and $code -ne 0) { $script:failedProbes += "$label ($code)" }
           }
-
-          # Preserve the original scratch-drive case as a report-only control:
-          # it is Administrators-owned on the elevated runner. Do not modify its
-          # owner/DACL or use safe.directory to make this control pass.
-          $work = Join-Path $env:RUNNER_TEMP 'actest'
-          New-Item -ItemType Directory -Force $work | Out-Null
-          Set-Location $work
-          git init -q -b main
-          "original`n" | Out-File tracked.txt -NoNewline
-          git add tracked.txt
-          git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
-          "stage me`n" | Out-File pending.txt -NoNewline
-          Run-Diag "original scratch fixture: cwd/listing" "cmd" @("/c", "cd & dir /b /a")
-          Run-Diag "original scratch fixture: git status" (Get-Command git.exe).Source @("status")
-          Run-Diag "original scratch fixture: git add" (Get-Command git.exe).Source @("add", "--", "pending.txt")
 
           # Match Rust tempfile fixtures: the invoking user's temp directory.
           # The RUNNER_TEMP owner change failed the unchanged-DACL guard.

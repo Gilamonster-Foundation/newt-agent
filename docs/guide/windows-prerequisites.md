@@ -31,18 +31,12 @@ launcher fixes those rights within the granted workspace. Newt therefore sends
 literal `git status` and `git add` through the ordinary confined exec path,
 including the exec gate and filesystem grants, without a host fallback.
 
-The native Git effect tests use repositories owned by the invoking user SID,
-matching a non-elevated user's repository. An elevated terminal can instead
-create an `Administrators`-owned repository: Git accepts that ownership outside
-the container, but can report **dubious ownership** after AppContainer disables
-that group. Newt does not bypass this Git check or add a `safe.directory`
-exception. The Windows test fixture helper changes only the temporary
-repository and `.git` owners, verifies the DACLs are unchanged, and is never
-called in production. Newt's existing Git environment ignores global
-and system Git configuration (`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point
-to `/dev/null`), so a global `safe.directory` entry does not resolve that refusal,
-even if its file is readable. Explicit config-file access still needs the
-corresponding filesystem read grant.
+Confined Git reports **dubious ownership** for repositories owned by the
+`Administrators` group, which an elevated terminal can create. A global
+`safe.directory` entry does not help because Newt ignores global and system
+Git configuration. Use a repository owned by your own account, for example
+one cloned from a non-elevated terminal; CI measures this user-owned case
+while running in an elevated session.
 
 ## Prepare the null device once per boot
 
