@@ -49,6 +49,18 @@ to `/dev/null`), so a global `safe.directory` entry does not resolve that refusa
 even if its file is readable. Explicit config-file access still needs the
 corresponding filesystem read grant.
 
+The current native Git success evidence uses user-owned fixtures on the system
+drive. Separate scratch-drive controls reproduce Git's cwd permission denial and
+`GetFinalPathNameByHandleW(VOLUME_NAME_DOS)` error 5 despite successful NT-name
+lookup and granted-file reads. Neither preceding DOS probes nor a directory
+listing repaired the failure; a fresh-run comparison also diverged before the
+differing launch sequence. The underlying host-dependent cause remains open;
+[diagnostic controls](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43664803228)
+do not establish general second-drive support. A user-owned second-drive fixture
+through Newt is unmeasured because its owner change failed the unchanged-DACL
+guard. Newt-confined workspace `dir` is also unmeasured; bare-launcher listing
+controls were denied on both drives.
+
 CI runs the same evidence commands on `windows-latest` with
 `BRIDLE_REQUIRE_APPCONTAINER=1` and `BRIDLE_REQUIRE_UNC_CONTROL=1`, so a missing
 launcher/probe or missing UNC positive control is a hard failure rather than a
