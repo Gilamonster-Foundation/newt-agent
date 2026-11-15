@@ -51,10 +51,11 @@ At f8f1e620, three diagnostic runs
 [43667427725](https://github.com/Gilamonster-Foundation/newt-agent/actions/runs/43667427725))
 measured **3 failures in 9 jobs** on D: through the bare launcher. Each launch
 order failed once; original-first also passed twice, refuting an order-specific
-cause. System-drive required probes and through-Newt tests passed throughout.
+cause. System-drive required probes passed in all nine; the through-Newt tests
+ran in three of them and passed.
 Failing scratch probes resolved NT names and read granted files but returned
 error 5 for DOS/GUID names; the underlying host-dependent cause is unresolved.
-The operator accepted this second-drive limit for v0.8.6: the single-job manual
+v0.8.6 ships with this second-drive limit: the single-job manual
 diagnostic now retains scratch Git/DOS observations as report-only, while host
 preparation, system-drive required effects and through-Newt tests remain gates.
 Through-Newt second-drive Git is unmeasured because changing the scratch fixture
@@ -63,7 +64,7 @@ CI drives; Newt-confined workspace `dir` is unmeasured.
 
 ### Windows 11 Pro desktop (build 26200)
 
-Shepherd measurements used one NTFS system drive, Git for Windows
+The measurements used one NTFS system drive, Git for Windows
 2.53.0.windows.1, the checksum-verified rc.7 launcher, no system/global
 `safe.directory`, and **no NUL or DOS-path host preparation**. Each bare-launcher
 probe granted only a fresh repository containing a committed tracked file and
@@ -84,7 +85,7 @@ an untracked `pending.txt`, with that repository as cwd.
 The non-elevated Git commands warned that the profile's `.config/git/ignore`
 was unreadable but still succeeded. The table measures the bare launcher.
 
-On the same desktop at f8f1e620, the shepherd also ran all five diagnostic tests
+On the same desktop at f8f1e620, all five diagnostic tests also ran
 through Newt in an interactive, non-elevated session, with the verified launcher
 staged by `Install-AppContainerLauncher.ps1` and **neither host-preparation script
 run**. Status, add, exec-grant retry, refreshed workspace grants and global-config
