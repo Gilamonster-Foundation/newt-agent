@@ -1,7 +1,9 @@
-name: Weekly red diagnosis (temporary manual)
+name: Weekly red diagnosis (temporary)
 
 # HOOK PARITY: temporary CI-only diagnosis, inventoried in .githooks/pre-push.
 on:
+  push:
+    branches: [fix/weekly-lane-red]
   workflow_dispatch: {}
 permissions:
   contents: read
