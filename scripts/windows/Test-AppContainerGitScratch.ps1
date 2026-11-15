@@ -48,6 +48,12 @@ try {
     Probe 'old-order git add' $git @('add', '--', 'pending.txt')
     Show-Snapshot 'after-launches'
     Probe 'git status after ACL snapshot' $git @('status')
+    if ($Phase -eq 'AfterWriteProbe') {
+        Probe 'cmd cwd/listing control' cmd @('/c', 'cd & dir /b /a')
+        Show-Snapshot 'after-cmd-dir'
+        Probe 'git status after cmd dir' $git @('status')
+        Probe 'git add after cmd dir' $git @('add', '--', 'pending.txt')
+    }
     # This is evidence collection, not a success gate. Required user-owned Git
     # effects remain separately gated by the direct and through-Newt probes.
     Write-Output 'CONTROL complete (report-only; inspect every exit code).'

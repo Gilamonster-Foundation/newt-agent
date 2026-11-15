@@ -94,6 +94,11 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: ./scripts/windows/Test-AppContainerGitScratch.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -Phase AfterWriteProbe
 
+      - name: DOS paths after scratch cmd directory-listing control
+        if: always()
+        shell: pwsh
+        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
+
       # Isolates the launcher from the Rust test harness entirely: does the
       # child process even start under AppContainer, for progressively more
       # git-like targets, before ever touching a repository.
