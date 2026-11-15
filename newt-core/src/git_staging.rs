@@ -662,6 +662,15 @@ pub struct TrustedTools {
     ctx: TrustContext,
 }
 
+/// The git to run: the toolchain binary Apple's `/usr/bin/git` locator stub
+/// forwards to when one was found and trusted, otherwise `git` unchanged.
+fn behind_locator_stub(git: PathBuf, twin: Option<PathBuf>) -> PathBuf {
+    match twin {
+        Some(twin) if git == Path::new("/usr/bin/git") => twin,
+        _ => git,
+    }
+}
+
 impl TrustedTools {
     /// Resolve and trust-check git, gh (if present), `/bin/sh` and git's
     /// exec-path. No subprocess runs before git passes the check; the one
@@ -727,6 +736,16 @@ impl TrustedTools {
         tools.ctx = tools.ctx.with_git(&exec_path);
         trust_check(&exec_path, &tools.ctx)?;
         tools.exec_path = std::fs::canonicalize(&exec_path).map_err(|e| e.to_string())?;
+        // #3109: Apple's `/usr/bin/git` only locates the selected toolchain's
+        // git through xcrun, which cannot reach its cache from a confined
+        // child: every call then ran xcodebuild and prefixed its complaints
+        // to git's output. Run the git it forwards to, as the shell lane does.
+        let twin = crate::confined_exec::developer_exec_twins([&"git".to_string()])
+            .into_iter()
+            .next()
+            .map(PathBuf::from)
+            .filter(|twin| trust_check(twin, &tools.ctx).is_ok());
+        tools.git = behind_locator_stub(tools.git, twin);
         Ok(tools)
     }
 
@@ -1836,6 +1855,19 @@ pub fn validate_pr_url(candidate: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// #3109: only Apple's locator stub is swapped for the toolchain git it
+    /// forwards to; any other git, or a stub with no trusted twin, is kept.
+    #[test]
+    fn only_the_locator_stub_is_swapped_for_the_git_behind_it() {
+        let (stub, real, brew) = ("/usr/bin/git", "/dev/usr/bin/git", "/opt/bin/git");
+        let pick = |git: &str, twin: Option<&str>| {
+            behind_locator_stub(PathBuf::from(git), twin.map(PathBuf::from))
+        };
+        assert_eq!(pick(stub, Some(real)), Path::new(real));
+        assert_eq!(pick(stub, None), Path::new(stub));
+        assert_eq!(pick(brew, Some(real)), Path::new(brew));
+    }
 
     /// PR #2853: checkout recognition cannot probe through an escaping link
     /// or turn an out-of-scope file into a positive confined-route decision.

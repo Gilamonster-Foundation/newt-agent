@@ -73,3 +73,13 @@ The read broker approved the initial forge but the host gh client could
 follow a redirect to an ungranted destination without another decision."""
 guard = { file = "newt-core/src/agentic/tools/native_git/gh_http.rs", test = "gh_http_only_approved_destinations_reach_upstream" }
 ground = { file = "newt-core/src/agentic/tools/native_git/gh_http_ground.rs", test = "gh_http_real_redirect_never_reaches_ungranted_listener" }
+
+[[regression]]
+id = "brokered-fetch-result-is-locator-noise"
+seen = "2026-11-15"
+symptom = """
+On macOS a brokered git fetch succeeded, but its result was only the Xcode
+tool locator's complaints from inside the sandbox, and nothing at all when
+no ref changed. The model told the operator the fetch had failed."""
+guard = { file = "newt-core/src/agentic/tools/native_git/fetch.rs", test = "a_delivered_fetch_says_what_happened_even_when_nothing_changed" }
+ground = { file = "newt-core/src/agentic/tools/native_git.rs", test = "a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace" }

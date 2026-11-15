@@ -3728,6 +3728,16 @@ mod governed_push_tests {
             "{second}"
         );
         assert!(!second.contains("staging-"), "{second}");
+        // #3109: a fetch that changes nothing still says so, and no step's
+        // output carries the Xcode tool locator's complaints.
+        let third = fetch("git fetch --prune");
+        assert!(third.contains("already up to date"), "{third}");
+        for result in [&first, &second, &third] {
+            assert!(
+                !result.contains("xcrun") && !result.contains("xcodebuild"),
+                "{result}"
+            );
+        }
     }
 
     /// Grounds the fetch selection and approval guards: a real dispatch asks

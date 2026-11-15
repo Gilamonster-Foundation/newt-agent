@@ -36,6 +36,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../src/agentic/tools/native_git/gh_read_ground.rs"),
     ),
     (
+        "newt-core/src/agentic/tools/native_git/fetch.rs",
+        include_str!("../src/agentic/tools/native_git/fetch.rs"),
+    ),
+    (
         "newt-core/src/agentic/tools/native_git.rs",
         include_str!("../src/agentic/tools/native_git.rs"),
     ),
@@ -47,7 +51,7 @@ const SOURCES: &[(&str, &str)] = &[
 
 /// Entries in the register. Raise it in the PR that adds an entry; it never
 /// goes down.
-const REGISTERED: usize = 6;
+const REGISTERED: usize = 7;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
