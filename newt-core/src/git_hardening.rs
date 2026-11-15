@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// This changes only fixture ownership, not the DACL or production Git policy.
 #[cfg(all(test, windows))]
 pub(crate) fn own_git_test_fixture(repo: &Path) {
-    let output = Command::new("powershell.exe")
+    let output = Command::new("pwsh.exe")
         .args(["-NoProfile", "-NonInteractive", "-File"])
         .arg(
             Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -1462,6 +1462,62 @@ async fn windows_disable_ocap_keeps_native_git_available() {
     assert!(!out.contains("routed:"), "{out}");
 }
 
+/// Grounds the filesystem read gate with Git's real global-config lookup.
+/// A host safe.directory entry is not implicitly readable by a confined child;
+/// an explicit grant for that one config file makes it readable. This probes
+/// configuration visibility, not an ownership bypass or production env override.
+#[cfg(windows)]
+#[tokio::test]
+async fn run_command_windows_global_git_config_needs_a_read_grant() {
+    let _lock = env_lock().await;
+    let _route = EnvVar::unset("NEWT_NO_ROUTE");
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".gitconfig");
+    let config_path = config.to_str().unwrap();
+    let root = workspace.path().to_str().unwrap();
+    let write = crate::git_hardening::hardened_git(
+        workspace.path(),
+        &["config", "--file", config_path, "safe.directory", root],
+    )
+    .unwrap()
+    .output()
+    .unwrap();
+    assert!(write.status.success(), "{write:?}");
+    let host = crate::git_hardening::hardened_git(
+        workspace.path(),
+        &["config", "--file", config_path, "--get", "safe.directory"],
+    )
+    .unwrap()
+    .output()
+    .unwrap();
+    assert!(host.status.success(), "{host:?}");
+    assert_eq!(String::from_utf8(host.stdout).unwrap().trim(), root);
+    let _home = EnvVar::set("HOME", home.path().to_str().unwrap());
+    let _passthrough = EnvVar::set("NEWT_SHELL_ENV_PASSTHROUGH", "HOME");
+    let mut caveats = caveats_no_exec(workspace.path());
+    caveats.exec = Scope::All;
+    caveats.net = Scope::All;
+    caveats.fs_write = Scope::none();
+    let command = "git config --global --get safe.directory";
+    let denied = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
+    assert!(!super::tool_result_ok(&denied), "{denied}");
+    assert!(
+        denied.contains("Permission denied") && denied.contains(".gitconfig"),
+        "{denied}"
+    );
+    caveats.fs_read = Scope::only([root.to_owned(), config_path.to_owned()]);
+    let granted = run_command_with_legacy_git(command, workspace.path(), &caveats).await;
+    assert!(super::tool_result_ok(&granted), "{granted}");
+    assert!(granted.contains(root), "{granted}");
+    eprintln!(
+        "global safe.directory: denied without config read grant; exact-file grant allowed read"
+    );
+}
+
 /// #1022: `run_command("rm file")` routes to the governed delete_file arm,
 /// so deletion works under fs_write without requiring raw shell `rm`.
 #[tokio::test]

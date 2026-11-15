@@ -69,6 +69,11 @@ jobs:
         shell: pwsh
         run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -ScratchParent $env:RUNNER_TEMP
 
+      - name: Compare DOS paths under a write-root grant
+        if: always()
+        shell: pwsh
+        run: ./scripts/windows/Test-AppContainerDosPaths.ps1 -LauncherPath (Get-Command agent-bridle-aclaunch.exe).Source -RequireDos -WriteGrant -ScratchParent $env:RUNNER_TEMP
+
       # Isolates the launcher from the Rust test harness entirely: does the
       # child process even start under AppContainer, for progressively more
       # git-like targets, before ever touching a repository.
@@ -117,6 +122,7 @@ jobs:
             'agentic::tools::disable_ocap_tests::native_git_status_requires_exec_and_reads_the_actual_repository',
             'agentic::tools::disable_ocap_tests::state_modifying_git_add_is_not_routed',
             'agentic::tools::disable_ocap_tests::native_git_exec_grant_retry_stages_under_appcontainer',
+            'agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_needs_a_read_grant',
             'agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants'
           )
           foreach ($t in $tests) {
