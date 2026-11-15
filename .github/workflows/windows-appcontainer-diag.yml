@@ -84,8 +84,29 @@ jobs:
           BRIDLE_REQUIRE_APPCONTAINER: "1"
         run: |
           $launcher = (Get-Command agent-bridle-aclaunch.exe).Source
+          function Run-Diag($label, $exe, $argv, [switch]$Required) {
+            Write-Output "== $label =="
+            & $launcher --fs-write $work $exe @argv
+            $code = $LASTEXITCODE
+            Write-Output "EXIT=$code"
+            if ($Required -and $code -ne 0) { throw "Required direct probe failed: $label ($code)" }
+          }
+
+          # Preserve the original scratch-drive case as a report-only control:
+          # it is Administrators-owned on the elevated runner. Do not modify its
+          # owner/DACL or use safe.directory to make this control pass.
           $work = Join-Path $env:RUNNER_TEMP 'actest'
           New-Item -ItemType Directory -Force $work | Out-Null
+          Set-Location $work
+          git init -q -b main
+          Run-Diag "original scratch fixture: cwd/listing" "cmd" @("/c", "cd & dir /b /a")
+          Run-Diag "original scratch fixture: git status" (Get-Command git.exe).Source @("status")
+
+          # Match Rust tempfile fixtures: the invoking user's temp directory.
+          # The RUNNER_TEMP owner change failed the unchanged-DACL guard.
+          # Keep that guard and use the same fixture location as Newt tests.
+          $work = Join-Path ([IO.Path]::GetTempPath()) ('newt-direct-git-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory $work | Out-Null
           Set-Location $work
           git init -q -b main
           & (Join-Path $env:GITHUB_WORKSPACE 'scripts/windows/Set-GitFixtureOwner.ps1') -Repository $work
@@ -93,19 +114,14 @@ jobs:
           git add tracked.txt
           git -c user.name="diag" -c user.email="diag@example.invalid" commit -qm init
           "stage me`n" | Out-File pending.txt -NoNewline
-
-          function Run-Diag($label, $exe, $argv) {
-            Write-Output "== $label =="
-            & $launcher --fs-write $work $exe @argv
-            Write-Output "EXIT=$LASTEXITCODE"
-            Write-Output ""
-          }
-
-          Run-Diag "cmd.exe (cwd and granted directory control)" "cmd" @("/c", "cd & dir /b")
-          Run-Diag "whoami.exe (System32, no unusual deps)" "$env:WINDIR\System32\whoami.exe" @()
-          Run-Diag "git --version" (Get-Command git.exe).Source @("--version")
-          Run-Diag "git status (real repo)" (Get-Command git.exe).Source @("status")
-          Run-Diag "git add pending.txt (the actual failing operation)" (Get-Command git.exe).Source @("add", "--", "pending.txt")
+          Run-Diag "cmd.exe (cwd and granted directory control)" "cmd" @("/c", "cd & dir /b") -Required
+          Run-Diag "whoami.exe (System32, no unusual deps)" "$env:WINDIR\System32\whoami.exe" @() -Required
+          Run-Diag "git --version" (Get-Command git.exe).Source @("--version") -Required
+          Run-Diag "git status (real repo)" (Get-Command git.exe).Source @("status") -Required
+          Run-Diag "git add pending.txt" (Get-Command git.exe).Source @("add", "--", "pending.txt") -Required
+          if (Test-Path .git/index.lock) { throw 'Confined Git left an index lock.' }
+          $staged = git diff --cached --name-only
+          if ($LASTEXITCODE -ne 0 -or $staged -cne 'pending.txt') { throw 'Later host Git did not see the staged file.' }
 
       - name: Stage launcher next to test binaries and run the actual failing test
         if: always()
@@ -125,9 +141,6 @@ jobs:
             'agentic::tools::disable_ocap_tests::run_command_windows_global_git_config_needs_a_read_grant',
             'agentic::tools::native_git::tests::native_staging_uses_current_workspace_grants'
           )
-          foreach ($t in $tests) {
-            Write-Output "===== cargo test $t ====="
-            cargo test -p newt-core --lib --features windows-appcontainer $t -- --test-threads=1 --nocapture
-            Write-Output "EXIT=$LASTEXITCODE"
-            if ($LASTEXITCODE -ne 0) { throw "Native Git evidence failed: $t" }
-          }
+          # One build and test invocation; all selected tests still run if one fails.
+          cargo test -p newt-core --lib --features windows-appcontainer -- @tests --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Native Git evidence failed.' }

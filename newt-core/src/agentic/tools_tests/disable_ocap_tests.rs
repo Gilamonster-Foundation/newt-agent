@@ -1475,6 +1475,12 @@ async fn run_command_windows_global_git_config_needs_a_read_grant() {
     let _full = EnvVar::unset("NEWT_FULL_ACCESS");
     let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let workspace = tempfile::tempdir().unwrap();
+    let init = crate::git_hardening::hardened_git(workspace.path(), &["init", "-q"])
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    crate::git_hardening::own_git_test_fixture(workspace.path());
     let home = tempfile::tempdir().unwrap();
     let config = home.path().join(".gitconfig");
     let config_path = config.to_str().unwrap();
