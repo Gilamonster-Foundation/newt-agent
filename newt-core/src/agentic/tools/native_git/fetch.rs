@@ -176,8 +176,8 @@ struct Plan<'a> {
     tools: &'a staging::TrustedTools,
 }
 
-/// Seed, dial, deliver. `Ok` is the deliver step's own summary of the refs
-/// it changed (empty when already up to date, as for git itself). Every
+/// Seed, dial, deliver. `Ok` names the remote and carries the deliver step's
+/// own summary of the refs it changed, or says nothing changed. Every
 /// `Err` is harness-authored: the dial's raw output can quote a credential
 /// helper and is dropped.
 fn run(plan: &Plan, caveats: &Caveats, held: &staging::HeldRoots) -> Result<String, String> {
