@@ -9,7 +9,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
-## [0.8.6] — 2026-11-15
+## [0.8.6] — 2026-11-16
 
 ### Added
 
