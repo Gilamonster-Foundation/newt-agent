@@ -161,6 +161,17 @@ jobs:
         # feature the tests enable makes a feature-gated lint regression
         # invisible until someone builds it locally.
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      - name: a repeat build compiles nothing
+        # HOOK PARITY: CI-only; named in .githooks/pre-push. Repeats the clippy
+        # step with nothing changed. newt-core's build script once watched a
+        # path that never exists in a checkout, so Cargo rebuilt newt-core and
+        # every crate above it on each invocation.
+        run: |
+          out=$(cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings 2>&1)
+          if grep -E '^ *(Checking|Compiling) ' <<<"$out"; then
+            echo "::error::a repeat build with nothing changed rebuilt the crates above"
+            exit 1
+          fi
       # HOOK PARITY: CI-only; named in .githooks/pre-push. The read-only
       # newt-flock library on its own, without dev-dependencies: its test
       # fixture enables the agent-mesh writer features, so tests and

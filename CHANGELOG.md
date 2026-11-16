@@ -9,6 +9,14 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed
+
+- Cargo no longer rebuilds `newt-core`, and every crate that depends on it, on
+  each invocation when nothing changed. Its build script watched a file that
+  exists only in a packaged crate, and Cargo treats a missing watched path as
+  changed. The script now watches only paths that exist: `HEAD`, its reflog,
+  the index, and the tracked top-level entries that decide the `-dirty` mark.
+
 ## [0.8.6] — 2026-11-16
 
 ### Added

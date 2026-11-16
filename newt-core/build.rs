@@ -29,32 +29,33 @@ fn packaged_commit(manifest_dir: &Path) -> Option<String> {
     short_commit(value)
 }
 
+/// Watch `path` only when it exists. Cargo treats a missing watched path as
+/// changed on every run, which rebuilt this crate on every invocation.
+fn watch(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=NEWT_BUILD_GIT_COMMIT");
 
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
         .map(std::path::PathBuf::from)
         .expect("Cargo sets CARGO_MANIFEST_DIR for build scripts");
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join(".cargo_vcs_info.json").display()
-    );
+    watch(&manifest_dir.join(".cargo_vcs_info.json"));
     let repo = manifest_dir.parent().unwrap_or(&manifest_dir);
 
-    if let Some(git_dir) = git(repo, &["rev-parse", "--absolute-git-dir"]) {
-        let git_dir = Path::new(&git_dir);
-        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-        println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
-        println!(
-            "cargo:rerun-if-changed={}",
-            git_dir.join("packed-refs").display()
-        );
-        if let Some(reference) = git(repo, &["symbolic-ref", "--quiet", "HEAD"]) {
-            println!(
-                "cargo:rerun-if-changed={}",
-                git_dir.join(reference).display()
-            );
+    // The commit moves with HEAD and its reflog; `-dirty` moves with the index
+    // and with any tracked top-level entry (Cargo scans a watched directory).
+    // `--git-path` resolves each name for a linked worktree too.
+    for name in ["HEAD", "logs/HEAD", "index"] {
+        if let Some(path) = git(repo, &["rev-parse", "--git-path", name]) {
+            watch(&repo.join(path));
         }
+    }
+    if let Some(tracked) = git(repo, &["ls-tree", "--name-only", "HEAD"]) {
+        tracked.lines().for_each(|entry| watch(&repo.join(entry)));
     }
 
     let supplied_commit = env::var("NEWT_BUILD_GIT_COMMIT")
@@ -70,8 +71,16 @@ fn main() {
         .or_else(|| packaged_commit(&manifest_dir));
     let commit = commit.unwrap_or_else(|| "unknown".to_string());
     let dirty = supplied_commit.is_none()
-        && git(repo, &["status", "--porcelain", "--untracked-files=normal"])
-            .is_some_and(|status| !status.is_empty());
+        && git(
+            repo,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+        )
+        .is_some_and(|status| !status.is_empty());
     let source_id = if dirty {
         format!("{commit}-dirty")
     } else {
