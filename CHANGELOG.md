@@ -53,6 +53,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Fixed
 
+- macOS: a brokered `git fetch` no longer reports the Xcode tool locator's warnings as its
+  result, and says so when nothing changed (#3109). The broker runs the toolchain git that
+  `/usr/bin/git` forwards to, which also removes an `xcodebuild` launch per confined call.
 - `newt mcp import --force`, `newt mcp remove` and `/mcp enable|disable` act on the file
   that owns the MCP entry discovery uses. A forced import merges into that entry and keeps
   its comments and layout; it refuses before writing when a local header, env value,

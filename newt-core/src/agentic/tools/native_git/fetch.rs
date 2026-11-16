@@ -291,10 +291,13 @@ fn delivery_result(
     .filter(|out| out.success)
     .ok_or_else(|| "failed: `git fetch` could not complete delivery. Repository refs, objects or FETCH_HEAD may have changed. Inspect the repository before retrying.".to_string())?;
     // Git names the source it fetched from; that is staging, so say the remote.
-    Ok(String::from_utf8_lossy(&delivered.stderr)
-        .replace(staging_dir, url)
-        .trim_end()
-        .to_string())
+    let summary = String::from_utf8_lossy(&delivered.stderr).replace(staging_dir, url);
+    // #3109: git prints nothing when nothing changed, and an empty result
+    // reads as a failure. Say what happened either way.
+    Ok(match summary.trim_end() {
+        "" => format!("Fetched from {url}: already up to date."),
+        changed => format!("Fetched from {url}.\n{changed}"),
+    })
 }
 
 #[cfg(test)]
@@ -331,6 +334,37 @@ mod tests {
                 "raw failure output leaked: {error}"
             );
         }
+    }
+
+    /// #3109: a delivery that changed nothing printed nothing, and the model
+    /// read the empty result as a failure. Either way the result says what
+    /// was fetched from, and never names the staging directory.
+    #[test]
+    fn a_delivered_fetch_says_what_happened_even_when_nothing_changed() {
+        let delivered = |stderr: &str| {
+            delivery_result(
+                Ok(crate::confined_exec::ConfinedOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: Vec::new(),
+                    stderr: stderr.as_bytes().to_vec(),
+                    sandbox_kind: agent_bridle::SandboxKind::Landlock,
+                    timed_out: false,
+                }),
+                "/staging",
+                "https://example.invalid/repo",
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            delivered(""),
+            "Fetched from https://example.invalid/repo: already up to date."
+        );
+        assert_eq!(
+            delivered("From /staging\n * [new branch] a -> origin/a\n"),
+            "Fetched from https://example.invalid/repo.\nFrom https://example.invalid/repo\n \
+             * [new branch] a -> origin/a"
+        );
     }
 
     fn argv(command: &str) -> Vec<String> {
