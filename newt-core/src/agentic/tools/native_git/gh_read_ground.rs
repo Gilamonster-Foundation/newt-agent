@@ -36,10 +36,12 @@ fn gh_read_real_dispatch_pins_host_and_isolates_config() {
 [ "$GH_HOST" = github.com ] || exit 21
 [ "$GH_TOKEN" = fixture-token ] || exit 22
 [ -z "$GH_ENTERPRISE_TOKEN" ] || exit 23
-[ "$HOME" = "$PWD" ] || exit 24
-[ "$GH_CONFIG_DIR" = "$PWD" ] || exit 25
+# macOS /tmp aliases can spell the same directory differently.
+[ "$HOME" -ef "$PWD" ] || exit 24
+[ "$GH_CONFIG_DIR" -ef "$PWD" ] || exit 25
 [ -S "$GH_CONFIG_DIR/http.sock" ] || exit 26
-[ "$(cat "$GH_CONFIG_DIR/config.yml")" = "http_unix_socket: $GH_CONFIG_DIR/http.sock" ] || exit 28
+# The authenticated PATH need not include /bin, where macOS installs cat.
+[ "$(/bin/cat "$GH_CONFIG_DIR/config.yml")" = "http_unix_socket: $GH_CONFIG_DIR/http.sock" ] || exit 28
 [ -z "$GH_REPO" ] || exit 27
 printf '%s\n' "$@" > '{}'
 echo 'issue 1'

@@ -30,10 +30,10 @@ env:
 jobs:
   real-resource-tier:
     name: MCP import real subprocess and filesystem tier
-    # Windows needs ~44.5 min (each step relinks its test target); 45 timed out
-    # a fully green run on 2026-10-12.
-    # ponytail: headroom, not speed; share one test build across steps if it grows.
-    timeout-minutes: 75
+    # macOS spent ~73 min through gh read grounding on 2026-11-15, then
+    # ~6 min per subsequent target. Budget for all remaining native grounds
+    # and their repeated target relinks to complete.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -219,6 +219,12 @@ jobs:
               brew install tmux
             fi
           fi
+
+      # Match macos-confined-contract.yml: versioned Xcode bundles need a
+      # non-group-writable ancestor to satisfy the unchanged executable trust policy.
+      - name: Make the system Git ancestor non-group-writable
+        if: runner.os == 'macOS'
+        run: sudo chmod g-w /Applications
 
       - name: Run gh read broker grounding
         if: runner.os != 'Windows'
