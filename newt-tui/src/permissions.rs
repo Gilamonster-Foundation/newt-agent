@@ -691,10 +691,25 @@ pub(crate) fn choice_form(
     }
 }
 
+/// A free-text question as transcript rows, for after its dialog has closed.
+#[cfg(all(unix, feature = "rich-tui"))]
+pub(crate) fn asked_rows(markdown: &str) -> Vec<Vec<u8>> {
+    let question = markdown.strip_prefix(FREE_TEXT_PREFIX).unwrap_or(markdown);
+    question
+        .lines()
+        .enumerate()
+        .map(|(n, line)| format!("{}{line}", if n == 0 { "?  " } else { "   " }).into_bytes())
+        .collect()
+}
+
 /// The free-text form for one question, as a definition.
 ///
 /// Split out by C1 (#1862) so the SESSION can build the semantic form while
 /// the TERMINAL renders it — the two now happen on different threads.
+/// What the plain projection puts before a free-text question. A boxed dialog
+/// names itself in its border and drops this.
+pub(crate) const FREE_TEXT_PREFIX: &str = "Prompt — ";
+
 pub(crate) fn free_text_form(question: &str) -> InteractionDefinition {
     // C0a (#1856): the free-text form is an `InteractionDefinition` too, so
     // it renders through the ONE plain projection rather than through a
@@ -706,7 +721,7 @@ pub(crate) fn free_text_form(question: &str) -> InteractionDefinition {
         note: Some(MODAL_CONTROL_HINT.into()),
         ..InteractionDefinition::new(
             InteractionKind::Prompt,
-            format!("Prompt — {question}"),
+            format!("{FREE_TEXT_PREFIX}{question}"),
             vec![Control {
                 id: ControlId::new(ANSWER_CONTROL).expect(
                     "`answer` is a valid control id (non-empty, drawn from \

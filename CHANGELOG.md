@@ -17,6 +17,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   changed. The script now watches only paths that exist: `HEAD`, its reflog,
   the index, and the tracked top-level entries that decide the `-dirty` mark.
 
+### Security
+
+- RUSTSEC-2026-0545 and RUSTSEC-2026-0548 (zip 1.1.4, via candle-core 0.8.4) are accepted.
+  candle takes zip without its AES feature, so the code -0545 names is not compiled in,
+  and it never uses the `ZipStreamReader` that -0548 names.
+
 ## [0.8.6] — 2026-11-16
 
 ### Added

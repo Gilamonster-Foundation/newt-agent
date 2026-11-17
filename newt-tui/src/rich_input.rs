@@ -1053,7 +1053,7 @@ fn draw(
 }
 
 /// The dim chevron marking a committed prompt in scrollback: `›` + two spaces.
-const ECHO_CHEVRON: &str = "›  ";
+pub(crate) const ECHO_CHEVRON: &str = "›  ";
 
 /// One physical row of a committed prompt echo. `lead` marks the single row that
 /// carries the `›` chevron (the first row of the first logical line); every other
