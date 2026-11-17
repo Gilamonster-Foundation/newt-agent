@@ -49,7 +49,7 @@ mod terminal {
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span as TuiSpan};
-    use ratatui::widgets::{Paragraph, Wrap};
+    use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
     use std::io;
     use std::time::Duration;
 
@@ -90,22 +90,43 @@ mod terminal {
 
     /// A meaning, as this surface draws it.
     ///
-    /// The one place `Emphasis` becomes a `Style`. Monochrome by
-    /// construction: every role maps to a MODIFIER (bold, italic, dim,
-    /// reversed), never to a colour, so the surface reads correctly on a
-    /// `NO_COLOR` terminal without a second code path to keep in step.
+    /// The one place `Emphasis` becomes a `Style`. Every role is told apart
+    /// by a MODIFIER (bold, italic, dim, reversed), so the surface reads
+    /// correctly on a `NO_COLOR` terminal without a second code path. The
+    /// colour underneath is the theme's body text: without it the rows fell
+    /// back to the terminal's own foreground inside a themed border.
     fn style_of(emphasis: Emphasis) -> Style {
+        let text = crate::theme::style(newt_core::tty::theme::Role::Text);
         match emphasis {
-            Emphasis::Plain => Style::default(),
-            Emphasis::Strong | Emphasis::Heading(_) => {
-                Style::default().add_modifier(Modifier::BOLD)
-            }
-            Emphasis::Emphasis => Style::default().add_modifier(Modifier::ITALIC),
-            Emphasis::Code | Emphasis::Quote | Emphasis::Marker => {
-                Style::default().add_modifier(Modifier::DIM)
-            }
-            Emphasis::Struck => Style::default().add_modifier(Modifier::CROSSED_OUT),
+            Emphasis::Plain => text,
+            Emphasis::Strong | Emphasis::Heading(_) => text.add_modifier(Modifier::BOLD),
+            Emphasis::Emphasis => text.add_modifier(Modifier::ITALIC),
+            Emphasis::Code | Emphasis::Quote | Emphasis::Marker => text.add_modifier(Modifier::DIM),
+            Emphasis::Struck => text.add_modifier(Modifier::CROSSED_OUT),
         }
+    }
+
+    /// The rows a boxed dialog draws: the view's, less what its border
+    /// already says. The plain projection keeps both, because it has no
+    /// border to say them.
+    fn boxed_rows(view: &InteractionView) -> Vec<ViewRow> {
+        let mut rows: Vec<ViewRow> = view
+            .rows()
+            .iter()
+            // The legend along the bottom edge is the one key list.
+            .filter(|row| {
+                row.kind != RowKind::Note
+                    || !matches!(row.spans.as_slice(), [span] if span.text == newt_core::tty::MODAL_CONTROL_HINT)
+            })
+            .cloned()
+            .collect();
+        // The title names the dialog.
+        if let Some(span) = rows.first_mut().and_then(|row| row.spans.first_mut()) {
+            if let Some(rest) = span.text.strip_prefix(crate::permissions::FREE_TEXT_PREFIX) {
+                span.text = rest.to_string();
+            }
+        }
+        rows
     }
 
     /// One view row as a styled ratatui line.
@@ -172,8 +193,7 @@ mod terminal {
     pub(crate) fn requested_rows(interaction: &SurfaceInteraction, cols: u16) -> u16 {
         let input = ModalInput::new(interaction);
         let body: usize = input
-            .view
-            .rows()
+            .rows
             .iter()
             .map(|row| physical_rows(row, cols.saturating_sub(2)))
             .sum();
@@ -194,12 +214,34 @@ mod terminal {
             inspection.draw(frame, body);
             return;
         }
-        let view = &input.view;
-        let lines: Vec<Line<'static>> = view
-            .rows()
+        let free_text = input.options.is_none();
+        let lines: Vec<Line<'static>> = input
+            .rows
             .iter()
             .map(|row| line_of(row, input.selection()))
             .collect();
+        // What the body can show, so the chrome can say where it is: two
+        // borders, the legend, and the answer row of a free-text question.
+        let area = frame.area();
+        let visible = usize::from(area.height.saturating_sub(3 + u16::from(free_text)));
+        let total: usize = input
+            .rows
+            .iter()
+            .map(|row| physical_rows(row, area.width.saturating_sub(2)))
+            .sum();
+        let overflows = total > visible;
+        input.scroll = input.scroll.min(total.saturating_sub(visible) as u16);
+        let top = usize::from(input.scroll);
+        let keys = if free_text {
+            "Enter send · Esc cancel · Ctrl-C exit · F4 inspect"
+        } else {
+            "↑↓ select · Enter confirm · Esc cancel · Ctrl-C exit · F4 inspect"
+        };
+        let hint = if overflows {
+            format!("{keys} · PgUp/PgDn scroll")
+        } else {
+            keys.to_string()
+        };
         // The shared edge, for the reason it exists: a prompt that has TAKEN
         // THE KEYBOARD should not be shaped like ordinary output.
         //
@@ -217,29 +259,45 @@ mod terminal {
                 // A free-text question is not a list to pick from: its chrome
                 // names the question and the keys that answer it, nothing
                 // about selecting.
-                title: if view.selected().is_some() {
+                title: if input.view.selected().is_some() {
                     "decision required"
-                } else if input.options.is_none() {
-                    "question — type your answer"
+                } else if free_text {
+                    "question"
                 } else {
                     "input required"
                 },
-                hint: Some(if input.options.is_none() {
-                    "Enter send · Esc cancel · F4 inspect · PgUp/PgDn scroll"
-                } else {
-                    "F4 inspect · Esc cancel · ↑↓ select · Enter confirm · PgUp/PgDn scroll"
+                // A reader who cannot see the end should know there is one.
+                subtitle: overflows.then(|| {
+                    format!(
+                        "· lines {}–{} of {total}",
+                        top + 1,
+                        (top + visible).min(total)
+                    )
                 }),
-                ..crate::modal::Chrome::default()
+                hint: Some(&hint),
             },
         );
         let body = if input.options.is_none() {
             let [body, answer_area] =
                 Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
+            // The chat prompt's own chevron and colours: this row is where
+            // the operator types, the same as that one.
+            let chevron = crate::rich_input::ECHO_CHEVRON;
             let shown = input.echo.display(&input.answer);
-            let fitted =
-                newt_core::tty::fit_line(&format!("> {shown}"), usize::from(answer_area.width));
+            let fitted = newt_core::tty::fit_line(
+                &format!("{chevron}{shown}"),
+                usize::from(answer_area.width),
+            );
             let shown = format!("{}{}{}", fitted.head, fitted.fade, fitted.ellipsis);
-            frame.render_widget(Paragraph::new(shown.as_str()), answer_area);
+            let (mark, typed) = shown.split_at(chevron.len().min(shown.len()));
+            let role = |role| crate::theme::style(role);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    TuiSpan::styled(mark.to_string(), role(newt_core::tty::theme::Role::Accent)),
+                    TuiSpan::styled(typed.to_string(), role(newt_core::tty::theme::Role::Text)),
+                ])),
+                answer_area,
+            );
             if answer_area.width > 0 && answer_area.height > 0 {
                 frame.set_cursor_position((
                     answer_area.x
@@ -257,6 +315,21 @@ mod terminal {
                 .scroll((input.scroll, 0)),
             body,
         );
+        if overflows {
+            // On the border column, so the body keeps its width and the
+            // wrapping `physical_rows` measured.
+            let mut state = ScrollbarState::new(total.saturating_sub(visible)).position(top);
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight).style(crate::theme::style(
+                    newt_core::tty::theme::Role::ModalBorder,
+                )),
+                Rect {
+                    width: body.width + 1,
+                    ..body
+                },
+                &mut state,
+            );
+        }
     }
 
     /// Present one interaction on the terminal and report what the operator
@@ -318,6 +391,8 @@ mod terminal {
 
     struct ModalInput {
         view: InteractionView,
+        /// [`boxed_rows`] of `view`, which never change while it is open.
+        rows: Vec<ViewRow>,
         options: Option<Vec<newt_interaction::ChoiceOption>>,
         answer: String,
         echo: Echo,
@@ -329,8 +404,10 @@ mod terminal {
 
     impl ModalInput {
         fn new(interaction: &SurfaceInteraction) -> Self {
+            let view = initial_view(interaction);
             Self {
-                view: initial_view(interaction),
+                rows: boxed_rows(&view),
+                view,
                 options: match interaction.definition.controls.as_slice() {
                     [control] => match &control.kind {
                         ControlKind::Choice { options } => Some(options.clone()),
@@ -412,7 +489,7 @@ mod terminal {
                     view.move_selection(if key.code == KeyCode::Up { -1 } else { 1 });
                     let visible = usize::from(area.height.saturating_sub(3));
                     let mut before = 0;
-                    for row in view.rows() {
+                    for row in &self.rows {
                         let count = physical_rows(row, area.width.saturating_sub(2));
                         if matches!(row.kind, RowKind::Option { index } if Some(index) == view.selected())
                         {
@@ -428,16 +505,17 @@ mod terminal {
                 }
                 KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
                 KeyCode::PageDown => {
+                    // Stop at the last full page, as `draw` lays it out: two
+                    // borders, the legend, and a free-text answer row.
+                    let chrome = 3 + u16::from(self.options.is_none());
                     let total: usize = self
-                        .view
-                        .rows()
+                        .rows
                         .iter()
                         .map(|row| physical_rows(row, area.width.saturating_sub(2)))
                         .sum();
-                    self.scroll = self
-                        .scroll
-                        .saturating_add(5)
-                        .min(total.saturating_sub(1) as u16);
+                    let last =
+                        total.saturating_sub(usize::from(area.height.saturating_sub(chrome)));
+                    self.scroll = self.scroll.saturating_add(5).min(last as u16);
                 }
                 KeyCode::Backspace => {
                     self.answer.pop();
@@ -950,6 +1028,72 @@ mod terminal {
                     Some(PromptLine::Line("yes".into()))
                 );
             }
+        }
+
+        fn drawn(question: &str, width: u16, height: u16, pages: usize) -> String {
+            let interaction =
+                SurfaceInteraction::blocking(crate::permissions::free_text_form(question));
+            let mut input = ModalInput::new(&interaction);
+            let area = Rect::new(0, 0, width, height);
+            for _ in 0..pages {
+                input.event(key(KeyCode::PageDown, KeyModifiers::NONE), area);
+            }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// The border names the dialog and the legend lists the keys, once
+        /// each. The plain projection's `Prompt —` and control note said both
+        /// a second time, with `Esc=back` beside `Esc cancel`.
+        #[test]
+        fn a_boxed_question_says_each_thing_once() {
+            let screen = drawn("Which branches should go?", 70, 5, 0);
+            assert!(screen.contains(" question "), "{screen}");
+            assert!(screen.contains("Which branches should go?"), "{screen}");
+            assert!(!screen.contains("Prompt"), "{screen}");
+            assert!(!screen.contains("Esc=back"), "{screen}");
+            assert_eq!(screen.matches("Esc").count(), 1, "{screen}");
+            assert!(screen.contains("›"), "{screen}");
+            // Nothing to scroll, so nothing about scrolling.
+            assert!(
+                !screen.contains("PgUp") && !screen.contains("lines"),
+                "{screen}"
+            );
+            assert_eq!(
+                requested_rows(
+                    &SurfaceInteraction::blocking(crate::permissions::free_text_form("One row?")),
+                    70
+                ),
+                5,
+                "two borders, the question, the answer row and the legend"
+            );
+        }
+
+        /// A question longer than the box scrolls under a fixed answer row,
+        /// says where it is, and stops at its last line.
+        #[test]
+        fn a_long_question_scrolls_and_says_where_it_is() {
+            let question = (1..=20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let top = drawn(&question, 80, 8, 0);
+            assert!(top.contains("· lines 1–4 of 20"), "{top}");
+            assert!(top.contains("PgUp/PgDn scroll"), "{top}");
+            assert!(top.contains("line 1") && !top.contains("line 20"), "{top}");
+            let end = drawn(&question, 80, 8, 99);
+            assert!(end.contains("· lines 17–20 of 20"), "{end}");
+            assert!(end.contains("line 20") && end.contains("›"), "{end}");
         }
 
         #[test]
