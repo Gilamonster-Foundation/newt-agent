@@ -47,11 +47,19 @@ const SOURCES: &[(&str, &str)] = &[
         "newt-tui/src/cockpit/presenter.rs",
         include_str!("../../newt-tui/src/cockpit/presenter.rs"),
     ),
+    (
+        "newt-tui/src/interaction_view.rs",
+        include_str!("../../newt-tui/src/interaction_view.rs"),
+    ),
+    (
+        "newt-tui/src/cockpit/presenter_terminal_acceptance.rs",
+        include_str!("../../newt-tui/src/cockpit/presenter_terminal_acceptance.rs"),
+    ),
 ];
 
 /// Entries in the register. Raise it in the PR that adds an entry; it never
 /// goes down.
-const REGISTERED: usize = 7;
+const REGISTERED: usize = 8;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

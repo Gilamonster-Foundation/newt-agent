@@ -691,10 +691,18 @@ pub(crate) fn choice_form(
     }
 }
 
-/// A free-text question as transcript rows, for after its dialog has closed.
+/// A question asked in free text ([`free_text_form`]) as transcript rows, for
+/// after its dialog has closed. Only that form writes the prefix, so a text
+/// field that a settings or crew form presents (also a `Prompt`) leaves no
+/// row: its label is the form's, not a question put to the operator.
+///
+/// Not the canonical text `present_in` returns: that carries the key hint,
+/// which says nothing once the dialog is gone.
 #[cfg(all(unix, feature = "rich-tui"))]
 pub(crate) fn asked_rows(markdown: &str) -> Vec<Vec<u8>> {
-    let question = markdown.strip_prefix(FREE_TEXT_PREFIX).unwrap_or(markdown);
+    let Some(question) = markdown.strip_prefix(FREE_TEXT_PREFIX) else {
+        return Vec::new();
+    };
     question
         .lines()
         .enumerate()
@@ -702,14 +710,14 @@ pub(crate) fn asked_rows(markdown: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// The free-text form for one question, as a definition.
-///
-/// Split out by C1 (#1862) so the SESSION can build the semantic form while
-/// the TERMINAL renders it — the two now happen on different threads.
 /// What the plain projection puts before a free-text question. A boxed dialog
 /// names itself in its border and drops this.
 pub(crate) const FREE_TEXT_PREFIX: &str = "Prompt — ";
 
+/// The free-text form for one question, as a definition.
+///
+/// Split out by C1 (#1862) so the SESSION can build the semantic form while
+/// the TERMINAL renders it — the two now happen on different threads.
 pub(crate) fn free_text_form(question: &str) -> InteractionDefinition {
     // C0a (#1856): the free-text form is an `InteractionDefinition` too, so
     // it renders through the ONE plain projection rather than through a

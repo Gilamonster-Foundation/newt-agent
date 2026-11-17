@@ -1484,9 +1484,7 @@ impl Presenter {
                 // committed here: the tool-call line above names the tool and
                 // the result below carries the answer, and neither says what
                 // was asked.
-                let asked = if rich.is_ok()
-                    && interaction.definition.kind == newt_interaction::InteractionKind::Prompt
-                {
+                let asked = if rich.is_ok() {
                     crate::permissions::asked_rows(&interaction.definition.markdown)
                 } else {
                     Vec::new()

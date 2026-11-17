@@ -233,15 +233,18 @@ mod terminal {
         input.scroll = input.scroll.min(total.saturating_sub(visible) as u16);
         let top = usize::from(input.scroll);
         let keys = if free_text {
-            "Enter send · Esc cancel · Ctrl-C exit · F4 inspect"
+            "Enter send · Esc cancel"
         } else {
-            "↑↓ select · Enter confirm · Esc cancel · Ctrl-C exit · F4 inspect"
+            "↑↓ select · Enter confirm · Esc cancel"
         };
-        let hint = if overflows {
-            format!("{keys} · PgUp/PgDn scroll")
+        // The legend is cut on the right, so the keys that answer and leave
+        // are kept longest, then scrolling.
+        let scroll = if overflows {
+            " · PgUp/PgDn scroll"
         } else {
-            keys.to_string()
+            ""
         };
+        let hint = format!("{keys}{scroll} · Ctrl-C exit · F4 inspect");
         // The shared edge, for the reason it exists: a prompt that has TAKEN
         // THE KEYBOARD should not be shaped like ordinary output.
         //
@@ -249,9 +252,9 @@ mod terminal {
         // `style_of`. That contract is "the surface reads correctly on a
         // NO_COLOR terminal without a second code path", and a border
         // satisfies it STRUCTURALLY — the box is drawn with glyphs, so it
-        // survives a terminal that discards every colour. The hue is additive,
-        // and the ROWS are untouched: every span still maps to a modifier,
-        // never to a colour.
+        // survives a terminal that discards every colour. The hue is additive:
+        // the rows still tell their roles apart by modifier alone, over the
+        // theme's one body colour (`style_of`).
         let body = crate::modal::frame(
             frame,
             frame.area(),
@@ -289,7 +292,12 @@ mod terminal {
                 usize::from(answer_area.width),
             );
             let shown = format!("{}{}{}", fitted.head, fitted.fade, fitted.ellipsis);
-            let (mark, typed) = shown.split_at(chevron.len().min(shown.len()));
+            // A row cut inside the chevron has no chevron left to colour, and
+            // a byte offset into it can land inside the ellipsis.
+            let (mark, typed) = match shown.strip_prefix(chevron) {
+                Some(typed) => (chevron, typed),
+                None => ("", shown.as_str()),
+            };
             let role = |role| crate::theme::style(role);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -1033,7 +1041,16 @@ mod terminal {
         fn drawn(question: &str, width: u16, height: u16, pages: usize) -> String {
             let interaction =
                 SurfaceInteraction::blocking(crate::permissions::free_text_form(question));
-            let mut input = ModalInput::new(&interaction);
+            screen(&interaction, width, height, pages)
+        }
+
+        fn screen(
+            interaction: &SurfaceInteraction,
+            width: u16,
+            height: u16,
+            pages: usize,
+        ) -> String {
+            let mut input = ModalInput::new(interaction);
             let area = Rect::new(0, 0, width, height);
             for _ in 0..pages {
                 input.event(key(KeyCode::PageDown, KeyModifiers::NONE), area);
@@ -1091,9 +1108,72 @@ mod terminal {
             assert!(top.contains("· lines 1–4 of 20"), "{top}");
             assert!(top.contains("PgUp/PgDn scroll"), "{top}");
             assert!(top.contains("line 1") && !top.contains("line 20"), "{top}");
+            assert!(
+                top.contains('█'),
+                "the right border carries a scrollbar: {top}"
+            );
+            // Narrower than the legend: the cut takes the tail, and the keys
+            // that answer, leave and scroll stay.
+            let narrow = drawn(&question, 46, 8, 0);
+            assert!(
+                narrow.contains("Enter send · Esc cancel · PgUp/PgDn scroll"),
+                "{narrow}"
+            );
+            // A decision dialog's legend is longer: 80 columns still show how
+            // to scroll, and 40 still show how to leave.
+            let decision = SurfaceInteraction::blocking(newt_core::interaction_form::confirm(
+                &question, "", "yes", "no",
+            ));
+            let wide = screen(&decision, 80, 8, 0);
+            assert!(wide.contains("Esc cancel · PgUp/PgDn scroll"), "{wide}");
+            let narrow = screen(&decision, 40, 8, 0);
+            assert!(narrow.contains("Esc cancel"), "{narrow}");
             let end = drawn(&question, 80, 8, 99);
             assert!(end.contains("· lines 17–20 of 20"), "{end}");
             assert!(end.contains("line 20") && end.contains("›"), "{end}");
+        }
+
+        /// A pane squeezed to a few columns cuts the answer row inside its
+        /// chevron. Splitting that row at the chevron's byte length landed
+        /// inside the ellipsis and panicked.
+        #[test]
+        fn a_squeezed_question_still_draws() {
+            let interaction =
+                SurfaceInteraction::blocking(crate::permissions::free_text_form("Narrow?"));
+            // Nothing typed, a narrow character, and a wide one.
+            for typed in [None, Some('x'), Some('界')] {
+                for (width, height) in (1..=8).flat_map(|w| (1..=9).map(move |h| (w, h))) {
+                    let mut input = ModalInput::new(&interaction);
+                    if let Some(c) = typed {
+                        let area = Rect::new(0, 0, width, height);
+                        input.event(key(KeyCode::Char(c), KeyModifiers::NONE), area);
+                    }
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap()
+                        .draw(|frame| draw(frame, &mut input))
+                        .unwrap();
+                }
+            }
+        }
+
+        /// The question takes the theme's text colour and the answer row's
+        /// chevron its accent. Before #3119 only the border was themed.
+        #[test]
+        fn a_boxed_question_follows_the_theme() {
+            use newt_core::tty::theme::Role;
+            let interaction =
+                SurfaceInteraction::blocking(crate::permissions::free_text_form("Themed?"));
+            let mut input = ModalInput::new(&interaction);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+            let buffer = terminal.backend().buffer();
+            // Inside the left border: row 1 is the question, row 2 the answer.
+            let (question, chevron) = (buffer.cell((1, 1)).unwrap(), buffer.cell((1, 2)).unwrap());
+            assert_eq!((question.symbol(), chevron.symbol()), ("T", "›"));
+            assert_eq!(question.fg, crate::theme::color(Role::Text));
+            assert_eq!(chevron.fg, crate::theme::color(Role::Accent));
+            assert_ne!(question.fg, chevron.fg, "two roles, two colours");
         }
 
         #[test]
