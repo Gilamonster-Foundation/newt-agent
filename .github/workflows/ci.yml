@@ -169,7 +169,7 @@ jobs:
         # each artifact `fresh` or not; its status lines are coloured here
         # (CARGO_TERM_COLOR above) and a grep for them matched nothing.
         run: |
-          out=$(cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema --message-format=json -- -D warnings 2>/dev/null)
+          out=$(cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema --message-format=json -- -D warnings)
           if grep '"fresh":false' <<<"$out" | grep -o '"package_id":"[^"]*"' | sort -u | grep .; then
             echo "::error::a repeat build with nothing changed rebuilt the crates above"
             exit 1

@@ -1162,6 +1162,20 @@ fn acceptance_case() {
         // lands above the question the closing dialog commits.
         writeln!(io::stdout(), "⚙  request_user_input:").unwrap();
         io::stdout().flush().unwrap();
+        // A write that has returned is not always readable at the other end
+        // of a pty yet. Wait until it is, reading nothing, so the arm's own
+        // drain stays the thing under test.
+        let mut pending = libc::pollfd {
+            fd: cockpit.capture.master_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll on one descriptor the cockpit owns; readiness only.
+        assert_eq!(
+            unsafe { libc::poll(&mut pending, 1, 2000) },
+            1,
+            "the tool-call line never reached the capture"
+        );
         let before_modal_round = tty.painted().len();
         let (reply, answer) = std::sync::mpsc::sync_channel(1);
         let (saw_box, while_modal) = std::thread::scope(|scope| {

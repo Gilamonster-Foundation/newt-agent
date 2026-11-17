@@ -10,6 +10,10 @@ pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_COMMIT: &str = env!("NEWT_BUILD_GIT_COMMIT");
 
 /// Git commit plus a `-dirty` suffix when tracked or untracked changes existed.
+///
+/// The build script recomputes it when `HEAD`, the index or a tracked
+/// top-level entry changes. A new untracked file at the top of the repository
+/// is none of those, so it does not add the suffix until one of them changes.
 pub const SOURCE_ID: &str = env!("NEWT_BUILD_SOURCE_ID");
 
 /// User-visible build identity, for example `0.7.5 (251c70c1adb4)`.
