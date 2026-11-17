@@ -34,6 +34,17 @@ ignore = [
                          # same crate/chain/condition as -0367.
     "RUSTSEC-2026-0429", # zip: extract() aborts the process on a symlink entry with
                          # a large declared size; same crate/chain/condition as -0367.
+    "RUSTSEC-2026-0545", # zip: AES entries returned without their authentication
+                         # check when the data ends early or is empty. The AES
+                         # reader is behind zip's `aes-crypto` feature.
+                         # candle-core takes zip with `default-features = false`,
+                         # so it is not compiled in: `cargo metadata` resolves
+                         # zip 1.1.4 with no features. Same chain and fix as -0367.
+    "RUSTSEC-2026-0548", # zip: `ZipStreamReader` and `read_zipfile_from_stream`
+                         # read entries under local-header names. candle-core
+                         # reads only through `ZipArchive` (`new`, `by_name`,
+                         # `by_index`) and names neither. Same chain as -0367;
+                         # fixed in zip 9.0.5.
     # unmaintained / unsound — deep transitive, no drop-in fix
     "RUSTSEC-2025-0141", # bincode unmaintained
     "RUSTSEC-2024-0436", # paste unmaintained
