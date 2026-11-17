@@ -1441,6 +1441,10 @@ impl Presenter {
                 // this rare allocation fails, the request's reply sender drops
                 // cleanly and chat never gets stranded in its inactive style.
                 let prompt_output = self.screen.tty.try_clone()?;
+                // What the session printed before it asked comes first: the
+                // tool-call line belongs above the dialog and above the
+                // question this arm commits when it closes.
+                self.drain_pty()?;
                 // Requests are drained in a batch before the loop's normal
                 // draw. Apply any pending editor/status geometry first so the
                 // modal reserves rows against the block that will actually be
@@ -1476,6 +1480,17 @@ impl Presenter {
                     let terminal = crate::inline_viewport::cockpit_panel_terminal(out, area)?;
                     crate::interaction_view::present_in(terminal, &interaction)
                 });
+                // A question the dialog showed leaves with it, so it is
+                // committed here: the tool-call line above names the tool and
+                // the result below carries the answer, and neither says what
+                // was asked.
+                let asked = if rich.is_ok()
+                    && interaction.definition.kind == newt_interaction::InteractionKind::Prompt
+                {
+                    crate::permissions::asked_rows(&interaction.definition.markdown)
+                } else {
+                    Vec::new()
+                };
                 let (outcome, prompt_notice) = match rich {
                     Ok((outcome, _)) => crate::permissions::apply_chat_prompt_policy(outcome),
                     Err(_) => crate::permissions::present_on_terminal_with_width(
@@ -1493,6 +1508,7 @@ impl Presenter {
                 // remain blocked waiting on a result it already supplied.
                 let repaint = (|| {
                     self.screen.term.clear()?;
+                    self.screen.insert_rows(asked)?;
                     if let Some(notice) = prompt_notice {
                         // A slash typed at a modal belongs at the chat prompt.
                         // Commit that guidance above the fixed viewport after

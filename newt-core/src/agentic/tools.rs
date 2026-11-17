@@ -3045,7 +3045,6 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "use_skill" => string("name", ""),
         "web_fetch" => string("url", ""),
         "request_permissions" => string("capability", ""),
-        "request_user_input" => string("question", ""),
         "propose_config_edit" => string("key", ""),
         "select_operating_mode" => string("mode", ""),
         "prompt_read" | "artifact_read" => string("address", "current"),
@@ -3069,6 +3068,9 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
             }
         }
         "render_report" => string("title", ""),
+        // The question is the dialog's to show, and the transcript's once it
+        // closes. Echoing it here as well printed it twice on one screen.
+        "request_user_input" => String::new(),
         "resume_context"
         | "state_clear"
         | "update_plan"
