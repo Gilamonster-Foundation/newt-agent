@@ -1230,16 +1230,24 @@ fn acceptance_case() {
             expected_top.min(expected_reservation.start),
             "the pending layout is applied before modal reservation"
         );
+        // #3119: the question is committed as one transcript row when its
+        // dialog closes, so the block sits one row below the reclaimed top.
+        let asked: u16 = 1;
         assert_eq!(
             cockpit.screen.top,
-            reclaimed_top(
+            (reclaimed_top(
                 &expected_reservation,
                 cockpit.screen.block_h,
                 cockpit.screen.rows
-            ),
+            ) + asked)
+                .min(cockpit.screen.rows - cockpit.screen.block_h),
             "closing the modal reclaims the rows it scrolled the transcript out of"
         );
         let provisional = tty.painted();
+        assert!(
+            provisional.contains("?  Cockpit modal visible?"),
+            "the closed dialog leaves its question in the transcript: {provisional:?}"
+        );
         let prompt_at = provisional
             .find("visible?")
             .expect("modal body reached the terminal");
