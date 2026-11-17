@@ -30,10 +30,12 @@ env:
 jobs:
   real-resource-tier:
     name: MCP import real subprocess and filesystem tier
-    # macOS spent ~73 min through gh read grounding on 2026-11-15, then
-    # ~6 min per subsequent target. Budget for all remaining native grounds
-    # and their repeated target relinks to complete.
-    timeout-minutes: 150
+    # Measured 2026-11-17 with no build cache (run 43987219705): macOS 24 min,
+    # Windows 17, Linux 11. macOS took 69 min (run 43791924314) while
+    # newt-core's build script reran on every cargo invocation.
+    # ponytail: 75 is headroom, not speed. Every step still runs its own
+    # `cargo test`; share one test build across the steps if this grows.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
