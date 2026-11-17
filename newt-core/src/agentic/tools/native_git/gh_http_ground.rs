@@ -47,6 +47,9 @@ fn gh_http_real_redirect_never_reaches_ungranted_listener() {
                     Err(e) => panic!("{e}"),
                 }
             };
+            // macOS hands an accepted socket its listener's non-blocking mode,
+            // so a read ahead of the client's first byte fails at once.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
