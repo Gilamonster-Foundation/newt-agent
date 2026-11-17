@@ -83,3 +83,16 @@ tool locator's complaints from inside the sandbox, and nothing at all when
 no ref changed. The model told the operator the fetch had failed."""
 guard = { file = "newt-core/src/agentic/tools/native_git/fetch.rs", test = "a_delivered_fetch_says_what_happened_even_when_nothing_changed" }
 ground = { file = "newt-core/src/agentic/tools/native_git.rs", test = "a_brokered_fetch_brings_new_refs_and_objects_into_the_workspace" }
+
+# The ground sees the first two clauses on a real terminal. The third, the
+# tool-call line, has only its mocked guard in newt-core:
+# `a_question_is_not_echoed_on_its_tool_call_line`.
+[[regression]]
+id = "question-dialog-says-things-twice"
+seen = "2026-11-16"
+symptom = """
+The boxed free-text question named itself twice (its border and `Prompt —`), \
+listed its keys twice (a note in the body and the legend), and showed the \
+question on the tool-call line as well as in the dialog."""
+guard = { file = "newt-tui/src/interaction_view.rs", test = "a_boxed_question_says_each_thing_once" }
+ground = { file = "newt-tui/src/cockpit/presenter_terminal_acceptance.rs", test = "the_cockpit_owns_the_terminal_correctly_and_gives_it_back" }

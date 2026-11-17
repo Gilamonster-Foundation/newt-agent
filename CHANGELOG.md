@@ -9,6 +9,14 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed
+
+- The boxed free-text question (`request_user_input`, for one) says each thing once (#3119).
+  Its border names it, one legend lists the keys, and the question appears in the dialog and
+  then once in the transcript, no longer on the tool-call line too. Its rows follow the
+  theme. A question longer than the box shows a line range, a scrollbar and, in its legend,
+  the keys that scroll. A headless run with no operator no longer prints the question text.
+
 ### Security
 
 - RUSTSEC-2026-0545 and RUSTSEC-2026-0548 (zip 1.1.4, via candle-core 0.8.4) are accepted.

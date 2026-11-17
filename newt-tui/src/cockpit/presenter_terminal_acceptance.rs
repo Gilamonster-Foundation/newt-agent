@@ -884,6 +884,8 @@ fn panel_loop(fill_rows: usize, operator: bool, decide: bool, heights: &'static 
 ///
 /// Real-PTY tier: `#[ignore]`d in the unit run (it opens a real PTY or a real
 /// subprocess and races libtest under load). Grounds the presenter's mocked row-model and mode-guard tests, which cannot observe a real terminal's modes, foreground group or size.
+/// Also grounds `a_boxed_question_says_each_thing_once` (#3119): what the boxed
+/// question shows on a real terminal, and the order of what it leaves behind.
 #[serial_test::serial(tty_arbiter, prompt_stdin)]
 #[test]
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
@@ -1155,6 +1157,11 @@ fn acceptance_case() {
         // That restore legitimately re-enables line wrap, so a whole-buffer
         // scan for `EnableLineWrap` was reading another test's teardown as
         // this modal's behavior.
+        // #3119: what the session printed before it asked is still unread when
+        // the request arrives. The arm drains it first, so the tool-call line
+        // lands above the question the closing dialog commits.
+        writeln!(io::stdout(), "⚙  request_user_input:").unwrap();
+        io::stdout().flush().unwrap();
         let before_modal_round = tty.painted().len();
         let (reply, answer) = std::sync::mpsc::sync_channel(1);
         let (saw_box, while_modal) = std::thread::scope(|scope| {
@@ -1217,6 +1224,13 @@ fn acceptance_case() {
             !modal_visible.contains("draft survives"),
             "the normal composer must not be drawn into the blocking window: {modal_visible}"
         );
+        // #3119: the border names the dialog and one legend lists the keys.
+        assert!(
+            !modal_visible.contains("Prompt")
+                && !modal_visible.contains("Esc=back")
+                && modal_visible.matches("Esc").count() == 1,
+            "the boxed question says each thing once: {modal_visible}"
+        );
         assert_eq!(
             answer.recv().expect("interaction answer"),
             newt_core::HumanQuestionOutcome::Answer("yes".into())
@@ -1244,10 +1258,6 @@ fn acceptance_case() {
             "closing the modal reclaims the rows it scrolled the transcript out of"
         );
         let provisional = tty.painted();
-        assert!(
-            provisional.contains("?  Cockpit modal visible?"),
-            "the closed dialog leaves its question in the transcript: {provisional:?}"
-        );
         let prompt_at = provisional
             .find("visible?")
             .expect("modal body reached the terminal");
@@ -1267,12 +1277,39 @@ fn acceptance_case() {
         // offset — the signature of a drain race, not a fixed defect.
         // Waiting for the exact evidence the assertion below checks for
         // changes WHEN it is safe to read, not WHAT is asserted.
+        //
+        // The dialog shows the cursor in its own frames too, so a Show after
+        // the dialog's body proves nothing about the close. The row the close
+        // commits (#3119) is written only by the closing repaint: wait for
+        // it, then for the Show that follows it.
+        let asked_row = "?  Cockpit modal visible?";
         assert!(
-            tty.wait_for_painted_after(prompt_at, &show, std::time::Duration::from_secs(2)),
+            tty.wait_for_painted_after(
+                before_modal_round,
+                asked_row,
+                std::time::Duration::from_secs(2)
+            ),
+            "the closed dialog left no question row (waited 2s): {:?}",
+            tty.painted()
+        );
+        let asked_at = before_modal_round
+            + tty.painted()[before_modal_round..]
+                .find(asked_row)
+                .expect("the wait above saw the row");
+        assert!(
+            tty.wait_for_painted_after(asked_at, &show, std::time::Duration::from_secs(2)),
             "the chat cursor was not restored after the modal closed (waited 2s): {:?}",
             tty.painted()
         );
         let painted = tty.painted();
+        let round = &painted[before_modal_round..];
+        assert!(
+            matches!(
+                (round.find("request_user_input:"), round.find(asked_row)),
+                (Some(call), Some(question)) if call < question
+            ) && round.matches(asked_row).count() == 1,
+            "the closed dialog leaves the tool-call line, then its question, once: {round:?}"
+        );
         let mut expected_move = Vec::new();
         queue!(expected_move, MoveTo(0, expected_reservation.start))
             .expect("cursor-placement bytes");

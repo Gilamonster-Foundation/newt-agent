@@ -126,6 +126,23 @@ fn the_free_text_form_renders_with_a_clear_modal_identity() {
     assert!(!form.markdown.starts_with("? "));
 }
 
+/// #3119: only a question asked in free text is committed to the transcript
+/// when its dialog closes. A text field that a settings or crew form presents
+/// is a `Prompt` too, and its label would be committed as `?  <label>`.
+#[cfg(all(unix, feature = "rich-tui"))]
+#[test]
+fn only_a_free_text_question_becomes_transcript_rows() {
+    let asked = |markdown: &str| -> Vec<String> {
+        asked_rows(markdown)
+            .into_iter()
+            .map(|row| String::from_utf8(row).unwrap())
+            .collect()
+    };
+    let form = free_text_form("Which colour?\nOne word.");
+    assert_eq!(asked(&form.markdown), ["?  Which colour?", "   One word."]);
+    assert!(asked("Display name").is_empty());
+}
+
 /// **The web surface is untouched by C0a.** The terminal changed how it
 /// RENDERS; the web still publishes the same definition, offers the same
 /// actions in the same order, and reconstructs the same legacy form for

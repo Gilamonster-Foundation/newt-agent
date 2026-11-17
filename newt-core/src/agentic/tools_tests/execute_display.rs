@@ -106,6 +106,19 @@ fn lifecycle_audit_names_the_resolved_command() {
     assert_eq!(detail, format!("test (run) → {}", resolved.join(" && ")));
 }
 
+/// #3119: the dialog shows the question and the transcript keeps it once the
+/// dialog closes. The tool-call line carried it too, twice on one screen.
+#[test]
+fn a_question_is_not_echoed_on_its_tool_call_line() {
+    let (name, detail) = tool_presentation(
+        "request_user_input",
+        &serde_json::json!({"question": "Which branches should go?"}),
+        std::path::Path::new("ws"),
+        &crate::caveats::Scope::All,
+    );
+    assert_eq!((name.as_str(), detail.as_str()), ("request_user_input", ""));
+}
+
 #[test]
 fn audit_preserves_whitespace_in_real_paths() {
     let ws = tempfile::TempDir::new().unwrap();
