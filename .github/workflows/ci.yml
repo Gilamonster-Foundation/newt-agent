@@ -165,10 +165,12 @@ jobs:
         # HOOK PARITY: CI-only; named in .githooks/pre-push. Repeats the clippy
         # step with nothing changed. newt-core's build script once watched a
         # path that never exists in a checkout, so Cargo rebuilt newt-core and
-        # every crate above it on each invocation.
+        # every crate above it on each invocation. Cargo's JSON messages mark
+        # each artifact `fresh` or not; its status lines are coloured here
+        # (CARGO_TERM_COLOR above) and a grep for them matched nothing.
         run: |
-          out=$(cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings 2>&1)
-          if grep -E '^ *(Checking|Compiling) ' <<<"$out"; then
+          out=$(cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema --message-format=json -- -D warnings 2>/dev/null)
+          if grep '"fresh":false' <<<"$out" | grep -o '"package_id":"[^"]*"' | sort -u | grep .; then
             echo "::error::a repeat build with nothing changed rebuilt the crates above"
             exit 1
           fi
