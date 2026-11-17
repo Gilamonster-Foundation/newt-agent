@@ -663,19 +663,25 @@ pub struct TrustedTools {
 }
 
 /// The git to run: the toolchain binary Apple's `/usr/bin/git` locator stub
-/// forwards to when one was found and trusted, otherwise `git` unchanged.
-fn behind_locator_stub(git: PathBuf, twin: Option<PathBuf>) -> PathBuf {
+/// forwards to when one was found and is `trusted`, otherwise `git` unchanged.
+fn behind_locator_stub(
+    git: PathBuf,
+    twin: Option<PathBuf>,
+    trusted: impl Fn(&Path) -> bool,
+) -> PathBuf {
     match twin {
-        Some(twin) if git == Path::new("/usr/bin/git") => twin,
+        Some(twin) if git == Path::new("/usr/bin/git") && trusted(&twin) => twin,
         _ => git,
     }
 }
 
 impl TrustedTools {
     /// Resolve and trust-check git, gh (if present), `/bin/sh` and git's
-    /// exec-path. No subprocess runs before git passes the check; the one
-    /// that follows (`git --exec-path`) already uses the checked binary and
-    /// the allowlist env.
+    /// exec-path. No subprocess runs before git passes the check. Two may
+    /// follow: `git --exec-path`, which uses the checked binary and the
+    /// allowlist env, and on macOS the developer-directory lookup
+    /// (`/usr/bin/xcode-select -p`: a fixed path, cleared environment, at
+    /// most once per process) that finds the git behind Apple's locator stub.
     ///
     /// # Errors
     /// When git is missing or any executable/directory fails [`trust_check`].
@@ -743,9 +749,9 @@ impl TrustedTools {
         let twin = crate::confined_exec::developer_exec_twins([&"git".to_string()])
             .into_iter()
             .next()
-            .map(PathBuf::from)
-            .filter(|twin| trust_check(twin, &tools.ctx).is_ok());
-        tools.git = behind_locator_stub(tools.git, twin);
+            .map(PathBuf::from);
+        let ctx = &tools.ctx;
+        tools.git = behind_locator_stub(tools.git, twin, |twin| trust_check(twin, ctx).is_ok());
         Ok(tools)
     }
 
@@ -1861,12 +1867,14 @@ mod tests {
     #[test]
     fn only_the_locator_stub_is_swapped_for_the_git_behind_it() {
         let (stub, real, brew) = ("/usr/bin/git", "/dev/usr/bin/git", "/opt/bin/git");
-        let pick = |git: &str, twin: Option<&str>| {
-            behind_locator_stub(PathBuf::from(git), twin.map(PathBuf::from))
+        let pick = |git: &str, twin: Option<&str>, trusted: bool| {
+            behind_locator_stub(PathBuf::from(git), twin.map(PathBuf::from), |_| trusted)
         };
-        assert_eq!(pick(stub, Some(real)), Path::new(real));
-        assert_eq!(pick(stub, None), Path::new(stub));
-        assert_eq!(pick(brew, Some(real)), Path::new(brew));
+        assert_eq!(pick(stub, Some(real), true), Path::new(real));
+        assert_eq!(pick(stub, None, true), Path::new(stub));
+        assert_eq!(pick(brew, Some(real), true), Path::new(brew));
+        // A twin that fails the trust check is never run.
+        assert_eq!(pick(stub, Some(real), false), Path::new(stub));
     }
 
     /// PR #2853: checkout recognition cannot probe through an escaping link
