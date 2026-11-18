@@ -50,7 +50,8 @@ explicitly skipped on Windows. Tests use temporary fixtures and no registry call
 ## Release
 
 The [release workflow](../.github/workflows/release.yml) validates npm inputs
-before `build-binaries`, then wraps its accepted artifacts without rebuilding.
+in `npm-preflight`, which both npm jobs wait for, then wraps the accepted
+`build-binaries` artifacts without rebuilding.
 Platform packages publish first; only after all six succeed do the two scoped
 shims and `newt-agent` umbrella publish. Existing published versions are skipped;
 other publication errors fail the job. Stable versions use `latest`, prereleases

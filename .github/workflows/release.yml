@@ -3,8 +3,9 @@ name: Release
 # HOOK PARITY: .githooks/pre-push checks publish coverage/order and that every
 # publish job needs every gate (#2873) on manifest and release-gate changes.
 # The same check holds every other job to both acceptance tiers unless it
-# lists the job as publishing nothing. Binary/wheel/npm assembly and
-# publication are CI-only.
+# lists the job as publishing nothing, and keeps the repository write token
+# away from those exempt jobs. Binary/wheel/npm assembly and publication are
+# CI-only.
 
 # Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
 # (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
@@ -33,8 +34,12 @@ on:
       - "release/**"
   workflow_dispatch:
 
+# Read-only by default. The gates and the builds start before either
+# acceptance tier is green, so no job that the tiers do not gate gets a write
+# scope (scripts/check_publish_order.py enforces it). `github-release`, which
+# waits for both tiers, takes `contents: write` for the draft release.
 permissions:
-  contents: write   # `gh release create` + binary asset upload
+  contents: read
 
 env:
   RUST_BACKTRACE: 1
@@ -398,6 +403,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package, sbom, setup-acceptance, mcp-import-acceptance]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the draft release and upload its assets
     steps:
       - uses: actions/checkout@v4
       - name: Download all binary artifacts

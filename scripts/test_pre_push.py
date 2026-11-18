@@ -202,7 +202,7 @@ class PrePushTests(unittest.TestCase):
             manifest.write_text(manifest.read_text().replace('path = ', 'version = "=0.1.0", path = '))
         gates = "[setup-acceptance, mcp-import-acceptance, build-binaries, build-wheels, build-sdist, check-publish-order, npm-preflight]"
         workflow = (
-            "jobs:\n"
+            "permissions:\n  contents: read\njobs:\n"
             + "".join(f"  {gate}: {{}}\n" for gate in gates[1:-1].split(", "))
             + "".join(f"  {job}:\n    needs: {gates}\n" for job in ("build-npm", "publish-npm-meta", "publish-pypi"))
             + "".join(f"  {job}:\n    needs: [setup-acceptance, mcp-import-acceptance]\n" for job in ("github-release", "sbom-attest"))
