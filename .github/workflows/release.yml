@@ -2,7 +2,8 @@ name: Release
 
 # HOOK PARITY: .githooks/pre-push checks publish coverage/order and that every
 # publish job needs every gate (#2873) on manifest and release-gate changes.
-# Binary/wheel/npm assembly and publication are CI-only.
+# The same check holds the draft GitHub release and the SBOM attestation to
+# both acceptance tiers. Binary/wheel/npm assembly and publication are CI-only.
 
 # Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
 # (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
@@ -73,12 +74,13 @@ jobs:
     permissions:
       contents: read
 
-  # MCP import and runtime recovery are stacked on setup acceptance because the
-  # shared crash-safe lock/replacement contract is their prerequisite. Every
-  # release build root below depends on this job, so no publication path can
-  # bypass either acceptance tier.
+  # MCP import and runtime recovery rest on the crash-safe lock/replacement
+  # contract that setup acceptance proves. The two tiers and the builds below
+  # all start at once: a release waits for the slowest of them, not their sum.
+  # No publication path can bypass either tier, because every job that ships
+  # something names both in `needs:` (scripts/check_publish_order.py enforces
+  # it). A red tier costs the build minutes spent beside it and nothing else.
   mcp-import-acceptance:
-    needs: [setup-acceptance]
     uses: ./.github/workflows/mcp-import-real.yml
     permissions:
       contents: read
@@ -91,7 +93,6 @@ jobs:
     # the npm version check rejects only sets npm_release=false (it does not
     # fail): the npm jobs are skipped, while crates.io and PyPI, which also
     # need npm-preflight (#2873), still publish.
-    needs: [mcp-import-acceptance]
     strategy:
       fail-fast: false
       matrix:
@@ -358,7 +359,8 @@ jobs:
   # signing or storage failure here cannot hold the release or lose the SBOM.
   sbom-attest:
     name: Attest SBOM to release archives
-    needs: [sbom, build-binaries]
+    # An attestation is public and permanent, so it waits for both tiers.
+    needs: [sbom, build-binaries, setup-acceptance, mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v')
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -391,7 +393,7 @@ jobs:
   github-release:
     name: GitHub release (${{ github.ref_name }})
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package, sbom]
+    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package, sbom, setup-acceptance, mcp-import-acceptance]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -576,7 +578,6 @@ jobs:
 
   build-wheels:
     name: Build wheel (${{ matrix.os }})
-    needs: [mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -613,7 +614,6 @@ jobs:
 
   build-sdist:
     name: Build sdist
-    needs: [mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:

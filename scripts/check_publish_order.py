@@ -24,12 +24,21 @@ RELEASE_GATES = (
     "check-publish-order",
     "npm-preflight",
 )
+# The draft GitHub release and the SBOM attestation ship the built archives.
+# The builds run beside the acceptance tiers, not after them, so these two
+# jobs have to wait for both tiers themselves.
+ACCEPTANCE = ("setup-acceptance", "mcp-import-acceptance")
+REQUIRED_GATES = {
+    **{job: RELEASE_GATES for job in PUBLISH_JOBS},
+    "github-release": ACCEPTANCE,
+    "sbom-attest": ACCEPTANCE,
+}
 
 
 def gate_errors(jobs):
     """Errors for publish jobs that can start before a release gate has passed."""
     errors = []
-    for job in PUBLISH_JOBS:
+    for job, gates in REQUIRED_GATES.items():
         if job not in jobs:
             errors.append(f"publish job '{job}' is missing from release.yml")
             continue
@@ -40,7 +49,7 @@ def gate_errors(jobs):
                 if need not in seen:
                     seen.add(need)
                     todo.append(need)
-        for gate in RELEASE_GATES:
+        for gate in gates:
             if gate not in seen:
                 errors.append(f"'{job}' can publish before gate '{gate}' passes")
     return errors
