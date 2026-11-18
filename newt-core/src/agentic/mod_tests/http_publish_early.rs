@@ -4,6 +4,9 @@ use super::*;
 use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
 
 #[tokio::test]
+// This test turns the self-verify gate off: keep it apart from the tests that
+// need the gate on.
+#[serial_test::serial(newt_self_verify_env)]
 async fn publish_early_reaches_provider_after_check_and_commit() {
     let _settings = default_loop_settings();
     let _lock = env_lock().await;

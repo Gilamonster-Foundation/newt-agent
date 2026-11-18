@@ -6,8 +6,10 @@
 //! and the host renders it, so these tests pin the request counts and the text
 //! that comes back rather than a display stream.
 //!
-//! These tests touch no process-global state (no env, no filesystem), so
-//! unlike `anthropic_loop.rs` they need neither a serial lane nor an env guard.
+//! Most of these tests touch no process-global state (no env, no filesystem),
+//! so unlike `anthropic_loop.rs` they need neither a serial lane nor an env
+//! guard. The ones that drive retries zero the `NEWT_HTTP_*` backoff and run
+//! on the `anthropic_loop_env` lane.
 
 use super::*;
 use crate::caveats::Caveats;
@@ -261,7 +263,11 @@ fn reissue_usage() -> Option<crate::TokenUsage> {
 /// fails the attempt with that usage even when `[DONE]` follows, and a context
 /// rejection is classified `ContextExceeded` while any other error is not.
 #[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
 async fn a_primary_stream_error_event_after_usage_is_failed_with_that_usage() {
+    // The 503 case is retried six times on a local endpoint: zero the backoff
+    // so the retries run without waiting about a minute.
+    let _env = super::anthropic_loop_tests::test_env(false);
     for (error_frame, context_exceeded) in [
         (
             r#"{"error":{"message":"Context size has been exceeded."}}"#,
