@@ -457,6 +457,16 @@ uninlined_format_args         = "warn"
 useless_conversion            = "warn"
 use_self                      = "warn"
 
+# Most debug info (types, variables, functions) is written to .dwo files
+# beside the objects, once per crate, and is no longer copied into every
+# executable. An executable keeps its line tables, so a backtrace still has
+# file and line. It names the .dwo files by absolute path, so a debugger
+# finds them while target/ stays where it was built. Cargo applies the
+# setting on Linux and macOS and leaves it out on Windows, where the mode is
+# not supported.
+[profile.dev]
+split-debuginfo = "unpacked"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

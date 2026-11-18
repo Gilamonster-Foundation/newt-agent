@@ -16,6 +16,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   then once in the transcript, no longer on the tool-call line too. Its rows follow the
   theme. A question longer than the box shows a line range, a scrollbar and, in its legend,
   the keys that scroll. A headless run with no operator no longer prints the question text.
+- A debug build writes most of its debug info to `.dwo` files beside the objects, once per
+  crate, and no longer copies it into every executable (`split-debuginfo = "unpacked"` in
+  `[profile.dev]`). On a 16-core Linux machine a cold build of every test target went from
+  499 s to about 200 s, and `target/` from 62 GB to 22 GB. A backtrace keeps file and line. A
+  debugger finds the `.dwo` files while `target/` stays where it was built. Windows builds
+  produce the same output as before.
 
 ### Fixed
 
