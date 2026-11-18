@@ -52,7 +52,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   against them. Other `gh` verbs, apart from `gh pr create`, still have no network in a
   confined session (#905). The broker reads the token from `gh`'s `hosts.yml`, which must
   be inside a `--read` grant; a keyring-only login is not supported. It does not run on
-  Windows and is not measured on macOS.
+  Windows.
 
 ### Changed
 
