@@ -2,7 +2,9 @@ name: Release
 
 # HOOK PARITY: .githooks/pre-push checks publish coverage/order and that every
 # publish job needs every gate (#2873) on manifest and release-gate changes.
-# Binary/wheel/npm assembly and publication are CI-only.
+# The same check holds every other job to both acceptance tiers unless it
+# lists the job as publishing nothing. Binary/wheel/npm assembly and
+# publication are CI-only.
 
 # Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
 # (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
@@ -73,12 +75,15 @@ jobs:
     permissions:
       contents: read
 
-  # MCP import and runtime recovery are stacked on setup acceptance because the
-  # shared crash-safe lock/replacement contract is their prerequisite. Every
-  # release build root below depends on this job, so no publication path can
-  # bypass either acceptance tier.
+  # MCP import and runtime recovery rest on the crash-safe lock/replacement
+  # contract that setup acceptance proves. The two tiers and the builds below
+  # all start at once: a release waits for the slowest of them, not their sum.
+  # No publication path can bypass either tier: scripts/check_publish_order.py
+  # holds every job in this file to both through `needs:`, except the gates,
+  # the builds and `sbom`, which only leave run artifacts. A red tier costs
+  # the build minutes spent beside it and leaves those unaccepted artifacts
+  # on the run. Never upload them by hand.
   mcp-import-acceptance:
-    needs: [setup-acceptance]
     uses: ./.github/workflows/mcp-import-real.yml
     permissions:
       contents: read
@@ -91,7 +96,6 @@ jobs:
     # the npm version check rejects only sets npm_release=false (it does not
     # fail): the npm jobs are skipped, while crates.io and PyPI, which also
     # need npm-preflight (#2873), still publish.
-    needs: [mcp-import-acceptance]
     strategy:
       fail-fast: false
       matrix:
@@ -193,7 +197,7 @@ jobs:
   linux-packages:
     name: Linux packages (deb + rpm)
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries]
+    needs: [build-binaries, setup-acceptance, mcp-import-acceptance]
     # An installer failure must NOT sink the release: it is reported red but the
     # `needs` gate on github-release still passes, so the binaries + the
     # installers that DID build still ship.
@@ -242,7 +246,7 @@ jobs:
   homebrew-formula:
     name: Homebrew formula
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries]
+    needs: [build-binaries, setup-acceptance, mcp-import-acceptance]
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -277,7 +281,7 @@ jobs:
   chocolatey-package:
     name: Chocolatey package
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries]
+    needs: [build-binaries, setup-acceptance, mcp-import-acceptance]
     continue-on-error: true
     runs-on: windows-latest
     steps:
@@ -358,7 +362,8 @@ jobs:
   # signing or storage failure here cannot hold the release or lose the SBOM.
   sbom-attest:
     name: Attest SBOM to release archives
-    needs: [sbom, build-binaries]
+    # An attestation is public and permanent, so it waits for both tiers.
+    needs: [sbom, build-binaries, setup-acceptance, mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v')
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -391,7 +396,7 @@ jobs:
   github-release:
     name: GitHub release (${{ github.ref_name }})
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package, sbom]
+    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package, sbom, setup-acceptance, mcp-import-acceptance]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -576,7 +581,6 @@ jobs:
 
   build-wheels:
     name: Build wheel (${{ matrix.os }})
-    needs: [mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
@@ -613,7 +617,6 @@ jobs:
 
   build-sdist:
     name: Build sdist
-    needs: [mcp-import-acceptance]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -696,7 +699,8 @@ jobs:
   # Auth: npm OIDC trusted publishing. Each of the nine shipped packages must
   # authorize this repository's release.yml for direct publishing (see npm/).
   # GitHub-hosted runners, Node >= 22.14 and npm >= 11.5.1 are required.
-  # Reuse build-binaries, preserving its setup and MCP acceptance prerequisites.
+  # Reuse build-binaries' archives. The acceptance tiers are in this job's own
+  # `needs:`.
 
   build-npm:
     name: npm binary (${{ matrix.key }})

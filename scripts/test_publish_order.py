@@ -328,10 +328,13 @@ class PublishGates(unittest.TestCase):
     """#2873: v0.8.0 uploaded crates and npm packages before a gate went red."""
 
     def jobs(self):
+        # As in release.yml: the gates run side by side, and nothing that
+        # ships reaches an acceptance tier through a build job.
         jobs = {gate: {} for gate in RELEASE_GATES}
-        jobs["mcp-import-acceptance"] = {"needs": ["setup-acceptance"]}
-        jobs["build-binaries"] = {"needs": "mcp-import-acceptance"}
         jobs.update({job: {"needs": list(RELEASE_GATES)} for job in PUBLISH_JOBS})
+        acceptance = ["setup-acceptance", "mcp-import-acceptance"]
+        jobs["github-release"] = {"needs": ["build-binaries", *acceptance]}
+        jobs["sbom-attest"] = {"needs": ["build-binaries", *acceptance]}
         return jobs
 
     def test_every_publish_job_waiting_on_every_gate_passes(self):
@@ -339,7 +342,7 @@ class PublishGates(unittest.TestCase):
 
     def test_transitive_need_counts(self):
         jobs = self.jobs()
-        jobs["publish-npm-meta"] = {"needs": ["build-npm"]}
+        jobs["publish-npm-meta"] = {"needs": "build-npm"}
         self.assertEqual(gate_errors(jobs), [])
 
     def test_publish_racing_a_preflight_fails(self):
@@ -347,7 +350,41 @@ class PublishGates(unittest.TestCase):
         jobs["publish-crates"]["needs"] = ["build-binaries", "check-publish-order"]
         errors = gate_errors(jobs)
         self.assertIn("'publish-crates' can publish before gate 'npm-preflight' passes", errors)
-        self.assertNotIn("'publish-crates' can publish before gate 'setup-acceptance' passes", errors)
+        # A build job no longer brings the acceptance tiers with it.
+        self.assertIn("'publish-crates' can publish before gate 'setup-acceptance' passes", errors)
+
+    def test_the_draft_release_and_the_attestation_wait_for_both_acceptance_tiers(self):
+        """Builds no longer wait for acceptance, so a job that ships the built
+        archives has to name both tiers itself."""
+        for job in ("github-release", "sbom-attest"):
+            jobs = self.jobs()
+            jobs[job]["needs"] = ["build-binaries", "setup-acceptance"]
+            self.assertEqual(
+                gate_errors(jobs),
+                [f"'{job}' can publish before gate 'mcp-import-acceptance' passes"],
+            )
+
+    def test_a_job_the_checker_does_not_know_waits_for_both_tiers(self):
+        """The built archives exist before acceptance passes, so a new job
+        that ships them is gated unless it is listed as publishing nothing."""
+        jobs = self.jobs()
+        jobs["push-to-a-tap"] = {"needs": ["build-binaries"]}
+        self.assertEqual(
+            gate_errors(jobs),
+            [
+                "'push-to-a-tap' can publish before gate 'setup-acceptance' passes",
+                "'push-to-a-tap' can publish before gate 'mcp-import-acceptance' passes",
+            ],
+        )
+
+    def test_a_gated_job_cannot_run_after_a_failed_gate(self):
+        """`needs:` holds a job back only while its `if:` lets a failure skip it."""
+        jobs = self.jobs()
+        jobs["github-release"]["if"] = "always() && startsWith(github.ref, 'refs/tags/')"
+        self.assertEqual(
+            gate_errors(jobs),
+            ["'github-release' can run after a failed gate: its `if:` uses always()"],
+        )
 
     def test_missing_publish_job_fails(self):
         jobs = self.jobs()

@@ -460,7 +460,7 @@ on:
   schedule: [{ cron: "30 6 * * 0" }]   # 04:00/05:00/05:30/06:00 Sun are taken
 ```
 
-Chained into the release gate exactly the way `setup-acceptance` is (`release.yml:41-58`): a `uses:` of the reusable workflow, with `build-binaries` gaining `needs: [tui-uat]`, so no publication path can bypass it.
+Chained into the release gate exactly the way `setup-acceptance` is (`release.yml:41-58`): a `uses:` of the reusable workflow, named in `ACCEPTANCE` in `scripts/check_publish_order.py` and in the `needs:` of every job that ships, so no publication path can bypass it.
 
 Scenarios appended to `tui-uat.sh` via its existing `expect <name> <deadline> <ERE>` helper: Esc mid-turn from vi NORMAL (interrupts); Esc mid-turn from vi INSERT (mode change only, no interrupt); Ctrl-C mid-turn with the palette open (interrupts); submit a line and assert the mode indicator still reads NORMAL (#2006).
 
@@ -492,7 +492,7 @@ One issue per PR. Crate PRs are `C*` in the new repo; newt PRs are `N*`. #2006 s
 | **N4** | mode-hint truthing | `rich_input.rs:395-398` `mode_hint` driven by `Ladder::describe`. Today it returns `&'static str` advertising `^C interrupt` in vi INSERT, vi NORMAL, emacs and nano — including at an idle prompt where Ctrl-C only clears the line (`:280-296`). | A test asserting the advertised affordance equals `describe()` for the same `Situation`; it fails on today's constant strings | — |
 | **N5** | #2010 | Consumer-side only. `hard` has exactly one non-test reader — `chat.rs:7706` — consulted *after* `response` already returned, purely to pick `"⊘ stopped"` vs `"⊘ interrupted"`. Nothing aborts, so press 2 is a store nobody reads. Make `hard` abort at the wire checkpoints and swap the spinner label the way `set_interrupt_pending` already does (`spinner.rs:71-86`). | A unit test that press 2 produces an observable state change, not a relabel; red before the fix | UAT `repeated-ctrl-c-escalates` |
 | **N6** | convert the first context | `transcript_pager` (2 loops → 1 registered ladder). **This is what makes the crate's second consumer real** and moves the ratchet down for the first time. | Ratchet: `unregistered` 12→10, `registered` 0→1, sum equality holds | G3(b) armed at 12, first decrement |
-| **N7** | UAT wiring + PTY lane | `input_context_ratchet.rs` at the verified baseline; `tui-uat.yml` (`workflow_call` + `cron "30 6 * * 0"` + `HOOK PARITY EXCEPTION`); `build-binaries needs:`; three PTY modules added to `newt-tui-pty.yml`'s tests **and** `paths:`; the `just shell-check` correction at `ci.yml:3-5`; audit existing UAT drives for accidental mid-turn Esc. | Ratchet fails when a 13th unregistered loop is added, and when the scan finds fewer than 12 total; one green manual `workflow_dispatch` **before** merge | ratchet armed; UAT wired |
+| **N7** | UAT wiring + PTY lane | `input_context_ratchet.rs` at the verified baseline; `tui-uat.yml` (`workflow_call` + `cron "30 6 * * 0"` + `HOOK PARITY EXCEPTION`); `ACCEPTANCE` and the shipping jobs' `needs:`; three PTY modules added to `newt-tui-pty.yml`'s tests **and** `paths:`; the `just shell-check` correction at `ci.yml:3-5`; audit existing UAT drives for accidental mid-turn Esc. | Ratchet fails when a 13th unregistered loop is added, and when the scan finds fewer than 12 total; one green manual `workflow_dispatch` **before** merge | ratchet armed; UAT wired |
 | **C4** | npm/wasm — deferred, not gating | `wasm` feature, `wasm-pack build`, one package | node smoke test resolving the same vectors | — |
 
 ---

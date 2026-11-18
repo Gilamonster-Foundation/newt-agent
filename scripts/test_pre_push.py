@@ -205,6 +205,7 @@ class PrePushTests(unittest.TestCase):
             "jobs:\n"
             + "".join(f"  {gate}: {{}}\n" for gate in gates[1:-1].split(", "))
             + "".join(f"  {job}:\n    needs: {gates}\n" for job in ("build-npm", "publish-npm-meta", "publish-pypi"))
+            + "".join(f"  {job}:\n    needs: [setup-acceptance, mcp-import-acceptance]\n" for job in ("github-release", "sbom-attest"))
             + f"  publish-crates:\n    needs: {gates}\n    strategy:\n      matrix:\n        crate: [crate-a, crate-b]\n"
         )
         local = self.commit(".github/workflows/release.yml", workflow)

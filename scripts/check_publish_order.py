@@ -24,15 +24,31 @@ RELEASE_GATES = (
     "check-publish-order",
     "npm-preflight",
 )
+# The builds run beside the acceptance tiers, not after them, so the built
+# archives exist before acceptance passes. Every job in release.yml therefore
+# waits for both tiers itself, unless it is listed here as publishing nothing:
+# the gates, and `sbom`, which only leaves a run artifact. A new job that
+# ships something is gated without anyone remembering to list it.
+ACCEPTANCE = ("setup-acceptance", "mcp-import-acceptance")
+UNGATED = frozenset(RELEASE_GATES) | {"sbom"}
+# `needs:` holds a job back only while its `if:` lets a failed gate skip it.
+RUNS_AFTER_FAILURE = re.compile(r"\b(always|cancelled|failure)\s*\(")
 
 
 def gate_errors(jobs):
-    """Errors for publish jobs that can start before a release gate has passed."""
-    errors = []
-    for job in PUBLISH_JOBS:
-        if job not in jobs:
-            errors.append(f"publish job '{job}' is missing from release.yml")
+    """Errors for jobs that can ship before a release gate has passed."""
+    errors = [
+        f"publish job '{job}' is missing from release.yml"
+        for job in PUBLISH_JOBS
+        if job not in jobs
+    ]
+    for job, spec in jobs.items():
+        if job in PUBLISH_JOBS:
+            gates = RELEASE_GATES
+        elif job in UNGATED:
             continue
+        else:
+            gates = ACCEPTANCE
         seen, todo = set(), [job]
         while todo:
             needs = jobs.get(todo.pop(), {}).get("needs", [])
@@ -40,9 +56,13 @@ def gate_errors(jobs):
                 if need not in seen:
                     seen.add(need)
                     todo.append(need)
-        for gate in RELEASE_GATES:
+        for gate in gates:
             if gate not in seen:
                 errors.append(f"'{job}' can publish before gate '{gate}' passes")
+        if status := RUNS_AFTER_FAILURE.search(str(spec.get("if", ""))):
+            errors.append(
+                f"'{job}' can run after a failed gate: its `if:` uses {status.group(1)}()"
+            )
     return errors
 
 
