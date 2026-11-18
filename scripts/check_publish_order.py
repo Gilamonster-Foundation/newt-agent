@@ -15,9 +15,9 @@ import yaml
 # uploading. An upload cannot be taken back, so every publish job must reach
 # every gate through `needs:` (#2873: v0.8.0 half-published twice).
 PUBLISH_JOBS = ("publish-crates", "build-npm", "publish-npm-meta", "publish-pypi")
+ACCEPTANCE = ("setup-acceptance", "mcp-import-acceptance")
 RELEASE_GATES = (
-    "setup-acceptance",
-    "mcp-import-acceptance",
+    *ACCEPTANCE,
     "build-binaries",
     "build-wheels",
     "build-sdist",
@@ -29,10 +29,11 @@ RELEASE_GATES = (
 # waits for both tiers itself, unless it is listed here as publishing nothing:
 # the gates, and `sbom`, which only leaves a run artifact. A new job that
 # ships something is gated without anyone remembering to list it.
-ACCEPTANCE = ("setup-acceptance", "mcp-import-acceptance")
 UNGATED = frozenset(RELEASE_GATES) | {"sbom"}
-# `needs:` holds a job back only while its `if:` lets a failed gate skip it.
-RUNS_AFTER_FAILURE = re.compile(r"\b(always|cancelled|failure)\s*\(")
+# `needs:` holds a job back only while GitHub's own "every need succeeded"
+# check applies. Any status function in `if:` replaces that check, and
+# `continue-on-error` on a gate makes its failure count as success.
+STATUS_FUNCTION = re.compile(r"\b(always|cancelled|failure|success)\s*\(", re.IGNORECASE)
 
 
 def gate_errors(jobs):
@@ -41,6 +42,11 @@ def gate_errors(jobs):
         f"publish job '{job}' is missing from release.yml"
         for job in PUBLISH_JOBS
         if job not in jobs
+    ]
+    errors += [
+        f"gate '{gate}' holds nothing back: it sets continue-on-error"
+        for gate in RELEASE_GATES
+        if jobs.get(gate, {}).get("continue-on-error")
     ]
     for job, spec in jobs.items():
         if job in PUBLISH_JOBS:
@@ -59,10 +65,31 @@ def gate_errors(jobs):
         for gate in gates:
             if gate not in seen:
                 errors.append(f"'{job}' can publish before gate '{gate}' passes")
-        if status := RUNS_AFTER_FAILURE.search(str(spec.get("if", ""))):
+        if status := STATUS_FUNCTION.search(str(spec.get("if", ""))):
             errors.append(
                 f"'{job}' can run after a failed gate: its `if:` uses {status.group(1)}()"
             )
+    return errors
+
+
+def token_errors(workflow):
+    """Errors for a repository write token on a job that the tiers do not gate.
+
+    The exemption in `UNGATED` is by job name and the check cannot read steps,
+    so an exempt job must not be able to write to the repository at all.
+    """
+
+    def writes(permissions):
+        return permissions is None or "write" in str(permissions)
+
+    errors = []
+    if writes(workflow.get("permissions")):
+        errors.append(
+            "release.yml gives every job a write token: grant write to gated jobs only"
+        )
+    for job, spec in workflow["jobs"].items():
+        if job in UNGATED and "permissions" in spec and writes(spec["permissions"]):
+            errors.append(f"'{job}' holds a write token before the acceptance tiers pass")
     return errors
 
 
@@ -366,6 +393,7 @@ def main():
     workflow = yaml.safe_load(Path(".github/workflows/release.yml").read_text())
     matrix = workflow["jobs"]["publish-crates"]["strategy"]["matrix"]["crate"]
     errors = check(metadata["packages"], matrix) + gate_errors(workflow["jobs"])
+    errors += token_errors(workflow)
     errors += registry_gaps(
         git_dependencies(
             metadata["packages"],

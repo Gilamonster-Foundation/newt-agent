@@ -37,8 +37,9 @@
 #
 # Release parity: publish-matrix tests and validation run here on manifest or
 # release-gate changes, including the check that every registry publish job
-# needs every release gate (#2873), and that every other release job needs
-# both acceptance tiers unless the check lists it as publishing nothing.
+# needs every release gate (#2873), that every other release job needs both
+# acceptance tiers unless the check lists it as publishing nothing, and that
+# no such exempt job holds a repository write token.
 # Release binaries, wheels, npm artifacts and registry publication
 # (.github/workflows/release.yml) remain CI-only.
 #

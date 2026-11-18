@@ -14,6 +14,7 @@ from check_publish_order import (
     check,
     crates_io_versions,
     gate_errors,
+    token_errors,
     git_dependencies,
     registry_gaps,
     req_matches,
@@ -385,6 +386,47 @@ class PublishGates(unittest.TestCase):
             gate_errors(jobs),
             ["'github-release' can run after a failed gate: its `if:` uses always()"],
         )
+        # Any status function replaces GitHub's own "every need succeeded"
+        # check, `success()` included, and the names are not case-sensitive.
+        for condition, name in (
+            ("success() || startsWith(github.ref, 'refs/tags/')", "success"),
+            ("Always()", "Always"),
+        ):
+            jobs["github-release"]["if"] = condition
+            self.assertEqual(
+                gate_errors(jobs),
+                [f"'github-release' can run after a failed gate: its `if:` uses {name}()"],
+            )
+
+    def test_a_gate_that_may_fail_holds_nothing_back(self):
+        """`continue-on-error` on a needed job lets its dependants run after it fails."""
+        jobs = self.jobs()
+        jobs["build-binaries"]["continue-on-error"] = True
+        self.assertEqual(
+            gate_errors(jobs),
+            ["gate 'build-binaries' holds nothing back: it sets continue-on-error"],
+        )
+
+    def test_only_a_gated_job_may_hold_a_write_token(self):
+        """The builds start before either tier is green, so a token that can
+        write to the repository must not reach them."""
+        read, write = {"contents": "read"}, {"contents": "write"}
+        workflow = {"permissions": read, "jobs": self.jobs()}
+        workflow["jobs"]["github-release"]["permissions"] = write
+        self.assertEqual(token_errors(workflow), [])
+        self.assertEqual(
+            token_errors({**workflow, "permissions": write}),
+            ["release.yml gives every job a write token: grant write to gated jobs only"],
+        )
+        self.assertEqual(
+            token_errors({"jobs": self.jobs()}),
+            ["release.yml gives every job a write token: grant write to gated jobs only"],
+        )
+        workflow["jobs"]["build-binaries"]["permissions"] = {"contents": "read", "packages": "write"}
+        self.assertEqual(
+            token_errors(workflow),
+            ["'build-binaries' holds a write token before the acceptance tiers pass"],
+        )
 
     def test_missing_publish_job_fails(self):
         jobs = self.jobs()
@@ -398,13 +440,13 @@ class CombinedMain(unittest.TestCase):
     preflight. A merge that keeps either side's `errors =` hunk alone stays
     green in every other test class and silently drops one gate."""
 
-    def run_main(self, jobs, versions):
+    def run_main(self, jobs, versions, permissions="read"):
         metadata = {
             "packages": [
                 package("newt-core", [dependency("newtui", "^0.1.0", source=GIT)])
             ]
         }
-        workflow = {"jobs": jobs}
+        workflow = {"permissions": {"contents": permissions}, "jobs": jobs}
         workflow["jobs"]["publish-crates"]["strategy"] = {
             "matrix": {"crate": ["newt-core"]}
         }
@@ -426,6 +468,11 @@ class CombinedMain(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("'publish-crates' can publish before gate 'npm-preflight' passes", out)
         self.assertIn("crates.io has no release matching it", out)
+
+    def test_main_reports_a_workflow_wide_write_token(self):
+        code, out = self.run_main(PublishGates().jobs(), ["0.1.0"], permissions="write")
+        self.assertEqual(code, 1)
+        self.assertIn("release.yml gives every job a write token", out)
 
     def test_main_passes_when_both_hold(self):
         code, out = self.run_main(PublishGates().jobs(), ["0.1.0"])
