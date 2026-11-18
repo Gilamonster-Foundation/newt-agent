@@ -200,7 +200,11 @@ process, and network authority checks. This preflight is not a command
 allowlist and leaves admitted shell source unchanged.
 This is deliberately bounded to inspectable commands, not an arbitrary
 program-execution boundary: failed inspection defers to the existing confined
-executor. Scripts, runtime-selected executables, aliases,
+executor. The one exception is a branch or stash delete written as bare words
+behind a dispatcher the inspector cannot model, such as
+`git branch --merged | xargs git branch -d`, which is refused with the same
+literal-names retry rather than run without confirmation. Git text quoted
+inside an interpreter string (`sh -c '…'`) still defers. Scripts, runtime-selected executables, aliases,
 repository redirection, concurrent repository changes, and metadata writes
 by other programs exceed this preflight's coverage. The scoped commit adapter
 does not turn it into a universal Git metadata boundary. Do not claim full

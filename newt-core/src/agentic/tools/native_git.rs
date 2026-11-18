@@ -26,10 +26,20 @@ pub(super) fn preflight(
 ) -> Result<(), String> {
     let inspection = match inspect_shell(source) {
         Ok(inspection) => inspection,
-        // Interpreter/dispatcher execution remains the confined executor's
-        // responsibility. Text mentioning Git is not proof of execution.
-        // Descendant/dynamic ref semantics still require a repository broker;
-        // this direct-command safeguard must not pretend to supply one.
+        // Bridle cannot see into xargs, sh -c, env and the like, so a delete
+        // behind one would run without the confirmation below. Refuse it.
+        Err(_) if hides_git_delete(source) => {
+            return Err(format!(
+                "refused: this command uses a program newt cannot see into (xargs, \
+                 env, nice), so newt cannot show the operator what its git delete \
+                 removes. {NAME_IT_LITERALLY}"
+            ))
+        }
+        // Other interpreter/dispatcher execution remains the confined
+        // executor's responsibility. Text mentioning Git is not proof of
+        // execution. Descendant/dynamic ref semantics still require a
+        // repository broker; this direct-command safeguard must not pretend to
+        // supply one.
         Err(_) => return Ok(()),
     };
     let caps = GitCaveats::from_session(caveats);
@@ -63,6 +73,35 @@ pub(super) fn preflight(
     } else {
         Err(format!("refused: the operator declined git {ops}"))
     }
+}
+
+/// Whether `source`, which Bridle could not inspect, runs a branch or stash
+/// delete as a bare word, as `xargs git branch -d` does. Without this,
+/// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
+/// tripwire, not a boundary: like the commit check in `catalog.rs`, words keep
+/// their quotes, so git text inside an interpreter string (`sh -c '…'`) stays
+/// the confined executor's, as does an obfuscated command.
+fn hides_git_delete(source: &str) -> bool {
+    source
+        .split(['|', ';', '&', '\n', '(', ')', '`', '<', '>'])
+        .map(|segment| {
+            segment
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|words| {
+            words.iter().enumerate().any(|(at, word)| {
+                is_git(word)
+                    && invocation(&words[at..]).is_ok_and(|(verb, args, _)| match verb {
+                        "branch" => has_option(args, "dD", &["--delete"]),
+                        "stash" => args
+                            .first()
+                            .is_some_and(|action| matches!(action.as_str(), "drop" | "clear")),
+                        _ => false,
+                    })
+            })
+        })
 }
 
 /// What to do instead when a delete names what it destroys only at runtime.
@@ -2068,6 +2107,32 @@ mod tests {
         assert_eq!(gate.requests.len(), 1);
     }
 
+    /// Pure: the tripwire reads bare words, so it sees through a dispatcher,
+    /// not a read beside one or quoted interpreter text.
+    #[test]
+    fn a_delete_behind_a_dispatcher_is_seen() {
+        for source in [
+            "git branch --merged | grep -v main | xargs git branch -d",
+            "xargs -n1 git -C repo branch --delete",
+            "git branch -D \\\n  victim | nohup cat",
+            "env GIT_TRACE=0 /usr/bin/git stash drop",
+            "nice git branch -vD victim",
+        ] {
+            assert!(hides_git_delete(source), "{source}");
+        }
+        for source in [
+            "git branch | xargs echo",
+            "xargs git branch --list",
+            "sh -c 'git stash list'",
+            "sh -c 'git branch -D victim'",
+            "python -c 'print(\"git branch -D example\")'",
+            "env git log --oneline -d",
+            "echo branch -D",
+        ] {
+            assert!(!hides_git_delete(source), "{source}");
+        }
+    }
+
     /// #3117: operands newt cannot show stay refused, and the refusal names
     /// the retry that works instead of calling deletion unsupported.
     #[tokio::test]
@@ -2080,6 +2145,8 @@ mod tests {
             "for b in victim; do git branch -D \"$b\"; done",
             "echo \"$(git branch -D victim)\"",
             "timeout 30 git branch -D victim",
+            "git branch --merged | xargs git branch -d",
+            "env GIT_TRACE=0 git stash clear",
             "find . -maxdepth 0 -exec git branch -D victim \\;",
         ] {
             let mut gate = Gate {
