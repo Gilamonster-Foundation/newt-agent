@@ -31,11 +31,23 @@ name: CI
 # This is the swarm training ground: every PR must clear the same
 # bar a human reviewer would set.
 
+# One run per push to a feature branch. The branch gets its run from its
+# pull request; a push trigger on feature branches started a second run of
+# the same jobs. A branch with no pull request:
+# `gh workflow run ci.yml --ref <branch>`.
 on:
   push:
-    branches: ["main", "feat/**", "fix/**", "step-*", "release/**"]
+    branches: ["main", "release/**"]
   pull_request:
     branches: ["main", "release/**"]
+  workflow_dispatch: {}
+
+# A new push to a pull request cancels the run for the push before it. A run
+# on main, on release/** or by hand is alone in its group, so it is never
+# cancelled and never waits.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
 
 env:
   RUST_BACKTRACE: 1

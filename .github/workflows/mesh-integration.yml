@@ -42,7 +42,7 @@ name: Mesh integration
 
 on:
   push:
-    branches: ["main", "feat/**", "fix/**", "step-*", "release/**"]
+    branches: ["main", "release/**"]
     paths:
       - "newt-mesh/**"
       - "newt-core/**"

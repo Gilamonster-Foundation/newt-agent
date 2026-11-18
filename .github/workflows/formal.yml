@@ -17,6 +17,10 @@ name: formal (Lean proofs)
 
 on:
   push:
+    branches: [main, "release/**"]
+    # GitHub does not apply a path filter to a tag push: every v* tag runs
+    # this, as every tag did before the branch filter was added.
+    tags: ["v*"]
     paths: ['formal/**', '.github/workflows/formal.yml']
   pull_request:
     paths: ['formal/**', '.github/workflows/formal.yml']

@@ -9,6 +9,10 @@ name: behavior-formal (constitution)
 
 on:
   push:
+    branches: [main, "release/**"]
+    # GitHub does not apply a path filter to a tag push: every v* tag runs
+    # this, as every tag did before the branch filter was added.
+    tags: ["v*"]
     paths: ['spec/**', 'formal/**', '.github/workflows/behavior-formal.yml']
   pull_request:
     paths: ['spec/**', 'formal/**', '.github/workflows/behavior-formal.yml']
