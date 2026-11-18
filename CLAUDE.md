@@ -286,8 +286,10 @@ green before opening any PR.
 ## Branch + PR policy
 
 - **Never push to `main`.** Open a PR from `step-NN.M-…` or
-  `feat/…` / `fix/…`. CI runs on PRs to main and pushes to those
-  branches.
+  `feat/…` / `fix/…`. CI runs on a PR to `main` or `release/**`, and on a
+  push to `main` or `release/**`. A push to a branch with an open PR runs
+  CI once, through the PR. A push to a branch with no PR starts no run;
+  start one with `gh workflow run ci.yml --ref <branch>`.
 - **The pre-push hook is a fast pre-flight on the CHANGED scope (#1098,
   CRAFT-14 v3.0).** `scripts/changed-scope.sh` classifies the pushed ref
   range into NONE / ALL / a crate list; the hook then runs `cargo fmt

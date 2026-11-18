@@ -17,6 +17,10 @@ on:
   # Also run when the harness itself changes, so a harness edit is validated;
   # feature-code changes rely on the weekly run + an on-demand dispatch.
   push:
+    branches: [main, "release/**"]
+    # GitHub does not apply a path filter to a tag push: every v* tag runs
+    # this, as every tag did before the branch filter was added.
+    tags: ["v*"]
     paths:
       - "newt-web/tests/drive/**"
       - ".github/workflows/newt-web-drive.yml"
