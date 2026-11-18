@@ -342,7 +342,7 @@ class PublishGates(unittest.TestCase):
 
     def test_transitive_need_counts(self):
         jobs = self.jobs()
-        jobs["publish-npm-meta"] = {"needs": ["build-npm"]}
+        jobs["publish-npm-meta"] = {"needs": "build-npm"}
         self.assertEqual(gate_errors(jobs), [])
 
     def test_publish_racing_a_preflight_fails(self):
@@ -363,6 +363,28 @@ class PublishGates(unittest.TestCase):
                 gate_errors(jobs),
                 [f"'{job}' can publish before gate 'mcp-import-acceptance' passes"],
             )
+
+    def test_a_job_the_checker_does_not_know_waits_for_both_tiers(self):
+        """The built archives exist before acceptance passes, so a new job
+        that ships them is gated unless it is listed as publishing nothing."""
+        jobs = self.jobs()
+        jobs["push-to-a-tap"] = {"needs": ["build-binaries"]}
+        self.assertEqual(
+            gate_errors(jobs),
+            [
+                "'push-to-a-tap' can publish before gate 'setup-acceptance' passes",
+                "'push-to-a-tap' can publish before gate 'mcp-import-acceptance' passes",
+            ],
+        )
+
+    def test_a_gated_job_cannot_run_after_a_failed_gate(self):
+        """`needs:` holds a job back only while its `if:` lets a failure skip it."""
+        jobs = self.jobs()
+        jobs["github-release"]["if"] = "always() && startsWith(github.ref, 'refs/tags/')"
+        self.assertEqual(
+            gate_errors(jobs),
+            ["'github-release' can run after a failed gate: its `if:` uses always()"],
+        )
 
     def test_missing_publish_job_fails(self):
         jobs = self.jobs()

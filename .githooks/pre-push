@@ -37,9 +37,10 @@
 #
 # Release parity: publish-matrix tests and validation run here on manifest or
 # release-gate changes, including the check that every registry publish job
-# needs every release gate (#2873), and that the draft GitHub release and the
-# SBOM attestation need both acceptance tiers. Release binaries, wheels, npm
-# artifacts and registry publication (.github/workflows/release.yml) remain CI-only.
+# needs every release gate (#2873), and that every other release job needs
+# both acceptance tiers unless the check lists it as publishing nothing.
+# Release binaries, wheels, npm artifacts and registry publication
+# (.github/workflows/release.yml) remain CI-only.
 #
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
