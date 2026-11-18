@@ -731,8 +731,12 @@ impl Respond for ThrashResponder {
 }
 
 #[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
 async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
     let _settings = crate::agentic::http_loop_tests::default_loop_settings();
+    // The final summary fails here, and a local endpoint retries six times: zero
+    // the backoff so the retries run without waiting about a minute.
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
@@ -1024,8 +1028,12 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
 }
 
 #[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
 async fn cap_exit_fallback_when_final_summary_errors() {
     let _settings = crate::agentic::http_loop_tests::default_loop_settings();
+    // The final summary fails here, and a local endpoint retries six times: zero
+    // the backoff so the retries run without waiting about a minute.
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
     // No mock for the tools-disabled request would still 404 via the
     // tool-offering mock only matching when... actually both match the same
     // path, so instead we mount a server that always 500s the *second*
@@ -1169,8 +1177,12 @@ async fn cap_exit_fallback_when_final_summary_errors() {
 /// When the final summary 500s, the accumulated usage from the tool rounds
 /// must still be returned (not None), so usage.jsonl is not blank.
 #[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
 async fn accumulated_usage_survives_summary_failure() {
     let _settings = crate::agentic::http_loop_tests::default_loop_settings();
+    // The final summary fails here, and a local endpoint retries six times: zero
+    // the backoff so the retries run without waiting about a minute.
+    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
     let server = MockServer::start().await;
     let served = Arc::new(AtomicUsize::new(0));
 

@@ -58,6 +58,9 @@ async fn run_openai_script_in(
     workspace: &str,
     task: &str,
 ) -> (String, usize) {
+    // The loop reads the process-wide initiative settings. Without the guard a
+    // test that installs a short no-progress brake ends this turn early.
+    let _settings = default_loop_settings();
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -138,6 +141,41 @@ async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check
         rounds, 1,
         "with nothing to verify the gate must stay silent — otherwise the assertion above is measuring some other nudge"
     );
+}
+
+/// A sibling brake fixture publishes `stop_after = 2` while it holds the
+/// shared settings guard. The scripted turn must set its own default policy,
+/// not inherit that budget, and must give its caller the budget back. Without
+/// the guard in `run_openai_script_in` the turn below stops after two rounds,
+/// which is how the armed-gate test above failed when its turn started under
+/// that budget.
+#[tokio::test]
+#[serial_test::serial(newt_self_verify_env)]
+async fn a_scripted_turn_isolates_and_restores_a_foreign_no_progress_budget() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::initiative::set_initiative_config(crate::initiative::InitiativeConfig {
+        no_progress: crate::initiative::NoProgressRounds {
+            steer_after: 0,
+            stop_after: 2,
+        },
+        ..Default::default()
+    });
+    let _armed = crate::agentic::anthropic_loop_tests::EnvGuard::set("NEWT_SELF_VERIFY", "1");
+    let script = vec![
+        serde_json::json!({ "content": "Done — the fix is in place." }),
+        serde_json::json!({ "content": "Still done." }),
+        serde_json::json!({ "content": "Confirmed complete." }),
+    ];
+    let (_, rounds) = crate::test_guard::hang_guarded(
+        "the scripted turn",
+        run_openai_script_in(script, ".", "Run `cargo test` to verify."),
+    )
+    .await;
+    assert_eq!(
+        rounds, 3,
+        "the scripted turn ran under a foreign no-progress budget"
+    );
+    assert_eq!(crate::initiative::installed_no_progress().stop_after, 2);
 }
 
 /// #1259: `request_user_input` is a legitimate escalation in an **Explain**
