@@ -1863,24 +1863,26 @@ fn is_git_data_loss_op(op: &str) -> bool {
     matches!(op, "stash-drop" | "branch-delete")
 }
 
-/// Ask the operator to confirm a data-loss git op (#1191). Returns true only on
-/// an explicit Allow; no gate (headless) or a decline means DON'T destroy the
+/// Ask the operator to confirm data-loss git ops (#1191), in one prompt.
+/// Returns true only on an explicit Allow; a decline means DON'T destroy the
 /// work. Distinct reason text so the prompt reads as a destructive-action
-/// confirmation, not a routine authority grant.
-fn git_data_loss_confirmed(gate: &mut dyn PermissionGate, op: &str) -> bool {
-    let request = PermissionRequest {
-        tool: "git".to_string(),
-        kind: DenialKind::GitWrite,
-        target: op.to_string(),
-        reason: format!(
-            "git {op} DESTROYS work irrecoverably (a dropped stash / deleted              branch cannot be recovered) — confirm before proceeding"
-        ),
-        harness_bound: false,
-    };
-    matches!(
-        gate.ask(std::slice::from_ref(&request)),
-        PermissionDecision::Allow(_)
-    )
+/// confirmation, not a routine authority grant. It carries `subject`, the
+/// command or call that does it, so the operator judges what will run (#3117).
+fn git_data_loss_confirmed(gate: &mut dyn PermissionGate, ops: &[&str], subject: &str) -> bool {
+    let requests: Vec<_> = ops
+        .iter()
+        .map(|op| PermissionRequest {
+            tool: "git".to_string(),
+            kind: DenialKind::GitWrite,
+            target: op.to_string(),
+            reason: format!(
+                "git {op} DESTROYS work irrecoverably (a dropped stash or deleted branch \
+                 cannot be recovered). Confirm this command: {subject}"
+            ),
+            harness_bound: false,
+        })
+        .collect();
+    matches!(gate.ask(&requests), PermissionDecision::Allow(_))
 }
 
 fn git_gate_allows(gate: &mut dyn PermissionGate, op: &str) -> bool {
@@ -4574,7 +4576,7 @@ async fn execute_authorized_tool(
                 if is_git_data_loss_op(op) {
                     let confirmed = permission_gate
                         .as_deref_mut()
-                        .is_some_and(|gate| git_data_loss_confirmed(gate, op));
+                        .is_some_and(|gate| git_data_loss_confirmed(gate, &[op], &args.to_string()));
                     if !confirmed {
                         let refusal = format!(
                             "refused: git {op} destroys work irrecoverably and was not \
