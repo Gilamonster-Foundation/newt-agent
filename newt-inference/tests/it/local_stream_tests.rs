@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "support/local_stream.rs"]
+#[path = "../support/local_stream.rs"]
 mod support;
 use support::request_body;
 
