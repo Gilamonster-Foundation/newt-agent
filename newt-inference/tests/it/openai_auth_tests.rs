@@ -4,11 +4,9 @@
 //! Local vLLM/llama.cpp servers are unauthenticated, but hosted
 //! OpenAI-compatible endpoints require `Authorization: Bearer <token>`.
 //! These tests assert the header is sent when (and only when) a key is
-//! configured, and that `from_config` wires the key in from a
-//! `BackendConfig`.
+//! configured. That `from_config` wires the key in from the environment is
+//! asserted in `openai_auth_env.rs`, which keeps its own process.
 
-use newt_core::router::Tier;
-use newt_core::{BackendConfig, BackendKind};
 use newt_inference::backend::ChatRequest;
 use newt_inference::local::LocalVllmBackend;
 use newt_inference::InferenceBackend;
@@ -103,39 +101,4 @@ async fn list_models_sends_bearer_token_when_api_key_set() {
     let backend = LocalVllmBackend::new(server.uri(), "m").with_api_key("key-123".to_string());
     let models = backend.list_models().await.unwrap();
     assert_eq!(models.len(), 1);
-}
-
-#[tokio::test]
-async fn from_config_wires_bearer_auth_from_env() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(header("authorization", "Bearer env-token-9"))
-        .respond_with(chat_ok())
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let var = "NEWT_TEST_OPENAI_FROM_CONFIG_KEY";
-    std::env::set_var(var, "env-token-9");
-    let cfg = BackendConfig {
-        name: "remote".into(),
-        endpoint: server.uri(),
-        model: Some("m".into()),
-        model_path: None,
-        tiers: vec![Tier::Fast],
-        kind: Some(BackendKind::Openai),
-        api: Default::default(),
-        api_key_file: None,
-        api_key_env: Some(var.into()),
-        ..Default::default()
-    };
-    let backend = LocalVllmBackend::from_config(&cfg);
-    std::env::remove_var(var);
-
-    let reply = backend
-        .complete(ChatRequest::new().user("hi"))
-        .await
-        .unwrap();
-    assert_eq!(reply.content, "hi");
 }

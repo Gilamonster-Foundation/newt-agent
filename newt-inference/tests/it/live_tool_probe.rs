@@ -14,7 +14,7 @@
 //!   NEWT_LIVE_MODEL=<model-id>  — model to probe (default: reads ~/.newt/config)
 //!
 //! Run with:
-//!   NEWT_LIVE_TEST=1 cargo test -p newt-inference --test live_tool_probe -- --nocapture
+//!   NEWT_LIVE_TEST=1 cargo test -p newt-inference --test it live_tool_probe -- --nocapture
 
 #[tokio::test]
 async fn probe_tool_call_wire_format() {

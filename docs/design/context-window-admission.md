@@ -164,7 +164,7 @@ settings, connection pool, and any stricter deadline. Retry backoff can make the
 whole turn longer than one attempt's bounds.
 
 Cancellation and timeout drop the in-flight request. The
-[socket regressions](../../newt-inference/tests/local_stream_tests.rs) check that
+[socket regressions](../../newt-inference/tests/it/local_stream_tests.rs) check that
 dropping the future closes an unfinished HTTP/1 connection. A server-side
 generation-slot fixture holds its slot until a streamed write observes that
 close; the `stream: false` control retains the slot until generation is explicitly
