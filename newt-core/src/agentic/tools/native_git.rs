@@ -1242,34 +1242,22 @@ fn deleted_branches(words: &[String]) -> Result<Vec<&str>, String> {
 }
 
 fn refuse_protected_branch(cwd: &Path, branch: &str, caveats: &Caveats) -> Result<(), String> {
+    let refused = || format!("refused: cannot delete protected default branch '{branch}'");
     if matches!(branch, "main" | "master") {
-        return Err(format!(
-            "refused: cannot delete protected default branch '{branch}'"
-        ));
+        return Err(refused());
     }
-    // metadata_git checks read authority before constructing or launching any
-    // process. Do not turn a bounded read grant into ambient repository reads.
-    let output = crate::git_hardening::metadata_git(
-        cwd,
-        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
-        &caveats.fs_read,
-    )
-    .and_then(|mut command| command.output())
-    .map_err(|_| {
-        unresolved("cannot establish the protected default branch under current read authority")
-    })?;
-    if output.status.success() {
-        if String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .strip_prefix("refs/remotes/origin/")
-            == Some(branch)
-        {
-            return Err(format!(
-                "refused: cannot delete protected default branch '{branch}'"
-            ));
-        }
-    } else if output.status.code() != Some(1) {
-        return Err(unresolved("cannot establish the repository default branch"));
+    // Read origin/HEAD as one file inside the session's read grant. A `git`
+    // process needs unrestricted reads, which a workspace-scoped session does
+    // not have, so every delete used to be refused here (#3117).
+    let default =
+        crate::git_hardening::remote_default_branch(cwd, &caveats.fs_read).map_err(|error| {
+            format!(
+                "refused: newt cannot read this repository's default branch within the \
+                 session's read grant ({error}), so it cannot check a branch delete here"
+            )
+        })?;
+    if default.as_deref() == Some(branch) {
+        return Err(refused());
     }
     Ok(())
 }
@@ -2047,6 +2035,37 @@ mod tests {
             assert_eq!(gate.requests.len(), 2, "{source}: {out}");
             assert!(!git(repo.path(), &["branch", "--list", "victim"]).contains("victim"));
         }
+    }
+
+    /// #3117, found live: a real session may read only its workspace, and the
+    /// protected-branch lookup spawned git, which needs unrestricted reads. So
+    /// every delete was refused before the operator was asked; the tests above
+    /// pass only because they run with `Caveats::top()`.
+    #[test]
+    fn a_delete_under_a_workspace_read_grant_reaches_the_operator() {
+        let repo = repository();
+        let root = repo.path().canonicalize().unwrap();
+        let mut caveats = Caveats::top();
+        caveats.fs_read = crate::Scope::only([root.to_string_lossy().into_owned()]);
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let err = preflight("git branch -D victim", &root, &caveats, &mut asked, false);
+        assert_eq!(
+            err,
+            Err("refused: the operator declined git branch-delete".into())
+        );
+        assert_eq!(gate.requests.len(), 1);
+        // The remote default, read from origin/HEAD within the grant, stays
+        // refused by name without asking.
+        let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let err = preflight("git branch -D stable", &root, &caveats, &mut asked, false);
+        assert!(err
+            .unwrap_err()
+            .contains("protected default branch 'stable'"));
+        assert_eq!(gate.requests.len(), 1);
     }
 
     /// #3117: operands newt cannot show stay refused, and the refusal names
