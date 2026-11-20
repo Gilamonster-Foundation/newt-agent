@@ -57,7 +57,7 @@
 //!   wasn't offered, but the thing that made `sed` worth dropping is the
 //!   execution hole, not the in-place edit).
 //! - **Interpreters / command-runners** (`awk`, `xargs`, `sh`, …) — per the
-//!   production danger table (`newt-tui::danger::INTERPRETER_EXEC`), granting
+//!   production danger table (`danger::INTERPRETER_EXEC`), granting
 //!   bare execution of one of these is equivalent to an open-ended shell
 //!   grant (`awk`'s `system()`; `xargs`/`sh -c`'s arbitrary child). They are
 //!   NAMED in [`Proposal::deferred`] (via the shared danger gate inside
@@ -115,7 +115,7 @@ const SETUP_PACK_COMMAND: &str = "newt setup: standard caveat pack";
 ///   (GNU/BSD/POSIX).
 ///
 /// High-danger (interpreter / command-runner, per
-/// `newt-tui::danger::INTERPRETER_EXEC`) — included here so the shared
+/// `danger::INTERPRETER_EXEC`) — included here so the shared
 /// danger gate NAMES them in [`Proposal::deferred`] with a reason, instead of
 /// the pack silently never mentioning why they keep prompting: `awk`,
 /// `xargs`, `sh`.
@@ -128,7 +128,7 @@ pub const STANDARD_TEXT_TOOLS: &[&str] = &[
 /// module docs' "What is deliberately excluded"). Matched on the command's
 /// file-name component, normalized the way an executable's spelling varies
 /// across platforms (same convention as
-/// `newt_tui::danger::DangerTable::is_interpreter`, plus the normalization):
+/// `danger::DangerTable::is_interpreter`, plus the normalization):
 /// lowercased, and a trailing `.exe` stripped, so `/usr/bin/git`, `git.exe`,
 /// `GIT.EXE`, and `C:/Program Files/Git/cmd/git.exe` are all caught (#2660
 /// round 3, item 3 — Windows resolves an executable case-insensitively and by
@@ -300,8 +300,7 @@ mod tests {
     use super::*;
 
     /// A danger predicate shaped like the production table
-    /// (`newt-tui::danger::DangerTable`, unreachable from this lower layer)
-    /// without duplicating it: interpreters/command-runners high, everything
+    /// (`danger::DangerTable`) without duplicating it: interpreters/command-runners high, everything
     /// else low. `newt-tui/src/setup/tests.rs` is what proves the REAL table
     /// agrees on these targets.
     fn danger(class: CapabilityClass, target: &str) -> bool {

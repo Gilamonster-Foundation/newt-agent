@@ -82,6 +82,10 @@ pub mod interaction_surface;
 // `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
 // `markup::plain`, which stays unconditional for exactly this reason.
 pub mod ambient_shell;
+/// Danger-tier terminal-echo policy. Was `PermissionChallenge` too, until
+/// #1839 deleted that hand-rolled encoding in favour of the definition's
+/// `ContentId`.
+pub mod danger;
 #[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;
@@ -108,9 +112,6 @@ pub mod ocap_propose;
 pub mod ocap_store;
 pub mod operating_mode;
 mod paths;
-/// Danger-tier terminal-echo policy. Was `PermissionChallenge` too, until
-/// #1839 deleted that hand-rolled encoding in favour of the definition's
-/// `ContentId`.
 pub mod permission_challenge;
 pub mod plan;
 pub mod posture;

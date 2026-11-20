@@ -32,7 +32,7 @@
 //! High tier (dec1-build-grant, #2483 F30) — it is bounded by the calibrated
 //! `build_tool_caveats` fence, not an open-ended interpreter/broad-root grant.
 
-use newt_core::DenialKind;
+use crate::DenialKind;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
