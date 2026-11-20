@@ -6,7 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
+use crate::config::validate_stable_anchor;
+use crate::paths::{normalize_path, resolve_uncreated_path};
 use crate::{Caveats, DenialKind, Scope};
 
 #[derive(Clone, Debug)]
