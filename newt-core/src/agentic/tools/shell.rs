@@ -3418,7 +3418,7 @@ pub(super) fn shell_envelope_output_with_view(
                         store,
                     );
                     let redacted = if selected_view {
-                        crate::agentic::compress::redact_secrets(view)
+                        crate::redact::redact_secrets(view)
                     } else {
                         redacted
                     };

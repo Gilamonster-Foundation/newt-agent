@@ -149,7 +149,7 @@ pub fn read_only_hidden_tool(name: &str) -> bool {
 /// JSON structure intact.
 fn redact_json_strings(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::String(text) => *text = super::compress::redact_secrets(text),
+        serde_json::Value::String(text) => *text = crate::redact::redact_secrets(text),
         serde_json::Value::Array(items) => items.iter_mut().for_each(redact_json_strings),
         serde_json::Value::Object(fields) => fields.values_mut().for_each(redact_json_strings),
         _ => {}

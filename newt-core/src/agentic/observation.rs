@@ -39,7 +39,7 @@
 //! raw `content` is private; a caller cannot construct the message without
 //! redaction happening first. See [`ShellObservation::redacted_content`].
 
-use super::compress::redact_secrets;
+use crate::redact::redact_secrets;
 use crate::MemMessage;
 
 /// The framing prefix stamped onto every rendered observation. It must read to

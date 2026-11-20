@@ -124,7 +124,7 @@ impl ToolInvocation<'_> {
                 let interruption_reason = format!("{error:#}");
                 let disclosed =
                     crate::agentic::redact_model_facing(self.disclosure, result.to_owned());
-                let disclosed = crate::agentic::compress::redact_secrets(&disclosed);
+                let disclosed = crate::redact::redact_secrets(&disclosed);
                 let error = error.context(format!(
                     "tool completion failed for {}; observed return: {disclosed}",
                     self.name
@@ -151,7 +151,7 @@ impl ToolInvocation<'_> {
         anyhow::ensure!(output.returned.is_none(), "tool return already observed");
         let mut text = crate::agentic::redact_model_facing(self.disclosure, result.to_owned());
         if !matches!(output.origin, ReturnOrigin::Retrieval) {
-            text = crate::agentic::compress::redact_secrets(&text);
+            text = crate::redact::redact_secrets(&text);
         }
         // The host has received these bytes. Publish that fact before parsing
         // textual handles or touching any optional retained source.

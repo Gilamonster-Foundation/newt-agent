@@ -118,7 +118,7 @@ impl DenialRecord {
         }
         Some(Self {
             ts_claim: chrono::Utc::now().to_rfc3339(),
-            command: crate::agentic::compress::redact_secrets(command),
+            command: crate::redact::redact_secrets(command),
             cwd: cwd.to_string(),
             stage,
             denials,

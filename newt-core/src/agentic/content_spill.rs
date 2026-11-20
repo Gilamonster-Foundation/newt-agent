@@ -34,7 +34,7 @@
 //! a CID either: it fails [`SpillCid::parse`] and resolves to the SAME labelled
 //! NotFound as any unknown handle, which is the correct answer.
 
-use crate::agentic::compress::redact_secrets;
+use crate::redact::redact_secrets;
 use content_addressable::{canonical, ContentAddressable, ContentError, ContentId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

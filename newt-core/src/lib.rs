@@ -136,6 +136,7 @@ pub mod psyche;
 /// One-time importer for the psyche vocabulary rename (deletable after one release).
 pub mod psyche_import;
 pub mod reasoning;
+mod redact;
 pub mod responses_wire;
 pub mod retry;
 /// #1030 node evaluators: Task/Plan done-ness from objective git state.
