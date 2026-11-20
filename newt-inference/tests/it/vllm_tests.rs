@@ -311,7 +311,14 @@ async fn complete_gives_up_after_max_retries() {
 async fn complete_timeout() {
     let server = MockServer::start().await;
 
-    // Timeout errors are retryable, so expect 4 total attempts.
+    // Timeout errors are retryable, so a request is attempted up to 4 times
+    // (the first try plus `test_retry()`'s 3 retries). Each attempt is
+    // abandoned at its 50 ms deadline, so whether wiremock has recorded a
+    // given attempt before the client's cancel lands is a real-I/O
+    // scheduling race: any count from 0 to 4 is legitimate (#3155). More than
+    // 4 would be a real bug, an unwanted extra retry. The exact count of 4 is
+    // proven without a race by `complete_gives_up_after_max_retries`, whose server
+    // answers at once.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -322,7 +329,7 @@ async fn complete_timeout() {
                 }))
                 .set_delay(Duration::from_secs(5)),
         )
-        .expect(4)
+        .expect(0..=4)
         .mount(&server)
         .await;
 
