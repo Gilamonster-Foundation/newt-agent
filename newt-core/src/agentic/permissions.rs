@@ -543,9 +543,9 @@ fn filesystem_grant_is_covered(scope: &Scope<String>, target: &str) -> bool {
     match target.canonicalize() {
         Ok(resolved) => dunce::simplified(&resolved).as_os_str() == target.as_os_str(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            crate::config::normalize_path(target)
+            crate::paths::normalize_path(target)
                 .is_ok_and(|path| path.as_os_str() == target.as_os_str())
-                && crate::config::resolve_uncreated_path(target)
+                && crate::paths::resolve_uncreated_path(target)
                     .is_ok_and(|path| dunce::simplified(&path).as_os_str() == target.as_os_str())
         }
         Err(_) => false,

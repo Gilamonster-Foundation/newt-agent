@@ -496,31 +496,10 @@ pub(crate) fn validate_stable_anchor(
     Ok(())
 }
 
+use crate::paths::{normalize_path, resolve_uncreated_path};
+
 fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
-}
-
-pub(crate) fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("frame authority paths must have lossless UTF-8 names"))?;
-    Ok(crate::caveats::lexically_normalize(path))
-}
-
-/// Resolve existing ancestors without creating paths named by untrusted grants.
-/// Unlike ResolvedPath's write setup, admission must have no filesystem effects.
-pub(crate) fn resolve_uncreated_path(path: &Path) -> anyhow::Result<PathBuf> {
-    for ancestor in path.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(_) => {
-                let resolved = ancestor.canonicalize()?.join(path.strip_prefix(ancestor)?);
-                return normalize_path(&resolved);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    anyhow::bail!("frame authority path has no existing ancestor")
 }
 
 fn read_cid(file: std::fs::File) -> anyhow::Result<ContentId> {

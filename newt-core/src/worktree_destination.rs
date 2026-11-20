@@ -156,7 +156,7 @@ mod tests {
 
     /// `GrantedRoot::acquire` wants an absolute, canonical root and refuses
     /// every symlink component (fdguard `beneath.rs`); production satisfies
-    /// that through `config::resolve_uncreated_path` before `capture`. macOS
+    /// that through `paths::resolve_uncreated_path` before `capture`. macOS
     /// keeps `$TMPDIR` under the `/var -> private/var` symlink, where the
     /// no-follow walk fails with ENOTDIR, so the fixture resolves it the way
     /// `execute_permissions.rs` already does. The `TempDir` comes back too:
