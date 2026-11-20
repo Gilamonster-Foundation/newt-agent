@@ -1,6 +1,6 @@
 //! Process-level acceptance for the denial repair journal presentation.
 
-mod common;
+use crate::common;
 
 use predicates::prelude::*;
 use std::path::Path;

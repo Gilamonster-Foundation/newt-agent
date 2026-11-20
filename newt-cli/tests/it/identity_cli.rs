@@ -8,7 +8,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
-mod common;
+use crate::common;
 
 /// A fake home plus a workspace below it, keeping both directories alive.
 fn identity_fixture() -> (tempfile::TempDir, tempfile::TempDir) {

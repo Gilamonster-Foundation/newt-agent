@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
-mod common;
+use crate::common;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};

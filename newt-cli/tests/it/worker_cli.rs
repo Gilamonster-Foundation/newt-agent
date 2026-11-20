@@ -21,7 +21,7 @@ use predicates::prelude::*;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-mod common;
+use crate::common;
 
 const INIT_LINE: &str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
 

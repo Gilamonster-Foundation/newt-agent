@@ -1,7 +1,7 @@
 //! #2907 P2 3: the TUI lane takes the card's tuning ceiling from the SAME
 //! per-turn capability decision as every other card layer.
 //!
-//! Source-shape guard, mirroring newt-cli's `tests/capability_wiring.rs`:
+//! Source-shape guard, mirroring newt-cli's `tests/it/capability_wiring.rs`:
 //! the ChatCtx literal lives inside the interactive run loop, which no
 //! in-process unit test can drive (a full behavioral proof of this lane is a
 //! real-PTY concern). The decision seam it reads — `output_ceiling()` — is

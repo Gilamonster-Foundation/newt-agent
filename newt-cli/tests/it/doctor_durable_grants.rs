@@ -1,5 +1,5 @@
 //! Real signed-store and PTY proof for doctor's report-only/confirmed repair boundary.
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::process::Stdio;

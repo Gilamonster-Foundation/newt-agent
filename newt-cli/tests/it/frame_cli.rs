@@ -14,7 +14,7 @@ use agent_frame::{Op, RootEvent, RootKind, Span, Unit};
 use predicates::prelude::*;
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 const SRC: &[u8] = b"the quick brown fox jumps over the lazy dog";
 

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 /// The built command's env deltas: `Some(v)` for a pin, `None` for a scrub.
 fn env_deltas(cmd: &assert_cmd::Command) -> HashMap<OsString, Option<OsString>> {
@@ -213,12 +213,12 @@ fn newt_is_only_constructed_through_the_isolation_helper() {
         ),
         ("identity_cli.rs", include_str!("identity_cli.rs"), 0),
         ("worker_cli.rs", include_str!("worker_cli.rs"), 2),
-        ("stdout_purity.rs", include_str!("stdout_purity.rs"), 0),
+        ("stdout_purity.rs", include_str!("../stdout_purity.rs"), 0),
         ("doctor_cli.rs", include_str!("doctor_cli.rs"), 2),
-        ("mcp_cli.rs", include_str!("mcp_cli.rs"), 0),
+        ("mcp_cli.rs", include_str!("../mcp_cli.rs"), 0),
         (
             "mcp_cli/grant_net.rs",
-            include_str!("mcp_cli/grant_net.rs"),
+            include_str!("../mcp_cli/grant_net.rs"),
             1,
         ),
         ("mcp_probe_cli.rs", include_str!("mcp_probe_cli.rs"), 1),
@@ -233,7 +233,7 @@ fn newt_is_only_constructed_through_the_isolation_helper() {
             0,
         ),
         ("providers_cli.rs", include_str!("providers_cli.rs"), 0),
-        ("setup_cli.rs", include_str!("setup_cli.rs"), 0),
+        ("setup_cli.rs", include_str!("../setup_cli.rs"), 0),
         ("timer_cli.rs", include_str!("timer_cli.rs"), 0),
         ("tunings_cli.rs", include_str!("tunings_cli.rs"), 0),
         ("web_cli.rs", include_str!("web_cli.rs"), 1),

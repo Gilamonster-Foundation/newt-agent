@@ -7,7 +7,7 @@
 //! unix hosts where the imports are used).
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::*;

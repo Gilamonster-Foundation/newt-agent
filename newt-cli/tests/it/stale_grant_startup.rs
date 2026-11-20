@@ -1,5 +1,5 @@
 //! Real startup grounds the permission filter against signed on-disk approvals.
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::Stdio;

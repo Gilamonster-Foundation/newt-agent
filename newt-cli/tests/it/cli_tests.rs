@@ -8,7 +8,7 @@ use std::io::Write;
 // axes. Reaching for the raw `cargo_bin` constructor here does not compile
 // until someone re-adds that import, and re-adding it trips
 // `config_isolation::newt_is_only_constructed_through_the_isolation_helper`.
-mod common;
+use crate::common;
 
 /// Ground-truth build provenance: the real binary must report the package
 /// version and the commit checked out in the real repository. This guards the

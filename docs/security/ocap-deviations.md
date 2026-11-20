@@ -664,7 +664,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `!permits_fs_read`/`!permits_fs_write` when the feature is off, and `top()` when on);
   `resolve_refuses_when_path_unresolved_without_allow_no_key` and (feature-off)
   `worker_allow_no_key_is_inert_in_production_build` (`newt-agent`
-  `tests/worker_cli.rs`, real-subprocess tier — a production `newt worker --allow-no-key` with an
+  `tests/it/worker_cli.rs`, real-subprocess tier — a production `newt worker --allow-no-key` with an
   unresolvable key exits with "refused to start" and never prints "unbounded debug authority").
   Flipping the feature re-enables the `top()` fallback (verified both directions).
 - **Status:** CLOSED (compile-gated) — step-1.3 · owner: — · review-by: if a runtime approval path

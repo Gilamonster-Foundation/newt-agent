@@ -304,7 +304,7 @@ fn import_hermes(flag: Option<PathBuf>, dry_run: bool, force: bool) -> anyhow::R
 }
 
 // ---------------------------------------------------------------------------
-// Tests — pure helpers only (the IO paths are covered by tests/providers_cli.rs)
+// Tests — pure helpers only (the IO paths are covered by tests/it/providers_cli.rs)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
