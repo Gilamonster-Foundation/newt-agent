@@ -44,6 +44,7 @@ mod branch;
 mod ref_namespace;
 pub(crate) use branch::create_worktree_branch;
 
+use crate::caveats::{apply_cli_fs_grants_with, Caveats, OwnGitGrant};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -74,21 +75,6 @@ pub(crate) fn own_git_test_fixture(repo: &Path) {
     );
 }
 
-/// Filesystem grants for the session workspace's **own** git metadata (F32,
-/// #2537): the extra read/write roots that let the model commit and move the
-/// ref of the branch it has checked out, without needing to reach outside the
-/// workspace fence for anything else.
-///
-/// Empty on any failure to resolve, on detached HEAD, and on the default
-/// branch (`main`/`master`/the remote's `HEAD`) — those get read-only access
-/// to the metadata, no write roots, so a caller that MEETs these into the
-/// session `fs_write` scope grants nothing extra.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct OwnGitGrant {
-    pub read: Vec<String>,
-    pub write: Vec<String>,
-}
-
 /// Compute [`OwnGitGrant`] for `workspace`'s checked-out repository.
 ///
 /// Resolves the worktree gitdir and the common (administrative) dir with
@@ -98,7 +84,7 @@ pub struct OwnGitGrant {
 /// per-dispatch caveats widening for a `git …` command
 /// (`newt_core::agentic::tools::shell::dispatch_caveats_for_git_shell`), never
 /// folded into the session `fs_write` scope (`write_file`/`edit_file` on git
-/// metadata stay refused there — see `caveats::apply_cli_fs_grants`). Real
+/// metadata stay refused there — see `git_hardening::apply_cli_fs_grants`). Real
 /// `git add`/`git commit` need `MAKE_REG`/`REFER`/`REMOVE_FILE` rights to
 /// create `index.lock` and rename it over `index`, plus insert objects —
 /// DIRECTORY rights a file-level Landlock rule cannot carry (round 1's
@@ -168,7 +154,7 @@ pub struct OwnGitGrant {
 /// workspace again.
 pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
     // PR #2577 round 4, Blocker 1: this is the SESSION-START call
-    // (`caveats::apply_cli_fs_grants`'s sole production caller runs before any
+    // (`git_hardening::apply_cli_fs_grants`'s sole production caller runs before any
     // model action). Prime the identity cache HERE, from this resolve, so a
     // later per-dispatch re-check (`own_gitdir_shell_write_grant`) has a
     // trustworthy answer to compare against instead of re-trusting whatever a
@@ -199,6 +185,18 @@ pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
         path_to_string(&common_dir.join("objects")),
     ];
     OwnGitGrant { read, write }
+}
+
+/// Apply [`crate::caveats::lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
+/// `NEWT_WRITE_PATHS` (absolute paths that `newt-cli` sets from `--read` /
+/// `--write`, joined with the platform path-list separator). The single entry
+/// point every session path calls.
+///
+/// Uses [`std::env::split_paths`] rather than splitting on a hard-coded `':'`,
+/// so a Windows drive-letter grant (`C:\…`) is not shattered into a bare `"C"`
+/// root that would prefix-match the whole drive.
+pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
+    apply_cli_fs_grants_with(caveats, workspace, own_gitdir_grants);
 }
 
 /// `(common_dir, absolute_git_dir)`.
@@ -3651,3 +3649,74 @@ mod governed_push_process_tests {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "git_hardening/commit_view_tests.rs"]
 mod commit_view_tests;
+
+#[cfg(test)]
+mod session_grants_tests {
+    use super::*;
+    use crate::caveats::permits_path;
+
+    /// PR #2577 round 2, item 2: `apply_cli_fs_grants` must extend `fs_read`
+    /// with the workspace's own git metadata (F32/#2537) but NEVER `fs_write`
+    /// — a write grant there let `write_file` retarget `HEAD` to `main` or
+    /// corrupt the shared `objects/` store with no prompt. Real `git`, real
+    /// tempdirs, `#[cfg(unix)]` per the real-resource testing tier.
+    #[cfg(unix)]
+    #[test]
+    fn own_gitdir_grants_are_read_only_in_session_caveats() {
+        let root = tempfile::tempdir().unwrap();
+        // Git resolves macOS's /var alias; compare the same physical paths.
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("main");
+        std::fs::create_dir(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("seed"), "x").unwrap();
+        git(&main, &["add", "seed"]);
+        git(&main, &["commit", "-q", "-m", "init"]);
+        let wt = root_path.join("wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+
+        std::env::remove_var("NEWT_READ_PATHS");
+        std::env::remove_var("NEWT_WRITE_PATHS");
+        let mut caveats = Caveats::top();
+        apply_cli_fs_grants(&mut caveats, &wt.to_string_lossy());
+
+        let common_dir = main.join(".git");
+        assert!(
+            permits_path(
+                &caveats.fs_read,
+                &common_dir.join("objects").to_string_lossy()
+            ),
+            "the common git dir must be READ-granted"
+        );
+        assert!(
+            !permits_path(
+                &caveats.fs_write,
+                &common_dir.join("objects").to_string_lossy()
+            ),
+            "the common git dir's objects/ must NOT be write-granted"
+        );
+        assert!(
+            !permits_path(
+                &caveats.fs_write,
+                &common_dir.join("worktrees/wt/HEAD").to_string_lossy()
+            ),
+            "the worktree's HEAD must NOT be write-granted — that would let a \
+             model retarget it to main with no prompt"
+        );
+    }
+}

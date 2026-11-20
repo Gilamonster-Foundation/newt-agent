@@ -177,7 +177,7 @@ fn commit_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
 
 /// The same invariant for `amend`, with the attempted retarget explicit: a
 /// model that somehow moved `HEAD` to `refs/heads/main` (the fence no longer
-/// grants writing `HEAD` at all — see `caveats::apply_cli_fs_grants` — but
+/// grants writing `HEAD` at all — see `git_hardening::apply_cli_fs_grants` — but
 /// the engine-level guard is the backstop if it ever did) still cannot amend
 /// there.
 #[test]
@@ -243,7 +243,7 @@ fn commit_onto_a_deleted_and_recreated_default_branch_is_still_refused() {
     git(dir.path(), &["branch", "-D", "main"]); // out of band — task survives
                                                 // Point HEAD at the now-unborn `main`, matching what `write_file HEAD`
                                                 // could do if the fence still granted it (it does not — see
-                                                // `caveats::apply_cli_fs_grants` — this is the engine-level backstop).
+                                                // `git_hardening::apply_cli_fs_grants` — this is the engine-level backstop).
     std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
 
     let t = tool(dir.path());

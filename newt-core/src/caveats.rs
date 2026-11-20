@@ -136,22 +136,35 @@ pub fn lock_fs_to_workspace(
     }
 }
 
+/// Filesystem grants for the session workspace's **own** git metadata (F32,
+/// #2537): the extra read/write roots that let the model commit and move the
+/// ref of the branch it has checked out, without needing to reach outside the
+/// workspace fence for anything else.
+///
+/// Empty on any failure to resolve, on detached HEAD, and on the default
+/// branch (`main`/`master`/the remote's `HEAD`) — those get read-only access
+/// to the metadata, no write roots, so a caller that MEETs these into the
+/// session `fs_write` scope grants nothing extra.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct OwnGitGrant {
+    pub read: Vec<String>,
+    pub write: Vec<String>,
+}
+
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
-/// `NEWT_WRITE_PATHS` (absolute paths that `newt-cli` sets from `--read` /
-/// `--write`, joined with the platform path-list separator). The single entry
-/// point every session path calls.
+/// `NEWT_WRITE_PATHS` and the `--net` hosts, widening `fs_read` by what `discover`
+/// returns for the workspace's own git metadata. The session entry point every
+/// path calls is `git_hardening::apply_cli_fs_grants`, which supplies the
+/// discovery; this function takes it as a parameter so this module does not
+/// depend on how git metadata is resolved.
 ///
 /// Uses [`std::env::split_paths`] rather than splitting on a hard-coded `':'`,
 /// so a Windows drive-letter grant (`C:\…`) is not shattered into a bare `"C"`
 /// root that would prefix-match the whole drive.
-pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
-    apply_cli_grants_with(caveats, workspace, crate::git_hardening::own_gitdir_grants);
-}
-
-fn apply_cli_grants_with(
+pub fn apply_cli_fs_grants_with(
     caveats: &mut Caveats,
     workspace: &str,
-    discover: impl FnOnce(&std::path::Path) -> crate::git_hardening::OwnGitGrant,
+    discover: impl FnOnce(&std::path::Path) -> OwnGitGrant,
 ) {
     let parse = |var: &str| -> Vec<String> {
         std::env::var_os(var)
@@ -492,71 +505,6 @@ mod tests {
         );
     }
 
-    /// PR #2577 round 2, item 2: `apply_cli_fs_grants` must extend `fs_read`
-    /// with the workspace's own git metadata (F32/#2537) but NEVER `fs_write`
-    /// — a write grant there let `write_file` retarget `HEAD` to `main` or
-    /// corrupt the shared `objects/` store with no prompt. Real `git`, real
-    /// tempdirs, `#[cfg(unix)]` per the real-resource testing tier.
-    #[cfg(unix)]
-    #[test]
-    fn own_gitdir_grants_are_read_only_in_session_caveats() {
-        let root = tempfile::tempdir().unwrap();
-        // Git resolves macOS's /var alias; compare the same physical paths.
-        let root_path = root.path().canonicalize().unwrap();
-        let main = root_path.join("main");
-        std::fs::create_dir(&main).unwrap();
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            assert!(std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-                .status()
-                .unwrap()
-                .success());
-        };
-        git(&main, &["init", "-q"]);
-        std::fs::write(main.join("seed"), "x").unwrap();
-        git(&main, &["add", "seed"]);
-        git(&main, &["commit", "-q", "-m", "init"]);
-        let wt = root_path.join("wt");
-        git(
-            &main,
-            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
-        );
-
-        std::env::remove_var("NEWT_READ_PATHS");
-        std::env::remove_var("NEWT_WRITE_PATHS");
-        let mut caveats = Caveats::top();
-        apply_cli_fs_grants(&mut caveats, &wt.to_string_lossy());
-
-        let common_dir = main.join(".git");
-        assert!(
-            permits_path(
-                &caveats.fs_read,
-                &common_dir.join("objects").to_string_lossy()
-            ),
-            "the common git dir must be READ-granted"
-        );
-        assert!(
-            !permits_path(
-                &caveats.fs_write,
-                &common_dir.join("objects").to_string_lossy()
-            ),
-            "the common git dir's objects/ must NOT be write-granted"
-        );
-        assert!(
-            !permits_path(
-                &caveats.fs_write,
-                &common_dir.join("worktrees/wt/HEAD").to_string_lossy()
-            ),
-            "the worktree's HEAD must NOT be write-granted — that would let a \
-             model retarget it to main with no prompt"
-        );
-    }
-
     /// #3089: a `--net <host>` launch grant joins an `Only` net scope, so the
     /// named host no longer prompts while an unnamed one still does.
     #[test]
@@ -600,7 +548,7 @@ mod tests {
             net: Scope::none(),
             ..Caveats::top()
         };
-        apply_cli_grants_with(&mut c, "/ws", |_| Default::default());
+        apply_cli_fs_grants_with(&mut c, "/ws", |_| Default::default());
         crate::process_env::remove_var(NEWT_NET_HOSTS_ENV);
         assert!(c.permits_net("github.com"));
         assert!(c.permits_net("doi.org"));

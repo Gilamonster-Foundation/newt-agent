@@ -1328,7 +1328,7 @@ fn policy_for_launch(
     let reads_deliberately_unbounded =
         matches!(caveats.fs_read, Scope::All) && matches!(caveats.fs_write, Scope::All);
     if !reads_deliberately_unbounded {
-        newt_core::caveats::apply_cli_fs_grants(&mut caveats, workspace);
+        newt_core::git_hardening::apply_cli_fs_grants(&mut caveats, workspace);
     }
     caveats
 }

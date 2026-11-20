@@ -1579,7 +1579,7 @@ async fn run_with(
     // for every path and `run_crew`'s REFUSED branch is dead code. A scoped
     // `fs_write` leash would be a real second boundary, but isn't wired yet.
     //
-    // NOTE: the CWD fs-lock (newt_core::caveats::apply_cli_fs_grants, applied for
+    // NOTE: the CWD fs-lock (newt_core::git_hardening::apply_cli_fs_grants, applied for
     // `newt code`) is NOT applied here yet — `run_crew` enforces `permits_fs_write`
     // by EXACT match on the planner's (relative) edit paths, which an
     // absolute-workspace-root grant can't match, so the lock would deny

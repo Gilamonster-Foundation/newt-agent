@@ -3125,7 +3125,7 @@ fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'
 ///
 /// Deliberately scoped to a SIMPLE `git` invocation, not folded into the
 /// session `fs_write` scope: `write_file`/`edit_file` on git metadata stay
-/// refused (`caveats::apply_cli_fs_grants` never grants this), and a shell
+/// refused (`git_hardening::apply_cli_fs_grants` never grants this), and a shell
 /// `git commit` is refused outright before reaching here
 /// (`run_command_creates_shell_git_commit`), so this widening never needs to
 /// cover a ref move — `refuse_if_default_branch` in `newt-git` is what
