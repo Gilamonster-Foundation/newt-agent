@@ -92,7 +92,7 @@ on:
       # terminal regression below only runs here.
       - "newt-core/src/agentic/tools/shell.rs"
       - "newt-core/src/agentic/tools_tests/host_timeout_tree_tests.rs"
-      - "newt-core/src/agentic/permissions.rs"
+      - "newt-core/src/permissions.rs"
       - "tests/pty/**"
       - ".github/workflows/newt-tui-pty.yml"
   schedule:

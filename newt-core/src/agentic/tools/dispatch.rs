@@ -9,12 +9,12 @@ use crate::agentic::git_tool::GitTool;
 use crate::agentic::mcp::McpTools;
 use crate::agentic::memory_fetch::MemorySource;
 use crate::agentic::note_sink::NoteSink;
-use crate::agentic::permissions::PermissionGate;
 use crate::agentic::prompt_intake::PromptDisposition;
 use crate::agentic::prompt_read::PromptReadContext;
 use crate::agentic::recall::RecallSource;
 use crate::agentic::tools::live_output::ToolSpinner;
 use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
+use crate::permissions::PermissionGate;
 
 #[allow(clippy::too_many_arguments)]
 /// The optional collaborator seams a tool dispatch may carry, bundled into ONE

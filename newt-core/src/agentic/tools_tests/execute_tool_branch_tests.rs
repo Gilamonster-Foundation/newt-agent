@@ -91,7 +91,7 @@ impl super::PermissionGate for MockGate {
             .iter()
             .map(|r| (r.kind, r.target.clone()))
             .collect();
-        super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+        super::PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
     }
     fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
         for r in requests {
@@ -103,7 +103,7 @@ impl super::PermissionGate for MockGate {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+            super::PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
         } else {
             super::PermissionDecision::Deny
         }

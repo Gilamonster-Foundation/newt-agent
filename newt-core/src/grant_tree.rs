@@ -16,8 +16,8 @@
 //! meeting that delta against a ceiling (`recalled_caveats`) is where
 //! attenuation is enforced.
 
-use crate::agentic::{widen_caveats, DenialKind};
 use crate::caveats::Caveats;
+use crate::permissions::{widen_caveats, DenialKind};
 
 /// Where the grant was decided — the web surface can never itself promote to
 /// durable (the web-surface law: only a terminal audit promotes). Carried

@@ -500,7 +500,7 @@ struct PlanApprovalEffects {
 /// queues nothing. No gate outcome other than a submitted answer can widen
 /// what the model may do.
 fn run_plan_approval(
-    gate: Option<&mut dyn newt_core::agentic::PermissionGate>,
+    gate: Option<&mut dyn newt_core::permissions::PermissionGate>,
     entry: newt_core::agentic::PlanEntry,
     plan_state: &PlanModeState,
     plan_draft: &PlanDraftState,
@@ -514,9 +514,8 @@ fn run_plan_approval(
         exit_guidance,
         ledger_plan,
     } = seed;
-    use newt_core::agentic::{
-        plan_verdict, HumanQuestionOutcome, PlanEntry, PlanModeControl as _, PlanVerdict,
-    };
+    use newt_core::agentic::{plan_verdict, PlanEntry, PlanModeControl as _, PlanVerdict};
+    use newt_core::permissions::HumanQuestionOutcome;
     // `/mode plan` is the operator's own standing choice, so leaving it is
     // their explicit act too: the question says so, and approval switches
     // the mode (design row 3).
@@ -10066,7 +10065,7 @@ fn session_body(
                                         );
                                         let effects = run_plan_approval(
                                             permission_gate.as_mut().map(|g| {
-                                                g as &mut dyn newt_core::agentic::PermissionGate
+                                                g as &mut dyn newt_core::permissions::PermissionGate
                                             }),
                                             entry,
                                             plan_state,

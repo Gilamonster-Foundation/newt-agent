@@ -38,7 +38,7 @@
     <button id="next" type="button">Next</button>
     <nav class="dots-nav" id="dots-nav" aria-label="Jump to step"></nav>
   </div>
-  <p class="fine">Example paths and hosts are illustrative. Types come from <code>newt-core/src/caveats.rs</code> and <code>newt-core/src/agentic/permissions.rs</code>. Keys: left/right arrows step, space plays or pauses.</p>
+  <p class="fine">Example paths and hosts are illustrative. Types come from <code>newt-core/src/caveats.rs</code> and <code>newt-core/src/permissions.rs</code>. Keys: left/right arrows step, space plays or pauses.</p>
 </section>
 <h2>Going further</h2>
 <p><a href="brush.html"><strong>The brush shell</strong></a>: how a shell command becomes individually checked spawns, and why.</p>
@@ -46,8 +46,8 @@
 <div class="tw"><table><thead><tr><th>Stage</th><th>What it does</th><th>Where</th><th>Status</th></tr></thead><tbody>
 <tr><td>Ceiling</td><td>Operator picks workspace access once; frozen for the session.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/launch_authority.rs"><code>newt-core/src/launch_authority.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Check</td><td>Each call is tested on fs_read, fs_write, exec and net.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/caveats.rs"><code>newt-core/src/caveats.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Deny and ask</td><td>Typed denial (DenialKind), then the gate asks the operator.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/permissions.rs"><code>newt-core/src/agentic/permissions.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
-<tr><td>Widen once</td><td>widen_caveats adds one target to one axis for one re-run.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/agentic/permissions.rs"><code>newt-core/src/agentic/permissions.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Deny and ask</td><td>Typed denial (DenialKind), then the gate asks the operator.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/permissions.rs"><code>newt-core/src/permissions.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
+<tr><td>Widen once</td><td>widen_caveats adds one target to one axis for one re-run.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/permissions.rs"><code>newt-core/src/permissions.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Durable grants</td><td>Signed approve.toml; four verdict files; unsigned approvals are dropped.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/ocap_store.rs"><code>newt-core/src/ocap_store.rs</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>
 <tr><td>Kernel fence</td><td>Confined child via agent-bridle; refuses if it cannot enforce.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/newt-core/src/confined_exec.rs"><code>newt-core/src/confined_exec.rs</code></a></td><td class="status"><span class="impl">Implemented, open deviations</span></td></tr>
 <tr><td>Delegation</td><td>meet only narrows; Lean proofs cover the lattice, not the whole runtime.</td><td><a href="https://github.com/Gilamonster-Foundation/newt-agent/blob/main/formal/CaveatLattice/"><code>formal/CaveatLattice/</code></a></td><td class="status"><span class="impl">Implemented</span></td></tr>

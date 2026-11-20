@@ -181,16 +181,16 @@ pub fn validate_isolation_runtime() -> anyhow::Result<()> {
 pub(super) struct FramePermissionGate<'a> {
     pub harness: &'a SmartHarness,
     pub workspace: &'a std::path::Path,
-    pub inner: &'a mut dyn super::permissions::PermissionGate,
+    pub inner: &'a mut dyn crate::permissions::PermissionGate,
     pub refusal: Option<String>,
 }
 
 impl FramePermissionGate<'_> {
     fn validate_decision(
         &mut self,
-        decision: super::permissions::PermissionDecision,
-    ) -> super::permissions::PermissionDecision {
-        use super::permissions::PermissionDecision;
+        decision: crate::permissions::PermissionDecision,
+    ) -> crate::permissions::PermissionDecision {
+        use crate::permissions::PermissionDecision;
         match decision {
             PermissionDecision::Allow(caveats) => {
                 match self
@@ -209,33 +209,33 @@ impl FramePermissionGate<'_> {
     }
 }
 
-impl super::permissions::PermissionGate for FramePermissionGate<'_> {
+impl crate::permissions::PermissionGate for FramePermissionGate<'_> {
     fn refresh_caveats(
         &mut self,
         baseline: &crate::caveats::Caveats,
-    ) -> super::permissions::PermissionDecision {
+    ) -> crate::permissions::PermissionDecision {
         let decision = self.inner.refresh_caveats(baseline);
         self.validate_decision(decision)
     }
 
     fn ask(
         &mut self,
-        requests: &[super::permissions::PermissionRequest],
-    ) -> super::permissions::PermissionDecision {
+        requests: &[crate::permissions::PermissionRequest],
+    ) -> crate::permissions::PermissionDecision {
         let decision = self.inner.ask(requests);
         self.validate_decision(decision)
     }
 
-    fn ask_question(&mut self, question: &str) -> super::permissions::HumanQuestionOutcome {
+    fn ask_question(&mut self, question: &str) -> crate::permissions::HumanQuestionOutcome {
         self.inner.ask_question(question)
     }
 
     fn ask_with_caveats(
         &mut self,
         baseline: &crate::caveats::Caveats,
-        requests: &[super::permissions::PermissionRequest],
-    ) -> super::permissions::PermissionDecision {
-        use super::permissions::{widen_caveats, PermissionDecision};
+        requests: &[crate::permissions::PermissionRequest],
+    ) -> crate::permissions::PermissionDecision {
+        use crate::permissions::{widen_caveats, PermissionDecision};
         let grants: Vec<_> = requests
             .iter()
             .map(|request| (request.kind, request.target.clone()))
@@ -255,9 +255,9 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
     fn ask_dependency_fetch(
         &mut self,
         prepared: &crate::caveats::Caveats,
-        request: &super::permissions::PermissionRequest,
-    ) -> super::permissions::PermissionDecision {
-        use super::permissions::PermissionDecision;
+        request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        use crate::permissions::PermissionDecision;
         if matches!(
             self.validate_decision(PermissionDecision::Allow(prepared.clone())),
             PermissionDecision::Deny
@@ -268,11 +268,11 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
         self.validate_decision(decision)
     }
 
-    fn consume_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
+    fn consume_pending_once(&mut self, kind: crate::permissions::DenialKind, target: &str) {
         self.inner.consume_pending_once(kind, target);
     }
 
-    fn queue_pending_once(&mut self, kind: super::permissions::DenialKind, target: &str) {
+    fn queue_pending_once(&mut self, kind: crate::permissions::DenialKind, target: &str) {
         self.inner.queue_pending_once(kind, target);
     }
 
@@ -280,7 +280,7 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
         &mut self,
         command: &str,
         cwd: &str,
-        requests: &[super::permissions::PermissionRequest],
+        requests: &[crate::permissions::PermissionRequest],
     ) {
         self.inner.queue_command_retry(command, cwd, requests);
     }
@@ -290,7 +290,7 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
         cwd: &str,
         baseline: &crate::caveats::Caveats,
     ) -> crate::caveats::Caveats {
-        use super::permissions::PermissionDecision;
+        use crate::permissions::PermissionDecision;
         let widened = self.inner.apply_command_retry(command, cwd, baseline);
         match self.validate_decision(PermissionDecision::Allow(widened)) {
             PermissionDecision::Allow(validated) => validated,
@@ -299,11 +299,11 @@ impl super::permissions::PermissionGate for FramePermissionGate<'_> {
     }
     fn apply_pending_once(
         &mut self,
-        kind: super::permissions::DenialKind,
+        kind: crate::permissions::DenialKind,
         target: &str,
         baseline: &crate::caveats::Caveats,
     ) -> crate::caveats::Caveats {
-        use super::permissions::PermissionDecision;
+        use crate::permissions::PermissionDecision;
         let widened = self.inner.apply_pending_once(kind, target, baseline);
         match self.validate_decision(PermissionDecision::Allow(widened)) {
             PermissionDecision::Allow(validated) => validated,

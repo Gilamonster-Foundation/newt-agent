@@ -14,13 +14,11 @@ mod inputs;
 
 use std::path::Path;
 
-use crate::agentic::permissions::{
-    DenialKind, PermissionDecision, PermissionGate, PermissionRequest,
-};
 use crate::caveats::{Caveats, CaveatsExt as _};
 use crate::confined_exec::{
     dependency_fetch_request, ConstrainedExecutor, ExecRequest, CRATES_IO_FETCH_HOSTS,
 };
+use crate::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 
 /// What cargo prints when the offline lane needs a crate the cache lacks.
 const OFFLINE_FETCH_NEEDED: &str = "but --offline was specified";
@@ -247,7 +245,7 @@ pub(super) fn blocked_note(reason: &str, cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agentic::permissions::HumanQuestionOutcome;
+    use crate::permissions::HumanQuestionOutcome;
     use std::collections::HashMap;
     use std::path::PathBuf;
 

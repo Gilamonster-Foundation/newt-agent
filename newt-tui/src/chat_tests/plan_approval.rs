@@ -315,9 +315,9 @@ fn approval_intake_resumes_as_act_even_when_the_text_opens_collaboratively() {
 // once, with the correct objective, draft, lineage, and authority?
 // ---------------------------------------------------------------------------
 
-use newt_core::agentic::{
+use newt_core::agentic::{PlanDraftSink as _, PlanModeControl as _};
+use newt_core::permissions::{
     HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
-    PlanDraftSink as _, PlanModeControl as _,
 };
 use newt_core::Caveats;
 
@@ -356,7 +356,7 @@ impl PermissionGate for ScriptedGate {
     fn ask_choice(
         &mut self,
         question: &str,
-        options: &[newt_core::agentic::ChoiceSpec],
+        options: &[newt_core::permissions::ChoiceSpec],
     ) -> HumanQuestionOutcome {
         assert_eq!(
             options.iter().map(|o| o.id).collect::<Vec<_>>(),

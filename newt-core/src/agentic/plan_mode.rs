@@ -153,20 +153,20 @@ pub enum PlanVerdict {
 /// is the default for a blank submission (`[Y/n/discuss]`). Cancellation or
 /// unavailable input is not a submission and never approves. `discuss` opens
 /// a free-text follow-up whose text is fed back to the model.
-pub const PLAN_APPROVAL_CHOICES: &[super::permissions::ChoiceSpec] = &[
-    super::permissions::ChoiceSpec {
+pub const PLAN_APPROVAL_CHOICES: &[crate::permissions::ChoiceSpec] = &[
+    crate::permissions::ChoiceSpec {
         id: "yes",
         label: "yes — implement this plan",
         key: "y",
         role: newt_interaction::SemanticRole::Allow,
     },
-    super::permissions::ChoiceSpec {
+    crate::permissions::ChoiceSpec {
         id: "no",
         label: "no — stay in plan mode",
         key: "n",
         role: newt_interaction::SemanticRole::Deny,
     },
-    super::permissions::ChoiceSpec {
+    crate::permissions::ChoiceSpec {
         id: "discuss",
         label: "discuss — tell the model what to change",
         key: "d",
@@ -180,9 +180,9 @@ pub const PLAN_APPROVAL_CHOICES: &[super::permissions::ChoiceSpec] = &[
 #[must_use]
 pub fn plan_verdict(
     _entry: PlanEntry,
-    outcome: super::permissions::HumanQuestionOutcome,
+    outcome: crate::permissions::HumanQuestionOutcome,
 ) -> PlanVerdict {
-    use super::permissions::HumanQuestionOutcome;
+    use crate::permissions::HumanQuestionOutcome;
     let HumanQuestionOutcome::Answer(text) = outcome else {
         // Unavailable, Cancelled, ExitRequested, InputClosed, InputFailed —
         // none of them carry an answer, so none of them can approve.
@@ -210,8 +210,8 @@ pub fn plan_verdict(
 
 #[cfg(test)]
 mod tests {
-    use super::super::permissions::HumanQuestionOutcome;
     use super::*;
+    use crate::permissions::HumanQuestionOutcome;
 
     /// The operator-selected default approves an actually submitted blank;
     /// missing input remains a separate, non-answer outcome.

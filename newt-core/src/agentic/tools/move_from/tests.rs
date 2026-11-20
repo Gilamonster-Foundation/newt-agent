@@ -182,21 +182,15 @@ fn real_move_from_fixture_compiles_and_failed_check_restores() {
     assert!(!child.exists());
     struct ApproveBuild(usize);
     impl PermissionGate for ApproveBuild {
-        fn ask_question(
-            &mut self,
-            _: &str,
-        ) -> super::super::super::permissions::HumanQuestionOutcome {
+        fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
             panic!("scoped fs_write needs only the Build authority prompt");
         }
         fn ask(
             &mut self,
-            requests: &[super::super::super::permissions::PermissionRequest],
+            requests: &[crate::permissions::PermissionRequest],
         ) -> PermissionDecision {
             assert_eq!(requests.len(), 1);
-            assert_eq!(
-                requests[0].kind,
-                super::super::super::permissions::DenialKind::Build
-            );
+            assert_eq!(requests[0].kind, crate::permissions::DenialKind::Build);
             self.0 += 1;
             PermissionDecision::Allow(Caveats::top())
         }
