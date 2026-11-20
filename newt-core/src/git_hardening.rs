@@ -3650,7 +3650,7 @@ mod governed_push_process_tests {
 #[path = "git_hardening/commit_view_tests.rs"]
 mod commit_view_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod session_grants_tests {
     use super::*;
     use crate::caveats::permits_path;
