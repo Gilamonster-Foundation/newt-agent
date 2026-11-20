@@ -12,6 +12,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 ### Changed
 
 - The tier router is its own crate, `newt-router`. `newt_core::router` (with `router::Classification`), `newt_core::Router` and `newt_core::Tier` are gone, with no re-export; import them from `newt_router` (#2234).
+- `newt_core::store::Verdict` is gone; the enum now lives beside `PermissionAction`, and `newt_core::Verdict` is unchanged (#3140).
 - `newt_core::caveats::apply_cli_fs_grants` and `newt_core::git_hardening::OwnGitGrant` are gone, with no re-export. Use `newt_core::git_hardening::apply_cli_fs_grants` and `newt_core::caveats::OwnGitGrant`; `caveats::apply_cli_fs_grants_with` takes the git-metadata discovery as a parameter (#3140).
 - The boxed free-text question (`request_user_input`, for one) says each thing once (#3119).
   Its border names it, one legend lists the keys, and the question appears in the dialog and

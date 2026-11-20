@@ -24,7 +24,6 @@
 //! grant is a human editing `[tui.permissions]`.
 
 use crate::caveats::{Caveats, Scope};
-use crate::store::Verdict;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::Path;
@@ -52,6 +51,21 @@ permission_actions! {
     AllowPermanent => "allow_permanent", Deny => "deny",
     DenyAlways => "deny_always", DenyPermanent => "deny_permanent",
     Back => "back", Exit => "exit",
+}
+
+/// A verdict an attach surface can NAME for a pending permission decision
+/// (A4/W6). It names a CHOICE the running gate then interprets and mints — the
+/// web never carries caveats/authority itself. `AllowSession` is session-scoped
+/// (ephemeral); there is deliberately NO durable "always-allow" verdict — the
+/// web cannot write durable OCAP policy (that is terminal-audit-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Allow this one denied action, this time only.
+    AllowOnce,
+    /// Allow it for the rest of the session (in-memory; NOT persisted).
+    AllowSession,
+    /// Refuse — the model sees the standard structured denial.
+    Deny,
 }
 
 impl From<Verdict> for PermissionAction {
