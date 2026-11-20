@@ -300,8 +300,8 @@ mod tests {
     use super::*;
 
     /// A danger predicate shaped like the production table
-    /// (`danger::DangerTable`) without duplicating it: interpreters/command-runners high, everything
-    /// else low. `newt-tui/src/setup/tests.rs` is what proves the REAL table
+    /// (`danger::DangerTable`) without duplicating it: interpreters and
+    /// command-runners high, everything else low. `newt-tui/src/setup/tests.rs` is what proves the REAL table
     /// agrees on these targets.
     fn danger(class: CapabilityClass, target: &str) -> bool {
         matches!(class, CapabilityClass::Exec) && matches!(target, "awk" | "xargs" | "sh")
