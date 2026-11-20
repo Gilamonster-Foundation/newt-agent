@@ -189,7 +189,12 @@ multi-commit lifecycles have equivalent attribution and publication coverage.
 A transitional native-command preflight preserves branch-delete and
 stash-drop/clear confirmation and rejects recognized protected-ref,
 ref-overwrite, and unresolved destructive forms in successfully inspected
-commands before execution. Ordinary branch creation, switching, queries,
+commands before execution. The confirmation is asked once per command and
+shows the whole command and its working directory, so a `cd`, `-C`, redirect
+or `echo` around a delete is the operator's to judge rather than a refusal
+(#3117). A delete whose branch or stash names exist only at runtime (a
+variable, a substitution, another program's arguments) is refused with the
+retry that names them literally. Ordinary branch creation, switching, queries,
 and unclassified Git verbs retain native execution and its filesystem,
 process, and network authority checks. This preflight is not a command
 allowlist and leaves admitted shell source unchanged.
