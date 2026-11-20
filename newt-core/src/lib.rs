@@ -82,6 +82,7 @@ pub mod interaction_surface;
 // `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
 // `markup::plain`, which stays unconditional for exactly this reason.
 pub mod ambient_shell;
+pub mod danger;
 #[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;

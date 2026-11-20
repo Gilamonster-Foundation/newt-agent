@@ -76,7 +76,7 @@ pub(crate) use persona_route::apply_persona_backend;
 mod commands;
 #[cfg(feature = "live-spill")]
 mod completed_spill;
-mod danger;
+use newt_core::danger;
 pub mod dgx_probe;
 /// #2085 PR-E2: where a non-setting state mutator's journal event is named,
 /// and the registry gate that decides whether it may be written at all.
