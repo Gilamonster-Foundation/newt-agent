@@ -77,7 +77,7 @@ wall-clock), so the profile always converts to `Scope::All` on that axis.
 
 ### Tier
 
-`tier` is the existing `newt_core::Tier` (`FAST`/`STANDARD`/`COMPLEX`/`REVIEW`,
+`tier` is the existing `newt_router::Tier` (`FAST`/`STANDARD`/`COMPLEX`/`REVIEW`,
 serialized UPPERCASE).
 
 ## API

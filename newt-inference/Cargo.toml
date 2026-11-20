@@ -13,6 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 newt-core.workspace = true
+newt-router.workspace = true
 content-addressable.workspace = true
 newt-identity.workspace = true
 plugins-protocol.workspace = true

@@ -11,6 +11,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- The tier router is its own crate, `newt-router`. `newt_core::router` (with `router::Classification`), `newt_core::Router` and `newt_core::Tier` are gone, with no re-export; import them from `newt_router` (#2234).
 - The boxed free-text question (`request_user_input`, for one) says each thing once (#3119).
   Its border names it, one legend lists the keys, and the question appears in the dialog and
   then once in the transcript, no longer on the tool-call line too. Its rows follow the

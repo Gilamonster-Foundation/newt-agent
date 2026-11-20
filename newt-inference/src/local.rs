@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use async_trait::async_trait;
-use newt_core::router::Tier;
+use newt_router::Tier;
 
 use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
 use crate::retry::{with_backoff, RetryPolicy};

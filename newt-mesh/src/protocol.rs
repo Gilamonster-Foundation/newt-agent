@@ -9,7 +9,7 @@
 //! [`agent_mesh_bus::BusMessage`], so the signature, replay defense,
 //! and correlation handling are all inherited from the bus.
 
-use newt_core::router::Tier;
+use newt_router::Tier;
 use serde::{Deserialize, Serialize};
 
 /// Request sent from one newt to another, asking for inference.

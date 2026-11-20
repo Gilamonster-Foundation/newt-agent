@@ -54,8 +54,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use newt_core::router::Tier;
 use newt_identity::{AgentKey, AgentMetadata};
+use newt_router::Tier;
 use plugins_protocol::{InitializeRequest, PluginClient, AGENT_KEY_ENV, PROTOCOL_VERSION};
 use tokio::process::Command;
 

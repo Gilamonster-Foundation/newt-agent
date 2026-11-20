@@ -32,9 +32,10 @@ use std::io::IsTerminal as _;
 use clap::Subcommand;
 use newt_core::dgx::{DgxConfig, DgxNode, EndpointKind};
 use newt_core::retry::{with_backoff, RetryPolicy};
-use newt_core::router::Classification;
-use newt_core::{Config, Router, Tier};
+use newt_core::Config;
 use newt_inference::local::LocalVllmBackend;
+use newt_router::Classification;
+use newt_router::{Router, Tier};
 
 use crate::dgx_registry::{self, InferenceTool, ModelVariant};
 use crate::dgx_status;

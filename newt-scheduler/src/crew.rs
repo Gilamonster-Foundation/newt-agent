@@ -23,7 +23,8 @@
 use crate::{BackendPool, ChatRequest, Dispatcher};
 use newt_core::caveats::{Caveats, CaveatsExt, CountBoundExt};
 use newt_core::lazy_emission::lazy_emission_reason;
-use newt_core::{Tier, TokenUsage};
+use newt_core::TokenUsage;
+use newt_router::Tier;
 use serde::Deserialize;
 
 /// A targeted edit: the full new content for one file (created if absent). The

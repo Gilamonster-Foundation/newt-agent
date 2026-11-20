@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use newt_coder::{Coder, CoderError};
-use newt_core::router::Tier;
 use newt_core::{Caveats, CountBound, Scope};
 use newt_inference::backend::{ChatReply, ChatRequest, InferenceBackend};
+use newt_router::Tier;
 use tempfile::TempDir;
 use tests_common::MockBackend;
 

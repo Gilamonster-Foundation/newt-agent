@@ -480,8 +480,8 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn parse_tier(s: &str) -> Result<newt_core::router::Tier> {
-    use newt_core::router::Tier;
+fn parse_tier(s: &str) -> Result<newt_router::Tier> {
+    use newt_router::Tier;
     match s.to_ascii_uppercase().as_str() {
         "FAST" => Ok(Tier::Fast),
         "STANDARD" => Ok(Tier::Standard),
@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn parse_tier_accepts_canonical_names() {
-        use newt_core::router::Tier;
+        use newt_router::Tier;
         assert!(matches!(parse_tier("FAST").unwrap(), Tier::Fast));
         assert!(matches!(parse_tier("standard").unwrap(), Tier::Standard));
         assert!(matches!(parse_tier("Complex").unwrap(), Tier::Complex));

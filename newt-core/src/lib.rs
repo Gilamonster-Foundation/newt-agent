@@ -1,8 +1,8 @@
-//! Newt-Agent core: shared types, errors, and the tier router.
+//! Newt-Agent core: shared types and errors.
 //!
-//! The router is the NeMoCode inheritance — it classifies an incoming turn
-//! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
-//! configured backends which can serve that tier.
+//! The tier router is the `newt-router` crate. It is the NeMoCode inheritance:
+//! it classifies an incoming turn into a `Tier` (FAST / STANDARD / COMPLEX /
+//! REVIEW), and the configured backends are asked which can serve that tier.
 
 pub mod agent_identity;
 pub mod agentic;
@@ -143,7 +143,6 @@ pub mod roadmap_eval;
 /// #1082 roadmap-as-code: the on-repo TOML codec (`.newt/roadmap.toml`).
 pub mod roadmap_file;
 pub mod role_profile;
-pub mod router;
 pub mod runtime;
 pub mod sas_confirm;
 pub mod sas_transcript;
@@ -314,7 +313,6 @@ pub use reasoning::{split_reasoning, ThinkFilter};
 pub use role_profile::{
     Altitude, CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
 };
-pub use router::{Router, Tier};
 pub use session::SessionId;
 // B0b-2 (#1846): the audience a surface answers from. Re-exported so
 // newt-web can name it without taking a direct newt-interaction

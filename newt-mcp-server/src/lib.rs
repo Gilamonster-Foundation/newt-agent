@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use newt_core::Router;
 use newt_inference::BackendRegistry;
+use newt_router::Router;
 
 pub mod caveats;
 pub mod handlers;
@@ -177,7 +177,8 @@ fn read_with_notices<T>(
 #[cfg(test)]
 mod tests {
     use newt_core::config::ProviderConfig;
-    use newt_core::{Config, Tier};
+    use newt_core::Config;
+    use newt_router::Tier;
 
     fn provider(name: &str) -> ProviderConfig {
         ProviderConfig {

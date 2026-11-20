@@ -198,7 +198,7 @@ fn reply_to_bytes(reply: InferenceReply) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::router::Tier;
+    use newt_router::Tier;
     use tests_common::MockBackend;
 
     #[tokio::test]

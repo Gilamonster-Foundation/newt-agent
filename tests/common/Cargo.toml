@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 newt-core.workspace = true
+newt-router.workspace = true
 newt-inference.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true

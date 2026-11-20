@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use base64::Engine;
 use newt_coder::Coder;
-use newt_core::router::Tier;
 use newt_core::Caveats;
 use newt_inference::backend::{ChatReply, ChatRequest, InferenceBackend};
+use newt_router::Tier;
 use tempfile::TempDir;
 
 /// Tiny inert backend — the parent-key tests don't actually call
