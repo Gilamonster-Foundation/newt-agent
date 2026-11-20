@@ -16,7 +16,7 @@
 
 use crate::{run_crew, BackendPool, ChatRequest, CrewConfig, CrewStatus, Dispatcher, Workspace};
 use newt_core::caveats::{Caveats, CaveatsExt};
-use newt_core::Tier;
+use newt_router::Tier;
 use serde::{Deserialize, Serialize};
 
 /// How a team runs: which model leads (decomposes), and the crew that executes

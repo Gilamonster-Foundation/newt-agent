@@ -19,7 +19,7 @@ use crate::backend::{ChatReply, ChatRequest, InferenceBackend, Message};
 use crate::local::{LocalOllamaBackend, LocalVllmBackend, ModelInfo};
 use crate::registry::BackendRegistry;
 use newt_core::pyo3_module::{PyNewtError, PyTier};
-use newt_core::router::Tier;
+use newt_router::Tier;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};

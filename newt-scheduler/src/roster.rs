@@ -12,7 +12,7 @@
 //! same environment always yields the same proposal.
 
 use crate::{BackendPool, CrewConfig, TeamConfig};
-use newt_core::Tier;
+use newt_router::Tier;
 
 /// How a composed roster runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

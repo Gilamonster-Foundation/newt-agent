@@ -8,7 +8,7 @@
 //!
 //! Tests use prompts that actually trigger the documented heuristics.
 
-use newt_core::router::{Router, Tier};
+use newt_router::{Router, Tier};
 
 #[test]
 fn short_prompt_with_no_keywords_is_fast() {

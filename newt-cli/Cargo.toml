@@ -30,6 +30,7 @@ async-trait.workspace = true
 # Reuse the shell's existing portable PATH/PATHEXT lookup for doctor.
 brush-core = { package = "brush-ocap-core", version = "=0.6.0-rc.1" }
 newt-core.workspace = true
+newt-router.workspace = true
 newt-git.workspace = true
 newt-inference.workspace = true
 newt-scheduler.workspace = true

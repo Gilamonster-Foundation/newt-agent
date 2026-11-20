@@ -3,7 +3,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum NewtError {
     #[error("no backend supports tier {0:?}")]
-    NoBackendForTier(crate::router::Tier),
+    NoBackendForTier(newt_router::Tier),
 
     #[error("backend error: {0}")]
     Backend(String),

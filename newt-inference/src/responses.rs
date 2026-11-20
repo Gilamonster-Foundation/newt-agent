@@ -17,7 +17,7 @@
 use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
 use crate::retry::{with_backoff, RetryPolicy};
 use async_trait::async_trait;
-use newt_core::router::Tier;
+use newt_router::Tier;
 use std::sync::Arc;
 
 /// OpenAI-compatible backend speaking the Responses API (`POST /v1/responses`).

@@ -53,8 +53,8 @@ use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
 
 use crate::initiative::Initiative;
-use crate::router::Tier;
 use crate::{Caveats, CountBound, Scope};
+use newt_router::Tier;
 
 /// A parsed role profile: a system-prompt overlay plus the optional toolset /
 /// capability / router policy declared in TOML front-matter.

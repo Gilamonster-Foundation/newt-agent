@@ -490,7 +490,7 @@ pub struct BackendArgs {
         value_delimiter = ',',
         value_parser = parse_tier
     )]
-    pub tiers: Vec<newt_core::Tier>,
+    pub tiers: Vec<newt_router::Tier>,
 
     /// Wire protocol: `ollama`, `openai` (alias `vllm`), `anthropic` (alias
     /// `claude`), or `embedded`.
@@ -624,8 +624,8 @@ fn backend_flag_axes(over: &newt_core::config::BackendOverride) -> newt_core::Pr
     }
 }
 
-fn parse_tier(s: &str) -> Result<newt_core::Tier, String> {
-    use newt_core::Tier;
+fn parse_tier(s: &str) -> Result<newt_router::Tier, String> {
+    use newt_router::Tier;
     match s.trim().to_ascii_uppercase().as_str() {
         "FAST" => Ok(Tier::Fast),
         "STANDARD" => Ok(Tier::Standard),
@@ -2417,10 +2417,10 @@ mod tests {
         assert_eq!(
             over.tiers,
             Some(vec![
-                newt_core::Tier::Fast,
-                newt_core::Tier::Standard,
-                newt_core::Tier::Complex,
-                newt_core::Tier::Review,
+                newt_router::Tier::Fast,
+                newt_router::Tier::Standard,
+                newt_router::Tier::Complex,
+                newt_router::Tier::Review,
             ])
         );
 

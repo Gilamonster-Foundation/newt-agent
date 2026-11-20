@@ -578,7 +578,7 @@ mod tests {
             fn model_id(&self) -> &str {
                 "stub-model"
             }
-            fn supports_tier(&self, _t: newt_core::router::Tier) -> bool {
+            fn supports_tier(&self, _t: newt_router::Tier) -> bool {
                 false
             }
             async fn complete(

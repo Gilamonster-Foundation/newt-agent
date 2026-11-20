@@ -13,9 +13,10 @@
 
 use crate::{BackendPool, Failover, PoolBackend};
 use async_trait::async_trait;
-use newt_core::{BackendKind, Tier};
+use newt_core::BackendKind;
 use newt_inference::local::{LocalOllamaBackend, LocalVllmBackend};
 use newt_inference::InferenceBackend;
+use newt_router::Tier;
 
 /// Shared transport state for one configured backend name.
 ///

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use newt_core::router::Tier;
 use newt_core::NewtError;
 use newt_inference::BackendRegistry;
+use newt_router::Tier;
 use tests_common::MockBackend;
 
 #[test]

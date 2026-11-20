@@ -1,10 +1,11 @@
 # newt-core
 
-Newt-Agent core types, errors, and the NeMoCode-style tier router.
+Newt-Agent core types and errors.
 
-The router is the NeMoCode inheritance: it classifies an incoming turn into a
-`Tier` (FAST / STANDARD / COMPLEX / REVIEW) and asks the configured backends
-which can serve that tier. The crate also carries the shared configuration
+The tier router is the `newt-router` crate. It is the NeMoCode inheritance: it
+classifies an incoming turn into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW)
+and the configured backends are asked which can serve that tier. `newt-core`
+itself carries the shared configuration
 model (`~/.newt/config.toml`; a project `.newt/config.toml` cannot set
 inference endpoints, credentials or other control-plane keys; the MCP servers
 it declares are kept but marked untrusted, which does not let them connect),

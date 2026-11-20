@@ -8,11 +8,11 @@
 //! separate process has no such thread. The other bearer-token tests are in
 //! `it/openai_auth_tests.rs`.
 
-use newt_core::router::Tier;
 use newt_core::{BackendConfig, BackendKind};
 use newt_inference::backend::ChatRequest;
 use newt_inference::local::LocalVllmBackend;
 use newt_inference::InferenceBackend;
+use newt_router::Tier;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

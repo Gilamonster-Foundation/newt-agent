@@ -1115,7 +1115,7 @@ pub async fn author_plan(
         .system(PLAN_AUTHOR_SYSTEM)
         .user(format!("GOAL:\n{goal}\n\nAt most {max_subtasks} subtasks."));
     let reply = pool
-        .run_role(dispatcher, newt_core::Tier::Complex, model, req)
+        .run_role(dispatcher, newt_router::Tier::Complex, model, req)
         .await
         .ok_or_else(|| {
             anyhow::anyhow!("no live model reachable to author the plan (model {model})")

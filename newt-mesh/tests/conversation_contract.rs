@@ -65,7 +65,7 @@ impl InferenceBackend for EchoBackend {
     fn model_id(&self) -> &str {
         "echo-model"
     }
-    fn supports_tier(&self, _tier: newt_core::router::Tier) -> bool {
+    fn supports_tier(&self, _tier: newt_router::Tier) -> bool {
         true
     }
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {

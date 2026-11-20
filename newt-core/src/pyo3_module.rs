@@ -13,9 +13,9 @@ use crate::{
     config::{BackendConfig, Config, ProviderConfig},
     error::NewtError,
     model_id::ModelId,
-    router::{Classification, Router, Tier},
     session::SessionId,
 };
+use newt_router::{Classification, Router, Tier};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;

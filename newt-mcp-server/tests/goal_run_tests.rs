@@ -21,12 +21,12 @@
 
 use std::sync::Arc;
 
-use newt_core::router::Tier;
-use newt_core::Router;
 use newt_inference::BackendRegistry;
 use newt_mcp_client::McpToolset;
 use newt_mcp_server::handlers::register_handlers;
 use newt_mcp_server::server::McpServer;
+use newt_router::Router;
+use newt_router::Tier;
 use serde_json::Value;
 use tests_common::MockBackend;
 use tokio::sync::Mutex;

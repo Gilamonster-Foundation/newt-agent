@@ -54,6 +54,7 @@ agent-mesh-discovery = { path = "../../agent-mesh/agent-mesh-discovery" }
 # newt's own crates — sibling path deps; no version pins since this
 # crate isn't part of the workspace and isn't published in lock-step.
 newt-core        = { path = "../newt-core" }
+newt-router      = { path = "../newt-router" }
 newt-inference   = { path = "../newt-inference" }
 plugins-protocol = { path = "../plugins-protocol" }
 

@@ -481,6 +481,7 @@ jobs:
           - newt-interaction
           - newt-launch
           - newt-refactor-evidence
+          - newt-router
           - newt-skills
           - newt-tuner
           - plugins-protocol

@@ -12,7 +12,7 @@
 ///
 /// The classifier is a pure function; it does not depend on any internal state,
 /// making it straightforward to test in isolation.
-use super::{Classification, Tier};
+use crate::{Classification, Tier};
 
 pub fn classify_detailed(prompt: &str, tier_override: Option<Tier>) -> Classification {
     if let Some(tier) = tier_override {

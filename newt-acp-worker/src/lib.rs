@@ -306,8 +306,8 @@ mod backend_selection_tests {
     //! `newt_core::config`'s `select_backend_tests`.
     use super::{instantiate_configured_backend, resolve_configured_backend, ResolvedBackend};
     use newt_core::config::{ProviderConfig, SelectedBackend, SelectionOutcome};
-    use newt_core::router::Tier;
     use newt_core::{BackendConfig, BackendKind, Config, OpenAiApi};
+    use newt_router::Tier;
     use std::sync::Arc;
     // `.name()` / `.endpoint()` are trait methods — bring the trait into scope so
     // the tests can assert the concrete destination each backend instantiates to.

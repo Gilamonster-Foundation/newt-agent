@@ -17,7 +17,8 @@ use crate::crew::{infer_test_command, model_for_role, worktree_id, WorktreeWorks
 use async_trait::async_trait;
 use newt_core::agentic::{crew_authz, crew_step_up_policy, CrewAuthz, CrewRunner, Presence};
 use newt_core::caveats::{Caveats, CaveatsExt};
-use newt_core::{Config, Tier};
+use newt_core::Config;
+use newt_router::Tier;
 use newt_scheduler::{
     compose_from_pool, run_crew, run_team, BackendPool, CrewConfig, CrewStatus, LocalDispatcher,
     RosterMode, RosterSpec, StaticSource, SubtaskStatus, TeamConfig, TeamStatus, WorkspaceFactory,
@@ -692,7 +693,7 @@ mod tests {
             refused: vec!["README.md".to_string()],
             steps: vec![newt_scheduler::RoleStep {
                 role: "planner".to_string(),
-                tier: newt_core::Tier::Complex,
+                tier: newt_router::Tier::Complex,
                 model: "requested-model".to_string(),
                 backend: Some("backend-b".to_string()),
                 failed_over: vec!["backend-a".to_string()],

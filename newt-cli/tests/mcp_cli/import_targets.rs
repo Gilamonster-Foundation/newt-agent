@@ -449,7 +449,7 @@ fn uat_import_updates_once_resolved_authoritative_config_target() {
         );
     }
     let config = load_config(&referent);
-    assert_eq!(config.default_tier_order, vec![newt_core::Tier::Fast]);
+    assert_eq!(config.default_tier_order, vec![newt_router::Tier::Fast]);
     assert_eq!(
         config.tui.unwrap().permissions.net,
         vec!["broker.example.test"]

@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
-use crate::router::Tier;
 pub use api_surface::{ApiSurfaceConfig, LanguagePack, SymbolRule};
 pub(crate) use backend::resolve_api_key_common;
 pub use backend::{
@@ -43,6 +42,7 @@ pub(crate) use layering::{
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
 pub use memory::{MemoryConfig, MemoryDisclosure, MemoryProviderKind};
+use newt_router::Tier;
 pub use newt_tuner::{ModelTuning, OverflowRetry};
 pub use permissions::{ModeConfig, PermissionPreset, ToolPermissions};
 pub use presentation::{
