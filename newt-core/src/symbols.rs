@@ -670,8 +670,8 @@ mod tests {
         // grades Rust via a different extractor — fabricated `use` paths are
         // caught exactly as fabricated Python imports are.
         let mut idx = SymbolIndex::new();
-        idx.add_symbol("crate::router", "Router");
-        let real = &extract_references("use crate::router::Router;", Lang::Rust)[0];
+        idx.add_symbol("crate::engine", "Engine");
+        let real = &extract_references("use crate::engine::Engine;", Lang::Rust)[0];
         assert_eq!(idx.resolve(real), Resolution::Resolved);
         let fab = &extract_references("use crate::nonsense::Widget;", Lang::Rust)[0];
         assert!(matches!(

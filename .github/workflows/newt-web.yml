@@ -15,6 +15,7 @@ on:
     paths:
       - "newt-web/**"
       - "newt-core/**"
+      - "newt-router/**"
       - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
   push:
@@ -22,6 +23,7 @@ on:
     paths:
       - "newt-web/**"
       - "newt-core/**"
+      - "newt-router/**"
       - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
   workflow_dispatch:

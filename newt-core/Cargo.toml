@@ -21,7 +21,7 @@ repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
 description = "Newt-Agent core types and errors"
-keywords = ["newt", "agent", "router", "llm", "nemo"]
+keywords = ["newt", "agent", "llm"]
 categories = ["api-bindings", "text-processing"]
 
 [[test]]
