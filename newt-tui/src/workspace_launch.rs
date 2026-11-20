@@ -176,7 +176,10 @@ impl WorkspaceSession {
                 }
                 let mut caveats = profile.caveats(workspace, permissions)?;
                 // Explicit launch grants remain per-invocation operator choices.
-                newt_core::caveats::apply_cli_fs_grants(&mut caveats, &workspace.to_string_lossy());
+                newt_core::git_hardening::apply_cli_fs_grants(
+                    &mut caveats,
+                    &workspace.to_string_lossy(),
+                );
                 if let newt_core::Scope::Only(commands) = &mut caveats.exec {
                     commands.extend(crate::scan_cli_exec_grants());
                 }
