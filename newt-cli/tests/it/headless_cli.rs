@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-mod common;
+use crate::common;
 #[path = "headless_cli/smart_startup.rs"]
 mod smart_startup;
 

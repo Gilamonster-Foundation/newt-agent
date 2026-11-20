@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 use predicates::prelude::*;
 

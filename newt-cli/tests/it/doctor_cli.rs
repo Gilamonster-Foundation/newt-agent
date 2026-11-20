@@ -6,7 +6,7 @@
 //! working directory are redirected to tempdirs so MCP discovery never reads
 //! the developer's real `~/.claude.json` / `./.mcp.json`.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::*;

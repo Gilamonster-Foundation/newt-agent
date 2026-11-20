@@ -16,7 +16,7 @@
 //! `newt-core::confined_exec` against a real released-shape invocation.
 #![cfg(target_os = "linux")]
 
-mod common;
+use crate::common;
 
 /// `newt __net-guard --probe-egress` installs `no_new_privs` + the seccomp
 /// socket()-family deny on the spawned `newt` process, then self-tests that

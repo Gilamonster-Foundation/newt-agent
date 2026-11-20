@@ -6,7 +6,7 @@
 //! and because each test spawns its own `newt` process, there is no shared
 //! mutable env state between parallel tests.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::*;

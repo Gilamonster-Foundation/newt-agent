@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 use predicates::prelude::*;

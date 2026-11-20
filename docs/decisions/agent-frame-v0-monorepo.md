@@ -165,7 +165,7 @@ itself, not a fresh DTO, since a raw packet **is** an untrusted DAG node — and
 `TryFrom<RawPacket> for Packet` admits zero parents or exactly one, refusing
 anything more with `PacketAdmitError::NotAChain`. `agent-frame/tests/admission.rs`
 drives it across the real `serde_json` boundary, and
-`newt-cli/tests/frame_cli.rs` proves the store now refuses a two-parent node
+`newt-cli/tests/it/frame_cli.rs` proves the store now refuses a two-parent node
 that is legitimately addressed and filed under its true id — so the store's own
 id check passes and only admission can object.
 
@@ -215,7 +215,7 @@ the same body with `--json`. A missing or substituted input fails before stdout
 receives request bytes. Replay reads evidence without granting session authority.
 
 `verify` **exits non-zero on mismatch**, so a script can gate on it.
-`newt-cli/tests/frame_cli.rs` asserts the CLI reaches the same verdict as the
+`newt-cli/tests/it/frame_cli.rs` asserts the CLI reaches the same verdict as the
 library on both the passing and the failing case — a wrapper that only agrees
 when things pass is two verifiers.
 

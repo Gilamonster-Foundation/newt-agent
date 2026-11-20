@@ -1480,7 +1480,7 @@ path = "newt-cli/src/headless.rs"
 symbol = "tests::fold_ocap_grants_of_an_empty_store_admits_nothing"
 tier = "unit"
 [[BHV-OCAP-001.refs.rust_tests]]
-path = "newt-cli/tests/headless_cli.rs"
+path = "newt-cli/tests/it/headless_cli.rs"
 symbol = "a_signed_ocap_fs_read_grant_is_admitted_into_headless_caveats_and_the_contract"
 tier = "unit"
 [[BHV-OCAP-001.refs.rust_tests]]
