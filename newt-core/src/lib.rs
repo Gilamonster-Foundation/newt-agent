@@ -229,7 +229,7 @@ pub use agentic::{
     ShellObservation, SolveObservation, SpillStore, Step, StepLedger, StepStatus,
     StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
     ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
-    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, BOUND_REASON_PREFIX,
+    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, Verdict, BOUND_REASON_PREFIX,
     EXPERIENCE_TOP_K, MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
@@ -343,7 +343,6 @@ pub use newt_interaction::InteractionDefinition;
 pub use store::{
     sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, FlockTask, InjectOutcome,
     InjectedPrompt, LivenessFn, NewFlockTask, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
-    Verdict,
 };
 pub use tokens::TokenEstimation;
 pub use tty::{Action, Question};

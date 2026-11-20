@@ -343,7 +343,7 @@ pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeCon
 pub use permissions::{
     append_denial, load_denials, widen_caveats, ChoiceSpec, DenialKind, HumanQuestionOutcome,
     PermissionAction, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
-    PersistentDenial, BOUND_REASON_PREFIX,
+    PersistentDenial, Verdict, BOUND_REASON_PREFIX,
 };
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,

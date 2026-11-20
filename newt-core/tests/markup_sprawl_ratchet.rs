@@ -1138,9 +1138,9 @@ fn action_model_registry_is_exact() {
             "HumanQuestionOutcome",
             1,
         ),
-        ("newt-core/src/store.rs", "Verdict", 1),
+        ("newt-core/src/agentic/permissions.rs", "Verdict", 1),
         // An unrelated eval Verdict shares the name; pinned so a rename or a
-        // third Verdict cannot hide behind the store one.
+        // third Verdict cannot hide behind the permissions one.
         ("newt-core/src/symbols.rs", "Verdict", 1),
         ("newt-core/src/tty/modal.rs", "PromptLine", 1),
         ("newt-core/src/sas_confirm.rs", "SasVerdict", 1),

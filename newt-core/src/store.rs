@@ -2467,25 +2467,11 @@ pub struct InjectedPrompt {
     pub seq: i64,
 }
 
-/// A verdict an attach surface can NAME for a pending permission decision
-/// (A4/W6). It names a CHOICE the running gate then interprets and mints — the
-/// web never carries caveats/authority itself. `AllowSession` is session-scoped
-/// (ephemeral); there is deliberately NO durable "always-allow" verdict — the
-/// web cannot write durable OCAP policy (that is terminal-audit-only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// Allow this one denied action, this time only.
-    AllowOnce,
-    /// Allow it for the rest of the session (in-memory; NOT persisted).
-    AllowSession,
-    /// Refuse — the model sees the standard structured denial.
-    Deny,
-}
-
 // B0b-2 (#1846): `Verdict`'s DATABASE serialization (`as_db_str` /
 // `from_db_str`) went with the `permission_requests.verdict` column it
-// existed for. The enum itself stays — `From<Verdict> for PermissionAction`
-// is still live — but nothing persists it any more: an answer is stored as
+// existed for. The enum now lives beside `PermissionAction` in
+// `agentic::permissions` (`From<Verdict> for PermissionAction` is still live),
+// and nothing persists it any more: an answer is stored as
 // the winning `Response` body in `interaction_offers`.
 //
 // The lenient-read guarantee those functions carried was RETARGETED, not
