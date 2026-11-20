@@ -26,23 +26,87 @@ pub(super) fn preflight(
 ) -> Result<(), String> {
     let inspection = match inspect_shell(source) {
         Ok(inspection) => inspection,
-        // Interpreter/dispatcher execution remains the confined executor's
-        // responsibility. Text mentioning Git is not proof of execution.
-        // Descendant/dynamic ref semantics still require a repository broker;
-        // this direct-command safeguard must not pretend to supply one.
+        // Bridle cannot see into xargs, sh -c, env and the like, so a delete
+        // behind one would run without the confirmation below. Refuse it.
+        Err(_) if hides_git_delete(source) => {
+            return Err(format!(
+                "refused: this command uses a program newt cannot see into (xargs, \
+                 env, nice), so newt cannot show the operator what its git delete \
+                 removes. {NAME_IT_LITERALLY}"
+            ))
+        }
+        // Other interpreter/dispatcher execution remains the confined
+        // executor's responsibility. Text mentioning Git is not proof of
+        // execution. Descendant/dynamic ref semantics still require a
+        // repository broker; this direct-command safeguard must not pretend to
+        // supply one.
         Err(_) => return Ok(()),
     };
     let caps = GitCaveats::from_session(caveats);
+    let mut destroys = Vec::new();
     inspect_commands(
         &inspection,
         true,
         cwd,
         caveats,
         &caps,
-        gate,
+        &mut destroys,
         native_commit_broker,
-    )
+    )?;
+    if destroys.is_empty() {
+        return Ok(());
+    }
+    destroys.sort_unstable();
+    destroys.dedup();
+    let ops = destroys.join(" and ");
+    // #3117: one confirmation for the whole command. Newt cannot vouch for a
+    // cd, -C, redirect or echo around a delete, so the operator sees all of it,
+    // and where it runs: a leading `cd` has already become `cwd`.
+    let Some(gate) = gate.as_deref_mut() else {
+        return Err(format!(
+            "refused: git {ops} needs an operator to confirm it, and none is available"
+        ));
+    };
+    let subject = format!("{source}\n(run in {})", cwd.display());
+    if super::git_data_loss_confirmed(gate, &destroys, &subject) {
+        Ok(())
+    } else {
+        Err(format!("refused: the operator declined git {ops}"))
+    }
 }
+
+/// Whether `source`, which Bridle could not inspect, runs a branch or stash
+/// delete as a bare word, as `xargs git branch -d` does. Without this,
+/// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
+/// tripwire, not a boundary: like the commit check in `catalog.rs`, words keep
+/// their quotes, so git text inside an interpreter string (`sh -c '…'`) stays
+/// the confined executor's, as does an obfuscated command.
+fn hides_git_delete(source: &str) -> bool {
+    source
+        .split(['|', ';', '&', '\n', '(', ')', '`', '<', '>'])
+        .map(|segment| {
+            segment
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|words| {
+            words.iter().enumerate().any(|(at, word)| {
+                is_git(word)
+                    && invocation(&words[at..]).is_ok_and(|(verb, args, _)| match verb {
+                        "branch" => has_option(args, "dD", &["--delete"]),
+                        "stash" => args
+                            .first()
+                            .is_some_and(|action| matches!(action.as_str(), "drop" | "clear")),
+                        _ => false,
+                    })
+            })
+        })
+}
+
+/// What to do instead when a delete names what it destroys only at runtime.
+const NAME_IT_LITERALLY: &str = "Retry with run_command naming each branch or stash \
+    literally, for example `git branch -D old-a old-b`; newt then asks the operator.";
 
 /// The first `git` verb in `verbs` that `source` invokes anywhere, nested
 /// constructs included. A loose trigger: text that merely mentions Git is not
@@ -994,7 +1058,7 @@ fn inspect_commands(
     cwd: &Path,
     caveats: &Caveats,
     caps: &GitCaveats,
-    gate: &mut Option<&mut dyn PermissionGate>,
+    destroys: &mut Vec<&'static str>,
     native_commit_broker: bool,
 ) -> Result<(), String> {
     for command in &inspection.commands {
@@ -1014,7 +1078,7 @@ fn inspect_commands(
                     warnings: vec![],
                 };
                 inspect_commands(
-                    &nested, false, cwd, caveats, caps, gate,
+                    &nested, false, cwd, caveats, caps, destroys,
                     // Native dispatchers spawn outside Brush's final command
                     // filter; another direct command's broker cannot cover them.
                     false,
@@ -1024,7 +1088,7 @@ fn inspect_commands(
         if !command.program.as_deref().is_some_and(is_git) {
             continue;
         }
-        let Ok((raw_verb, args, same_repository)) = invocation(&command.argv) else {
+        let Ok((raw_verb, args, _)) = invocation(&command.argv) else {
             // Unknown CLI forms retain Git's own interpretation and the
             // existing confined executor's authority checks.
             continue;
@@ -1126,17 +1190,16 @@ fn inspect_commands(
                 continue;
             }
         }
-        // The flattened inventory deliberately does not promise shell state
-        // or control-flow edges. Only a single literal invocation may use the
-        // cwd-bound destructive check; never guess after cd/env/substitution.
-        let standalone = top_level
-            && inspection.commands.len() == 1
-            && inspection.constructs.is_empty()
-            && command.redirects.is_empty()
-            && command.descendant_execs.is_empty()
-            && command.source.trim_start().starts_with(&command.argv[0]);
-        if !standalone || !same_repository {
-            return Err(unresolved("composed or redirected Git mutation"));
+        // The flattened inventory does not promise shell state or control
+        // flow, so the checks below see names, not which repository a cd or -C
+        // reaches. The operator confirms the whole command for that (#3117).
+        // A delete run by another program or inside a substitution cannot be
+        // shown that way.
+        if !top_level {
+            return Err(format!(
+                "refused: git {verb} run by another program or inside a substitution \
+                 cannot show the operator what it deletes. {NAME_IT_LITERALLY}"
+            ));
         }
         let op = if verb == "branch" {
             let branches = deleted_branches(&words)?;
@@ -1153,14 +1216,7 @@ fn inspect_commands(
             }
             "stash-drop"
         };
-        if !gate
-            .as_deref_mut()
-            .is_some_and(|gate| super::git_data_loss_confirmed(gate, op))
-        {
-            return Err(format!(
-                "refused: git {op} requires explicit destructive-operation confirmation"
-            ));
-        }
+        destroys.push(op);
     }
     for construct in &inspection.constructs {
         if let Some(nested) = &construct.inspection {
@@ -1170,7 +1226,7 @@ fn inspect_commands(
                 cwd,
                 caveats,
                 caps,
-                gate,
+                destroys,
                 native_commit_broker,
             )?;
         }
@@ -1180,7 +1236,14 @@ fn inspect_commands(
 
 fn literal_arguments(args: &[String]) -> Result<Vec<String>, String> {
     args.iter()
-        .map(|arg| literal(arg).ok_or_else(|| unresolved("dynamic Git ref or stash arguments")))
+        .map(|arg| {
+            literal(arg).ok_or_else(|| {
+                format!(
+                    "refused: git branch and stash arguments must be written out, \
+                     since a variable or substitution could hide a delete. {NAME_IT_LITERALLY}"
+                )
+            })
+        })
         .collect()
 }
 
@@ -1218,34 +1281,22 @@ fn deleted_branches(words: &[String]) -> Result<Vec<&str>, String> {
 }
 
 fn refuse_protected_branch(cwd: &Path, branch: &str, caveats: &Caveats) -> Result<(), String> {
+    let refused = || format!("refused: cannot delete protected default branch '{branch}'");
     if matches!(branch, "main" | "master") {
-        return Err(format!(
-            "refused: cannot delete protected default branch '{branch}'"
-        ));
+        return Err(refused());
     }
-    // metadata_git checks read authority before constructing or launching any
-    // process. Do not turn a bounded read grant into ambient repository reads.
-    let output = crate::git_hardening::metadata_git(
-        cwd,
-        &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"],
-        &caveats.fs_read,
-    )
-    .and_then(|mut command| command.output())
-    .map_err(|_| {
-        unresolved("cannot establish the protected default branch under current read authority")
-    })?;
-    if output.status.success() {
-        if String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .strip_prefix("refs/remotes/origin/")
-            == Some(branch)
-        {
-            return Err(format!(
-                "refused: cannot delete protected default branch '{branch}'"
-            ));
-        }
-    } else if output.status.code() != Some(1) {
-        return Err(unresolved("cannot establish the repository default branch"));
+    // Read origin/HEAD as one file inside the session's read grant. A `git`
+    // process needs unrestricted reads, which a workspace-scoped session does
+    // not have, so every delete used to be refused here (#3117).
+    let default =
+        crate::git_hardening::remote_default_branch(cwd, &caveats.fs_read).map_err(|error| {
+            format!(
+                "refused: newt cannot read this repository's default branch within the \
+                 session's read grant ({error}), so it cannot check a branch delete here"
+            )
+        })?;
+    if default.as_deref() == Some(branch) {
+        return Err(refused());
     }
     Ok(())
 }
@@ -1811,10 +1862,8 @@ mod tests {
             "git checkout -B main HEAD",
             "git checkout --force main",
             "git reflog delete 'HEAD@{0}'",
-            "git -C . branch -D victim",
             "git branch -D \"$TARGET\"",
             "git stash \"$ACTION\"",
-            "echo before && git branch -D victim",
             "git branch --list -D victim",
         ] {
             let mut gate = Gate {
@@ -1974,6 +2023,143 @@ mod tests {
         assert!(git(repo.path(), &["stash", "list"]).is_empty());
         assert_eq!(gate.requests.len(), 2);
         assert_eq!(gate.requests[1].target, "stash-drop");
+    }
+
+    /// #3117: a model wraps its delete in `set -e`, `cd`, `-C`, an echo or a
+    /// `2>&1`. That was refused as "not yet supported", and the model gave
+    /// up. The operator now confirms once, shown the whole command.
+    #[tokio::test]
+    async fn a_wrapped_native_deletion_asks_once_showing_the_whole_command() {
+        let _lock = env_lock().await;
+        let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+        let repo = repository();
+        let witnessed = "set -e\necho \"=== deleting ===\"\ngit branch -D \\\n  victim \\\n  spare 2>&1\necho \"done.\"";
+        let cd = format!(
+            "cd {} && git branch -D victim spare 2>&1 && echo ok",
+            repo.path().display()
+        );
+        // safe-subset refuses `set`, a builtin; the witnessed session ran
+        // Brush. The prompt is this check's, so that shape asserts only it.
+        for (source, runs) in [
+            (witnessed, false),
+            (&cd, true),
+            ("git -C . branch -D victim spare", true),
+        ] {
+            git(repo.path(), &["branch", "-f", "victim"]);
+            git(repo.path(), &["branch", "-f", "spare"]);
+            let before = git(repo.path(), &["show-ref"]);
+            let mut gate = Gate {
+                allow: false,
+                requests: vec![],
+            };
+            let out = run(source, repo.path(), Some(&mut gate)).await;
+            assert!(out.starts_with("refused:"), "{source}: {out}");
+            assert_eq!(gate.requests.len(), 1, "{source}: {out}");
+            // A leading `cd` arrives as the cwd, which the prompt names.
+            let shown = source.split_once(" && ").map_or(source, |(_, rest)| rest);
+            let reason = &gate.requests[0].reason;
+            assert!(
+                reason.contains(if runs { shown } else { source }),
+                "{reason}"
+            );
+            assert!(reason.contains("(run in "), "{reason}");
+            assert_eq!(git(repo.path(), &["show-ref"]), before, "{source}");
+            if !runs {
+                continue;
+            }
+            gate.allow = true;
+            let out = run(source, repo.path(), Some(&mut gate)).await;
+            assert!(out.contains("Deleted branch spare"), "{source}: {out}");
+            assert_eq!(gate.requests.len(), 2, "{source}: {out}");
+            assert!(!git(repo.path(), &["branch", "--list", "victim"]).contains("victim"));
+        }
+    }
+
+    /// #3117, found live: a real session may read only its workspace, and the
+    /// protected-branch lookup spawned git, which needs unrestricted reads. So
+    /// every delete was refused before the operator was asked; the tests above
+    /// pass only because they run with `Caveats::top()`.
+    #[test]
+    fn a_delete_under_a_workspace_read_grant_reaches_the_operator() {
+        let repo = repository();
+        let root = repo.path().canonicalize().unwrap();
+        let mut caveats = Caveats::top();
+        caveats.fs_read = crate::Scope::only([root.to_string_lossy().into_owned()]);
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let err = preflight("git branch -D victim", &root, &caveats, &mut asked, false);
+        assert_eq!(
+            err,
+            Err("refused: the operator declined git branch-delete".into())
+        );
+        assert_eq!(gate.requests.len(), 1);
+        // The remote default, read from origin/HEAD within the grant, stays
+        // refused by name without asking.
+        let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let err = preflight("git branch -D stable", &root, &caveats, &mut asked, false);
+        assert!(err
+            .unwrap_err()
+            .contains("protected default branch 'stable'"));
+        assert_eq!(gate.requests.len(), 1);
+    }
+
+    /// Pure: the tripwire reads bare words, so it sees through a dispatcher,
+    /// not a read beside one or quoted interpreter text.
+    #[test]
+    fn a_delete_behind_a_dispatcher_is_seen() {
+        for source in [
+            "git branch --merged | grep -v main | xargs git branch -d",
+            "xargs -n1 git -C repo branch --delete",
+            "git branch -D \\\n  victim | nohup cat",
+            "env GIT_TRACE=0 /usr/bin/git stash drop",
+            "nice git branch -vD victim",
+        ] {
+            assert!(hides_git_delete(source), "{source}");
+        }
+        for source in [
+            "git branch | xargs echo",
+            "xargs git branch --list",
+            "sh -c 'git stash list'",
+            "sh -c 'git branch -D victim'",
+            "python -c 'print(\"git branch -D example\")'",
+            "env git log --oneline -d",
+            "echo branch -D",
+        ] {
+            assert!(!hides_git_delete(source), "{source}");
+        }
+    }
+
+    /// #3117: operands newt cannot show stay refused, and the refusal names
+    /// the retry that works instead of calling deletion unsupported.
+    #[tokio::test]
+    async fn a_deletion_newt_cannot_name_is_refused_with_the_retry() {
+        let _lock = env_lock().await;
+        let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let repo = repository();
+        let before = git(repo.path(), &["show-ref"]);
+        for source in [
+            "for b in victim; do git branch -D \"$b\"; done",
+            "echo \"$(git branch -D victim)\"",
+            "timeout 30 git branch -D victim",
+            "git branch --merged | xargs git branch -d",
+            "env GIT_TRACE=0 git stash clear",
+            "find . -maxdepth 0 -exec git branch -D victim \\;",
+        ] {
+            let mut gate = Gate {
+                allow: true,
+                requests: vec![],
+            };
+            let out = run(source, repo.path(), Some(&mut gate)).await;
+            assert!(out.starts_with("refused:"), "{source}: {out}");
+            assert!(out.contains("`git branch -D"), "{source}: {out}");
+            assert!(!out.contains("not yet supported"), "{source}: {out}");
+            assert!(gate.requests.is_empty(), "{source}");
+            assert_eq!(git(repo.path(), &["show-ref"]), before, "{source}");
+        }
     }
 }
 

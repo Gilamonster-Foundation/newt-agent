@@ -189,13 +189,22 @@ multi-commit lifecycles have equivalent attribution and publication coverage.
 A transitional native-command preflight preserves branch-delete and
 stash-drop/clear confirmation and rejects recognized protected-ref,
 ref-overwrite, and unresolved destructive forms in successfully inspected
-commands before execution. Ordinary branch creation, switching, queries,
+commands before execution. The confirmation is asked once per command and
+shows the whole command and its working directory, so a `cd`, `-C`, redirect
+or `echo` around a delete is the operator's to judge rather than a refusal
+(#3117). A delete whose branch or stash names exist only at runtime (a
+variable, a substitution, another program's arguments) is refused with the
+retry that names them literally. Ordinary branch creation, switching, queries,
 and unclassified Git verbs retain native execution and its filesystem,
 process, and network authority checks. This preflight is not a command
 allowlist and leaves admitted shell source unchanged.
 This is deliberately bounded to inspectable commands, not an arbitrary
 program-execution boundary: failed inspection defers to the existing confined
-executor. Scripts, runtime-selected executables, aliases,
+executor. The one exception is a branch or stash delete written as bare words
+behind a dispatcher the inspector cannot model, such as
+`git branch --merged | xargs git branch -d`, which is refused with the same
+literal-names retry rather than run without confirmation. Git text quoted
+inside an interpreter string (`sh -c '…'`) still defers. Scripts, runtime-selected executables, aliases,
 repository redirection, concurrent repository changes, and metadata writes
 by other programs exceed this preflight's coverage. The scoped commit adapter
 does not turn it into a universal Git metadata boundary. Do not claim full
