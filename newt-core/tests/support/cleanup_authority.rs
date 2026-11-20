@@ -28,7 +28,7 @@ impl PermissionGate for OnceGate {
             .collect();
         self.requests.extend(grants.clone());
         if self.allow {
-            PermissionDecision::Allow(newt_core::agentic::widen_caveats(baseline, &grants))
+            PermissionDecision::Allow(newt_core::permissions::widen_caveats(baseline, &grants))
         } else {
             PermissionDecision::Deny
         }
@@ -160,7 +160,7 @@ pub async fn run(root: &Path) {
 
     // Filesystem authority never implies command authority.
     tree(&approved);
-    let mut no_exec = newt_core::agentic::widen_caveats(
+    let mut no_exec = newt_core::permissions::widen_caveats(
         &baseline,
         &[
             (DenialKind::FsRead, approved.to_string_lossy().into_owned()),

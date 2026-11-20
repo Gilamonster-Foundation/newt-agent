@@ -1128,17 +1128,9 @@ fn the_audience_discriminator_stays_confined_to_its_branches() {
 fn action_model_registry_is_exact() {
     // (workspace-relative file, enum name, expected definition count there)
     const REGISTRY: &[(&str, &str, usize)] = &[
-        (
-            "newt-core/src/agentic/permissions.rs",
-            "PermissionAction",
-            1,
-        ),
-        (
-            "newt-core/src/agentic/permissions.rs",
-            "HumanQuestionOutcome",
-            1,
-        ),
-        ("newt-core/src/agentic/permissions.rs", "Verdict", 1),
+        ("newt-core/src/permissions.rs", "PermissionAction", 1),
+        ("newt-core/src/permissions.rs", "HumanQuestionOutcome", 1),
+        ("newt-core/src/permissions.rs", "Verdict", 1),
         // An unrelated eval Verdict shares the name; pinned so a rename or a
         // third Verdict cannot hide behind the permissions one.
         ("newt-core/src/symbols.rs", "Verdict", 1),

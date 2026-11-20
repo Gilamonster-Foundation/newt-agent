@@ -112,6 +112,7 @@ mod paths;
 /// #1839 deleted that hand-rolled encoding in favour of the definition's
 /// `ContentId`.
 pub mod permission_challenge;
+pub mod permissions;
 pub mod plan;
 pub mod posture;
 pub mod pricing;
@@ -209,30 +210,28 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use agentic::preserve_mcp_resource_url_affinity;
 pub use agentic::wrap_untrusted;
 pub use agentic::{
-    append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
+    chat_complete, chat_complete_with_prompt, compress_user_initiated,
     compress_user_initiated_for_task, execute_tool, execute_tool_quiet, experience_block,
     format_index_status, format_search_hits, format_search_model, format_search_preview,
     format_search_rejects, fresh_multi_step_plan, gather_code_files, gather_with_manifest,
-    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
+    index_files, memory_fetch_tool_definition, openai_chat_complete,
     openai_chat_complete_with_prompt, openai_responses_complete,
     openai_responses_complete_with_prompt, parse_context_window_error, plan_block, plan_verdict,
     recover_context_window_400, render_code_evidence, retrieve_evidence, retrieve_evidence_steered,
     retrieve_ranked, set_spill_lines, set_spill_summary, set_time_marker_secs, transcript_lines,
-    transcript_lines_styled, trim_for_summary, widen_caveats, BehaviorSignal, ChatCtx, CodeSearch,
-    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ErrorClass,
-    EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
-    HeadlessCodeSearch, HumanQuestionOutcome, IndexStatus, LiveToolOutput, ManualCompressOutcome,
-    ManualCompressPolicy, McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink,
-    ParseSignal, PermissionAction, PermissionDecision, PermissionGate, PermissionRecord,
-    PermissionRequest, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanSnapshot,
-    PlanVerdict, RankedHit, RecallSource, RejectReason, RetrievalResult, RetrievalSteer,
-    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
-    SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
-    ShellObservation, SolveObservation, SpillStore, Step, StepLedger, StepStatus,
-    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    transcript_lines_styled, trim_for_summary, BehaviorSignal, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, Embedder, EmbeddingsClient, ErrorClass, EvidenceKind,
+    ExperienceStore, ExposureSettings, GatherCaps, GatherManifest, HeadlessCodeSearch, IndexStatus,
+    LiveToolOutput, ManualCompressOutcome, ManualCompressPolicy, McpTools, MemAddr, MemPayload,
+    MemorySource, NoMcp, NoteNudge, NoteSink, ParseSignal, PlanDraft, PlanDraftSink, PlanEntry,
+    PlanModeControl, PlanSnapshot, PlanVerdict, RankedHit, RecallSource, RejectReason,
+    RetrievalResult, RetrievalSteer, RoundObservation, ScratchpadStore, SemanticIndex,
+    SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore,
+    SessionStepLedger, ShellObservation, SolveObservation, SpillStore, Step, StepLedger,
+    StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
     ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
-    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, Verdict, BOUND_REASON_PREFIX,
-    EXPERIENCE_TOP_K, MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
+    MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};
@@ -277,6 +276,11 @@ pub use navigator::{
     goto_definition, hash_context, impact_analysis, inspect_type, project_map_nav, text_search,
     GotoDefinitionArgs, GraphIndex, ImpactReport, NavHit, NavResult, NavToolCtx, NavigatorSession,
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
+};
+pub use permissions::{
+    append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
+    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, Verdict,
+    BOUND_REASON_PREFIX,
 };
 pub use project_map::ProjectMapProvider;
 pub use runtime::{

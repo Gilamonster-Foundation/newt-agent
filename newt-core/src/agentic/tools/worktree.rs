@@ -364,11 +364,12 @@ impl PermissionGate for Guard<'_, '_> {
             });
         self.decision(decision)
     }
-    fn ask_question(&mut self, q: &str) -> super::super::permissions::HumanQuestionOutcome {
-        self.inner.as_deref_mut().map_or(
-            super::super::permissions::HumanQuestionOutcome::Unavailable,
-            |g| g.ask_question(q),
-        )
+    fn ask_question(&mut self, q: &str) -> crate::permissions::HumanQuestionOutcome {
+        self.inner
+            .as_deref_mut()
+            .map_or(crate::permissions::HumanQuestionOutcome::Unavailable, |g| {
+                g.ask_question(q)
+            })
     }
     fn consume_pending_once(&mut self, kind: DenialKind, target: &str) {
         if let Some(g) = self.inner.as_deref_mut() {

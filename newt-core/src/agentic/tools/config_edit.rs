@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use super::super::permissions::{ChoiceSpec, HumanQuestionOutcome, PermissionGate};
 use crate::config::{backup_path, Config, ConfigEdit};
+use crate::permissions::{ChoiceSpec, HumanQuestionOutcome, PermissionGate};
 
 /// `no` first: a blank submission is the default, and the default declines.
 const CONFIG_EDIT_CHOICES: &[ChoiceSpec] = &[
@@ -136,9 +136,9 @@ mod tests {
     impl PermissionGate for ChoiceGate {
         fn ask(
             &mut self,
-            _: &[super::super::super::permissions::PermissionRequest],
-        ) -> super::super::super::permissions::PermissionDecision {
-            super::super::super::permissions::PermissionDecision::Deny
+            _: &[crate::permissions::PermissionRequest],
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             panic!("a config edit is a choice, not free text")

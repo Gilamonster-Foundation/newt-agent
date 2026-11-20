@@ -1,6 +1,6 @@
 //! #2757: ground destination approvals in real confined Git with bounded reads.
 use super::*;
-use crate::agentic::permissions::widen_caveats;
+use crate::permissions::widen_caveats;
 use crate::worktree_adoption::WorktreeSession;
 use crate::{ExecOutcome, Scope};
 

@@ -352,7 +352,7 @@ and the proxy. The OS socket list is a cross-check, not an accounting source.
 
 Inventory before introducing records or another permission system:
 
-- `newt-core/src/agentic/permissions.rs`: existing actions, session gate, and
+- `newt-core/src/permissions.rs`: existing actions, session gate, and
   permission request/decision types; `newt-tui/src/permissions.rs` owns prompting
   and signed durable promotion. `permissions_panel.rs` already returns operator
   intents to the chat owner rather than persisting from the view.

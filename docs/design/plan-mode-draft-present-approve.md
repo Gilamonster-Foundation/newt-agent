@@ -1,6 +1,6 @@
 # Plan mode: draft in scratch, present once, approve, then implement
 
-**Status:** design note with implemented handoff update · **Amends:** [`plan_editor_ephemeral_tui.md`](../decisions/plan_editor_ephemeral_tui.md) · **Builds on:** `PlanModeControl` ([`plan_mode.rs`](../../newt-core/src/agentic/plan_mode.rs)), `render_report` ([`report.rs`](../../newt-core/src/agentic/report.rs)), the permission gate ([`permissions.rs`](../../newt-core/src/agentic/permissions.rs)), per-session `plan.md` (`session_plan_path`, #220) · **Prior art:** [`weak-model-plan-mode-findings.md`](../research/weak-model-plan-mode-findings.md), [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md)
+**Status:** design note with implemented handoff update · **Amends:** [`plan_editor_ephemeral_tui.md`](../decisions/plan_editor_ephemeral_tui.md) · **Builds on:** `PlanModeControl` ([`plan_mode.rs`](../../newt-core/src/agentic/plan_mode.rs)), `render_report` ([`report.rs`](../../newt-core/src/agentic/report.rs)), the permission gate ([`permissions.rs`](../../newt-core/src/permissions.rs)), per-session `plan.md` (`session_plan_path`, #220) · **Prior art:** [`weak-model-plan-mode-findings.md`](../research/weak-model-plan-mode-findings.md), [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md)
 
 ## The failure this answers
 

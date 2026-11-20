@@ -2470,7 +2470,7 @@ pub struct InjectedPrompt {
 // B0b-2 (#1846): `Verdict`'s DATABASE serialization (`as_db_str` /
 // `from_db_str`) went with the `permission_requests.verdict` column it
 // existed for. The enum now lives beside `PermissionAction` in
-// `agentic::permissions` (`From<Verdict> for PermissionAction` is still live),
+// `permissions` (`From<Verdict> for PermissionAction` is still live),
 // and nothing persists it any more: an answer is stored as
 // the winning `Response` body in `interaction_offers`.
 //

@@ -17,10 +17,6 @@ use super::display::ToolPresentation;
 use super::mcp::{leash_mcp_call, McpGrant, McpTools};
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition};
 use super::note_sink::{execute_save_note, save_note_tool_definition};
-use super::permissions::{
-    DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
-    BOUND_REASON_PREFIX,
-};
 use super::prompt_intake::PromptDisposition;
 use super::prompt_read::execute_prompt_read_silent;
 #[cfg(test)]
@@ -28,6 +24,10 @@ use super::prompt_read::PromptReadContext;
 use super::recall::{execute_recall, recall_tool_definition};
 use super::report::{execute_render_report, render_report_tool_definition};
 use crate::caveats::CaveatsExt as _;
+use crate::permissions::{
+    DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
+    BOUND_REASON_PREFIX,
+};
 use crate::PermissionAction;
 #[cfg(test)]
 use output_budget::paginate_read;

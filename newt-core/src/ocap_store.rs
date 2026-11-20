@@ -34,7 +34,7 @@ pub use agent_bridle::policy::{
     PolicyFile, PolicySet, Verdict,
 };
 
-use crate::agentic::DenialKind;
+use crate::permissions::DenialKind;
 
 /// Shared recovery nudge for startup grant/protection diagnostics.
 pub const REPAIR_HINT: &str = "run `newt doctor` to inspect and repair";

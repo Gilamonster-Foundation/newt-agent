@@ -3,9 +3,6 @@
 
 use super::super::content_spill::{self, SpillStore};
 use super::super::display::ToolPresentation;
-use super::super::permissions::{
-    DenialKind, PermissionDecision, PermissionGate, PermissionRequest,
-};
 use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
@@ -14,6 +11,7 @@ use super::{
     denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
     permission_granted_result, requests_are_replay_safe, resolve_tool_alias, AliasOutcome,
 };
+use crate::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {

@@ -20,7 +20,7 @@ impl PermissionGate for BuildGate {
         self.0.push((baseline.clone(), requests[0].target.clone()));
         PermissionDecision::Deny // deterministically stop before spawning
     }
-    fn ask_question(&mut self, _: &str) -> super::super::permissions::HumanQuestionOutcome {
+    fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
         panic!("no question expected")
     }
 }

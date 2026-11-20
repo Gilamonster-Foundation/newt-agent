@@ -2215,7 +2215,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+            super::PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -2244,7 +2244,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
                 let grants = std::mem::take(&mut self.queue)
                     .into_iter()
                     .collect::<Vec<_>>();
-                crate::agentic::widen_caveats(base, &grants)
+                crate::permissions::widen_caveats(base, &grants)
             } else {
                 base.clone()
             }
@@ -2260,7 +2260,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         ) -> Caveats {
             let key = (kind, target.to_string());
             if self.queue.remove(&key) {
-                crate::agentic::widen_caveats(baseline, &[key])
+                crate::permissions::widen_caveats(baseline, &[key])
             } else {
                 baseline.clone()
             }
@@ -2727,7 +2727,7 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
         )]
     );
 
-    let granted = crate::agentic::widen_caveats(
+    let granted = crate::permissions::widen_caveats(
         &base,
         &[(DenialKind::Exec, executable.to_string_lossy().into_owned())],
     );
@@ -3086,7 +3086,7 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            self.current = crate::agentic::widen_caveats(&self.current, &grants);
+            self.current = crate::permissions::widen_caveats(&self.current, &grants);
             PermissionDecision::Allow(self.current.clone())
         }
         fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
@@ -4032,7 +4032,7 @@ async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set()
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+            PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -4131,7 +4131,7 @@ async fn bound_wording_and_replay_require_complete_missing_coverage() {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+            PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -4281,7 +4281,7 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+            PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
