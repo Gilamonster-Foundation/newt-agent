@@ -2661,6 +2661,60 @@ mod tests {
         assert_eq!(back[..21], expected, "{back:#?}");
     }
 
+    /// #3143, decided 2026-11-21: the grow repaint stays and its cost is accepted. A
+    /// terminal that keeps its scrollback and adds rows at the bottom on a grow (the
+    /// recorded one; tmux does once its history is cleared) already holds every row a
+    /// shrink scrolled away, and the repaint writes those rows above the block again, so
+    /// each is held twice. This pins that cost so it cannot grow unnoticed: for a 24-row
+    /// pane shrunk to 10 and grown back, exactly the 14 rows the shrink scrolled away are
+    /// held twice, and no other row is. A change that removes the duplicates fails here
+    /// on purpose, and should replace the numbers with zero.
+    #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
+    fn a_shrink_and_grow_holds_exactly_the_scrolled_away_rows_twice() {
+        let Some(term) = RealTerminal::open() else {
+            return;
+        };
+        term.write("\x1b[H\x1b[J");
+        term.paint_block(0, 3);
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        screen.insert_rows(transcript).unwrap();
+        term.paint_block(screen.top, 3);
+        term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+
+        let mut kept = Vec::new();
+        for rows in [10, 24] {
+            screen.painted_widths = vec![2, 2, 2];
+            screen.caret_frame = Some(CaretFrame {
+                top: screen.top,
+                block_h: 3,
+                cols: 80,
+                rows: screen.rows,
+                y: screen.top + 1,
+                x: 2,
+            });
+            term.rows(rows);
+            let measured = term.cursor_row() - 1;
+            screen.resize(80, rows, 2, 1, Some(measured)).unwrap();
+            term.paint_block(screen.top, 3);
+            if rows == 10 {
+                // Everything above the 10 visible rows is what the terminal keeps.
+                let held = term.history(|rows| rows.len() == 10 && rows[9] == "B2");
+                kept = held[..held.len() - 10].to_vec();
+            }
+            term.tmux(&["clear-history"]);
+        }
+        let back = term.screen(|rows| rows.len() == 24 && rows[23] == "B2");
+        let twice: Vec<String> = transcript_rows(&back)
+            .into_iter()
+            .filter(|row| kept.iter().any(|held| held == row))
+            .map(str::to_string)
+            .collect();
+        let expected: Vec<String> = (9..23).map(|n| format!("T{n:02}")).collect();
+        assert_eq!(twice, expected, "kept {kept:?}, back {back:#?}");
+    }
+
     /// The live recording of 2026-11-13: a pane dragged small and then large again came
     /// back with only the rows that fit the small pane, under blank rows. The rows the
     /// shrink scrolled away are repainted from the transcript this screen inserted.
