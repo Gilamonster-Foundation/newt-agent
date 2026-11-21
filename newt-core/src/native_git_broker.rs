@@ -125,13 +125,18 @@ impl NativeGitBroker {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_git_image(program: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
-    if agent_bridle::is_xcselect_stub(program) {
-        let tools = crate::confined_exec::developer_tool_directory()
-            .ok_or("cannot resolve the host's native Git image")?;
-        return tools
-            .join(program.file_name().ok_or("native Git has no file name")?)
-            .canonicalize()
-            .map_err(|error| error.to_string());
+    {
+        // The shell tool canonicalizes before it recognises a stub, so do the
+        // same here: a symlink to the stub is the stub.
+        let real = program.canonicalize().map_err(|error| error.to_string())?;
+        if agent_bridle::is_xcselect_stub(&real) {
+            let tools = crate::confined_exec::developer_tool_directory()
+                .ok_or("cannot resolve the host's native Git image")?;
+            return tools
+                .join(program.file_name().ok_or("native Git has no file name")?)
+                .canonicalize()
+                .map_err(|error| error.to_string());
+        }
     }
     Ok(program.to_owned())
 }

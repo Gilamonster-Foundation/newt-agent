@@ -608,6 +608,20 @@ mod tests {
             launcher_image(&stub, &real, is_stub, |image| image == real_git),
             Some(real_git)
         );
+        // A symlink to the stub under another name is still the stub, and runs the
+        // same-named real tool: the multi-call stub would have forwarded by that
+        // name too. With no such tool in the directory the stub is kept.
+        std::fs::write(real.join("clang"), b"real clang").unwrap();
+        let alias = stubs.join("clang");
+        std::os::unix::fs::symlink(&stub, &alias).unwrap();
+        assert_eq!(
+            launcher_image(&alias, &real, is_stub, yes),
+            Some(real.join("clang").canonicalize().unwrap())
+        );
+        std::fs::remove_file(real.join("clang")).unwrap();
+        assert_eq!(launcher_image(&alias, &real, is_stub, yes), None);
+        // A path with no file name has no same-named tool.
+        assert_eq!(launcher_image(Path::new("/"), &real, |_| true, yes), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
