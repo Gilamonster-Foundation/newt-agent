@@ -42,6 +42,55 @@ struct Fetch {
     prune: bool,
 }
 
+/// What the broker did with a `git fetch`.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::agentic::tools) enum Brokered {
+    /// The broker ran or refused it; this is the result to show the model.
+    Answered(String),
+    /// The remote is a path on this machine: no network is involved, so the
+    /// caller runs the command in the fence with no network prompt (#3148).
+    LocalRemote,
+}
+
+impl Brokered {
+    #[cfg(all(test, unix))]
+    pub(in crate::agentic::tools) fn answer(self) -> String {
+        match self {
+            Self::Answered(result) => result,
+            Self::LocalRemote => panic!("a local remote has no brokered answer"),
+        }
+    }
+}
+
+/// Whether a remote's literal URL names a path on this machine (absolute,
+/// relative, `file://` or a Windows drive), not a network host. A URL with a
+/// scheme (`https://`, `ssh://`) or an scp-like `host:path` is not local, and
+/// neither is a `transport::address` helper (`ext::`): those keep the prompt.
+fn is_local_remote(url: &str) -> bool {
+    // Empty, or shaped like an option: never a path to read.
+    if url.is_empty() || url.starts_with('-') {
+        return false;
+    }
+    if url.starts_with("file://") {
+        return true;
+    }
+    if url.contains("://") {
+        return false;
+    }
+    match url.find([':', '/', '\\']) {
+        // `host:path` and `transport::address` have a colon before any slash.
+        Some(i) if url.as_bytes()[i] == b':' => {
+            // A drive letter is a path only on Windows; elsewhere git reads
+            // `x:/y` as ssh to a host named `x`.
+            cfg!(windows)
+                && i == 1
+                && url.as_bytes()[0].is_ascii_alphabetic()
+                && url[2..].starts_with(['/', '\\'])
+        }
+        _ => true,
+    }
+}
+
 fn parse(argv: &[String]) -> Option<Fetch> {
     let (verb, args, same_repository) = invocation(argv).ok()?;
     if !argv.first().is_some_and(|a| is_git(a)) || verb != "fetch" || !same_repository {
@@ -86,13 +135,14 @@ pub(in crate::agentic::tools) fn wanted(source: &str, caveats: &Caveats) -> bool
 }
 
 /// Run a brokered fetch. `None` means "not handled here": no transfer or
-/// approval occurred, and the caller uses the consent-first fallback.
+/// approval occurred, and the caller uses the consent-first fallback;
+/// [`Brokered::LocalRemote`] means the same without the prompt.
 pub(in crate::agentic::tools) fn execute(
     source: &str,
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
-) -> Option<String> {
+) -> Option<Brokered> {
     execute_with(source, cwd, caveats, gate, |url| {
         crate::git_hardening::push_url_host(url).ok()
     })
@@ -106,7 +156,7 @@ pub(super) fn execute_with(
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
     dialable_host: impl FnOnce(&str) -> Option<String>,
-) -> Option<String> {
+) -> Option<Brokered> {
     let command = GovernedCommand::parse(source).ok()?;
     let fetch = parse(&command.argv)?;
     super::broker_available(caveats).ok()?;
@@ -114,11 +164,21 @@ pub(super) fn execute_with(
         return None;
     }
     let held = staging::HeldRoots::bind(&caveats.fs_read).ok()?;
+    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &held).ok()?;
+    // The LITERAL url, as for a push: what the operator approves is dialed.
+    let url = staging::literal_remote_url(&common_dir, &fetch.remote, &held).ok()?;
+    let Some(host) = dialable_host(&url) else {
+        // A path on this machine needs no network: the shell's own git reads
+        // it in the fence, as before #3097's prompt, instead of asking for
+        // egress the command does not use (#3148). Decided before the gates
+        // below, which only a dial needs: an adopted worktree cannot write the
+        // shared git directory, yet still has nothing to ask for.
+        return is_local_remote(&url).then_some(Brokered::LocalRemote);
+    };
     let tools =
         staging::TrustedTools::authenticate(staging::TrustContext::bind(&caveats.fs_write).ok()?)
             .map_err(|refusal| unavailable_notice(&refusal, std::io::stdout()))
             .ok()?;
-    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &held).ok()?;
     let writable = [&common_dir, &git_dir].map(|dir| dir.to_string_lossy().into_owned());
     if !writable
         .iter()
@@ -126,9 +186,6 @@ pub(super) fn execute_with(
     {
         return None;
     }
-    // The LITERAL url, as for a push: what the operator approves is dialed.
-    let url = staging::literal_remote_url(&common_dir, &fetch.remote, &held).ok()?;
-    let host = dialable_host(&url)?;
 
     // From here the broker owns the command: it answers, it never falls back.
     let result = ensure_net_granted(caveats, gate, &host, &format!("fetch from {host} ({url})"))
@@ -150,7 +207,9 @@ pub(super) fn execute_with(
             run(&plan, caveats, &held)
         });
     let success = result.is_ok();
-    Some(command.render(result.unwrap_or_else(|reason| reason), success))
+    Some(Brokered::Answered(
+        command.render(result.unwrap_or_else(|reason| reason), success),
+    ))
 }
 
 /// Tells the operator why a fetch was not brokered. The model sees nothing:
@@ -383,6 +442,40 @@ mod tests {
             "{notice}"
         );
         assert!(!notice.contains("DETAIL"), "{notice}");
+    }
+
+    /// #3148: which literal remote URLs are paths on this machine. Anything with
+    /// a scheme, an scp-like `host:path` or a `transport::address` helper stays
+    /// a network remote, so it keeps the prompt.
+    #[test]
+    fn only_a_path_on_this_machine_is_a_local_remote() {
+        for local in [
+            "/srv/git/repo.git",
+            "../sibling",
+            "./repo",
+            "repo",
+            "file:///srv/git/repo.git",
+        ] {
+            assert!(is_local_remote(local), "{local} is a path");
+        }
+        // A drive letter is a path on Windows only; on Unix git dials host `C`.
+        for drive in ["C:\\work\\repo", "C:/work/repo", "x:/y"] {
+            assert_eq!(is_local_remote(drive), cfg!(windows), "{drive}");
+        }
+        for network in [
+            "https://forge.example/o/r.git",
+            "ssh://git@forge.example/o/r.git",
+            "git@forge.example:o/r.git",
+            "forge.example:o/r.git",
+            "ext::sh -c evil",
+            "fd::3",
+            "git://forge.example/o/r.git",
+            "a:b/c",
+            "-oProxyCommand=evil",
+            "",
+        ] {
+            assert!(!is_local_remote(network), "{network} is not a path");
+        }
     }
 
     #[test]

@@ -2323,6 +2323,9 @@ fn session_body(
         print_newt(&notice, color, verbose);
     }
     workspace_settings.protect(cap.caveats())?;
+    if let Some(notice) = workspace_settings.unprotected_notice() {
+        print_newt(&notice, color, verbose);
+    }
     permission_state.protection = workspace_settings.protection.clone();
     if workspace_settings.profile.is_some() {
         print_newt("Saved workspace settings active. Changes in /settings workspaces apply after a full Newt restart.", color, verbose);

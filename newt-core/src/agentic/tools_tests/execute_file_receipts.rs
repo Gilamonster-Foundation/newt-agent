@@ -350,6 +350,13 @@ struct ChangeWhileConfirming {
 }
 
 impl PermissionGate for ChangeWhileConfirming {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("the configured scope already permits this write")
     }
@@ -861,6 +868,13 @@ async fn a_write_without_a_string_content_fails_and_changes_nothing() {
 struct NeverAsked;
 
 impl PermissionGate for NeverAsked {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
         panic!("a malformed call reached the permission gate: {requests:?}")
     }

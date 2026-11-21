@@ -4,6 +4,13 @@ struct Approve {
     asked: bool,
 }
 impl PermissionGate for Approve {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         self.asked = true;
         PermissionDecision::Allow(Caveats::top())

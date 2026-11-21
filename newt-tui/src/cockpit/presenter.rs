@@ -316,6 +316,10 @@ struct Screen<W: Write = File> {
     /// 0 or 1: the row above the viewport carrying the session's in-progress
     /// line and the queued chip.
     status_rows: u16,
+    /// The status row is allocated but blank: the status went while the block sat on
+    /// the bottom row, and `relayout` kept the block's height rather than slide the
+    /// transcript down (#3144). The next `insert_rows` writes over the row.
+    status_lingers: bool,
     /// The in-progress line as last fed by the stream.
     status: Row,
     /// Submits made while a turn ran, not yet consumed by a `ReadLine`.
@@ -534,9 +538,18 @@ impl<W: Write> Screen<W> {
         self.tail.extend(rows);
         let excess = self.tail.len().saturating_sub(TAIL_ROWS);
         self.tail.drain(..excess);
-        let (buf, plan) = render_insert(self.top, self.block_h, self.rows, &phys)?;
+        // A blank status row left at the block's top (see `relayout`) is free space
+        // for these rows: they are written over it, and it is no longer the block's.
+        let lingering = self.status_lingers;
+        let block_h = self.block_h - u16::from(lingering);
+        let (buf, plan) = render_insert(self.top, block_h, self.rows, &phys)?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
+        if lingering {
+            self.block_h = block_h;
+            self.status_rows = 0;
+            self.status_lingers = false;
+        }
         let moved = plan.new_top != self.top;
         self.top = plan.new_top;
         // FORCED: the scroll has already happened on the terminal. See
@@ -560,8 +573,25 @@ impl<W: Write> Screen<W> {
         self.moved_cursor();
         let new_h = (editor_rows + status_rows).clamp(1, self.rows.max(1));
         if new_h == self.block_h && status_rows == self.status_rows {
+            // The status is back on its row, or nothing changed.
+            self.status_lingers &= status_rows == 0;
             return Ok(());
         }
+        // #3144: when only the status row goes (a turn ends: the spinner stops) on a
+        // block on the bottom row, leave its row blank at the block's top instead of
+        // sliding the transcript down. The slide repainted the rows above the block
+        // from `tail`, but a terminal never takes scrollback back, so they were
+        // already in scrollback and the next scroll added a second copy: a shrink of
+        // n rows repeated n rows. The next insert writes over the blank row.
+        if status_rows == 0
+            && self.status_rows == 1
+            && editor_rows == self.block_h - 1
+            && self.top + self.block_h == self.rows
+        {
+            self.status_lingers = true;
+            return Ok(());
+        }
+        self.status_lingers = false;
         let mut buf = Vec::new();
         queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
         if self.top + new_h > self.rows {
@@ -639,6 +669,7 @@ impl<W: Write> Screen<W> {
         let new_h = (editor_rows + status_rows).clamp(1, self.rows);
         self.block_h = new_h;
         self.status_rows = status_rows;
+        self.status_lingers = false;
         self.top = resize_new_top(old_top, old_rows, self.rows, new_h);
         self.caret_frame = None;
         // FORCED: the TERMINAL resized; the block's new position is a
@@ -1215,6 +1246,7 @@ impl Presenter {
             top,
             block_h,
             status_rows: 0,
+            status_lingers: false,
             status: Vec::new(),
             queued: 0,
             region,
@@ -2404,6 +2436,7 @@ mod tests {
             top,
             block_h,
             status_rows: 1,
+            status_lingers: false,
             status: Vec::new(),
             queued: 0,
             region,
@@ -2492,6 +2525,17 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             rows
+        }
+
+        /// Every row tmux holds: its scrollback, then the visible screen, once
+        /// `ready` holds for the visible screen (#3144 reads the history, which the
+        /// grounds above never did: they read the screen, or cleared the history).
+        fn history(&self, ready: impl Fn(&[String]) -> bool) -> Vec<String> {
+            self.screen(ready);
+            self.tmux(&["capture-pane", "-p", "-S", "-"])
+                .lines()
+                .map(|row| row.trim_end().to_string())
+                .collect()
         }
 
         /// 21 transcript rows `T00`..`T20`, then a 3-row block on the bottom rows of
@@ -2692,6 +2736,75 @@ mod tests {
         assert_eq!(closed[21..], ["B0", "B1", "B2"], "{closed:#?}");
     }
 
+    /// #3144: a block on the bottom row that gets shorter slides the transcript down and
+    /// repaints the rows above it from the tail, but a terminal never takes scrollback
+    /// back, so those rows were already in scrollback and the next scroll added a
+    /// second copy. Here a full 80x24 screen has a status row that comes and goes
+    /// (the spinner of each turn), with rows inserted between; every row must be in
+    /// tmux's history once. Reads the history, as no ground did.
+    #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
+    fn a_real_terminal_holds_each_transcript_row_once_when_the_status_row_comes_and_goes() {
+        let Some(term) = RealTerminal::open() else {
+            return;
+        };
+        term.write("\x1b[H\x1b[J");
+        term.paint_block(0, 4);
+        let mut screen = screen_on(
+            (term.tty(), term.tty()),
+            80,
+            24,
+            0,
+            4,
+            &[2, 2, 2, 2],
+            (2, 1),
+        );
+        let mut next = 0u32;
+        let mut insert = |screen: &mut Screen<_>, n: u32| {
+            let rows = (next..next + n)
+                .map(|i| format!("T{i:03}").into_bytes())
+                .collect();
+            next += n;
+            screen.insert_rows(rows).unwrap();
+        };
+        // A full screen and some history, with the status row showing.
+        insert(&mut screen, 50);
+        for _ in 0..6 {
+            // The turn ends: the status row goes, the block gets one row shorter.
+            term.paint_block(screen.top, 4);
+            screen.relayout(3, 0).unwrap();
+            term.paint_block(screen.top, 3);
+            insert(&mut screen, 9);
+            // The next turn starts: the status row comes back, the block grows.
+            screen.relayout(3, 1).unwrap();
+            term.paint_block(screen.top, 4);
+            insert(&mut screen, 7);
+        }
+        let last = term.screen(|rows| rows.len() == 24 && rows[23].starts_with('B'));
+        assert_eq!(last.len(), 24);
+        let history = term.history(|rows| rows.len() == 24 && rows[23].starts_with('B'));
+        let rows: Vec<&str> = history
+            .iter()
+            .map(String::as_str)
+            .filter(|row| row.starts_with('T'))
+            .collect();
+        let mut seen = std::collections::BTreeMap::new();
+        for row in &rows {
+            *seen.entry(*row).or_insert(0u32) += 1;
+        }
+        let repeated: Vec<_> = seen.iter().filter(|(_, count)| **count > 1).collect();
+        assert!(
+            repeated.is_empty(),
+            "{} rows are in the history more than once: {repeated:?}",
+            repeated.len()
+        );
+        assert_eq!(
+            rows.len() as u32,
+            next,
+            "every inserted row is in the history once"
+        );
+    }
+
     /// The first row (zero-based) the resize erased downward from.
     fn first_erase_row(written: Boundaries) -> u16 {
         let text = written.text();
@@ -2746,6 +2859,63 @@ mod tests {
             erased.iter().all(|&r| r >= 10),
             "transcript erased: erase rows {erased:?}"
         );
+    }
+
+    /// #3144: a turn ends and its status row goes while the block is on the bottom row.
+    /// Sliding the transcript down repainted rows already in scrollback, so the next
+    /// scroll added a second copy of each. The block keeps its height instead, the
+    /// status row stays blank, and the next insert writes over that row.
+    #[test]
+    fn a_status_row_that_goes_on_the_bottom_row_is_left_blank_for_the_next_insert() {
+        // A 3-row block (status row + 2 editor rows) on the bottom of a 24-row screen.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[2, 2, 2], (2, 22));
+        screen.relayout(2, 0).unwrap();
+        assert_eq!(
+            (screen.top, screen.block_h, screen.status_rows),
+            (21, 3, 1),
+            "the block keeps its rows"
+        );
+        assert!(screen.status_lingers);
+        assert!(
+            !log.text().contains("\x1b[1T"),
+            "the transcript is not slid down: {:?}",
+            log.text()
+        );
+        // The status comes back before anything is inserted: nothing is written.
+        let quiet = log.text().len();
+        screen.relayout(2, 1).unwrap();
+        assert!(!screen.status_lingers);
+        assert_eq!(
+            log.text().len(),
+            quiet,
+            "a returning status row costs no bytes"
+        );
+        screen.relayout(2, 0).unwrap();
+        assert!(screen.status_lingers);
+
+        // The next insert writes over the blank row; the block is then 2 rows at the bottom.
+        let before = log.text().len();
+        screen.insert_rows(vec![b"T00".to_vec()]).unwrap();
+        assert_eq!(
+            (screen.top, screen.block_h, screen.status_rows),
+            (22, 2, 0),
+            "the blank row is the row the insert fills"
+        );
+        assert!(!screen.status_lingers);
+        let text = log.text()[before..].to_string();
+        assert!(
+            text.contains("\x1b[22;1H") && text.contains("T00"),
+            "written from the blank row (row 22, 1-based): {text:?}"
+        );
+        drop(screen);
+
+        // The editor grows into the blank row instead: still no slide, the block fills it.
+        let (mut screen, log) = screen_with_block(80, 24, 21, 3, &[2, 2, 2], (2, 22));
+        screen.relayout(2, 0).unwrap();
+        screen.relayout(3, 0).unwrap();
+        assert_eq!((screen.top, screen.block_h, screen.status_rows), (21, 3, 0));
+        assert!(!screen.status_lingers);
+        assert!(!log.text().contains("\x1b[1T"), "{:?}", log.text());
     }
 
     /// The live recording: the `/` palette opened on a bottom-row block and scrolled the

@@ -34,7 +34,7 @@ try {
     New-Item -ItemType Directory -Path $pack | Out-Null
     $multicall = Join-Path $pack 'newt-carried-tools.exe'
     Copy-Item -LiteralPath $binary -Destination $multicall
-    foreach ($name in @('cat','head','tail','wc','ls','mkdir','rm','cp','mv','sort','uniq','tr','cut','echo','grep','which')) {
+    foreach ($name in @('cat','head','tail','wc','ls','mkdir','rm','cp','mv','sort','uniq','tr','cut','echo','date','grep','which')) {
         $alias = Join-Path $pack "$name.exe"
         # Hardlinks save disk on NTFS. Copies preserve argv[0] on other filesystems.
         try { New-Item -ItemType HardLink -Path $alias -Target $multicall -ErrorAction Stop | Out-Null }

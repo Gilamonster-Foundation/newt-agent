@@ -113,6 +113,13 @@ async fn exposed_frame_refuses_generic_tool_dispatch() {
 
 struct WidenAll;
 impl PermissionGate for WidenAll {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         PermissionDecision::Allow(Caveats::top())
     }
@@ -133,6 +140,13 @@ async fn native_once_filesystem_frame_preflight_precedes_consumption_and_spawn()
     let _full = super::disable_ocap_tests::EnvVar::unset("NEWT_FULL_ACCESS");
     struct CountingGate(usize);
     impl PermissionGate for CountingGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             self.0 += 1;
             PermissionDecision::Allow(Caveats::top())
@@ -196,6 +210,13 @@ async fn live_permission_refresh_cannot_bypass_frame_isolation() {
     let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
     struct RecalledAll;
     impl PermissionGate for RecalledAll {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("passive refresh must not ask for new authority");
         }
@@ -785,6 +806,13 @@ fn frame_permission_gate_forwards_consume_pending_once() {
 
     struct ConsumeSpy(Rc<Cell<bool>>);
     impl PermissionGate for ConsumeSpy {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             PermissionDecision::Deny
         }

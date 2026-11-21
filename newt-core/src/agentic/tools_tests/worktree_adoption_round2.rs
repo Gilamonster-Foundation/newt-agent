@@ -9,6 +9,13 @@ use crate::Scope;
 #[derive(Default)]
 struct BuildGate(Vec<(Caveats, String)>);
 impl PermissionGate for BuildGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("build request must retain its fence")
     }
@@ -257,6 +264,13 @@ async fn worktree_adoption_dispatch_isolates_and_restores_bypass() {
 async fn worktree_adoption_round2_native_builds_keep_original_read_only() {
     struct ApproveBuild;
     impl PermissionGate for ApproveBuild {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("expected scoped build approval")
         }

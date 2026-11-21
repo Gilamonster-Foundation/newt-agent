@@ -162,12 +162,63 @@ fn sibling_round2_preparation_failure_spends_once_queue() {
     assert!(!target.exists());
 }
 
+/// #3148: while a sibling worktree is being prepared, the one-command network
+/// prompt still reaches the operator's gate; it used to inherit `Deny`.
+#[test]
+fn sibling_guard_forwards_the_dependency_fetch_prompt() {
+    struct Operator(usize);
+    impl PermissionGate for Operator {
+        fn ask_dependency_fetch(
+            &mut self,
+            prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            self.0 += 1;
+            PermissionDecision::Allow(prepared.clone())
+        }
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+    let (_temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+    let original = policy.worktree.parent().unwrap().join("main");
+    let mut candidate = Creation::before(&original, &policy.worktree, &Caveats::top()).unwrap();
+    candidate.prepare(&Caveats::top()).unwrap();
+    let mut operator = Operator(0);
+    let mut guard = super::super::prepare::Guard {
+        candidate: &candidate,
+        inner: Some(&mut operator),
+    };
+    let request = PermissionRequest {
+        tool: "run_command".into(),
+        kind: DenialKind::Net,
+        target: "all destinations for one git fetch".into(),
+        reason: "test".into(),
+        harness_bound: true,
+    };
+    assert!(matches!(
+        guard.ask_dependency_fetch(&Caveats::top(), &request),
+        PermissionDecision::Allow(_)
+    ));
+    assert_eq!(operator.0, 1, "the operator was asked exactly once");
+}
+
 /// #2757: permission refresh happens after preparation; a swap there must
 /// refuse before the refreshed authority is handed to the Git dispatch.
 #[test]
 fn sibling_round2_late_refresh_swap_refuses() {
     struct Swap(std::path::PathBuf);
     impl PermissionGate for Swap {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             PermissionDecision::Deny
         }

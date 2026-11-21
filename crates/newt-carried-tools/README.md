@@ -28,7 +28,7 @@ PR 2's layout contract, relative to `newt.exe`:
 
 ```text
 tools/newt-carried-tools.exe
-tools/{cat,head,tail,wc,ls,mkdir,rm,cp,mv,sort,uniq,tr,cut,echo,grep,which}.exe
+tools/{cat,head,tail,wc,ls,mkdir,rm,cp,mv,sort,uniq,tr,cut,echo,date,grep,which}.exe
 tools/{sed,awk,xargs}.exe
 tools/newt-ambient-brush.exe
 tools/rg.exe
@@ -47,7 +47,7 @@ sanitized child PATH so descendants can also resolve names. Only sed, awk and xa
 sh.exe or applet installation step. This limits PATH exposure, not the compiled
 capabilities of the upstream multicall binary.
 
-All 14 uutils crates are pinned to 0.12.0. The installer obtains upstream ripgrep
+All 15 uutils crates are pinned to 0.12.0. The installer obtains upstream ripgrep
 14.1.1 x86_64-pc-windows-msvc.zip, pinned SHA256
 `d0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1`.
 This is a foreign upstream checksum, verified using the same SHA256 pattern as
@@ -80,7 +80,7 @@ extension. It reports paths, never executes the located commands.
 
 ## Bounded grep contract
 
-Supported short flags (including clusters): `-r -R -E -F -n -c -v -i -l -w -o
+Supported short flags (including clusters): `-r -R -E -F -P -n -c -v -i -l -w -o
 -H -h -e PATTERN`. `-ePATTERN`, repeated `-e`, newline-separated patterns and
 `--` work. Paths retain native OS encoding; patterns must be UTF-8. Unsupported
 options and missing operands exit 2 with the supported set and a direct-rg hint.
@@ -99,7 +99,10 @@ No GNU long-option surface is claimed.
   ERE-only punctuation is escaped, so `alpha|beta` is literal in default mode.
   BRE escapes for groups, repetitions, word boundaries or backreferences and
   nested/POSIX bracket syntax are rejected. Use `-E` for rg's regex dialect
-  (no backreferences/lookaround) or `-F` for fixed strings. `-E` and `-F` conflict.
+  (no backreferences/lookaround), `-F` for fixed strings, or `-P` for rg's PCRE2
+  engine (`\K`, lookaround; the pattern is passed untranslated, #3151). `-P`
+  needs an adjacent ripgrep built with PCRE2; if it is not, rg's own error is
+  shown. `-E`, `-F` and `-P` conflict.
 - `-c` counts matching lines, including printing `0` for a no-match file;
   no-match still exits 1. `-l` overrides count/only-matching in either order;
   count overrides only-matching. `-vo` suppresses output but completes the

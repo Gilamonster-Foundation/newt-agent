@@ -24,6 +24,7 @@ fn main() {
         "tr" => uu_tr::uumain(std::env::args_os()),
         "cut" => uu_cut::uumain(std::env::args_os()),
         "echo" => uu_echo::uumain(std::env::args_os()),
+        "date" => uu_date::uumain(std::env::args_os()),
         "grep" => grep(&args[1..]),
         "which" => which::run(&args[1..]),
         _ => {
