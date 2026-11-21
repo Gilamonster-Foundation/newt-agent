@@ -21,6 +21,32 @@ fn security_posture_lines(report: &SecurityReport) -> Vec<String> {
     lines
 }
 
+/// #3152: exec grants a session would keep as bare names because a directory on
+/// their path is group- or other-writable, with the same repair hint `gh` gets.
+/// Derived the way a session derives them (the configured permissions, then the
+/// same resolver), so this and the startup notice cannot disagree.
+fn diagnose_exec_grants(config: &Config) {
+    let Some(tui) = config.tui.as_ref() else {
+        return;
+    };
+    let workspace = std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".into());
+    let mut caveats = tui.permissions.to_caveats(&workspace);
+    let path = newt_core::exec_grants::dispatch_path();
+    let (_, unpinned) =
+        newt_core::exec_grants::resolve_basenames_detailed(&mut caveats, path.as_deref());
+    let report =
+        newt_core::git_staging::tool_diagnostics::diagnose_exec_grants(&unpinned, path.as_deref());
+    if report.lines.is_empty() {
+        return;
+    }
+    println!("\nExecutable grants refused for a writable directory:");
+    for line in report.lines {
+        println!("  {line}");
+    }
+}
+
 pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     println!("newt doctor — checking backends\n");
 
@@ -62,6 +88,8 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
         );
         return Ok(());
     };
+
+    diagnose_exec_grants(&config);
 
     println!("\nConfigured backends:");
     for backend in &config.backends {

@@ -202,6 +202,49 @@ pub fn diagnose_tool_paths() -> ToolTrustReport {
     }
 }
 
+/// #3152: the same tool-path walk for exec grants that stayed basenames because
+/// a directory on their path is writable, with the same consented `chmod g-w`
+/// repair `git`, `gh` and `ssh` already get. Toolchain wrappers (cargo, rustc,
+/// ...) are the exception: no path or `chmod` makes them run in a confined
+/// `run_command`, so they are sent to `lifecycle action=build` and offered no
+/// repair. Names that are simply not installed are not this report's business.
+#[must_use]
+pub fn diagnose_exec_grants(
+    unpinned: &[crate::exec_grants::Unpinned],
+    path: Option<&OsStr>,
+) -> ToolTrustReport {
+    #[cfg(unix)]
+    {
+        use crate::exec_grants::{is_toolchain_proxy, UnpinnedReason};
+        let mut report = ToolTrustReport::default();
+        let ctx = TrustContext::bind(&Scope::none()).expect("empty write scope");
+        for entry in unpinned
+            .iter()
+            .filter(|u| matches!(u.reason, UnpinnedReason::Refused(_)))
+            // Already inspected above, with git's own trust context.
+            .filter(|u| !matches!(u.name.as_str(), "git" | "gh" | "ssh"))
+        {
+            if is_toolchain_proxy(&entry.name) {
+                report.lines.push(format!(
+                    "{}: a toolchain wrapper; no path or chmod makes it run confined. Run builds and tests with `lifecycle action=build`.",
+                    entry.name
+                ));
+                continue;
+            }
+            match crate::git_hardening::resolve_trusted_program(Path::new("."), path, &entry.name) {
+                Ok(tool) => report.inspect(&tool, &ctx),
+                Err(e) => report.lines.push(format!("{}: {e}", entry.name)),
+            }
+        }
+        report
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (unpinned, path);
+        ToolTrustReport::default()
+    }
+}
+
 #[cfg(unix)]
 fn find_helpers(dir: &Path, candidates: &mut BTreeSet<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -270,6 +313,57 @@ fn helper_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3152: an exec grant refused for a writable directory is walked like `gh`,
+    /// with the same repair hint; a toolchain wrapper is sent to the build lane
+    /// with no hint; a name that is merely not installed is not reported.
+    #[cfg(unix)]
+    #[test]
+    fn exec_grants_refused_for_a_writable_directory_get_the_repair_hint() {
+        use crate::exec_grants::{Unpinned, UnpinnedReason};
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o775)).unwrap();
+        for name in ["tool", "cargo"] {
+            let program = bin.join(name);
+            std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let refused = |name: &str| Unpinned {
+            name: name.into(),
+            reason: UnpinnedReason::Refused(vec![bin.clone()]),
+        };
+        let report = diagnose_exec_grants(
+            &[
+                refused("tool"),
+                refused("cargo"),
+                Unpinned {
+                    name: "absent".into(),
+                    reason: UnpinnedReason::NotFound,
+                },
+            ],
+            Some(bin.as_os_str()),
+        );
+        let text = report.lines.join("\n");
+        assert!(text.contains("tool: writable tool path"), "{text}");
+        assert!(
+            report.hints.iter().any(|h| h.path.ends_with("bin")),
+            "the writable directory carries the repair hint: {text}"
+        );
+        assert!(text.contains("cargo: a toolchain wrapper"), "{text}");
+        assert!(text.contains("lifecycle action=build"), "{text}");
+        assert!(!text.contains("absent"), "{text}");
+        // The wrapper adds no repair of its own: the hints are those of the
+        // ordinary tool alone (a temp directory's ancestors may add more, by platform).
+        let alone = diagnose_exec_grants(&[refused("tool")], Some(bin.as_os_str()));
+        assert_eq!(
+            report.hints, alone.hints,
+            "the wrapper gets no repair: {text}"
+        );
+    }
 
     /// #2739: no filesystem mutation without a positive operator decision.
     #[test]

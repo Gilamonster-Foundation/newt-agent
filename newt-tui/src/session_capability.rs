@@ -120,8 +120,7 @@ impl SessionCapability {
             let path = newt_core::exec_grants::dispatch_path();
             let writes = effective_writes.unwrap_or(&policy.fs_write).clone();
             let (pins, unresolved) = pin_exec_policy(&mut policy, &writes, path.as_deref());
-            let notice = (!unresolved.is_empty()).then(|| format!(
-                "Executable grants kept as basenames (not found or untrusted on PATH): {}. Confined execution may need an explicit trusted executable path.", unresolved.join(", ")));
+            let notice = newt_core::exec_grants::startup_notice(&unresolved);
             (policy, pins, notice)
         };
         let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());
@@ -291,10 +290,13 @@ fn pin_exec_policy(
     policy: &mut newt_core::Caveats,
     effective_writes: &newt_core::Scope<String>,
     path: Option<&std::ffi::OsStr>,
-) -> (newt_core::exec_grants::ExecPins, Vec<String>) {
+) -> (
+    newt_core::exec_grants::ExecPins,
+    Vec<newt_core::exec_grants::Unpinned>,
+) {
     let mut lookup = policy.clone();
     lookup.fs_write = effective_writes.clone();
-    let result = newt_core::exec_grants::resolve_basenames(&mut lookup, path);
+    let result = newt_core::exec_grants::resolve_basenames_detailed(&mut lookup, path);
     // Recalled authority excludes paths; it does not widen the signed base.
     policy.exec = lookup.exec;
     result
@@ -340,8 +342,9 @@ mod pin_tests {
             program.to_str().unwrap()
         ));
         let mut denied = policy.clone();
+        let unpinned = pin_exec_policy(&mut denied, &writes, Some(bin.as_os_str())).1;
         assert_eq!(
-            pin_exec_policy(&mut denied, &writes, Some(bin.as_os_str())).1,
+            unpinned.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
             ["gh"]
         );
         assert_eq!(denied, policy);
