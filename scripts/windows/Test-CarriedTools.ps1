@@ -70,6 +70,7 @@ try {
     Check-Tool uniq @('repeat.txt') 0 "b`na`n"
     Check-Tool cut @('-c1','repeat.txt') 0 "b`na`na`n"
     Check-Tool echo @('carried','echo') 0 "carried echo`n"
+    Check-Tool date @('-u','-d','2026-11-13 10:00:00 -0500','+%s') 0 "1794582000`n"
     Check-Tool tr @('a-z','A-Z') 0 "B`nA`nA`n" "b`na`na`n"
     Check-Tool grep @('-n','alpha','data.txt') 0 "1:alpha`n3:alpha beta`n"
     # #2790: BRE interior anchors / leading stars are literals, not rg operators.

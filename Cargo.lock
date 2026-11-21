@@ -4685,6 +4685,7 @@ dependencies = [
  "uu_cat",
  "uu_cp",
  "uu_cut",
+ "uu_date",
  "uu_echo",
  "uu_head",
  "uu_ls",
@@ -5509,6 +5510,17 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "parse_datetime"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "503fd4c8b0685e5eb32a8276533611f63e3b44768e9e8724e73f6852c2542f82"
+dependencies = [
+ "jiff",
+ "num-traits",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -8453,6 +8465,27 @@ dependencies = [
  "fluent 0.17.0",
  "memchr",
  "uucore",
+]
+
+[[package]]
+name = "uu_date"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "949f0a6c6449604f71c42915ac5ad8ffa87644d403c028e97023bb775483d789"
+dependencies = [
+ "clap",
+ "fluent 0.17.0",
+ "icu_calendar",
+ "icu_locale",
+ "jiff",
+ "jiff-icu",
+ "jiff-tzdb",
+ "libc",
+ "parse_datetime",
+ "rustix 1.1.4",
+ "thiserror 2.0.18",
+ "uucore",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
