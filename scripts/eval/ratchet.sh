@@ -28,6 +28,22 @@ NEWT="${NEWT_BIN:-$TARGET/debug/newt}"
 NEWT_EVAL="${NEWT_EVAL_BIN:-$TARGET/debug/newt-eval}"
 
 TASK="" MODE="" MODEL="" CODER="" MAX_LEAVES=6 TIMEOUT=1200 WORKER_TIMEOUT_MS=120000
+
+# GNU `timeout` is not on macOS (#3154): use it when there, then Homebrew's
+# `gtimeout`, then perl, which macOS ships. perl's alarm stops the run at the
+# deadline but has no -k escalation to SIGKILL, so there a TERM-immune run could
+# outlive it.
+run_with_timeout() {
+  local kill_after="$1" secs="$2"
+  shift 2
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k "$kill_after" "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout -k "$kill_after" "$secs" "$@"
+  else
+    perl -e 'alarm shift; exec @ARGV or exit 127' "$secs" "$@"
+  fi
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --task) TASK="$2"; shift 2;;
@@ -127,7 +143,7 @@ except (ValueError, KeyError, TypeError):
     # The autonomous loop. --one-shot is the headless approval. Crew roster from ~/.newt.
     # -k 60: timeout setpgid()s newt into its own process group, which escapes an
     # outer group-kill — escalate to SIGKILL so a TERM-immune run can't orphan.
-    CARGO_TARGET_DIR="$TARGET" timeout -k 60 "$TIMEOUT" \
+    CARGO_TARGET_DIR="$TARGET" run_with_timeout 60 "$TIMEOUT" \
       "$NEWT" plan --goal "$prompt" --one-shot --dir "$throw" --max-leaves "$MAX_LEAVES" \
       >"$throw/.plan.log" 2>&1
     plan_rc=$?

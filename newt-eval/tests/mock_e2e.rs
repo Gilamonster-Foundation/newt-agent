@@ -314,6 +314,11 @@ diff --git a/Cargo.toml b/Cargo.toml
 
     /// Crew mode with the stub landing `diff` (`None`: the crew lands nothing).
     async fn crew_row(diff: Option<&str>) -> Vec<String> {
+        crew_row_with(diff, &[]).await
+    }
+
+    /// [`crew_row`] with `extra` environment on top.
+    async fn crew_row_with(diff: Option<&str>, extra: &[(&str, &Path)]) -> Vec<String> {
         let file = tempfile::NamedTempFile::new().unwrap();
         let stub = repo_path("tests/fixtures/stub-newt-plan.sh");
         let mut env: Vec<(&str, &Path)> = vec![("NEWT_BIN", &stub)];
@@ -321,7 +326,30 @@ diff --git a/Cargo.toml b/Cargo.toml
             std::fs::write(file.path(), diff).unwrap();
             env.push(("STUB_CREW_DIFF", file.path()));
         }
+        env.extend_from_slice(extra);
         ratchet_row(&["--mode", "crew"], &env).await
+    }
+
+    /// A directory holding every command on the current `PATH` except `timeout` and
+    /// `gtimeout`: the host a Mac presents, whatever this host is.
+    fn path_without_timeout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for entry in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+            let Ok(entries) = std::fs::read_dir(&entry) else {
+                continue;
+            };
+            for item in entries.flatten() {
+                let name = item.file_name();
+                if name == "timeout" || name == "gtimeout" {
+                    continue;
+                }
+                let link = dir.path().join(&name);
+                if !link.exists() {
+                    let _ = std::os::unix::fs::symlink(item.path(), &link);
+                }
+            }
+        }
+        dir
     }
 
     /// The value of `key=` in a row's space-separated `details` column.
@@ -428,6 +456,24 @@ diff --git a/Cargo.toml b/Cargo.toml
     async fn a_crew_that_never_ran_is_an_error() {
         let row = crew_row(None).await;
         assert_eq!(row[4], "ERROR(infra)", "{row:?}");
+    }
+
+    /// #3154: macOS has no GNU `timeout`, and ratchet.sh ran the plan under it, so
+    /// every crew row there read "command not found" into the plan log and graded as
+    /// a behavioural FAIL. With `timeout` and `gtimeout` off the PATH the crew row
+    /// must grade exactly as it does with them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crew_row_does_not_need_gnu_timeout() {
+        let honest = t0_honest_diff();
+        let with = crew_row(Some(&honest)).await;
+        let bin = path_without_timeout();
+        let without = crew_row_with(Some(&honest), &[("PATH", bin.path())]).await;
+        assert_eq!(
+            grade(&without),
+            grade(&with),
+            "with timeout {with:?}\nwithout {without:?}"
+        );
+        assert_eq!(without[4], "PASS", "{without:?}");
     }
 }
 
