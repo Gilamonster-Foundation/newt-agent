@@ -23,6 +23,7 @@ uu_uniq = "=0.12.0"
 uu_tr = "=0.12.0"
 uu_cut = "=0.12.0"
 uu_echo = "=0.12.0"
+uu_date = "=0.12.0"
 
 [lints]
 workspace = true

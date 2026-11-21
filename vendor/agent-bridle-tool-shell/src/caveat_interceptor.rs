@@ -145,6 +145,10 @@ pub struct CaveatInterceptor {
     allow_cache: Option<AllowCache>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     broker: Option<Arc<crate::broker_runtime::WorkerBroker>>,
+    /// Host-supplied directory of the real developer tools, for starting the
+    /// tool a platform locator stub would only forward to (#3156). `None` leaves
+    /// every command unchanged.
+    launcher_image_dir: Option<std::path::PathBuf>,
 }
 
 impl CaveatInterceptor {
@@ -163,6 +167,7 @@ impl CaveatInterceptor {
             allow_cache: Some(Arc::new(Mutex::new(HashSet::new()))),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             broker: None,
+            launcher_image_dir: None,
         }
     }
 
@@ -191,6 +196,14 @@ impl CaveatInterceptor {
     #[must_use]
     pub(crate) fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Start the real tool instead of a platform locator stub (#3156): see
+    /// [`launcher_image`]. The directory is host policy, never learned here.
+    #[must_use]
+    pub(crate) fn with_launcher_image_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.launcher_image_dir = dir;
         self
     }
 
@@ -315,6 +328,24 @@ impl CaveatInterceptor {
     /// redirect setup, outside any command dispatch, so `pre_simple_cmd` is not
     /// provably ahead of this hook. Checked before the /dev/null allowance below
     /// so cancellation wins outright. Fail-closed and cheap.
+    /// The real tool to start in place of `params`' program, when that program is
+    /// a platform locator stub and the exec grant already admits the real one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn launcher_substitute<SE: ShellExtensions>(
+        &self,
+        params: &ExternalCmdParams<'_, SE>,
+    ) -> Option<std::path::PathBuf> {
+        let dir = self.launcher_image_dir.as_deref()?;
+        let cx = self.cx.as_ref()?;
+        let program = Path::new(params.command.program());
+        if !program.is_absolute() {
+            return None;
+        }
+        launcher_image(program, dir, agent_bridle_core::is_xcselect_stub, |image| {
+            image.to_str().is_some_and(|image| cx.check_exec(image).is_ok())
+        })
+    }
+
     fn check_open(&self, path: &Path, write: bool) -> Result<(), brush_core::Error> {
         if self.is_cancelled() {
             return Err(cancelled_error(
@@ -361,6 +392,33 @@ impl CaveatInterceptor {
     }
 }
 
+/// The real tool to start instead of `program`, when `program` is a platform
+/// locator stub (Apple's `/usr/bin/git`, `python3`, ...): the same-named tool in
+/// `dir`, the host's own selected developer directory (#3156).
+///
+/// A stub only locates and re-execs the selected toolchain's tool, and inside the
+/// kernel fence it cannot: it needs a per-user cache and a helper the fence
+/// hides, so every absolute-path call failed while a bare name, resolved through
+/// the host's PATH to the real tool, worked. Nothing here is a fixed path: the
+/// stub is recognised by `is_launcher` (its Mach-O imports), the directory is
+/// host policy, and the image must be a regular file that is neither the stub nor
+/// another launcher. `permitted` is the exec grant, so a session that did not
+/// admit the real tool keeps the stub and the ordinary denial, never a wider run.
+fn launcher_image(
+    program: &Path,
+    dir: &Path,
+    is_launcher: impl Fn(&Path) -> bool,
+    permitted: impl Fn(&Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    let real = program.canonicalize().ok()?;
+    if !is_launcher(&real) {
+        return None;
+    }
+    let image = dir.join(program.file_name()?).canonicalize().ok()?;
+    (image != real && image.is_file() && !is_launcher(&image) && permitted(&image))
+        .then_some(image)
+}
+
 fn permission_error(reason: String) -> brush_core::Error {
     std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason).into()
 }
@@ -377,6 +435,20 @@ impl CmdExecFilter for CaveatInterceptor {
     ) -> PreFilterResult<ExternalCmdParams<'a, SE>, brush_core::filter::ExternalCmdOutput> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let mut params = params;
+        // Before the broker sees the command: it must describe the image that
+        // will actually run. Admission of the final program still follows in
+        // `authorize_external_cmd`.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(image) = self.launcher_substitute(&params) {
+            match crate::broker_runtime::rebuild_command(&params.command, image, None) {
+                Ok(command) => params.command = command,
+                Err(error) => {
+                    return PreFilterResult::Return(Err(
+                        permission_error(error.to_string()).into_terminating()
+                    ));
+                }
+            }
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(broker) = &self.broker {
             if let Err(error) = broker.prepare(&mut params) {
@@ -500,6 +572,59 @@ mod tests {
 
     /// Mint a `ToolContext` the only legitimate way — through the gate — using a
     /// trivial tool with default (`top`) requirements so `effective == granted`.
+    /// #3156: a launcher stub is replaced by the same-named real tool in the host's
+    /// directory, only when every condition holds; anything else keeps the stub.
+    #[test]
+    fn launcher_image_replaces_only_a_recognised_stub_with_a_permitted_real_tool() {
+        let root = std::env::temp_dir().join(format!("bridle-3156-launcher-{}", std::process::id()));
+        let (stubs, real) = (root.join("stubs"), root.join("real"));
+        std::fs::create_dir_all(&stubs).unwrap();
+        std::fs::create_dir_all(&real).unwrap();
+        let stub = stubs.join("git");
+        std::fs::write(&stub, b"stub").unwrap();
+        std::fs::write(real.join("git"), b"real").unwrap();
+        std::fs::write(stubs.join("plain"), b"x").unwrap();
+        std::fs::write(real.join("plain"), b"y").unwrap();
+        let stub_real = stub.canonicalize().unwrap();
+        let real_git = real.join("git").canonicalize().unwrap();
+        let is_stub = |p: &Path| p == stub_real;
+        let yes = |_: &Path| true;
+
+        assert_eq!(
+            launcher_image(&stub, &real, is_stub, yes),
+            Some(real_git.clone())
+        );
+        // Not a launcher: left alone, whatever sits in the directory.
+        assert_eq!(launcher_image(&stubs.join("plain"), &real, is_stub, yes), None);
+        // No same-named tool in the directory.
+        assert_eq!(launcher_image(&stub, &stubs.join("absent"), is_stub, yes), None);
+        // The directory holds the stub itself, or another launcher: no loop.
+        assert_eq!(launcher_image(&stub, &stubs, is_stub, yes), None);
+        assert_eq!(launcher_image(&stub, &real, |_| true, yes), None);
+        // The exec grant does not admit the real tool: keep the stub and its denial.
+        assert_eq!(launcher_image(&stub, &real, is_stub, |_| false), None);
+        // The admission is asked about the real image, not the stub.
+        assert_eq!(
+            launcher_image(&stub, &real, is_stub, |image| image == real_git),
+            Some(real_git)
+        );
+        // A symlink to the stub under another name is still the stub, and runs the
+        // same-named real tool: the multi-call stub would have forwarded by that
+        // name too. With no such tool in the directory the stub is kept.
+        std::fs::write(real.join("clang"), b"real clang").unwrap();
+        let alias = stubs.join("clang");
+        std::os::unix::fs::symlink(&stub, &alias).unwrap();
+        assert_eq!(
+            launcher_image(&alias, &real, is_stub, yes),
+            Some(real.join("clang").canonicalize().unwrap())
+        );
+        std::fs::remove_file(real.join("clang")).unwrap();
+        assert_eq!(launcher_image(&alias, &real, is_stub, yes), None);
+        // A path with no file name has no same-named tool.
+        assert_eq!(launcher_image(Path::new("/"), &real, |_| true, yes), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn ctx(granted: Caveats) -> ToolContext {
         struct AnyTool;
         #[async_trait::async_trait]

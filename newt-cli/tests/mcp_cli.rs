@@ -104,6 +104,13 @@ mod composed_private_mcp_uat {
     }
 
     impl newt_core::PermissionGate for ReviewPermission {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &newt_core::caveats::Caveats,
+            _request: &newt_core::permissions::PermissionRequest,
+        ) -> newt_core::permissions::PermissionDecision {
+            newt_core::permissions::PermissionDecision::Deny
+        }
         fn ask_question(&mut self, _question: &str) -> newt_core::HumanQuestionOutcome {
             newt_core::HumanQuestionOutcome::Unavailable
         }

@@ -28,7 +28,7 @@ PR 2's layout contract, relative to `newt.exe`:
 
 ```text
 tools/newt-carried-tools.exe
-tools/{cat,head,tail,wc,ls,mkdir,rm,cp,mv,sort,uniq,tr,cut,echo,grep,which}.exe
+tools/{cat,head,tail,wc,ls,mkdir,rm,cp,mv,sort,uniq,tr,cut,echo,date,grep,which}.exe
 tools/{sed,awk,xargs}.exe
 tools/newt-ambient-brush.exe
 tools/rg.exe
@@ -47,7 +47,7 @@ sanitized child PATH so descendants can also resolve names. Only sed, awk and xa
 sh.exe or applet installation step. This limits PATH exposure, not the compiled
 capabilities of the upstream multicall binary.
 
-All 14 uutils crates are pinned to 0.12.0. The installer obtains upstream ripgrep
+All 15 uutils crates are pinned to 0.12.0. The installer obtains upstream ripgrep
 14.1.1 x86_64-pc-windows-msvc.zip, pinned SHA256
 `d0f534024c42afd6cb4d38907c25cd2b249b79bbe6cc1dbee8e3e37c2b6e25a1`.
 This is a foreign upstream checksum, verified using the same SHA256 pattern as

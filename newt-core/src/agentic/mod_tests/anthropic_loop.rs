@@ -113,6 +113,13 @@ impl<'a> FixtureMcpPermission<'a> {
 }
 
 impl crate::PermissionGate for FixtureMcpPermission<'_> {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
         crate::HumanQuestionOutcome::Unavailable
     }

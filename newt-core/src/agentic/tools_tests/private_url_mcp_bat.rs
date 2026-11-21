@@ -25,6 +25,13 @@ const MCP_RESULT: &str = "authenticated review 42 loaded";
 struct ReviewPermission(usize);
 
 impl crate::PermissionGate for ReviewPermission {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
         crate::HumanQuestionOutcome::Unavailable
     }

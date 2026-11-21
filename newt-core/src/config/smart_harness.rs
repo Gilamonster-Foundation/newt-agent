@@ -464,8 +464,10 @@ pub(crate) fn validate_stable_anchor(
                     !writable.iter().any(|(write_name, write_target)| {
                         named.starts_with(write_name) || resolved.starts_with(write_target)
                     }),
-                    "{context} filesystem grant anchor {} has a model-writable ancestor {}",
+                    "{context} filesystem grant anchor {} has a model-writable ancestor {}; \
+                     grant a root that is not inside {}, or remove this grant",
                     path.display(),
+                    parent.display(),
                     parent.display()
                 );
             }

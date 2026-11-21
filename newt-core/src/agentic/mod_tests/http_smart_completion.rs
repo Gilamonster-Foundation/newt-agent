@@ -1132,6 +1132,13 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
 struct AllowEverything(Caveats);
 
 impl crate::PermissionGate for AllowEverything {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
         crate::HumanQuestionOutcome::Answer("y".to_string())
     }

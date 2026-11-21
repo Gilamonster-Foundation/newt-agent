@@ -199,3 +199,7 @@ and wrapper-backend refusal stay there. No handles or new fields are
 serialized into the worker protocol. Composing held roots with #419's worker
 binding keeps both original objects after their pathnames are replaced
 (#2692). Retire this section if the mechanism is upstreamed.
+
+Newt #3156 makes `xcselect::is_xcselect_stub` public (`pub use` in `lib.rs`). The
+shell tool's launcher substitution recognises Apple's locator stub by identity
+rather than by a fixed path. The function and its checks are unchanged.

@@ -826,6 +826,13 @@ async fn unrestricted_mutation_confirm_accepts_y_case_insensitively_and_fails_cl
 
     struct ScriptGate(HumanQuestionOutcome);
     impl super::PermissionGate for ScriptGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _r: &[super::PermissionRequest]) -> super::PermissionDecision {
             super::PermissionDecision::Deny
         }
@@ -891,6 +898,13 @@ async fn unrestricted_write_and_delete_confirm_through_permission_gate() {
         questions: Vec<String>,
     }
     impl super::PermissionGate for ConfirmGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             super::PermissionDecision::Deny
         }
@@ -1119,6 +1133,13 @@ async fn yolo_keeps_the_fs_workspace_fence() {
 async fn yolo_never_consults_the_permission_gate_for_exec() {
     struct PanicGate;
     impl super::PermissionGate for PanicGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             panic!("yolo exec must never prompt, but the gate was asked: {requests:?}");
         }
@@ -1301,6 +1322,13 @@ async fn routed_cargo_test_reaches_the_confined_build_lane() {
         seen: Option<super::PermissionRequest>,
     }
     impl super::PermissionGate for RecordingDenyGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.seen = requests.first().cloned();
             super::PermissionDecision::Deny
@@ -1635,6 +1663,13 @@ async fn native_git_exec_grant_retry_stages_under_appcontainer() {
         granted: Caveats,
     }
     impl super::PermissionGate for GrantExecGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.requests.extend_from_slice(requests);
             super::PermissionDecision::Allow(self.granted.clone())
@@ -2466,6 +2501,13 @@ async fn lifecycle_run_of_build_tool_requests_build_authority() {
         seen: Option<super::PermissionRequest>,
     }
     impl super::PermissionGate for RecordingDenyGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.seen = requests.first().cloned();
             super::PermissionDecision::Deny
@@ -2540,6 +2582,13 @@ async fn lifecycle_run_of_non_build_tool_does_not_request_build_authority() {
         seen: Option<super::PermissionRequest>,
     }
     impl super::PermissionGate for RecordingDenyGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.seen = requests.first().cloned();
             super::PermissionDecision::Deny

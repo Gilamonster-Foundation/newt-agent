@@ -476,13 +476,16 @@ pub trait PermissionGate {
     /// on platforms without a host boundary. Never persist/reuse the approval
     /// or widen the session; enforce delegation and preset ceilings. Legacy
     /// gates fail closed rather than interpreting a host approval as All.
+    ///
+    /// Required, with no default, so a wrapper around another gate cannot
+    /// inherit a silent `Deny` by omission: a gate that holds an `inner` gate
+    /// forwards this (#3148, where the adopted-worktree guards did not and
+    /// every fetch in an adopted worktree was refused without asking).
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &Caveats,
-        _request: &PermissionRequest,
-    ) -> PermissionDecision {
-        PermissionDecision::Deny
-    }
+        prepared: &Caveats,
+        request: &PermissionRequest,
+    ) -> PermissionDecision;
 
     /// #728: ask the human a free-text `question` and return a typed
     /// [`HumanQuestionOutcome`] — the GENERIC ask-the-human primitive behind the
@@ -725,6 +728,13 @@ mod tests {
         #[derive(Default)]
         struct LegacyGate(Vec<(DenialKind, String)>);
         impl PermissionGate for LegacyGate {
+            fn ask_dependency_fetch(
+                &mut self,
+                _prepared: &crate::caveats::Caveats,
+                _request: &crate::permissions::PermissionRequest,
+            ) -> crate::permissions::PermissionDecision {
+                crate::permissions::PermissionDecision::Deny
+            }
             fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
                 PermissionDecision::Deny
             }

@@ -8,6 +8,13 @@ use std::path::Path;
 #[derive(Default)]
 struct BuildGate(Vec<(Caveats, String)>);
 impl PermissionGate for BuildGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("build admission must retain its requested caveats")
     }

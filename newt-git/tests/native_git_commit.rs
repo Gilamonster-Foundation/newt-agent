@@ -8,6 +8,7 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    newt_core::answer_nextest_listing("native_git_commit");
     if !std::env::args().any(|arg| arg == "--ignored") {
         eprintln!("native_git_commit ... ignored (real native Git and confinement)");
         return;
@@ -313,6 +314,18 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
 
     #[cfg(target_os = "macos")]
     {
+        // #3156: Apple's `/usr/bin/git` is a locator stub that cannot reach its
+        // toolchain inside the fence, so every absolute-path call exited 71 with
+        // xcrun and xcodebuild errors while bare `git` worked. The real tool
+        // from the host's developer directory is started instead.
+        for command in ["/usr/bin/git status --short", "/usr/bin/git rev-parse HEAD"] {
+            assert_succeeded(&execute(&repo, &tool, &authority, command).await);
+        }
+        println!("test apple_system_git_absolute_path_runs_the_real_tool ... ok");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
         let before = git(&repo, &["rev-parse", "HEAD"]).stdout;
         let output = execute(
             &repo,
@@ -331,25 +344,28 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
         println!("test apple_system_git_exec_transition_keeps_native_command ... ok");
     }
 
+    // #2720: an ambient (unrestricted-write) session is not the commit child's
+    // write grant. The broker bounds writes to the workspace and its git
+    // directory for the invocation, so the helpers stay immutable and the commit
+    // proceeds under the narrower authority instead of being refused. (This step
+    // once asserted a refusal; #2720 replaced that with attenuation, and nothing
+    // ran this proof to notice.)
     let before = git(&repo, &["rev-parse", "HEAD"]).stdout;
     let output = execute(
         &repo,
         &tool,
         &newt_core::Caveats::top(),
-        "git commit --allow-empty -m 'unprotectable grant'",
+        "git commit --allow-empty -m 'ambient grant is bounded'",
     )
     .await;
-    assert_eq!(
+    assert_succeeded(&output);
+    assert_ne!(
         git(&repo, &["rev-parse", "HEAD"]).stdout,
         before,
         "{output}"
     );
-    assert_eq!(tool.drain_commit_success(), 0);
-    assert!(
-        output.contains("protect") || output.contains("write"),
-        "{output}"
-    );
-    println!("test unrestricted_write_cannot_claim_protected_helpers ... ok");
+    assert_eq!(tool.drain_commit_success(), 1);
+    println!("test ambient_write_grant_is_bounded_for_the_commit ... ok");
 
     // Ordinary native commands retain the same ref policy as the embedded
     // engine, including a nonstandard origin default and an unborn default
@@ -461,6 +477,13 @@ struct DenyingParentGate {
 }
 
 impl newt_core::PermissionGate for DenyingParentGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &newt_core::caveats::Caveats,
+        _request: &newt_core::permissions::PermissionRequest,
+    ) -> newt_core::permissions::PermissionDecision {
+        newt_core::permissions::PermissionDecision::Deny
+    }
     fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
         self.refreshes += 1;
         newt_core::PermissionDecision::Allow(baseline.clone())
@@ -494,6 +517,13 @@ struct CountingAllowGate {
 }
 
 impl newt_core::PermissionGate for CountingAllowGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &newt_core::caveats::Caveats,
+        _request: &newt_core::permissions::PermissionRequest,
+    ) -> newt_core::permissions::PermissionDecision {
+        newt_core::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
         self.asks += 1;
         let _ = requests;

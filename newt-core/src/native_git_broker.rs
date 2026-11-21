@@ -117,19 +117,26 @@ impl NativeGitBroker {
     }
 }
 
-/// Apple's system Git is an exec shim. Resolve only that fixed system shim
-/// using the existing host-selected developer toolchain, with no model env.
-/// The native command still executes its original /usr/bin/git exactly once.
+/// Apple's system Git is a locator stub that only forwards to the selected
+/// toolchain's Git. Recognise it by identity (its Mach-O imports), not by path,
+/// and resolve the real image in the host-selected developer directory, with no
+/// model env. The shell tool starts that image directly (#3156), so the stub
+/// never runs inside the fence, where it cannot reach its toolchain.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_git_image(program: &Path) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
-    if program == Path::new("/usr/bin/git") {
-        let developer = crate::confined_exec::selected_developer_directory()
-            .ok_or("cannot resolve the host's native Git image")?;
-        return Path::new(developer)
-            .join("usr/bin/git")
-            .canonicalize()
-            .map_err(|error| error.to_string());
+    {
+        // The shell tool canonicalizes before it recognises a stub, so do the
+        // same here: a symlink to the stub is the stub.
+        let real = program.canonicalize().map_err(|error| error.to_string())?;
+        if agent_bridle::is_xcselect_stub(&real) {
+            let tools = crate::confined_exec::developer_tool_directory()
+                .ok_or("cannot resolve the host's native Git image")?;
+            return tools
+                .join(program.file_name().ok_or("native Git has no file name")?)
+                .canonicalize()
+                .map_err(|error| error.to_string());
+        }
     }
     Ok(program.to_owned())
 }

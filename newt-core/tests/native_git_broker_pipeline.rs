@@ -109,6 +109,7 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    newt_core::answer_nextest_listing("native_git_broker_pipeline");
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if std::env::args().any(|arg| arg == "--confined-contract") {
         contract::run();
