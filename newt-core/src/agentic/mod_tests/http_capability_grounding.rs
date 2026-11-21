@@ -15,7 +15,7 @@ const UNRUN_OUTPUT: [&str; 3] = [
     "Done. Removed `old-c` (was at `9a7b9b3`).",
     "Output:\n```\nDeleted branch feature/branch-1 (was 1a2b3c4).\n```",
 ];
-const NO_TOOL_RAN: &str = "No tool ran this turn.";
+const NO_TOOL_RAN: &str = "No tool ran this turn, so nothing was fetched";
 const WIRES: [&str; 4] = ["ollama", "openai", "anthropic", "responses"];
 
 fn response(wire: &str, text: &str, tool: Option<&str>) -> ResponseTemplate {

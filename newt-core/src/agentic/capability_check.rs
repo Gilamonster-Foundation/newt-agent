@@ -172,10 +172,18 @@ fn disclaims(line: &str) -> bool {
             "example:",
             "have not run",
             "haven't run",
-            "not run",
-            "will run",
+            "has not run",
+            "i will run",
+            "i'll run",
             "would print",
             "you'll see",
+            "what if",
+            "last turn",
+            "last time",
+            "last week",
+            "yesterday",
+            "days ago",
+            "weeks ago",
         ]
         .iter()
         .any(|phrase| line.contains(phrase))
@@ -208,7 +216,7 @@ fn claims_unrun_command_output(text: &str) -> bool {
         let program_after = |rest: &str| {
             let word = rest
                 .trim_start_matches('`')
-                .split([' ', '`'])
+                .split([' ', '`', '.', ',', ';'])
                 .next()
                 .unwrap_or("");
             PRESENTED_PROGRAMS.contains(&word)
@@ -231,18 +239,21 @@ fn claims_unrun_command_output(text: &str) -> bool {
         ]
         .iter()
         .any(|lead| {
-            line.split_once(lead)
-                .is_some_and(|(_, rest)| program_after(rest))
+            line.match_indices(lead)
+                .any(|(at, _)| program_after(&line[at + lead.len()..]))
         }) {
             return true;
         }
         if line.strip_prefix("$ ").is_some_and(program_after) {
             shows_command = true;
         }
-        // Past tense only: "returns exit code 0" in an explanation is not a result.
+        // A result line leads with its status ("exited 0", or "(exit 0)" as the
+        // transcript's own tool output renders it); "the process exited 0 on
+        // success" in an explanation does not.
+        let status_line = line.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '(');
         if ["exited 0", "(exit 0)"]
             .iter()
-            .any(|status| line.contains(status))
+            .any(|status| status_line.starts_with(status))
         {
             shows_status = true;
         }
@@ -325,9 +336,9 @@ pub(crate) fn annotate_unobserved_probe(text: String, evidence: &Evidence) -> St
     if !evidence.unsupported_probe_claim(&text) {
         if evidence.unsupported_output_claim(&text) {
             return format!(
-                "{text}\n\n⚠ Harness evidence: No tool ran this turn. The command output or \
-                completed action described above did not come from a command: nothing was \
-                fetched, deleted or changed by this turn."
+                "{text}\n\n⚠ Harness evidence: No tool ran this turn, so nothing was fetched, \
+                deleted or changed by this turn. Output or actions described above that are \
+                not from an earlier turn or from text you pasted did not come from a command."
             );
         }
         return text;
@@ -578,6 +589,8 @@ mod tests {
             "Done. Removed `old-c` (was at `9a7b9b3`).",
             "Output:\n```\nDeleted branch feature/branch-1 (was 1a2b3c4).\nDeleted branch feature/branch-2 (was 5d6e7f8).\n```",
             "Done — ran `git fetch --prune` myself.",
+            "I ran into trouble. I ran `git fetch --prune`.",
+            "I ran git.",
         ] {
             let evidence = Evidence::default();
             let out = annotate_unobserved_probe(reply.into(), &evidence);
@@ -590,6 +603,26 @@ mod tests {
             assert!(nudge.contains("no tool ran this turn"), "{nudge}");
             assert!(used, "the correction is one-shot");
             assert!(evidence.correction(reply, &tools, &mut used, true).is_none());
+        }
+    }
+
+    /// #2482 item 8, a known limit, pinned: the ledger is per turn, so a reply
+    /// that re-quotes an earlier turn's real output, or echoes a log the user
+    /// pasted, is flagged too (a fenced result line is not skipped: the measured
+    /// replies need that). The note therefore says only what the ledger proves
+    /// and names the way out, so it is never a false statement about that turn.
+    #[test]
+    fn a_requoted_or_pasted_transcript_is_flagged_with_a_note_that_names_the_escape() {
+        for reply in [
+            "```\nDeleted branch topic (was abc1234).\n```",
+            "Here is that output again:\n```\nDeleted branch topic (was abc1234).\n```",
+        ] {
+            let out = annotate_unobserved_probe(reply.into(), &Evidence::default());
+            assert!(out.contains("No tool ran this turn"), "{out}");
+            assert!(
+                out.contains("not from an earlier turn or from text you pasted"),
+                "{out}"
+            );
         }
     }
 
@@ -607,6 +640,10 @@ mod tests {
         for text in [
             "To fetch, run:\n```\n$ git fetch --prune\n```",
             "To check, run:\n```\n$ cargo test\n```\nIt returns exit code 0 when everything passes.",
+            "To check, run:\n```\n$ cargo build\n```\nThe process exited 0 on success.",
+            "What if I ran `git fetch` now?",
+            "I ran `cargo test` for you last week.",
+            "As I removed `x` (was at abc1234) in the last turn.",
             "I have not run `git fetch --prune`; here is what it would do.",
             "If it works you'll see `Deleted branch topic (was 1a2b3c4)`.",
             "The command prints `Deleted branch topic (was 1a2b3c4)` when it succeeds.",
