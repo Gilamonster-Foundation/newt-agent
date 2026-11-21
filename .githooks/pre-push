@@ -464,67 +464,43 @@ cargo fmt --all -- --check
 # nextest's discovery model calls EVERY test binary with `--list [--format
 # terse] [--ignored]` to enumerate tests before running any of them. `cargo
 # test` never does this -- it invokes a harness=false binary directly and
-# lets its own main() decide what to do. This repo has seven `harness = false`
-# custom-main test binaries (`grep -rn "harness = false" --include=Cargo.toml`),
-# and #1098 is the first thing to ever run nextest against them. Two are
-# confirmed broken by this real push (2026-09-30): newt-git::native_git_commit
-# treats the mere PRESENCE of "--ignored" in argv as "run the real confined
-# git test" (tests/native_git_commit.rs:11) instead of gating on an exact
-# match, so nextest's discovery pass runs it for real outside a sandboxed CI
-# runner; newt-harness::writer_inheritance ignores argv entirely and always
-# runs its fork-based test (tests/writer_inheritance.rs:149), which then hits
-# a broken pipe when nextest closes the child's stdout after the list request
-# it never asked for. newt-core::brush_build_pipeline and (#2693)
-# newt-core::native_git_broker_pipeline are excluded alongside them as a
-# precaution -- same shape of custom main (both gate on an exact `--ignored`
-# match, same as the fix `native_git_commit` still needs), not yet proven safe
-# under nextest's discovery pass either, and cheap to exclude versus expensive
-# to prove. The three vendored agent-bridle-tool-shell real-shell binaries
-# (brush_real, carried_coreutils, named_host_root_real) need `required-features
-# = ["brush"]` / `["carried-coreutils"]` this hook never enables, so they are
+# lets its own main() decide what to do.
+#
+# Four custom-main binaries gate their real body on `--ignored`:
+# newt-git::native_git_commit, newt-core::brush_build_pipeline,
+# newt-core::native_git_broker_pipeline and newt-core::macos_exec_basenames.
+# nextest's listing call passes exactly `--ignored`, so each used to run its
+# real proof during discovery (#3156). Each now calls
+# `newt_core::answer_nextest_listing` first, which answers the listing pass
+# (names the test only in the `--ignored` listing) and exits, so nextest lists
+# them as ignored tests and skips them here: they are no longer excluded below.
+# Their real bodies still run only under `-- --ignored`:
+#   native_git_broker_pipeline  .github/workflows/native-git-broker-real.yml
+#                               (weekly, release tags, PRs touching newt-core
+#                               or agent-toolchain) and macos-confined-contract.yml
+#   brush_build_pipeline        macos-confined-contract.yml, which runs only its
+#                               linked_worktree_build_reads row
+#   macos_exec_basenames        newt-tui-pty.yml (root-owned gh copy)
+#   native_git_commit           no CI lane yet: a disclosed gap (#3156 Expected 2)
+# newt-harness::writer_inheritance is a different shape and stays excluded: it
+# ignores argv entirely and always runs its fork-based test
+# (tests/writer_inheritance.rs), which then hits a broken pipe when nextest
+# closes the child's stdout after the list request it never asked for. CI's
+# plain `cargo test --workspace` DOES run it, so it is covered there.
+#
+# The three vendored agent-bridle-tool-shell real-shell binaries (brush_real,
+# carried_coreutils, named_host_root_real) need `required-features =
+# ["brush"]` / `["carried-coreutils"]` this hook never enables, so they are
 # never compiled here and must NOT be named in this filter -- nextest's
 # `binary_id()` predicate hard-errors ("no binary IDs matched") on a name with
-# zero matches in the discovered set, unlike `package()`. Fixing the three
-# excluded binaries' arg handling is tracked separately; out of scope for
-# #1098's hook-only change.
-#
-# What CI actually exercises for these three, named rather than assumed (fix-
-# first review on #2658, finding P2/5 -- do not claim execution from mere
-# compilation): the `test` job's `cargo test --workspace` (ci.yml) DOES
-# compile and invoke all three main()s with no extra args, same as this
-# hook's own no-nextest fallback above. Under that no-arg invocation,
-# writer_inheritance always runs its real fork test (its main() ignores argv
-# entirely) -- so CI's plain `cargo test --workspace` genuinely covers it.
-# native_git_commit and brush_build_pipeline instead gate their real body on
-# an exact `--ignored` match and print a one-line "... ignored" stub without
-# it; grepping every workflow in .github/workflows/ for their test-binary
-# names or an `-- --ignored` invocation that reaches them finds NONE. Their
-# real bodies are therefore DISCLOSED GAPS, not covered anywhere in CI today
-# -- `cargo test -p newt-git --test native_git_commit -- --ignored` and
-# `cargo test -p newt-core --test brush_build_pipeline -- --ignored` need a
-# real-resource CI lane of their own (tracked separately; out of scope here).
-# newt-core::macos_exec_basenames (#2816) runs its whole native-Seatbelt proof on
-# any argv containing --ignored, so nextest's discovery pass fails it on a dev Mac
-# whose ambient Homebrew gh is not a trusted exec fixture. It is CI-only (see the
-# header entry above; newt-tui-pty.yml stages a root-owned gh copy).
-# newt-core::native_git_broker_pipeline gates the SAME way but is NOT a
-# disclosed gap (#2693): `.github/workflows/native-git-broker-real.yml` runs
-# `cargo test -p newt-core --test native_git_broker_pipeline -- --ignored`
-# weekly, on release tags and on PRs touching newt-core or agent-toolchain
-# (#2947), with NEWT_NATIVE_GIT_BROKER_REQUIRE_KERNEL=1
-# so missing Landlock/git fails instead of silently skipping. This remains
-# a CI-only real-resource proof, excluded from the local pre-flight.
+# zero matches in the discovered set, unlike `package()`.
 #
 # The nine newt-agent binaries are the real-`newt`-session / real-PTY tier;
 # newt-eval::mock_e2e (whole binary) and the two named newt-tui tests are the
 # same tier, added later: see the CI-ONLY list in the header for each one's
 # reason and where CI runs it. scripts/test_pre_push.py pins this list;
 # change both together.
-NEXTEST_EXCLUDE='not binary_id(newt-core::brush_build_pipeline)
-    and not binary_id(newt-core::native_git_broker_pipeline)
-    and not binary_id(newt-core::macos_exec_basenames)
-    and not binary_id(newt-harness::writer_inheritance)
-    and not binary_id(newt-git::native_git_commit)
+NEXTEST_EXCLUDE='not binary_id(newt-harness::writer_inheritance)
     and not binary_id(newt-agent::lean_surface_purity)
     and not binary_id(newt-agent::stdout_purity)
     and not binary_id(newt-agent::posture_turn)

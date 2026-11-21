@@ -11,6 +11,7 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    newt_core::answer_nextest_listing("brush_build_pipeline");
     #[cfg(unix)]
     if std::env::args().any(|arg| arg == "--build-unix-socket-probe") {
         use std::io::{Read, Write};

@@ -193,6 +193,31 @@ pub fn maybe_dispatch() -> Option<i32> {
     fs_aliases::initialize();
     native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
 }
+
+/// What a `harness = false` test binary whose real body runs only under
+/// `--ignored` answers to nextest's discovery pass (#3156): `Some(Some(line))`
+/// names the test, `Some(None)` lists nothing, `None` is not a listing at all.
+/// nextest lists twice, once plain and once with `--ignored`; a lane that is
+/// ignored by default appears only in the second.
+#[doc(hidden)]
+pub fn ignored_lane_listing(args: &[String], name: &str) -> Option<Option<String>> {
+    let has = |flag: &str| args.iter().any(|arg| arg == flag);
+    has("--list").then(|| has("--ignored").then(|| format!("{name}: test")))
+}
+
+/// Call at the top of such a binary's `main`, after [`maybe_dispatch`]: during
+/// nextest's discovery pass it prints the listing and exits instead of running
+/// the real body, which an `--ignored` listing would otherwise trigger.
+#[doc(hidden)]
+pub fn answer_nextest_listing(name: &str) {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(listing) = ignored_lane_listing(&args, name) {
+        if let Some(line) = listing {
+            println!("{line}");
+        }
+        std::process::exit(0);
+    }
+}
 pub use agent_identity::{
     default_operator, AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef,
     AGENT_IDENTITY_FILENAME, DEFAULT_AGENT_EMAIL, DEFAULT_AGENT_NAME, GITHUB_APP_BOT_EMAIL,
@@ -363,3 +388,33 @@ pub use workspace_key::workspace_key_v2;
 pub mod ambient_brush;
 
 pub mod exec_grants;
+
+#[cfg(test)]
+mod ignored_lane_listing_tests {
+    use super::ignored_lane_listing;
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(ToString::to_string).collect()
+    }
+
+    /// #3156: nextest's discovery pass lists a plain pass and an `--ignored`
+    /// pass. An ignored-by-default lane is named only in the second, and neither
+    /// pass runs its body; a run (no `--list`) is not a listing.
+    #[test]
+    fn an_ignored_lane_is_named_only_in_the_ignored_listing() {
+        let plain = args(&["bin", "--list", "--format", "terse"]);
+        let ignored = args(&["bin", "--list", "--format", "terse", "--ignored"]);
+        assert_eq!(ignored_lane_listing(&plain, "proof"), Some(None));
+        assert_eq!(
+            ignored_lane_listing(&ignored, "proof"),
+            Some(Some("proof: test".to_string()))
+        );
+        for run in [
+            args(&["bin"]),
+            args(&["bin", "--ignored"]),
+            args(&["bin", "--exact", "proof", "--ignored", "--nocapture"]),
+        ] {
+            assert_eq!(ignored_lane_listing(&run, "proof"), None, "{run:?}");
+        }
+    }
+}
