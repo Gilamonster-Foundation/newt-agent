@@ -341,6 +341,13 @@ impl ScriptedGate {
 }
 
 impl PermissionGate for ScriptedGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &newt_core::caveats::Caveats,
+        _request: &newt_core::permissions::PermissionRequest,
+    ) -> newt_core::permissions::PermissionDecision {
+        newt_core::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("plan approval must never request a permission grant");
     }

@@ -45,6 +45,13 @@ enum Root {
 #[derive(Default)]
 struct Gate(Vec<PermissionRequest>);
 impl PermissionGate for Gate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
         self.0.extend_from_slice(requests);
         PermissionDecision::Deny

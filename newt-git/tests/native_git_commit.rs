@@ -461,6 +461,13 @@ struct DenyingParentGate {
 }
 
 impl newt_core::PermissionGate for DenyingParentGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &newt_core::caveats::Caveats,
+        _request: &newt_core::permissions::PermissionRequest,
+    ) -> newt_core::permissions::PermissionDecision {
+        newt_core::permissions::PermissionDecision::Deny
+    }
     fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
         self.refreshes += 1;
         newt_core::PermissionDecision::Allow(baseline.clone())
@@ -494,6 +501,13 @@ struct CountingAllowGate {
 }
 
 impl newt_core::PermissionGate for CountingAllowGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &newt_core::caveats::Caveats,
+        _request: &newt_core::permissions::PermissionRequest,
+    ) -> newt_core::permissions::PermissionDecision {
+        newt_core::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
         self.asks += 1;
         let _ = requests;

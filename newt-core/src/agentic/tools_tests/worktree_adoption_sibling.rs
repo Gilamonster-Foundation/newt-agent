@@ -12,6 +12,13 @@ struct AllowOnce(
     bool,
 );
 impl PermissionGate for AllowOnce {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("approval must preserve the caller baseline")
     }
@@ -57,6 +64,13 @@ impl ToolPresentation for Notices {
 
 struct ReadOnly;
 impl PermissionGate for ReadOnly {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn refresh_caveats(&mut self, base: &Caveats) -> PermissionDecision {
         PermissionDecision::Allow(Caveats {
             fs_write: Scope::none(),

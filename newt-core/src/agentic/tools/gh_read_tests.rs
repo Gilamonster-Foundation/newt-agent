@@ -44,6 +44,13 @@ impl Probe {
 #[derive(Default)]
 struct Gate(Vec<PermissionRequest>);
 impl PermissionGate for Gate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
         panic!("read broker must not ask a freeform question")
     }
@@ -233,6 +240,13 @@ struct AllowGate {
     requests: Vec<String>,
 }
 impl PermissionGate for AllowGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
         panic!("unexpected question")
     }

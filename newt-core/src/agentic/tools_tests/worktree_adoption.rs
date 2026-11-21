@@ -7,6 +7,13 @@ use crate::Scope;
 
 struct BroadGate;
 impl PermissionGate for BroadGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Allow(Caveats::top())
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         PermissionDecision::Allow(Caveats::top())
     }
@@ -120,6 +127,38 @@ fn worktree_adoption_clamps_refresh_retry_and_build_requests() {
             PermissionDecision::Deny
         ));
     }
+}
+
+/// #3148: the one-command network prompt reaches the operator's gate from an
+/// adopted worktree, attenuated like every other grant. The guard used to
+/// inherit the trait default `Deny`, so a plain `git fetch` there was refused
+/// without anyone being asked. With no gate behind it nothing can ask.
+#[test]
+fn worktree_guard_forwards_the_dependency_fetch_prompt_and_attenuates_it() {
+    let (_temp, policy, _) = fixture(true);
+    let original = policy.worktree.parent().unwrap().parent().unwrap();
+    let mut inner = BroadGate;
+    let mut gate = Guard {
+        policy: &policy,
+        inner: Some(&mut inner),
+    };
+    let PermissionDecision::Allow(c) =
+        gate.ask_dependency_fetch(&Caveats::top(), &request_fixture())
+    else {
+        panic!("the prompt must reach the operator's gate")
+    };
+    assert!(!crate::caveats::permits_path(
+        &c.fs_write,
+        original.to_str().unwrap()
+    ));
+    let mut bare = Guard {
+        policy: &policy,
+        inner: None,
+    };
+    assert!(matches!(
+        bare.ask_dependency_fetch(&Caveats::top(), &request_fixture()),
+        PermissionDecision::Deny
+    ));
 }
 
 fn request_fixture() -> PermissionRequest {
