@@ -97,3 +97,31 @@ fn invalid_bre_is_refused_instead_of_changing_regex_dialect() {
         assert!(translate(&[OsString::from(pattern)]).is_err(), "{pattern}");
     }
 }
+
+#[test]
+fn issue_3151_perl_regex_reaches_pcre2_as_written() {
+    // The model's own pattern from #3151: \K and \S are PCRE, not basic regex.
+    let pattern = r"^\S+\s+\S+\s+\K\[origin/\S+: gone\]";
+    let args = translated(&["-oP", pattern]);
+    assert!(args.contains(&"--pcre2".into()));
+    assert!(args.contains(&"--only-matching".into()));
+    assert!(args.windows(2).any(|a| a == ["--regexp", pattern]));
+    assert_eq!(args.last().unwrap(), "-");
+}
+
+#[test]
+fn issue_3151_perl_regex_does_not_mix_with_other_regex_modes() {
+    for flags in ["-PE", "-PF", "-EP", "-FP"] {
+        let error = translate(&[OsString::from(flags), OsString::from("x")]).unwrap_err();
+        assert!(
+            error.contains("conflicting regex modes"),
+            "{flags}: {error}"
+        );
+    }
+}
+
+#[test]
+fn issue_3151_perl_regex_is_listed_among_the_supported_options() {
+    let error = translate(&[OsString::from("-q"), OsString::from("x")]).unwrap_err();
+    assert!(error.contains("-P"), "{error}");
+}

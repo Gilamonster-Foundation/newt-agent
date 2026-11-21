@@ -80,7 +80,7 @@ extension. It reports paths, never executes the located commands.
 
 ## Bounded grep contract
 
-Supported short flags (including clusters): `-r -R -E -F -n -c -v -i -l -w -o
+Supported short flags (including clusters): `-r -R -E -F -P -n -c -v -i -l -w -o
 -H -h -e PATTERN`. `-ePATTERN`, repeated `-e`, newline-separated patterns and
 `--` work. Paths retain native OS encoding; patterns must be UTF-8. Unsupported
 options and missing operands exit 2 with the supported set and a direct-rg hint.
@@ -99,7 +99,10 @@ No GNU long-option surface is claimed.
   ERE-only punctuation is escaped, so `alpha|beta` is literal in default mode.
   BRE escapes for groups, repetitions, word boundaries or backreferences and
   nested/POSIX bracket syntax are rejected. Use `-E` for rg's regex dialect
-  (no backreferences/lookaround) or `-F` for fixed strings. `-E` and `-F` conflict.
+  (no backreferences/lookaround), `-F` for fixed strings, or `-P` for rg's PCRE2
+  engine (`\K`, lookaround; the pattern is passed untranslated, #3151). `-P`
+  needs an adjacent ripgrep built with PCRE2; if it is not, rg's own error is
+  shown. `-E`, `-F` and `-P` conflict.
 - `-c` counts matching lines, including printing `0` for a no-match file;
   no-match still exits 1. `-l` overrides count/only-matching in either order;
   count overrides only-matching. `-vo` suppresses output but completes the
