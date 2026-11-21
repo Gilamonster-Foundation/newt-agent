@@ -31,8 +31,8 @@ pub(super) fn preflight(
         Err(_) if hides_git_delete(source) => {
             return Err(format!(
                 "refused: this command uses a program newt cannot see into (xargs, \
-                 env, nice), so newt cannot show the operator what its git delete \
-                 removes. {NAME_IT_LITERALLY}"
+                 env, nice), so newt cannot show the operator what its git command \
+                 destroys. {NAME_IT_LITERALLY}"
             ))
         }
         // Other interpreter/dispatcher execution remains the confined
@@ -67,7 +67,10 @@ pub(super) fn preflight(
             "refused: git {ops} needs an operator to confirm it, and none is available"
         ));
     };
-    let subject = format!("{source}\n(run in {})", cwd.display());
+    let mut subject = format!("{source}\n(run in {})", cwd.display());
+    if destroys.contains(&"worktree-prune") {
+        subject.push_str(&prune_listing(cwd));
+    }
     if super::git_data_loss_confirmed(gate, &destroys, &subject) {
         Ok(())
     } else {
@@ -75,8 +78,55 @@ pub(super) fn preflight(
     }
 }
 
+/// What the host's own `git worktree prune --dry-run --verbose` would drop (#3145),
+/// as lines to append to the prompt. The confined git sees only part of the
+/// repository, so the operator is shown the host's list, not its own. git writes
+/// the list to stderr.
+fn prune_listing(cwd: &Path) -> String {
+    let listed =
+        crate::git_hardening::hardened_git(cwd, &["worktree", "prune", "--dry-run", "--verbose"])
+            .ok()
+            .and_then(|mut command| command.output().ok())
+            .filter(|output| output.status.success());
+    match listed {
+        Some(output) => {
+            let text = String::from_utf8_lossy(&output.stderr);
+            let lines: Vec<&str> = text.lines().take(20).collect();
+            if lines.is_empty() {
+                "\n(git worktree prune would drop nothing)".to_string()
+            } else {
+                format!("\n(git worktree prune would drop:\n{})", lines.join("\n"))
+            }
+        }
+        None => "\n(git could not list what a prune would drop)".to_string(),
+    }
+}
+
+/// The work-destroying git ops beyond a branch or stash delete (#3145), by what the
+/// command names: `worktree remove`, `worktree prune` without `--dry-run`, `reset
+/// --hard`, and `clean -f` without `-n`. A tripwire on literal words, like the
+/// delete checks beside it: a word it cannot read is not seen.
+fn other_data_loss_op(verb: &str, args: &[String]) -> Option<&'static str> {
+    let words: Vec<String> = args.iter().filter_map(|arg| literal(arg)).collect();
+    match verb {
+        "worktree" => match words.first().map(String::as_str) {
+            Some("remove") => Some("worktree-remove"),
+            Some("prune") => {
+                (!has_option(&words[1..], "n", &["--dry-run"])).then_some("worktree-prune")
+            }
+            _ => None,
+        },
+        "reset" => has_option(&words, "", &["--hard"]).then_some("reset-hard"),
+        "clean" => (has_option(&words, "f", &["--force"])
+            && !has_option(&words, "n", &["--dry-run"]))
+        .then_some("clean"),
+        _ => None,
+    }
+}
+
 /// Whether `source`, which Bridle could not inspect, runs a branch or stash
-/// delete as a bare word, as `xargs git branch -d` does. Without this,
+/// delete, or another work-destroying op, as a bare word, as `xargs git branch -d`
+/// does. Without this,
 /// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
 /// tripwire, not a boundary: like the commit check in `catalog.rs`, words keep
 /// their quotes, so git text inside an interpreter string (`sh -c '…'`) stays
@@ -93,20 +143,24 @@ fn hides_git_delete(source: &str) -> bool {
         .any(|words| {
             words.iter().enumerate().any(|(at, word)| {
                 is_git(word)
-                    && invocation(&words[at..]).is_ok_and(|(verb, args, _)| match verb {
-                        "branch" => has_option(args, "dD", &["--delete"]),
-                        "stash" => args
-                            .first()
-                            .is_some_and(|action| matches!(action.as_str(), "drop" | "clear")),
-                        _ => false,
+                    && invocation(&words[at..]).is_ok_and(|(verb, args, _)| {
+                        other_data_loss_op(verb, args).is_some()
+                            || match verb {
+                                "branch" => has_option(args, "dD", &["--delete"]),
+                                "stash" => args.first().is_some_and(|action| {
+                                    matches!(action.as_str(), "drop" | "clear")
+                                }),
+                                _ => false,
+                            }
                     })
             })
         })
 }
 
 /// What to do instead when a delete names what it destroys only at runtime.
-const NAME_IT_LITERALLY: &str = "Retry with run_command naming each branch or stash \
-    literally, for example `git branch -D old-a old-b`; newt then asks the operator.";
+const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out \
+    literally, for example `git branch -D old-a old-b` or `git worktree remove ../old`; \
+    newt then asks the operator.";
 
 /// The first `git` verb in `verbs` that `source` invokes anywhere, nested
 /// constructs included. A loose trigger: text that merely mentions Git is not
@@ -1101,6 +1155,18 @@ fn inspect_commands(
         let Some(verb) = literal(raw_verb) else {
             continue;
         };
+        // #3145: work-destroying ops beyond a branch or stash delete are confirmed
+        // the same way, and refused when newt cannot show what they run.
+        if let Some(op) = other_data_loss_op(&verb, args) {
+            if !top_level {
+                return Err(format!(
+                    "refused: git {verb} run by another program or inside a substitution \
+                     cannot show the operator what it destroys. {NAME_IT_LITERALLY}"
+                ));
+            }
+            destroys.push(op);
+            continue;
+        }
         match verb.as_str() {
             "commit" if native_commit_broker => continue,
             // Complement the preexisting lexical attribution guard for
@@ -2152,6 +2218,191 @@ mod tests {
             .unwrap_err()
             .contains("protected default branch 'stable'"));
         assert_eq!(gate.requests.len(), 1);
+    }
+
+    /// #3145: the ops are named by their words, and a dry run or a soft reset is not one.
+    #[test]
+    fn other_work_destroying_ops_are_named_by_their_words() {
+        let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (verb, args, op) in [
+            ("worktree", &["remove", "../old"][..], "worktree-remove"),
+            (
+                "worktree",
+                &["remove", "--force", "../old"][..],
+                "worktree-remove",
+            ),
+            ("worktree", &["prune"][..], "worktree-prune"),
+            ("worktree", &["prune", "--verbose"][..], "worktree-prune"),
+            ("reset", &["--hard"][..], "reset-hard"),
+            ("reset", &["--hard", "HEAD~1"][..], "reset-hard"),
+            ("clean", &["-fd"][..], "clean"),
+            ("clean", &["--force", "-x"][..], "clean"),
+        ] {
+            assert_eq!(
+                other_data_loss_op(verb, &words(args)),
+                Some(op),
+                "{verb} {args:?}"
+            );
+        }
+        for (verb, args) in [
+            ("worktree", &["list"][..]),
+            ("worktree", &["add", "../new"][..]),
+            ("worktree", &["prune", "--dry-run"][..]),
+            ("worktree", &["prune", "-n"][..]),
+            ("worktree", &[][..]),
+            ("reset", &["--soft", "HEAD~1"][..]),
+            ("reset", &["HEAD", "file"][..]),
+            ("reset", &[][..]),
+            ("clean", &["-n"][..]),
+            ("clean", &["-nfd"][..]),
+            ("clean", &["--dry-run"][..]),
+            ("clean", &["-i"][..]),
+            ("status", &[][..]),
+        ] {
+            assert_eq!(
+                other_data_loss_op(verb, &words(args)),
+                None,
+                "{verb} {args:?}"
+            );
+        }
+    }
+
+    /// #3145, found live: a model removed twelve worktrees and the operator was never
+    /// asked. Each of these now reaches the operator, once, and is refused when
+    /// declined or when nobody can be asked; the harmless forms are not asked.
+    #[test]
+    fn work_destroying_ops_reach_the_operator() {
+        let repo = repository();
+        let root = repo.path().canonicalize().unwrap();
+        for (source, op) in [
+            ("git reset --hard", "reset-hard"),
+            ("git clean -fd", "clean"),
+            ("git worktree remove ../old", "worktree-remove"),
+            ("git worktree prune", "worktree-prune"),
+        ] {
+            let mut gate = Gate {
+                allow: false,
+                requests: vec![],
+            };
+            let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+            let err = preflight(source, &root, &Caveats::top(), &mut asked, false);
+            assert_eq!(
+                err,
+                Err(format!("refused: the operator declined git {op}")),
+                "{source}"
+            );
+            assert_eq!(gate.requests.len(), 1, "{source}");
+            assert_eq!(gate.requests[0].target, op, "{source}");
+            assert!(gate.requests[0].reason.contains(source), "{source}");
+
+            gate.allow = true;
+            let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+            assert_eq!(
+                preflight(source, &root, &Caveats::top(), &mut asked, false),
+                Ok(()),
+                "{source}"
+            );
+
+            let none = preflight(source, &root, &Caveats::top(), &mut None, false);
+            assert!(
+                none.unwrap_err()
+                    .contains("needs an operator to confirm it"),
+                "{source}"
+            );
+        }
+        for source in [
+            "git reset --soft HEAD~1",
+            "git reset HEAD file",
+            "git clean -n",
+            "git worktree list",
+            "git worktree prune --dry-run",
+            "git status",
+        ] {
+            let mut gate = Gate {
+                allow: false,
+                requests: vec![],
+            };
+            let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+            assert_eq!(
+                preflight(source, &root, &Caveats::top(), &mut asked, false),
+                Ok(()),
+                "{source}"
+            );
+            assert!(gate.requests.is_empty(), "{source} asked");
+        }
+        // In a loop or a substitution newt cannot show what runs: refused, with the retry.
+        let err = preflight(
+            "echo $(git reset --hard)",
+            &root,
+            &Caveats::top(),
+            &mut None,
+            false,
+        );
+        assert!(err
+            .unwrap_err()
+            .contains("cannot show the operator what it destroys"));
+    }
+
+    /// #3145: a prune prompt lists what the host's own dry run would drop, which the
+    /// confined git cannot see in full.
+    #[test]
+    fn a_prune_prompt_lists_what_the_host_would_drop() {
+        let repo = repository();
+        let root = repo.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let gone = outside.path().join("gone");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                gone.to_str().unwrap(),
+                "-b",
+                "gone-branch",
+            ],
+        );
+        std::fs::remove_dir_all(&gone).unwrap();
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let err = preflight(
+            "git worktree prune",
+            &root,
+            &Caveats::top(),
+            &mut asked,
+            false,
+        );
+        assert_eq!(
+            err,
+            Err("refused: the operator declined git worktree-prune".into())
+        );
+        let reason = &gate.requests[0].reason;
+        assert!(reason.contains("would drop"), "{reason}");
+        assert!(reason.contains("worktrees/gone"), "{reason}");
+    }
+
+    /// #3145: the tripwire sees the new ops behind a dispatcher, as it does a delete.
+    #[test]
+    fn other_work_destroying_ops_behind_a_dispatcher_are_seen() {
+        for source in [
+            "git worktree list | xargs -n1 git worktree remove",
+            "xargs git reset --hard",
+            "env GIT_TRACE=0 /usr/bin/git clean -fd",
+            "nice git worktree prune",
+        ] {
+            assert!(hides_git_delete(source), "{source}");
+        }
+        for source in [
+            "xargs git worktree list",
+            "env git reset --soft",
+            "nice git clean -n",
+            "git worktree prune --dry-run | xargs echo",
+        ] {
+            assert!(!hides_git_delete(source), "{source}");
+        }
     }
 
     /// Pure: the tripwire reads bare words, so it sees through a dispatcher,
