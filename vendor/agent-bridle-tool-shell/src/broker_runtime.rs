@@ -445,21 +445,7 @@ impl WorkerBroker {
         // Rebuild only when native argv was prepared. Preserve every original
         // property, including prior explicit delegations and env-clear intent.
         if let Some(args) = prepared.args {
-            let previous = &params.command;
-            let mut command = ExternalCommand::new(previous.program());
-            command.set_argv0(previous.argv0()).args_extend(args);
-            if previous.env_clear() {
-                command.clear_env();
-            }
-            for (key, value) in previous.envs() {
-                command.env(key, value);
-            }
-            if let Some(cwd) = previous.current_dir() {
-                command.set_current_dir(cwd);
-            }
-            for delegation in previous.delegated_fds() {
-                command.delegate_fd(delegation.clone()).map_err(error)?;
-            }
+            let command = rebuild_command(&params.command, params.command.program(), Some(args))?;
             params.command = command;
         }
         for (key, value) in prepared.env {
@@ -507,6 +493,35 @@ impl WorkerBroker {
         }
         Ok(())
     }
+}
+
+/// `previous` with another program and, optionally, another argument vector.
+/// Every other property survives: argv[0], the environment and its clear
+/// intent, the working directory, and every explicit descriptor delegation.
+/// The one rebuild shared by broker preparation and launcher substitution
+/// (#3156), so neither can drop a property the other keeps.
+pub(crate) fn rebuild_command(
+    previous: &ExternalCommand,
+    program: impl AsRef<std::ffi::OsStr>,
+    args: Option<Vec<std::ffi::OsString>>,
+) -> ToolResult<ExternalCommand> {
+    let mut command = ExternalCommand::new(program);
+    command
+        .set_argv0(previous.argv0())
+        .args_extend(args.unwrap_or_else(|| previous.args().to_vec()));
+    if previous.env_clear() {
+        command.clear_env();
+    }
+    for (key, value) in previous.envs() {
+        command.env(key, value);
+    }
+    if let Some(cwd) = previous.current_dir() {
+        command.set_current_dir(cwd);
+    }
+    for delegation in previous.delegated_fds() {
+        command.delegate_fd(delegation.clone()).map_err(error)?;
+    }
+    Ok(command)
 }
 
 #[cfg(test)]

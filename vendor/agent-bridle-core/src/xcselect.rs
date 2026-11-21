@@ -16,7 +16,7 @@ use std::path::Path;
 /// Whether `real` (a canonical path) is the Xcode locator stub. Always `false`
 /// off macOS.
 #[cfg(target_os = "macos")]
-pub(crate) fn is_xcselect_stub(real: &Path) -> bool {
+pub fn is_xcselect_stub(real: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     // One open fd for every check, so they all describe the same object.
     let Ok(mut f) = std::fs::File::open(real) else {
@@ -34,7 +34,7 @@ pub(crate) fn is_xcselect_stub(real: &Path) -> bool {
 
 /// Always `false` off macOS: there is no locator stub to exempt.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn is_xcselect_stub(_real: &Path) -> bool {
+pub fn is_xcselect_stub(_real: &Path) -> bool {
     false
 }
 

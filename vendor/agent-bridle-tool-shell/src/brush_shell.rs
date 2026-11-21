@@ -99,6 +99,7 @@ pub struct BrushShellTool {
     execution_lease: Option<crate::ExecutionLease>,
     held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
     command_broker: Option<Arc<dyn crate::CommandBroker>>,
+    launcher_image_dir: Option<std::path::PathBuf>,
     /// Wall-clock ceiling for one run (FIX 3). A run that exceeds it is stopped
     /// and reported `timed_out:true` with exit 124.
     timeout: Duration,
@@ -129,6 +130,7 @@ impl BrushShellTool {
             execution_lease: None,
             held_read_roots: Vec::new(),
             command_broker: None,
+            launcher_image_dir: None,
             timeout: default_timeout(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
             named_host_roots: false,
@@ -182,6 +184,20 @@ impl BrushShellTool {
     #[must_use]
     pub fn with_command_broker(mut self, broker: Arc<dyn crate::CommandBroker>) -> Self {
         self.command_broker = Some(broker);
+        self
+    }
+
+    /// Start the real developer tool instead of a platform locator stub (#3156).
+    ///
+    /// `dir` is the host's own selected developer-tool directory. When a command
+    /// names a locator stub by absolute path (Apple's `/usr/bin/git`), the worker
+    /// starts the same-named tool from `dir` instead, if the exec grant admits
+    /// it: the stub only forwards to that tool, and cannot do so inside the
+    /// fence. The engine never discovers the directory itself; the host supplies
+    /// it, and `None` leaves every command unchanged.
+    #[must_use]
+    pub fn with_launcher_image_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.launcher_image_dir = Some(dir);
         self
     }
 
@@ -343,7 +359,8 @@ impl Tool for BrushShellTool {
             path_value,
             env,
             max_output,
-        );
+        )
+        .with_launcher_image_dir(self.launcher_image_dir.clone());
         payload.broker = self.command_broker.is_some();
         let confined = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))

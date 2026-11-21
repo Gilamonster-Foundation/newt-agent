@@ -148,8 +148,8 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     // The shims need ambient per-user caches; direct tools keep workspace-only
     // writes. Explicit venv and operator executable roots retain precedence.
     #[cfg(target_os = "macos")]
-    if let Some(developer) = crate::confined_exec::selected_developer_directory() {
-        path_dirs.push(format!("{developer}/usr/bin"));
+    if let Some(tools) = crate::confined_exec::developer_tool_directory() {
+        path_dirs.push(tools.to_string_lossy().into_owned());
     }
 
     if !path_dirs.is_empty() {
@@ -912,6 +912,13 @@ fn bridle_registry(
                 }
                 if let Some(broker) = command_broker {
                     tool = tool.with_command_broker(broker);
+                }
+                // An absolute `/usr/bin/git` is Apple's locator stub, which cannot
+                // reach its toolchain inside the fence (#3156): start the real tool
+                // from the host's own developer directory instead.
+                #[cfg(target_os = "macos")]
+                if let Some(tools) = crate::confined_exec::developer_tool_directory() {
+                    tool = tool.with_launcher_image_dir(tools);
                 }
                 if let Some(observer) = live {
                     tool = tool.with_output_observer(observer);
