@@ -534,7 +534,7 @@ fn role_bound_persona_loads_tools_and_caveats() {
 
     let wc = store.load("wing-commander").unwrap();
     assert_eq!(wc.profile.role.as_deref(), Some("wing-commander"));
-    assert_eq!(wc.profile.tier, Some(newt_core::Tier::Review));
+    assert_eq!(wc.profile.tier, Some(newt_router::Tier::Review));
     assert_eq!(
         wc.profile.tools.as_deref(),
         Some(["read_file".to_string(), "grade_diff".to_string()].as_slice())

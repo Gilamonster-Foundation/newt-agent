@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use newt_core::router::Tier;
 use newt_core::NewtError;
+use newt_router::Tier;
 
 use crate::backend::InferenceBackend;
 use crate::provider_plugin::ProviderPluginBackend;
@@ -71,7 +71,8 @@ impl Default for BackendRegistry {
 mod tests {
     use super::*;
     use newt_core::config::ProviderConfig;
-    use newt_core::{Config, Tier};
+    use newt_core::Config;
+    use newt_router::Tier;
 
     fn provider(model: Option<&str>) -> ProviderConfig {
         ProviderConfig {

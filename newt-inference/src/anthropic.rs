@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use newt_core::agentic::anthropic_wire;
 use newt_core::backend_probe::ANTHROPIC_VERSION;
-use newt_core::router::Tier;
+use newt_router::Tier;
 
 use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
 use crate::retry::{with_backoff, RetryPolicy};

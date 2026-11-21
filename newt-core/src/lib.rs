@@ -1,8 +1,8 @@
-//! Newt-Agent core: shared types, errors, and the tier router.
+//! Newt-Agent core: shared types and errors.
 //!
-//! The router is the NeMoCode inheritance — it classifies an incoming turn
-//! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
-//! configured backends which can serve that tier.
+//! The tier router is the `newt-router` crate. It is the NeMoCode inheritance:
+//! it classifies an incoming turn into a `Tier` (FAST / STANDARD / COMPLEX /
+//! REVIEW), and the configured backends are asked which can serve that tier.
 
 pub mod agent_identity;
 pub mod agentic;
@@ -82,6 +82,7 @@ pub mod interaction_surface;
 // `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
 // `markup::plain`, which stays unconditional for exactly this reason.
 pub mod ambient_shell;
+pub mod danger;
 #[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;
@@ -107,10 +108,12 @@ pub mod ocap;
 pub mod ocap_propose;
 pub mod ocap_store;
 pub mod operating_mode;
+mod paths;
 /// Danger-tier terminal-echo policy. Was `PermissionChallenge` too, until
 /// #1839 deleted that hand-rolled encoding in favour of the definition's
 /// `ContentId`.
 pub mod permission_challenge;
+pub mod permissions;
 pub mod plan;
 pub mod posture;
 pub mod pricing;
@@ -136,6 +139,7 @@ pub mod psyche;
 /// One-time importer for the psyche vocabulary rename (deletable after one release).
 pub mod psyche_import;
 pub mod reasoning;
+mod redact;
 pub mod responses_wire;
 pub mod retry;
 /// #1030 node evaluators: Task/Plan done-ness from objective git state.
@@ -143,7 +147,6 @@ pub mod roadmap_eval;
 /// #1082 roadmap-as-code: the on-repo TOML codec (`.newt/roadmap.toml`).
 pub mod roadmap_file;
 pub mod role_profile;
-pub mod router;
 pub mod runtime;
 pub mod sas_confirm;
 pub mod sas_transcript;
@@ -208,30 +211,28 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use agentic::preserve_mcp_resource_url_affinity;
 pub use agentic::wrap_untrusted;
 pub use agentic::{
-    append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
+    chat_complete, chat_complete_with_prompt, compress_user_initiated,
     compress_user_initiated_for_task, execute_tool, execute_tool_quiet, experience_block,
     format_index_status, format_search_hits, format_search_model, format_search_preview,
     format_search_rejects, fresh_multi_step_plan, gather_code_files, gather_with_manifest,
-    index_files, load_denials, memory_fetch_tool_definition, openai_chat_complete,
+    index_files, memory_fetch_tool_definition, openai_chat_complete,
     openai_chat_complete_with_prompt, openai_responses_complete,
     openai_responses_complete_with_prompt, parse_context_window_error, plan_block, plan_verdict,
     recover_context_window_400, render_code_evidence, retrieve_evidence, retrieve_evidence_steered,
     retrieve_ranked, set_spill_lines, set_spill_summary, set_time_marker_secs, transcript_lines,
-    transcript_lines_styled, trim_for_summary, widen_caveats, BehaviorSignal, ChatCtx, CodeSearch,
-    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ErrorClass,
-    EvidenceKind, ExperienceStore, ExposureSettings, GatherCaps, GatherManifest,
-    HeadlessCodeSearch, HumanQuestionOutcome, IndexStatus, LiveToolOutput, ManualCompressOutcome,
-    ManualCompressPolicy, McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink,
-    ParseSignal, PermissionAction, PermissionDecision, PermissionGate, PermissionRecord,
-    PermissionRequest, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanSnapshot,
-    PlanVerdict, RankedHit, RecallSource, RejectReason, RetrievalResult, RetrievalSteer,
-    RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
-    SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
-    ShellObservation, SolveObservation, SpillStore, Step, StepLedger, StepStatus,
-    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    transcript_lines_styled, trim_for_summary, BehaviorSignal, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, Embedder, EmbeddingsClient, ErrorClass, EvidenceKind,
+    ExperienceStore, ExposureSettings, GatherCaps, GatherManifest, HeadlessCodeSearch, IndexStatus,
+    LiveToolOutput, ManualCompressOutcome, ManualCompressPolicy, McpTools, MemAddr, MemPayload,
+    MemorySource, NoMcp, NoteNudge, NoteSink, ParseSignal, PlanDraft, PlanDraftSink, PlanEntry,
+    PlanModeControl, PlanSnapshot, PlanVerdict, RankedHit, RecallSource, RejectReason,
+    RetrievalResult, RetrievalSteer, RoundObservation, ScratchpadStore, SemanticIndex,
+    SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore,
+    SessionStepLedger, ShellObservation, SolveObservation, SpillStore, Step, StepLedger,
+    StepStatus, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
     ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
-    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, BOUND_REASON_PREFIX,
-    EXPERIENCE_TOP_K, MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
+    MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};
@@ -277,6 +278,11 @@ pub use navigator::{
     GotoDefinitionArgs, GraphIndex, ImpactReport, NavHit, NavResult, NavToolCtx, NavigatorSession,
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
 };
+pub use permissions::{
+    append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
+    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, Verdict,
+    BOUND_REASON_PREFIX,
+};
 pub use project_map::ProjectMapProvider;
 pub use runtime::{
     BackendAxisAction, BackendState, OperatorPreferencePin, PreferenceActions, PreferenceApplyPlan,
@@ -314,7 +320,6 @@ pub use reasoning::{split_reasoning, ThinkFilter};
 pub use role_profile::{
     Altitude, CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
 };
-pub use router::{Router, Tier};
 pub use session::SessionId;
 // B0b-2 (#1846): the audience a surface answers from. Re-exported so
 // newt-web can name it without taking a direct newt-interaction
@@ -345,7 +350,6 @@ pub use newt_interaction::InteractionDefinition;
 pub use store::{
     sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, FlockTask, InjectOutcome,
     InjectedPrompt, LivenessFn, NewFlockTask, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
-    Verdict,
 };
 pub use tokens::TokenEstimation;
 pub use tty::{Action, Question};

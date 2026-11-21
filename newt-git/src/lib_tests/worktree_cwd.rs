@@ -153,7 +153,7 @@ fn own_branch_linked_worktree_commit_succeeds_under_a_production_shaped_session(
     // ops refuse a bounded read scope outright (`check_git_read_scope`) —
     // that is a SEPARATE, orthogonal gate from the `fs_write` fix under test
     // here. `own_gitdir_grants().read` is exercised directly by
-    // `newt-core::caveats::own_gitdir_grants_are_read_only_in_session_caveats`.
+    // `newt-core::git_hardening::session_grants_tests::own_gitdir_grants_are_read_only_in_session_caveats`.
     let mut session = Caveats::top();
     session.fs_write = Scope::only([worktree.to_string_lossy().into_owned()]);
 

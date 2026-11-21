@@ -5,7 +5,8 @@
 //! models below pulled. Creates a throwaway scratch dir; the crew's edits land
 //! there, and `run_test` runs a real python check.
 
-use newt_core::{BackendKind, Tier};
+use newt_core::BackendKind;
+use newt_router::Tier;
 use newt_scheduler::{
     run_team, BackendPool, CrewConfig, Edit, Health, LocalDispatcher, PoolBackend, StaticSource,
     SubtaskStatus, TeamConfig, TeamStatus, Workspace, WorkspaceFactory,

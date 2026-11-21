@@ -11,6 +11,7 @@ exclude = [
     "tests/markup_sprawl_ratchet.rs",
     "tests/first_principle.rs",
     "tests/inert_code_ratchet.rs",
+    "tests/closure_ledger.rs",
     "tests/common",
 ]
 edition.workspace = true
@@ -19,8 +20,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "Newt-Agent core types, errors, and the NeMoCode-style tier router"
-keywords = ["newt", "agent", "router", "llm", "nemo"]
+description = "Newt-Agent core types and errors"
+keywords = ["newt", "agent", "llm"]
 categories = ["api-bindings", "text-processing"]
 
 [[test]]
@@ -111,6 +112,7 @@ uuid.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
 newt-interaction.workspace = true
+newt-router.workspace = true
 newt-skills.workspace = true
 reqwest.workspace = true
 # Already in reqwest's dependency graph; bounded HTTP/1.1 over the gh socket.

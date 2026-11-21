@@ -620,7 +620,7 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
         request.reason
     );
     assert_eq!(
-        crate::agentic::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
+        crate::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
         base
     );
     assert_eq!(

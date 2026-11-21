@@ -8,8 +8,8 @@ impl PermissionGate for Approve {
         self.asked = true;
         PermissionDecision::Allow(Caveats::top())
     }
-    fn ask_question(&mut self, _: &str) -> crate::agentic::permissions::HumanQuestionOutcome {
-        crate::agentic::permissions::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+        crate::permissions::HumanQuestionOutcome::Unavailable
     }
 }
 

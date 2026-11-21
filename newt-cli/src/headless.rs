@@ -618,7 +618,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
     // its chain-of-thought printed into the answer in headless runs only —
     // the N-call-sites trap, in the one lane with no human watching the
     // stream. `headless_takes_every_capability_from_the_decision`
-    // (tests/capability_wiring.rs) pins the pair.
+    // (tests/it/capability_wiring.rs) pins the pair.
     dc.emits_leading_reasoning = decision.emits_leading_reasoning();
     dc.max_tool_rounds = headless_tool_round_limit(
         dc.max_tool_rounds,
@@ -663,7 +663,7 @@ pub async fn run(args: HeadlessArgs) -> Result<i32> {
         let scoped = newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
         calibrate_headless_filesystem(&mut dc.caveats, &scoped, smart_enabled);
         if smart_enabled {
-            newt_core::caveats::apply_cli_fs_grants(&mut dc.caveats, &workspace);
+            newt_core::git_hardening::apply_cli_fs_grants(&mut dc.caveats, &workspace);
         }
         // Fold AFTER the lane's own fence (and any smart-lane narrowing +
         // explicit CLI grants) is in place, so a durable grant widens the

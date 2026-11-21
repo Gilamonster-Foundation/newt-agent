@@ -16,7 +16,7 @@
 //! mocked here.
 
 use crate::{BackendPool, ChatRequest, Dispatcher};
-use newt_core::Tier;
+use newt_router::Tier;
 use std::collections::HashMap;
 
 /// One voice on the panel: a label + the model it is pinned to (the diversity axis).

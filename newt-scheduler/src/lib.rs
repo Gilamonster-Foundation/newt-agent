@@ -20,7 +20,8 @@
 //! - **Count-adaptive dispatch** (`workflow-swarm-harness.md` §3.1): 0 live
 //!   candidates → refuse, 1 → time-slice, N → fan out.
 
-use newt_core::{BackendConfig, BackendKind, Tier};
+use newt_core::{BackendConfig, BackendKind};
+use newt_router::Tier;
 
 mod crew;
 mod dispatch;

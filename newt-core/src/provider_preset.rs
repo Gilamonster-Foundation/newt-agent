@@ -46,7 +46,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{BackendConfig, BackendKind, Config, OpenAiApi};
-use crate::router::Tier;
+use newt_router::Tier;
 
 /// One hosted-provider preset. Fields mirror Hermes `ProviderProfile`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

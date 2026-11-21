@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
-use crate::router::Tier;
 pub use api_surface::{ApiSurfaceConfig, LanguagePack, SymbolRule};
 pub(crate) use backend::resolve_api_key_common;
 pub use backend::{
@@ -43,6 +42,7 @@ pub(crate) use layering::{
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
 pub use memory::{MemoryConfig, MemoryDisclosure, MemoryProviderKind};
+use newt_router::Tier;
 pub use newt_tuner::{ModelTuning, OverflowRetry};
 pub use permissions::{ModeConfig, PermissionPreset, ToolPermissions};
 pub use presentation::{
@@ -56,7 +56,7 @@ pub use profile::{
 pub use prompt::{ComponentDeltas, PromptConfig, SystemPromptOverride, SYSTEM_PROMPT_FILE_ENV};
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
-pub(crate) use smart_harness::{normalize_path, resolve_uncreated_path, validate_stable_anchor};
+pub(crate) use smart_harness::validate_stable_anchor;
 pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
 pub use tool_exposure::{ExposureProfile, ToolExposureConfig, PI_PRESET_TOOLS};

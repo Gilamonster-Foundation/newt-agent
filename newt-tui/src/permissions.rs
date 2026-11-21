@@ -656,7 +656,7 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
 /// the default a blank submission resolves to.
 pub(crate) fn choice_form(
     question: &str,
-    options: &[newt_core::agentic::ChoiceSpec],
+    options: &[newt_core::permissions::ChoiceSpec],
 ) -> SurfaceInteraction {
     let choices: Vec<ChoiceOption> = options
         .iter()
@@ -2135,7 +2135,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
     fn ask_choice(
         &mut self,
         question: &str,
-        options: &[newt_core::agentic::ChoiceSpec],
+        options: &[newt_core::permissions::ChoiceSpec],
     ) -> HumanQuestionOutcome {
         // Same seam as `ask_question`: the session builds the form, whichever
         // surface owns the terminal renders and reads it, and the control

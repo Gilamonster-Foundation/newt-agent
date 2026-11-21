@@ -76,7 +76,7 @@ pub(crate) use persona_route::apply_persona_backend;
 mod commands;
 #[cfg(feature = "live-spill")]
 mod completed_spill;
-mod danger;
+use newt_core::danger;
 pub mod dgx_probe;
 /// #2085 PR-E2: where a non-setting state mutator's journal event is named,
 /// and the registry gate that decides whether it may be written at all.
@@ -1328,7 +1328,7 @@ fn policy_for_launch(
     let reads_deliberately_unbounded =
         matches!(caveats.fs_read, Scope::All) && matches!(caveats.fs_write, Scope::All);
     if !reads_deliberately_unbounded {
-        newt_core::caveats::apply_cli_fs_grants(&mut caveats, workspace);
+        newt_core::git_hardening::apply_cli_fs_grants(&mut caveats, workspace);
     }
     caveats
 }

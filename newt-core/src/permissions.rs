@@ -1,0 +1,950 @@
+//! Prompted ocap grants (issue #263) — the seam between a capability denial
+//! and an interactive human decision.
+//!
+//! Default behavior is UNCHANGED: without a [`PermissionGate`] every denial
+//! fails the tool call exactly as before. The TUI may supply a gate (the
+//! `--prompt-for-permissions` flag / `[tui.permissions] prompt = true`);
+//! headless callers (ACP worker, `newt-eval`) never construct one, so a
+//! denial there can never block on a prompt — the eval gate stays honest.
+//!
+//! Ocap honesty: **attenuation-only is the invariant — a live key is never
+//! widened.** An *allow* decision is implemented gate-side by re-minting a
+//! fresh operating authority from the user root as (previous caveats ∪ new
+//! grant); [`widen_caveats`] only builds that *policy* value — the signed
+//! re-mint itself lives with the key holder (the TUI). The widened caveats
+//! returned in [`PermissionDecision::Allow`] apply to the single re-executed
+//! call; "allow for this session" is the gate remembering the grant so the
+//! next denial of the same target re-mints without re-prompting. The
+//! session's enforced baseline (`ChatCtx::caveats`) is never mutated.
+//!
+//! Every prompted decision is recorded ([`PermissionRecord`]) with the
+//! conversation id so implicit denials can be promoted to explicit config
+//! grants — or stay denied — deliberately. The record is a REVIEW artifact,
+//! not config: nothing reads it back into authority. Promotion to a durable
+//! grant is a human editing `[tui.permissions]`.
+
+use crate::caveats::{Caveats, Scope};
+use serde::{Deserialize, Serialize};
+use std::io::Write as _;
+use std::path::Path;
+
+macro_rules! permission_actions {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        /// A stable, serializable permission-form action shared by every UI surface.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum PermissionAction {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+        impl PermissionAction {
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+        }
+        impl AsRef<str> for PermissionAction {
+            fn as_ref(&self) -> &str { self.as_str() }
+        }
+    };
+}
+
+permission_actions! {
+    AllowOnce => "allow_once", AllowSession => "allow_session",
+    AllowPermanent => "allow_permanent", Deny => "deny",
+    DenyAlways => "deny_always", DenyPermanent => "deny_permanent",
+    Back => "back", Exit => "exit",
+}
+
+/// A verdict an attach surface can NAME for a pending permission decision
+/// (A4/W6). It names a CHOICE the running gate then interprets and mints — the
+/// web never carries caveats/authority itself. `AllowSession` is session-scoped
+/// (ephemeral); there is deliberately NO durable "always-allow" verdict — the
+/// web cannot write durable OCAP policy (that is terminal-audit-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Allow this one denied action, this time only.
+    AllowOnce,
+    /// Allow it for the rest of the session (in-memory; NOT persisted).
+    AllowSession,
+    /// Refuse — the model sees the standard structured denial.
+    Deny,
+}
+
+impl From<Verdict> for PermissionAction {
+    fn from(value: Verdict) -> Self {
+        match value {
+            Verdict::AllowOnce => Self::AllowOnce,
+            Verdict::AllowSession => Self::AllowSession,
+            Verdict::Deny => Self::Deny,
+        }
+    }
+}
+
+impl TryFrom<PermissionAction> for Verdict {
+    type Error = ();
+
+    fn try_from(value: PermissionAction) -> Result<Self, Self::Error> {
+        match value {
+            PermissionAction::AllowOnce => Ok(Self::AllowOnce),
+            PermissionAction::AllowSession => Ok(Self::AllowSession),
+            PermissionAction::Deny => Ok(Self::Deny),
+            _ => Err(()),
+        }
+    }
+}
+
+/// The capability axis a denial occurred on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DenialKind {
+    /// `exec` — a command outside the granted exec allowlist.
+    Exec,
+    /// `fs_read` — a path outside the granted read scope.
+    FsRead,
+    /// `fs_write` — a path outside the granted write scope.
+    FsWrite,
+    /// `net` — a host outside the granted net allowlist.
+    Net,
+    /// FR-2 (#1001): a remote MCP `server__tool` the active persona does not
+    /// grant. Unlike the four axes above it maps to NO fs/exec/net caveat — a
+    /// remote tool's leash is name-based — so an `Allow` here is purely "proceed
+    /// with this call" (it widens nothing). `target` is the tool name.
+    RemoteTool,
+    /// #1056: a LOCAL git write (`add`/`commit`/`reset`/`branch`/…) the embedded
+    /// git tool's projected [`GitCaveats`](crate::git_caveats::GitCaveats) does
+    /// not grant. Like [`RemoteTool`](Self::RemoteTool) it maps to NO
+    /// fs/exec/net caveat — the git tool's leash is its own op-class lattice, not
+    /// the shell allowlist — so an `Allow` means "proceed with local git writes
+    /// this call" (it widens no `Caveats` axis; the git arm re-dispatches under a
+    /// local-write `GitCaveats`). `target` is the git op (`commit`, `add`, …).
+    /// The network verbs (push/fetch/clone) are NOT this capability — they stay
+    /// deferred / shell-net-gated. A readonly `/posture` still denies it (the gate
+    /// refuses the grant when the preset floor projects no git write).
+    GitWrite,
+    /// Explicit execution of a resolved lifecycle command under the calibrated
+    /// build fence. Like GitWrite this is a call grant, never an expansion of
+    /// standing shell caveats. Target is the workspace; the prompt names the
+    /// command. Compiler/build-script/test descendants remain kernel-confined.
+    Build,
+}
+
+impl DenialKind {
+    /// Stable string form — also the `kind` field of [`PermissionRecord`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::FsRead => "fs_read",
+            Self::FsWrite => "fs_write",
+            Self::Net => "net",
+            Self::RemoteTool => "remote_tool",
+            Self::GitWrite => "git_write",
+            Self::Build => "build",
+        }
+    }
+}
+
+/// Inverse of [`DenialKind::as_str`] — parse a persisted `kind`. `Err(())` for
+/// an unknown string so a corrupt/forward-incompatible denylist line is skipped
+/// rather than trusted (#904). A trait impl (not an inherent `from_str`) so
+/// `"net".parse::<DenialKind>()` works and clippy's `should_implement_trait` is
+/// satisfied.
+impl std::str::FromStr for DenialKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "exec" => Ok(Self::Exec),
+            "fs_read" => Ok(Self::FsRead),
+            "fs_write" => Ok(Self::FsWrite),
+            "net" => Ok(Self::Net),
+            "remote_tool" => Ok(Self::RemoteTool),
+            "git_write" => Ok(Self::GitWrite),
+            "build" => Ok(Self::Build),
+            _ => Err(()),
+        }
+    }
+}
+
+/// #904: one durable "permanently deny" entry — a `(kind, target)` the human
+/// chose to deny across restarts, so the gate refuses it WITHOUT re-prompting.
+/// Stored one JSON line per entry in `~/.newt/permission-denials.jsonl` (a
+/// sibling of `permission-log.jsonl`).
+///
+/// Unlike the permission LOG (a review artifact that is never read back into
+/// authority), this file IS read back — at gate construction — and consulted
+/// before prompting. That is sound precisely because it is **deny-only**: a
+/// denylist can never widen authority, so reading it back cannot break the
+/// attenuation-only invariant. A permanent *allow* has no analogue here; a
+/// durable grant stays a deliberate `[tui.permissions]` edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentDenial {
+    /// Capability axis: `exec` / `fs_read` / `fs_write` / `net`.
+    pub kind: String,
+    /// What is denied — a command name (exec), a path (fs_*), or a host (net).
+    pub target: String,
+    /// Wall-clock at decision time (RFC 3339, UTC) — a display claim, never
+    /// an ordering key.
+    pub ts_claim: String,
+}
+
+/// Parse a denials file body into `(kind, target)` pairs — PURE (no I/O), so it
+/// unit-tests without a filesystem. Malformed lines and unknown `kind`s are
+/// skipped (a corrupt entry must never crash the gate or, worse, be trusted).
+pub fn parse_denials(contents: &str) -> Vec<(DenialKind, String)> {
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let d: PersistentDenial = serde_json::from_str(line).ok()?;
+            let kind: DenialKind = d.kind.parse().ok()?;
+            (!d.target.is_empty()).then_some((kind, d.target))
+        })
+        .collect()
+}
+
+/// Load the persistent denylist from `path`. A missing file is an empty list
+/// (not an error) — the common first-run case.
+pub fn load_denials(path: &Path) -> Vec<(DenialKind, String)> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => parse_denials(&body),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Append one permanent-deny entry as a JSON line, creating parent dirs as
+/// needed.
+pub fn append_denial(path: &Path, kind: DenialKind, target: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let entry = PersistentDenial {
+        kind: kind.as_str().to_string(),
+        target: target.to_string(),
+        ts_claim: chrono::Utc::now().to_rfc3339(),
+    };
+    let line = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
+/// One denied capability surfaced for a human decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    /// The tool the model called (`run_command`, `read_file`, …).
+    pub tool: String,
+    /// Capability axis the denial occurred on.
+    pub kind: DenialKind,
+    /// What an *allow* would grant: a command name (exec), an absolute
+    /// path (fs_read / fs_write), or a host (net).
+    pub target: String,
+    /// The denial text the model would otherwise see — shown to the human
+    /// for context.
+    pub reason: String,
+    /// #2636 finding 4: true when the harness wrote the `reason` from the
+    /// bound denial record (not the model's tool call). `reason_is_model_authored`
+    /// uses this field, not the `BOUND_REASON_PREFIX` string check, so a model
+    /// that forges the prefix cannot suppress the "(model says unverified)" label.
+    /// Nonblocking hardening (#2636 round3): `skip_deserializing`, not just
+    /// `default` — a model-supplied JSON payload can never set this field
+    /// true even if it forges the key, because deserialization never reads
+    /// it at all.
+    #[serde(default, skip_deserializing)]
+    pub harness_bound: bool,
+}
+
+impl PermissionRequest {
+    /// Whether this asks for ONE operation's unrestricted egress rather than a
+    /// host grant: the harness's own dependency fetch, or a `run_command` the
+    /// harness itself bound to the prompt. A gate offers allow-once or deny
+    /// for it and never records the answer, because a spawned child cannot be
+    /// held to a host allowlist (`caveats::spawn_net_scope`).
+    #[must_use]
+    pub fn operation_egress(&self) -> bool {
+        self.kind == DenialKind::Net
+            && (self.tool == "lifecycle" || (self.tool == "run_command" && self.harness_bound))
+    }
+}
+
+/// #2636 (round1 finding 4): prefix marking a `request_permissions` reason
+/// as HARNESS-authored (it discloses the exact command a #2628 replay is
+/// about to run), not the model-supplied text. `reason_is_model_authored`
+/// in the interactive gate must not label this "model says (unverified)" —
+/// it is the one case where the reason IS verified, because the harness
+/// wrote it from the bound denial record, not from the model's tool call.
+pub const BOUND_REASON_PREFIX: &str = "#2628 approval executes: ";
+
+/// Verdict from consulting the gate.
+pub enum PermissionDecision {
+    /// Re-execute the denied call under these caveats. They are a freshly
+    /// minted authority (root ∪ grant) — the session's live key/baseline is
+    /// untouched, and the value does not outlive the re-executed call.
+    Allow(Caveats),
+    /// Keep the standard structured denial, bit-for-bit.
+    Deny,
+}
+
+/// The outcome of asking the human a free-text question through
+/// [`PermissionGate::ask_question`]. Replaces a lossy `Option<String>` that
+/// collapsed a real answer, an absent operator, Esc/back, Ctrl-C/Ctrl-D exit,
+/// stdin EOF, and an input I/O failure into two indistinguishable cases — which
+/// made `request_user_input` report a deliberate operator cancel/exit to the
+/// model as "running headless". Each variant below is a distinct, truthful
+/// outcome, and every non-[`Answer`](HumanQuestionOutcome::Answer) variant fails
+/// closed for security-sensitive callers (only an `Answer` may authorize).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HumanQuestionOutcome {
+    /// The operator submitted a line (possibly empty — an explicitly submitted
+    /// empty line is `Answer(String::new())`, which is NOT the input stream
+    /// closing; that is [`InputClosed`](HumanQuestionOutcome::InputClosed)).
+    Answer(String),
+    /// The gate exists but has no interactive operator to consult this session
+    /// (e.g. no attached TTY). Distinct from "no gate at all" — the caller must
+    /// not claim the process is headless unless that is actually known.
+    Unavailable,
+    /// The operator pressed Esc / backed out (turn cancellation applied).
+    Cancelled,
+    /// The operator pressed Ctrl-C / Ctrl-D (turn cancellation AND exit applied).
+    ExitRequested,
+    /// The operator's input stream reached EOF before an answer was provided.
+    InputClosed,
+    /// Reading operator input failed (I/O error); no answer was provided.
+    InputFailed,
+}
+
+/// The interactive human-interface seam (mirrors `NoteSink` / `RecallSource`):
+/// the one gate the agentic loop consults whenever it must reach the human. It
+/// carries two distinct interactions that share the same operator presence:
+///
+/// * [`PermissionGate::ask`] — decide a capability GRANT (the #263 / #721 ocap
+///   flow). It can WIDEN authority by re-minting caveats.
+/// * [`PermissionGate::ask_question`] — ask a free-text QUESTION and read back
+///   the answer (the #728 `request_user_input` tool). It only gathers text; it
+///   never touches authority.
+///
+/// Keeping both on one gate realizes "both surface to the human" without merging
+/// the tools: grants flow through `ask`, questions through `ask_question`.
+///
+/// The call blocks the agentic loop like a long tool call (issue #263 §6 of
+/// the design notes). Implementations that auto-allow previously
+/// session-granted targets must still return freshly minted caveats.
+/// One answer a [`PermissionGate::ask_choice`] question offers: the wire id
+/// the answer carries, the label a surface shows, the accelerator a keyboard
+/// surface offers, and what picking it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChoiceSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub key: &'static str,
+    pub role: newt_interaction::SemanticRole,
+}
+
+pub trait PermissionGate {
+    /// Read current standing authority without prompting or consuming an
+    /// allow-once grant. Apply approved grants to the caller's baseline without
+    /// restoring unrelated authority from a broader base. Implementations must
+    /// retain their preset and delegation ceilings; wrappers may refuse an invalid
+    /// refresh.
+    /// The default preserves the caller's baseline for gates without live state.
+    fn refresh_caveats(&mut self, baseline: &Caveats) -> PermissionDecision {
+        PermissionDecision::Allow(baseline.clone())
+    }
+
+    /// Ask about a batch of denials from ONE tool call (a compound command
+    /// can be refused on several targets at once). `Allow` means every
+    /// request was allowed; any single deny keeps the whole denial.
+    fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
+
+    /// #2995: `--full-access` is the operator's launch-time grant, so the
+    /// caller wants the PROMPT skipped, not the gate. A gate that can honour
+    /// that runs its own non-interactive vetoes (inherited delegation ceiling,
+    /// stored denials), and only then records an "allow for this session"
+    /// naming full access as the reason, never persisted. The caller must
+    /// honour the returned decision. Default: no pre-approval path, so ask.
+    fn ask_full_access(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        self.ask(requests)
+    }
+
+    /// #2636: a caller that just spent an `Allow(kind, target)` on an
+    /// immediate, one-shot action — rather than leaving it for the model's
+    /// own later retry — tells the gate so any proactive once-grant it
+    /// queued for that later retry is dropped too. Without this, a gate that
+    /// tracks a separate "the model's next matching call auto-approves"
+    /// queue (built for the ordinary request→retry flow) keeps honoring a
+    /// grant that was already spent, widening its effective lifetime past
+    /// the single approval the operator gave. Default no-op: gates with no
+    /// such queue have nothing to drop.
+    fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
+
+    /// #2689/#2681 round 3: the inverse of [`Self::consume_pending_once`] —
+    /// a caller that just received `Allow(kind, target)` but is NOT spending
+    /// it on an immediate, one-shot action (because replaying the denied
+    /// command is not provably safe) tells the gate to hold the grant for
+    /// the model's own next matching call instead, exactly as the ordinary
+    /// request→retry flow already does for `request_permissions`. Default
+    /// no-op: gates with no such queue have nothing to hold.
+    fn queue_pending_once(&mut self, _kind: DenialKind, _target: &str) {}
+
+    /// Hold an approved exec denial for this exact command and working directory.
+    /// Interpreters cannot be projected by shell inspection. Binding the invocation
+    /// lets its explicit retry use exact granted paths without replaying effects.
+    /// Gates without invocation-bound storage fail closed; never degrade this
+    /// approval into the older target-only pending queue.
+    fn queue_command_retry(&mut self, _command: &str, _cwd: &str, _requests: &[PermissionRequest]) {
+    }
+
+    /// Consume a matching invocation-bound grant without creating standing authority.
+    fn apply_command_retry(&mut self, _command: &str, _cwd: &str, base: &Caveats) -> Caveats {
+        base.clone()
+    }
+
+    /// #2691 round 3 (P2): called BEFORE a dispatch runs (`shell.rs`,
+    /// `exec_confined_command_with_broker`'s top), once per exec target the
+    /// about-to-run command statically needs. When `(kind, target)` is
+    /// already sitting in the gate's pending-once queue — put there by
+    /// [`Self::queue_pending_once`] because an earlier denial of THIS SAME
+    /// target was not provably safe to auto-replay (e.g. a compound `git add
+    /// -A && git commit …`) — binds it into `baseline` and consumes it
+    /// (one-shot), so the model's re-issue of the held command succeeds on
+    /// its first attempt instead of being denied all over again and looping
+    /// through "granted…Retry the original operation now" forever. Scoped to
+    /// the exact target named: an unrelated command must never inherit a
+    /// grant queued for a different retry. Returns `baseline` unchanged, and
+    /// consumes nothing, when no match is queued. Default no-op: gates with
+    /// no such queue have nothing to bind.
+    fn apply_pending_once(
+        &mut self,
+        _kind: DenialKind,
+        _target: &str,
+        baseline: &Caveats,
+    ) -> Caveats {
+        baseline.clone()
+    }
+
+    /// Ask for additions to this invocation's authority, retaining its caller
+    /// bounds and prior one-shot grants. Legacy gates may conservatively drop
+    /// prior call-only authority, but cannot restore unrelated broader authority.
+    fn ask_with_caveats(
+        &mut self,
+        baseline: &Caveats,
+        requests: &[PermissionRequest],
+    ) -> PermissionDecision {
+        match self.ask(requests) {
+            PermissionDecision::Allow(allowed) => {
+                let grants: Vec<_> = requests
+                    .iter()
+                    .map(|request| (request.kind, request.target.clone()))
+                    .collect();
+                PermissionDecision::Allow(allowed.meet(&widen_caveats(baseline, &grants)))
+            }
+            PermissionDecision::Deny => PermissionDecision::Deny,
+        }
+    }
+
+    /// Approve the exact fence of one harness-owned `cargo fetch --locked`.
+    /// Unlike a host grant, this can explicitly authorize unrestricted egress
+    /// on platforms without a host boundary. Never persist/reuse the approval
+    /// or widen the session; enforce delegation and preset ceilings. Legacy
+    /// gates fail closed rather than interpreting a host approval as All.
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &Caveats,
+        _request: &PermissionRequest,
+    ) -> PermissionDecision {
+        PermissionDecision::Deny
+    }
+
+    /// #728: ask the human a free-text `question` and return a typed
+    /// [`HumanQuestionOutcome`] — the GENERIC ask-the-human primitive behind the
+    /// `request_user_input` tool. Distinct from [`PermissionGate::ask`], which
+    /// decides capability grants: `ask` can widen authority, `ask_question`
+    /// only gathers text. The typed outcome distinguishes a real answer from an
+    /// absent operator, an Esc/back cancel, a Ctrl-C/Ctrl-D exit, stdin EOF, and
+    /// an input failure, so a caller never misreports a deliberate operator
+    /// cancel/exit as "running headless". A headless caller must NEVER hang on
+    /// it: implementations without an operator return
+    /// [`HumanQuestionOutcome::Unavailable`] rather than blocking.
+    fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome;
+
+    /// Ask the operator to pick one of a few named answers — a plan
+    /// approval's yes / no / discuss — through the same decision form a
+    /// permission prompt uses, so a decision is a selection, not a text box.
+    /// The answer is the chosen option's id. The first option is the default
+    /// a blank submission resolves to. Gates that only gather text (tests,
+    /// legacy embedders) fall back to [`Self::ask_question`], and the typed
+    /// text stands in for an option id.
+    fn ask_choice(&mut self, question: &str, _options: &[ChoiceSpec]) -> HumanQuestionOutcome {
+        self.ask_question(question)
+    }
+}
+
+/// Build the widened *policy* for a re-mint: `base` with each grant's target
+/// added to its axis. `Scope::All` axes are left untouched (nothing to add);
+/// this never narrows and never touches `max_calls` /
+/// `valid_for_generation`. This is a plain policy value — minting it into a
+/// signed key (and thereby proving base ⊑ root still holds) is the gate
+/// implementation's job.
+pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats {
+    let mut out = base.clone();
+    for (kind, target) in grants {
+        let covered = match kind {
+            DenialKind::FsRead => filesystem_grant_is_covered(&base.fs_read, target),
+            DenialKind::FsWrite => filesystem_grant_is_covered(&base.fs_write, target),
+            _ => false,
+        };
+        if covered {
+            continue;
+        }
+        let scope = match kind {
+            DenialKind::Exec => &mut out.exec,
+            DenialKind::FsRead => &mut out.fs_read,
+            DenialKind::FsWrite => &mut out.fs_write,
+            DenialKind::Net => &mut out.net,
+            // FR-2 (#1001): a remote-tool grant maps to no caveat axis — the
+            // `Allow` means "proceed with this call", not "widen an axis". Skip.
+            DenialKind::RemoteTool => continue,
+            // #1056: a git-write grant maps to no caveat axis either — the git
+            // tool's authority is projected separately (GitCaveats); the git arm
+            // re-dispatches under a local-write surface on Allow. Widen nothing.
+            DenialKind::GitWrite | DenialKind::Build => continue,
+        };
+        if let Scope::Only(set) = scope {
+            #[cfg(target_os = "macos")]
+            let target = if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
+                crate::fs_aliases::rewrite(target).into_owned()
+            } else {
+                target.clone()
+            };
+            set.insert(target.clone());
+        }
+    }
+    out
+}
+
+/// Do not emit redundant roots: their mutable parent would fail anchor checks.
+/// Missing names count only when their existing ancestors resolve exactly as
+/// named. Aliases, traversal and other I/O failures still require validation.
+fn filesystem_grant_is_covered(scope: &Scope<String>, target: &str) -> bool {
+    let Scope::Only(roots) = scope else {
+        return true;
+    };
+    // Canonical Windows paths use a verbatim prefix even when the signed name
+    // or policy root uses an ordinary drive path. Reuse the platform simplifier
+    // without resolving aliases or collapsing traversal in the named path.
+    let target = dunce::simplified(Path::new(target));
+    let exact = |path: &Path| {
+        path.canonicalize()
+            .is_ok_and(|resolved| dunce::simplified(&resolved).as_os_str() == path.as_os_str())
+    };
+    if !roots.iter().any(|root| {
+        let root = dunce::simplified(Path::new(root));
+        exact(root) && target.starts_with(root)
+    }) {
+        return false;
+    }
+    match target.canonicalize() {
+        Ok(resolved) => dunce::simplified(&resolved).as_os_str() == target.as_os_str(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::paths::normalize_path(target)
+                .is_ok_and(|path| path.as_os_str() == target.as_os_str())
+                && crate::paths::resolve_uncreated_path(target)
+                    .is_ok_and(|path| dunce::simplified(&path).as_os_str() == target.as_os_str())
+        }
+        Err(_) => false,
+    }
+}
+
+/// One prompted permission decision, recorded with the session for later
+/// review (issue #263). Chained onto `~/.newt/permission-log.jsonl` via
+/// [`crate::permission_journal`] (issue #2524 item 3) — see that module for
+/// the append/read machinery; this type is only the payload.
+///
+/// This file is a record, NOT config: nothing reads it back into authority.
+/// Promoting an `allow` to a durable grant is a human editing
+/// `[tui.permissions]` (`extra_exec` / `net` / preset) — see issue #181.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRecord {
+    /// Wall-clock at decision time (RFC 3339, UTC). A display claim (§6) —
+    /// never an ordering key; ordering is the file's append order.
+    pub ts_claim: String,
+    /// The conversation/session the decision belongs to.
+    pub conversation_id: String,
+    /// Tool whose call was denied.
+    pub tool: String,
+    /// Capability axis: `exec` / `fs_read` / `fs_write` / `net`.
+    pub kind: String,
+    /// What the decision was about (command name / path / host).
+    pub target: String,
+    /// `allow` or `deny`.
+    pub decision: String,
+    /// `once` (this call only) or `session` (until the session ends).
+    pub scope: String,
+}
+
+impl PermissionRecord {
+    /// Record one decision now. `ts_claim` is stamped from the wall clock —
+    /// a display claim per the §6 discipline.
+    pub fn new(
+        conversation_id: &str,
+        tool: &str,
+        kind: DenialKind,
+        target: &str,
+        decision: &str,
+        scope: &str,
+    ) -> Self {
+        Self {
+            ts_claim: chrono::Utc::now().to_rfc3339(),
+            conversation_id: conversation_id.to_string(),
+            tool: tool.to_string(),
+            kind: kind.as_str().to_string(),
+            target: target.to_string(),
+            decision: decision.to_string(),
+            scope: scope.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    /// Stale signed filesystem children must not become redundant unstable roots.
+    #[test]
+    fn missing_grant_filter_is_shared_and_keeps_axis_and_alias_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let covered = root.join("covered");
+        std::fs::create_dir(&covered).unwrap();
+        let base = Caveats {
+            fs_read: Scope::none(),
+            fs_write: Scope::only([covered.to_str().unwrap().into()]),
+            ..Caveats::top()
+        };
+        let dead = covered.join("missing/plan.md").to_str().unwrap().to_owned();
+        assert_eq!(
+            widen_caveats(&base, &[(DenialKind::FsWrite, dead.clone())]),
+            base
+        );
+        assert_ne!(
+            widen_caveats(&base, &[(DenialKind::FsRead, dead)]),
+            base,
+            "read is not covered by write"
+        );
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let names = vec![
+            outside.join("dead"),
+            Path::new(&format!("{}/../outside/dead", covered.display())).to_path_buf(),
+        ];
+        #[cfg(unix)]
+        let names = {
+            let mut names = names;
+            let alias = covered.join("alias");
+            std::os::unix::fs::symlink(&outside, &alias).unwrap();
+            names.push(alias.join("missing"));
+            names.push(alias);
+            names
+        };
+        for path in names {
+            assert_ne!(
+                widen_caveats(
+                    &base,
+                    &[(DenialKind::FsWrite, path.to_str().unwrap().into())]
+                ),
+                base,
+                "uncovered/alias/traversal: {path:?}"
+            );
+        }
+    }
+
+    /// PR #2838: canonical verbatim Windows names must not add unstable roots.
+    #[cfg(windows)]
+    #[test]
+    fn covered_windows_grants_accept_ordinary_and_verbatim_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let verbatim = temp.path().canonicalize().unwrap();
+        let ordinary = dunce::simplified(&verbatim).to_path_buf();
+        assert_ne!(ordinary.as_os_str(), verbatim.as_os_str());
+        std::fs::write(ordinary.join("existing"), "fixture").unwrap();
+        for root in [&ordinary, &verbatim] {
+            let base = Caveats {
+                fs_read: Scope::only([root.to_str().unwrap().into()]),
+                fs_write: Scope::only([root.to_str().unwrap().into()]),
+                ..Caveats::top()
+            };
+            for name in [&ordinary, &verbatim] {
+                for leaf in ["existing", "deleted\\plan.md"] {
+                    for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+                        let target = name.join(leaf).to_str().unwrap().to_owned();
+                        assert_eq!(widen_caveats(&base, &[(kind, target)]), base);
+                    }
+                }
+                // String concatenation preserves traversal in verbatim names:
+                // PathBuf::join would normalize it before the filter sees it.
+                let traversal = format!("{}\\deleted\\..\\missing", name.display());
+                assert_ne!(
+                    widen_caveats(&base, &[(DenialKind::FsWrite, traversal)]),
+                    base
+                );
+            }
+        }
+    }
+
+    /// #2823: invocation-bound approval must never fall back to a target-only queue.
+    #[test]
+    fn command_retry_default_does_not_queue_legacy_authority() {
+        #[derive(Default)]
+        struct LegacyGate(Vec<(DenialKind, String)>);
+        impl PermissionGate for LegacyGate {
+            fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+                PermissionDecision::Deny
+            }
+            fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+                HumanQuestionOutcome::Unavailable
+            }
+            fn queue_pending_once(&mut self, kind: DenialKind, target: &str) {
+                self.0.push((kind, target.into()));
+            }
+        }
+        let mut gate = LegacyGate::default();
+        let request = PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "/bin/bash".into(),
+            reason: "denied".into(),
+            harness_bound: true,
+        };
+        gate.queue_command_retry("bash script.sh", "/workspace", &[request]);
+        assert!(
+            gate.0.is_empty(),
+            "invocation grant degraded into transferable target authority"
+        );
+    }
+    use super::*;
+    use crate::caveats::{CaveatsExt as _, CountBound};
+
+    fn base() -> Caveats {
+        Caveats {
+            fs_read: Scope::only(["/ws".to_string()]),
+            fs_write: Scope::only(["/ws".to_string()]),
+            exec: Scope::only(["cargo".to_string()]),
+            net: Scope::none(),
+            max_calls: CountBound::AtMost(7),
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    #[test]
+    fn denial_kind_strings_are_stable() {
+        // Load-bearing: these are the `kind` values in the on-disk record
+        // and the keys a human greps the log for.
+        assert_eq!(DenialKind::Exec.as_str(), "exec");
+        assert_eq!(DenialKind::FsRead.as_str(), "fs_read");
+        assert_eq!(DenialKind::FsWrite.as_str(), "fs_write");
+        assert_eq!(DenialKind::Net.as_str(), "net");
+    }
+
+    #[test]
+    fn permission_actions_have_stable_wire_values_and_verdict_conversions() {
+        let actions = [
+            PermissionAction::AllowOnce,
+            PermissionAction::AllowSession,
+            PermissionAction::AllowPermanent,
+            PermissionAction::Deny,
+            PermissionAction::DenyAlways,
+            PermissionAction::DenyPermanent,
+            PermissionAction::Back,
+            PermissionAction::Exit,
+        ];
+        assert_eq!(
+            serde_json::to_string(&actions).unwrap(),
+            r#"["allow_once","allow_session","allow_permanent","deny","deny_always","deny_permanent","back","exit"]"#
+        );
+        assert_eq!(
+            PermissionAction::from(Verdict::AllowOnce),
+            PermissionAction::AllowOnce
+        );
+        assert_eq!(
+            Verdict::try_from(PermissionAction::AllowSession),
+            Ok(Verdict::AllowSession)
+        );
+        assert_eq!(Verdict::try_from(PermissionAction::Deny), Ok(Verdict::Deny));
+        assert!(Verdict::try_from(PermissionAction::AllowPermanent).is_err());
+    }
+
+    /// macOS spells /etc, /tmp and /var as symlinks into /private; a grant
+    /// for the alias must be stored (and so matched) under the real spelling.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn widen_stores_macos_fs_grants_under_their_private_spelling() {
+        let widened = widen_caveats(
+            &base(),
+            &[
+                (DenialKind::FsRead, "/etc/hosts".to_string()),
+                (DenialKind::FsWrite, "/tmp/out".to_string()),
+            ],
+        );
+        assert!(widened.permits_fs_read("/private/etc/hosts"));
+        assert!(widened.permits_fs_write("/private/tmp/out"));
+    }
+
+    #[test]
+    fn widen_adds_each_grant_to_its_axis_only() {
+        let widened = widen_caveats(
+            &base(),
+            &[
+                (DenialKind::Exec, "npm".to_string()),
+                (DenialKind::Net, "docs.rs".to_string()),
+                (DenialKind::FsRead, "/etc/hosts".to_string()),
+                (DenialKind::FsWrite, "/tmp/out".to_string()),
+            ],
+        );
+        assert!(widened.permits_exec("npm"));
+        assert!(widened.permits_exec("cargo"), "existing grants kept");
+        assert!(widened.permits_net("docs.rs"));
+        // macOS stores fs grants under their canonical alias (/private/...);
+        // `rewrite` is the identity elsewhere, and absent off Unix.
+        #[cfg(unix)]
+        let alias = |p: &'static str| crate::fs_aliases::rewrite(p).into_owned();
+        #[cfg(not(unix))]
+        let alias = |p: &'static str| p.to_owned();
+        assert!(widened.permits_fs_read(&alias("/etc/hosts")));
+        assert!(widened.permits_fs_write(&alias("/tmp/out")));
+        // Untouched axes / non-granted targets stay denied.
+        assert!(!widened.permits_exec("rm"));
+        assert!(!widened.permits_net("evil.example.com"));
+        // Non-scope axes are never altered by a grant.
+        assert_eq!(widened.max_calls, CountBound::AtMost(7));
+    }
+
+    /// dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579, BLOCKER): an
+    /// earlier version of this widen ALSO added a build tool's toolchain read
+    /// roots to `fs_read` here. That was a real leak: `widen_caveats`'s
+    /// result feeds `recalled_caveats`/`fold_ocap_approvals`, which is the
+    /// caveats checked for EVERY tool the model calls this session —
+    /// including `read_file`. Widening `fs_read` here would have let the
+    /// model's own `read_file` tool read `$CARGO_HOME/credentials.toml` (or
+    /// any other file under the toolchain roots) for the rest of the
+    /// session, armed by nothing more than a session `exec:cargo` grant meant
+    /// only to let the confined build's OWN subprocess resolve its
+    /// toolchain. The toolchain reads now live ONLY on the confined shell
+    /// dispatch's call-scoped caveats
+    /// (`agentic::tools::shell::dispatch_caveats_for_command`), never here.
+    /// This test pins the negative: an exec grant, build tool or not, widens
+    /// `exec` alone.
+    #[test]
+    fn widen_of_an_exec_grant_never_touches_fs_read_even_for_a_build_tool() {
+        let widened = widen_caveats(&base(), &[(DenialKind::Exec, "cargo".to_string())]);
+        assert!(widened.permits_exec("cargo"));
+        assert_eq!(
+            widened.fs_read,
+            base().fs_read,
+            "an exec grant — build tool or not — must never widen fs_read; \
+             that axis feeds every tool the model can call this session, \
+             not just the confined child this grant was asked for"
+        );
+    }
+
+    #[test]
+    fn widen_leaves_base_unchanged_and_all_stays_all() {
+        let b = base();
+        let _ = widen_caveats(&b, &[(DenialKind::Exec, "npm".to_string())]);
+        assert_eq!(b, base(), "widen builds a NEW policy; base is immutable");
+
+        let all = Caveats::top();
+        let widened = widen_caveats(&all, &[(DenialKind::Exec, "npm".to_string())]);
+        assert_eq!(widened, all, "Scope::All has nothing to add");
+    }
+
+    #[test]
+    fn widen_with_no_grants_is_identity() {
+        assert_eq!(widen_caveats(&base(), &[]), base());
+    }
+
+    #[test]
+    fn record_serializes_the_issue_shape() {
+        let rec = PermissionRecord::new(
+            "conv-1",
+            "run_command",
+            DenialKind::Exec,
+            "npm",
+            "allow",
+            "session",
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(json["conversation_id"], "conv-1");
+        assert_eq!(json["tool"], "run_command");
+        assert_eq!(json["kind"], "exec");
+        assert_eq!(json["target"], "npm");
+        assert_eq!(json["decision"], "allow");
+        assert_eq!(json["scope"], "session");
+        // ts_claim is present and RFC 3339-shaped (a display claim, §6).
+        let ts = json["ts_claim"].as_str().unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+            "got: {ts}"
+        );
+    }
+
+    // Chained append/round-trip for `PermissionRecord` is covered in
+    // `crate::permission_journal`'s tests (issue #2524 item 3) — this type
+    // is now only the chain's payload, not its own flat writer.
+
+    // ---- #904: persistent "permanently deny" store ----
+
+    #[test]
+    fn denial_kind_from_str_round_trips_and_rejects_unknown() {
+        for k in [
+            DenialKind::Exec,
+            DenialKind::FsRead,
+            DenialKind::FsWrite,
+            DenialKind::Net,
+        ] {
+            assert_eq!(k.as_str().parse::<DenialKind>(), Ok(k));
+        }
+        assert!("nope".parse::<DenialKind>().is_err());
+        assert!("".parse::<DenialKind>().is_err());
+    }
+
+    #[test]
+    fn parse_denials_is_pure_and_skips_bad_lines() {
+        let body = "\
+{\"kind\":\"net\",\"target\":\"github.com\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+{\"kind\":\"exec\",\"target\":\"rm\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+
+not json at all
+{\"kind\":\"bogus\",\"target\":\"x\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+{\"kind\":\"net\",\"target\":\"\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+";
+        let got = parse_denials(body);
+        // Only the two well-formed, known-kind, non-empty-target lines survive.
+        assert_eq!(
+            got,
+            vec![
+                (DenialKind::Net, "github.com".to_string()),
+                (DenialKind::Exec, "rm".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_denials_missing_file_is_empty_not_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nope").join("permission-denials.jsonl");
+        assert!(load_denials(&missing).is_empty());
+    }
+
+    #[test]
+    fn append_denial_then_load_round_trips_and_creates_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("permission-denials.jsonl");
+        append_denial(&path, DenialKind::Net, "github.com").unwrap();
+        append_denial(&path, DenialKind::Exec, "curl").unwrap();
+        let loaded = load_denials(&path);
+        assert_eq!(
+            loaded,
+            vec![
+                (DenialKind::Net, "github.com".to_string()),
+                (DenialKind::Exec, "curl".to_string()),
+            ]
+        );
+    }
+}

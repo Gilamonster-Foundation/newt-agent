@@ -1342,8 +1342,8 @@ mod tests {
                 PermissionDecision::Deny
             }
         }
-        fn ask_question(&mut self, _: &str) -> crate::agentic::HumanQuestionOutcome {
-            crate::agentic::HumanQuestionOutcome::Unavailable
+        fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+            crate::permissions::HumanQuestionOutcome::Unavailable
         }
     }
 
@@ -1621,8 +1621,8 @@ mod tests {
                 PermissionDecision::Deny
             }
         }
-        fn ask_question(&mut self, _question: &str) -> crate::agentic::HumanQuestionOutcome {
-            crate::agentic::HumanQuestionOutcome::Unavailable
+        fn ask_question(&mut self, _question: &str) -> crate::permissions::HumanQuestionOutcome {
+            crate::permissions::HumanQuestionOutcome::Unavailable
         }
     }
 
@@ -1755,8 +1755,8 @@ mod tests {
                 self.requests.extend_from_slice(requests);
                 PermissionDecision::Deny
             }
-            fn ask_question(&mut self, _: &str) -> crate::agentic::HumanQuestionOutcome {
-                crate::agentic::HumanQuestionOutcome::Unavailable
+            fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+                crate::permissions::HumanQuestionOutcome::Unavailable
             }
         }
 
@@ -2358,8 +2358,8 @@ mod governed_push_tests {
                 PermissionDecision::Deny
             }
         }
-        fn ask_question(&mut self, _question: &str) -> crate::agentic::HumanQuestionOutcome {
-            crate::agentic::HumanQuestionOutcome::Unavailable
+        fn ask_question(&mut self, _question: &str) -> crate::permissions::HumanQuestionOutcome {
+            crate::permissions::HumanQuestionOutcome::Unavailable
         }
     }
 
@@ -2921,8 +2921,11 @@ mod governed_push_tests {
                     ..Caveats::top()
                 })
             }
-            fn ask_question(&mut self, _question: &str) -> crate::agentic::HumanQuestionOutcome {
-                crate::agentic::HumanQuestionOutcome::Unavailable
+            fn ask_question(
+                &mut self,
+                _question: &str,
+            ) -> crate::permissions::HumanQuestionOutcome {
+                crate::permissions::HumanQuestionOutcome::Unavailable
             }
         }
         let err = plan_push_test(

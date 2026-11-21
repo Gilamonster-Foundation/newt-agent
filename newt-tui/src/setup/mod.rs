@@ -56,8 +56,9 @@ use newt_core::provider_preset::{
     self, list_models_for_preset, preset_support,
     validate_authenticated_url as validate_authenticated_target, PresetSupport, ProviderPreset,
 };
-use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, OpenAiApi, Tier};
+use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, OpenAiApi};
 use newt_interaction::InteractionDefinition;
+use newt_router::Tier;
 use operator::Operator;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};

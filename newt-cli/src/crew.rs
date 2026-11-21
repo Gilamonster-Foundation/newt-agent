@@ -1115,7 +1115,7 @@ pub async fn author_plan(
         .system(PLAN_AUTHOR_SYSTEM)
         .user(format!("GOAL:\n{goal}\n\nAt most {max_subtasks} subtasks."));
     let reply = pool
-        .run_role(dispatcher, newt_core::Tier::Complex, model, req)
+        .run_role(dispatcher, newt_router::Tier::Complex, model, req)
         .await
         .ok_or_else(|| {
             anyhow::anyhow!("no live model reachable to author the plan (model {model})")
@@ -1579,7 +1579,7 @@ async fn run_with(
     // for every path and `run_crew`'s REFUSED branch is dead code. A scoped
     // `fs_write` leash would be a real second boundary, but isn't wired yet.
     //
-    // NOTE: the CWD fs-lock (newt_core::caveats::apply_cli_fs_grants, applied for
+    // NOTE: the CWD fs-lock (newt_core::git_hardening::apply_cli_fs_grants, applied for
     // `newt code`) is NOT applied here yet — `run_crew` enforces `permits_fs_write`
     // by EXACT match on the planner's (relative) edit paths, which an
     // absolute-workspace-root grant can't match, so the lock would deny

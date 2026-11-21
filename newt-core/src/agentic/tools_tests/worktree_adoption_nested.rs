@@ -42,7 +42,7 @@ impl PermissionGate for GrantExec {
         self.0 += 1;
         PermissionDecision::Allow(Caveats::top())
     }
-    fn ask_question(&mut self, _: &str) -> super::super::super::permissions::HumanQuestionOutcome {
+    fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
         panic!("unexpected question")
     }
 }

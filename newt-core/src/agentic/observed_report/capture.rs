@@ -11,7 +11,7 @@ pub(crate) struct Capture {
 }
 
 pub(super) fn bounded(text: &str, limit: usize) -> String {
-    crate::agentic::compress::redact_secrets(text)
+    crate::redact::redact_secrets(text)
         .chars()
         .take(limit)
         .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })

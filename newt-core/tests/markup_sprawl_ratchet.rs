@@ -1128,19 +1128,11 @@ fn the_audience_discriminator_stays_confined_to_its_branches() {
 fn action_model_registry_is_exact() {
     // (workspace-relative file, enum name, expected definition count there)
     const REGISTRY: &[(&str, &str, usize)] = &[
-        (
-            "newt-core/src/agentic/permissions.rs",
-            "PermissionAction",
-            1,
-        ),
-        (
-            "newt-core/src/agentic/permissions.rs",
-            "HumanQuestionOutcome",
-            1,
-        ),
-        ("newt-core/src/store.rs", "Verdict", 1),
+        ("newt-core/src/permissions.rs", "PermissionAction", 1),
+        ("newt-core/src/permissions.rs", "HumanQuestionOutcome", 1),
+        ("newt-core/src/permissions.rs", "Verdict", 1),
         // An unrelated eval Verdict shares the name; pinned so a rename or a
-        // third Verdict cannot hide behind the store one.
+        // third Verdict cannot hide behind the permissions one.
         ("newt-core/src/symbols.rs", "Verdict", 1),
         ("newt-core/src/tty/modal.rs", "PromptLine", 1),
         ("newt-core/src/sas_confirm.rs", "SasVerdict", 1),
@@ -1747,8 +1739,8 @@ fn the_real_workspace_root_set_is_unchanged() {
     let roots = production_roots(&workspace_root());
     assert_eq!(
         roots.len(),
-        30,
-        "29 production members + newt-web; a change here rescopes every \
+        31,
+        "30 production members + newt-web; a change here rescopes every \
          law and every baseline. Moved 21 -> 22 by #1828 A2.0, which adds \
          the `newt-interaction` protocol crate; 22 -> 23 by the \
          `crates/newt-launch` launch-configuration crate; 23 -> 24 by \
@@ -1758,7 +1750,8 @@ fn the_real_workspace_root_set_is_unchanged() {
          extractable agent-toolchain crate; 27 -> 28 adds the standalone \
          `crates/newt-carried-tools` command pack (#2776); 28 -> 29 adds the parsed Rust extraction \
          helper in scripts/eval/rust-evidence (#2804); 29 -> 30 adds `newt-flock`, the \
-         verified read-only flock follower (agent-mesh#109 step 12a). All production laws also scan \
+         verified read-only flock follower (agent-mesh#109 step 12a); 30 -> 31 adds `newt-router`, the tier \
+         router extracted from newt-core (#2234). All production laws also scan \
          these new crates; their existing baselines do not increase"
     );
     for member in [

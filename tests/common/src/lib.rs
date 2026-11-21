@@ -9,8 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use newt_core::router::Tier;
 use newt_inference::backend::{ChatReply, ChatRequest, InferenceBackend};
+use newt_router::Tier;
 
 // ── Tracing ──────────────────────────────────────────────────────────
 
@@ -179,7 +179,7 @@ fn escape_cmd_echo_arg(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::router::Tier;
+    use newt_router::Tier;
 
     #[test]
     fn mock_backend_supports_configured_tiers() {

@@ -23,7 +23,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use agent_mesh_core::{AgentKey, AgentMetadata, Caveats as AmCaveats, CountBound, Scope, UserKey};
-use newt_core::router::Tier;
+use newt_router::Tier;
 // `permits_*` / `permits_one_more` live on newt-core's extension traits
 // (post-#95 agent-mesh-protocol exports only the lattice algebra).
 use newt_core::{CaveatsExt, CountBoundExt};

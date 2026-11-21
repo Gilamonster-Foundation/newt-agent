@@ -133,7 +133,7 @@ HEAD `1a0fb88`.
 
 ### 2.1 The permission surface
 
-**`newt-core/src/agentic/permissions.rs`** — the kernel-facing seam. *(Line
+**`newt-core/src/permissions.rs`** — the kernel-facing seam. *(Line
 numbers re-verified against HEAD `1a0fb88` in the 2026-06-29 red-team; the
 24-line module header had shifted the prior citations ~20 lines.)*
 

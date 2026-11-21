@@ -224,8 +224,8 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
             );
             PermissionDecision::Deny
         }
-        fn ask_question(&mut self, _: &str) -> crate::agentic::permissions::HumanQuestionOutcome {
-            crate::agentic::permissions::HumanQuestionOutcome::Unavailable
+        fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+            crate::permissions::HumanQuestionOutcome::Unavailable
         }
     }
     let _lock = env_lock().await;

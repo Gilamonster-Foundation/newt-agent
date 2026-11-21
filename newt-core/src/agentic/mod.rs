@@ -181,7 +181,6 @@ mod memory_fetch;
 mod note_sink;
 mod observation;
 mod operating_mode;
-mod permissions;
 mod plan_mode;
 pub mod smart_harness;
 // PR5: deterministic prompt-comprehension intake owns the turn disposition,
@@ -340,11 +339,6 @@ pub use memory_fetch::{
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
 pub use operating_mode::{select_operating_mode_tool_definition, OperatingModeControl};
-pub use permissions::{
-    append_denial, load_denials, widen_caveats, ChoiceSpec, DenialKind, HumanQuestionOutcome,
-    PermissionAction, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
-    PersistentDenial, BOUND_REASON_PREFIX,
-};
 pub use plan_mode::{
     plan_verdict, PlanDraft, PlanDraftSink, PlanEntry, PlanModeControl, PlanVerdict, PresentedPlan,
     PLAN_APPROVAL_CHOICES,
@@ -371,6 +365,7 @@ pub use trim::{ollama_usage, openai_usage, trim_for_summary};
 pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
+use crate::permissions::PermissionGate;
 use crate::retry::{with_backoff_notify_error, RetryPolicy};
 use compress::{
     compression_trigger, CompressAction, CompressRequest, CompressTrigger,

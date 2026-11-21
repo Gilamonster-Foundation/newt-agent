@@ -1534,7 +1534,7 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
 
 /// The per-user toolchain / package-cache roots alone (no workspace), derived
 /// from the operator's environment. Shared by [`build_tool_read_roots`] and by
-/// [`crate::agentic::permissions::widen_caveats`]'s build-tool exec arm — an
+/// [`crate::permissions::widen_caveats`]'s build-tool exec arm — an
 /// `exec` grant for `cargo`/`just`/`make` carries the same calibrated reads a
 /// lifecycle build gets, one derivation, not two (dec1-build-grant, F35).
 ///

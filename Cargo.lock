@@ -4602,6 +4602,7 @@ dependencies = [
  "newt-core",
  "newt-identity",
  "newt-inference",
+ "newt-router",
  "newt-tools",
  "prometheus",
  "pyo3",
@@ -4638,6 +4639,7 @@ dependencies = [
  "newt-launch",
  "newt-mcp-client",
  "newt-mcp-server",
+ "newt-router",
  "newt-scheduler",
  "newt-skills",
  "newt-tui",
@@ -4707,6 +4709,7 @@ dependencies = [
  "newt-core",
  "newt-identity",
  "newt-inference",
+ "newt-router",
  "newt-tools",
  "plugins-protocol",
  "pyo3",
@@ -4750,6 +4753,7 @@ dependencies = [
  "markdown-table-formatter",
  "newt-harness",
  "newt-interaction",
+ "newt-router",
  "newt-skills",
  "newt-tuner",
  "newtui",
@@ -4911,6 +4915,7 @@ dependencies = [
  "newt-core",
  "newt-harness",
  "newt-identity",
+ "newt-router",
  "plugins-protocol",
  "pyo3",
  "pyo3-async-runtimes",
@@ -4989,6 +4994,7 @@ dependencies = [
  "newt-git",
  "newt-inference",
  "newt-mcp-client",
+ "newt-router",
  "pyo3",
  "serde",
  "serde_json",
@@ -5028,6 +5034,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-router"
+version = "0.8.6"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "newt-scheduler"
 version = "0.8.6"
 dependencies = [
@@ -5035,6 +5048,7 @@ dependencies = [
  "async-trait",
  "newt-core",
  "newt-inference",
+ "newt-router",
  "reqwest",
  "serde",
  "serde_json",
@@ -5089,6 +5103,7 @@ dependencies = [
  "newt-inference",
  "newt-interaction",
  "newt-mcp-client",
+ "newt-router",
  "newt-skills",
  "newtui",
  "precedence-ladder",
@@ -7573,6 +7588,7 @@ dependencies = [
  "async-trait",
  "newt-core",
  "newt-inference",
+ "newt-router",
  "serde",
  "serde_json",
  "tempfile",

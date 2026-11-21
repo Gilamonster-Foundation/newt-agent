@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
-use crate::router::Tier;
+use newt_router::Tier;
 
 use super::dropin::{
     classify_untagged_dropin, disk_record_tag, parse_dropin, parse_probe_record, DropinOwner,

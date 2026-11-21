@@ -103,7 +103,7 @@ below is cited at the file:symbol the harness will consume.
   The `[backend_pool]` config (§5) is the natural extension: today `[dgx]`
   describes one active node; the pool generalizes to a *list* of reachable
   things, of which DGX nodes are one kind.
-- `newt-core/src/router/mod.rs` — **`Router::classify_detailed(prompt) →
+- `newt-router/src/lib.rs` — **`Router::classify_detailed(prompt) →
   Classification { tier, confidence, reasons }`** (and the thin
   `classify → Tier`). This is the **task → tier** hinge. The scheduler runs it
   per subtask to get a `Tier`, then the pool answers **tier → which backend +

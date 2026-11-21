@@ -124,7 +124,7 @@ pub(crate) struct AdoptedWorktree {
 }
 
 fn resolved(path: &Path) -> Option<PathBuf> {
-    crate::config::resolve_uncreated_path(path).ok()
+    crate::paths::resolve_uncreated_path(path).ok()
 }
 fn overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)

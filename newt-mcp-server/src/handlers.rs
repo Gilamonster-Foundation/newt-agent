@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_bridle::{Caveats, Grant, Registry, ToolError};
-use newt_core::router::{Router, Tier};
 use newt_inference::BackendRegistry;
 use newt_mcp_client::McpToolset;
+use newt_router::{Router, Tier};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
