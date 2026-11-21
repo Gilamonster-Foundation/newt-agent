@@ -66,7 +66,10 @@ fn the_journal_directory_is_synced_before_any_emission_and_a_failing_sync_stops_
 #[test]
 fn every_open_syncs_the_whole_chain_before_any_emission() {
     let tmp = tempfile::tempdir().unwrap();
-    let base = tmp.path().join("base");
+    // Canonical, so the lexical and the physical chain `open` syncs are one: macOS
+    // temp dirs sit under the `/var` symlink, and `open` syncs `/private/var/..` too.
+    let root = tmp.path().canonicalize().unwrap();
+    let base = root.join("base");
     // "another opener" already made the first level
     std::fs::create_dir_all(base.join("a")).unwrap();
     let dir = base.join("a").join("b");
@@ -86,7 +89,8 @@ fn every_open_syncs_the_whole_chain_before_any_emission() {
 #[test]
 fn a_failed_sync_fails_the_open_and_the_retry_syncs_everything_again() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("x").join("y");
+    // Canonical: see `every_open_syncs_the_whole_chain_before_any_emission`.
+    let dir = tmp.path().canonicalize().unwrap().join("x").join("y");
     let first = Arc::new(Mutex::new(true));
     let f = Arc::clone(&first);
     let log = Arc::new(Mutex::new(vec![]));
