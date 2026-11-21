@@ -264,6 +264,25 @@ impl PermissionRequest {
     }
 }
 
+/// The git ops that destroy work irrecoverably (#1191), each with what a prompt
+/// calls it (#3147). One table: the gate asks about exactly these ops, and the
+/// prompt names the action from the same row, so a new data-loss op cannot be
+/// asked about under the commit label.
+const GIT_DATA_LOSS_ACTIONS: [(&str, &str); 2] = [
+    ("branch-delete", "delete a branch via git"),
+    ("stash-drop", "drop a stash via git"),
+];
+
+/// What the git op `op` does when it destroys work, as a prompt names it, or
+/// `None` for any other op. `Some` is also the test for "asked even under full
+/// access".
+#[must_use]
+pub fn git_data_loss_action(op: &str) -> Option<&'static str> {
+    GIT_DATA_LOSS_ACTIONS
+        .iter()
+        .find_map(|(name, action)| (*name == op).then_some(*action))
+}
+
 /// #2636 (round1 finding 4): prefix marking a `request_permissions` reason
 /// as HARNESS-authored (it discloses the exact command a #2628 replay is
 /// about to run), not the model-supplied text. `reason_is_model_authored`
@@ -946,5 +965,22 @@ not json at all
                 (DenialKind::Exec, "curl".to_string()),
             ]
         );
+    }
+
+    /// #3147: the work-destroying git ops are named in one table, and no other
+    /// op is in it, so a prompt can tell a data-loss confirmation from a commit.
+    #[test]
+    fn only_the_work_destroying_git_ops_have_a_data_loss_action() {
+        assert_eq!(
+            git_data_loss_action("branch-delete"),
+            Some("delete a branch via git")
+        );
+        assert_eq!(
+            git_data_loss_action("stash-drop"),
+            Some("drop a stash via git")
+        );
+        for op in ["commit", "add", "checkout", "branch", "stash-pop", ""] {
+            assert_eq!(git_data_loss_action(op), None, "{op:?}");
+        }
     }
 }

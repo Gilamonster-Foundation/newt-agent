@@ -1532,6 +1532,36 @@ fn nested_controls_cancel_without_recording_a_permission_decision() {
     }
 }
 
+/// #3147: a data-loss confirmation (#1191) is asked even with git-write
+/// authority, so its header must neither announce a commit nor say the op is
+/// outside the grant. It read "commit/stage via git `branch-delete` — outside
+/// the granted git-write authority".
+#[test]
+fn a_data_loss_confirmation_is_not_announced_as_a_commit() {
+    let danger = danger::DangerTable::builtin();
+    let q = permission_definition(
+        &PermissionRequest {
+            tool: "git".into(),
+            kind: DenialKind::GitWrite,
+            target: "branch-delete".into(),
+            reason: "git branch-delete DESTROYS work irrecoverably".into(),
+            harness_bound: false,
+        },
+        &danger,
+        Audience::Terminal,
+    );
+    assert!(
+        q.markdown
+            .contains("git wants to delete a branch via git `branch-delete`"),
+        "{}",
+        q.markdown
+    );
+    assert!(q.markdown.contains("asked even with git-write authority"));
+    for wrong in ["commit/stage", "outside the granted"] {
+        assert!(!q.markdown.contains(wrong), "{wrong:?} in {}", q.markdown);
+    }
+}
+
 #[test]
 fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
     let danger = danger::DangerTable::builtin();
@@ -1541,6 +1571,12 @@ fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
         (DenialKind::Net, "docs.rs", "reach"),
         (DenialKind::RemoteTool, "remote__tool", "call"),
         (DenialKind::GitWrite, "commit", "commit/stage via git"),
+        (
+            DenialKind::GitWrite,
+            "branch-delete",
+            "delete a branch via git",
+        ),
+        (DenialKind::GitWrite, "stash-drop", "drop a stash via git"),
     ] {
         let q = permission_definition(
             &PermissionRequest {

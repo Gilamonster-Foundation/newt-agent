@@ -1860,7 +1860,7 @@ fn is_git_write_denial(out: &str) -> bool {
 /// away). Read-side and constructive ops (commit/branch/checkout/stash-pop…)
 /// are unaffected.
 fn is_git_data_loss_op(op: &str) -> bool {
-    matches!(op, "stash-drop" | "branch-delete")
+    crate::permissions::git_data_loss_action(op).is_some()
 }
 
 /// Ask the operator to confirm data-loss git ops (#1191), in one prompt.

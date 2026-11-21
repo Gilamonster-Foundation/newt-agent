@@ -267,10 +267,15 @@ fn permission_definition_with_default(
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
         DenialKind::RemoteTool => ("call", "requires operator permission"),
         DenialKind::Build => ("build/test", "requires confined build authority"),
-        DenialKind::GitWrite => (
-            "commit/stage via git",
-            "outside the granted git-write authority",
-        ),
+        // #3147: a data-loss confirmation (#1191) is asked even with git-write
+        // authority, so it is neither a commit nor "outside the grant".
+        DenialKind::GitWrite => match newt_core::permissions::git_data_loss_action(&req.target) {
+            Some(action) => (action, "asked even with git-write authority"),
+            None => (
+                "commit/stage via git",
+                "outside the granted git-write authority",
+            ),
+        },
     };
 
     let axis = if req.tool == "request_permissions" {
