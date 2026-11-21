@@ -523,6 +523,13 @@ checksum = "00"
 
     struct Answer(bool, usize);
     impl PermissionGate for Answer {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.1 += 1;
             assert!(requests.iter().all(|r| r.kind == DenialKind::Net));

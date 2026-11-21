@@ -120,6 +120,13 @@ fn denial_context_quotes_paths_and_bounds_scope_details() {
 fn declined_permissions_report_defaults_without_refreshing_authority() {
     struct NoDiagnosticRefresh;
     impl PermissionGate for NoDiagnosticRefresh {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
             panic!("permission diagnostics must not refresh or remint authority")
         }
@@ -2206,6 +2213,13 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         sufficient: bool,
     }
     impl super::PermissionGate for QueueBackedGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.asks += 1;
             if !self.sufficient {
@@ -3079,6 +3093,13 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
         prompts: usize,
     }
     impl PermissionGate for SessionGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             assert!(requests.iter().all(|r| r.tool == "request_permissions"));
             self.prompts += 1;
@@ -3316,6 +3337,13 @@ async fn gate_allow_turns_list_dir_denial_into_the_listing() {
 async fn gate_allow_without_real_coverage_is_still_denied() {
     struct LyingGate;
     impl super::PermissionGate for LyingGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             // "Allow", but the caveats grant nothing at all.
             super::PermissionDecision::Allow(Caveats {
@@ -4027,6 +4055,13 @@ async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set()
         base: Caveats,
     }
     impl PermissionGate for ConsumeSpy {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             let grants: Vec<_> = requests
                 .iter()
@@ -4125,6 +4160,13 @@ async fn bound_wording_and_replay_require_complete_missing_coverage() {
         captured: Rc<RefCell<Option<PermissionRequest>>>,
     }
     impl PermissionGate for CaptureGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             *self.captured.borrow_mut() = requests.first().cloned();
             let grants: Vec<_> = requests
@@ -4275,6 +4317,13 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
         captured: Rc<RefCell<Option<PermissionRequest>>>,
     }
     impl PermissionGate for CaptureGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             *self.captured.borrow_mut() = requests.first().cloned();
             let grants: Vec<_> = requests
@@ -4374,6 +4423,13 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
         consume_count: Rc<Cell<usize>>,
     }
     impl PermissionGate for StatefulGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             self.ask_count.set(self.ask_count.get() + 1);
             // Always approve with top authority so widened caveats cover everything.
@@ -4597,6 +4653,13 @@ async fn queue_owning_gate_proves_once_grant_lifetime_across_replay_and_fresh_co
         consume_count: Rc<Cell<usize>>,
     }
     impl PermissionGate for QueueGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.ask_count.set(self.ask_count.get() + 1);
             let req = &requests[0];
@@ -4851,6 +4914,13 @@ async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consume
         consumed: Rc<Cell<bool>>,
     }
     impl PermissionGate for InsufficientGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             // Allow, but the returned caveats grant NOTHING for fs_write —
             // eligible pre-prompt (target matches exactly), insufficient
@@ -4977,6 +5047,13 @@ async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls()
         consume_count: Rc<Cell<usize>>,
     }
     impl PermissionGate for ExecQueueGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.ask_count.set(self.ask_count.get() + 1);
             let req = &requests[0];
