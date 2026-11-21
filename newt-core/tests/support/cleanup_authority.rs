@@ -13,6 +13,13 @@ struct OnceGate {
 }
 
 impl PermissionGate for OnceGate {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &newt_core::caveats::Caveats,
+        _request: &newt_core::permissions::PermissionRequest,
+    ) -> newt_core::permissions::PermissionDecision {
+        newt_core::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("native cleanup must preserve its invocation baseline");
     }

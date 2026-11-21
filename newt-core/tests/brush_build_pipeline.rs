@@ -147,6 +147,13 @@ mod native {
     }
 
     impl PermissionGate for CachedBuildGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &newt_core::caveats::Caveats,
+            _request: &newt_core::permissions::PermissionRequest,
+        ) -> newt_core::permissions::PermissionDecision {
+            newt_core::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("build projection must retain the invocation baseline");
         }

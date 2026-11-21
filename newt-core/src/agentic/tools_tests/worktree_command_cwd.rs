@@ -209,6 +209,13 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
     #[derive(Default)]
     struct Gate(Vec<(Caveats, String)>);
     impl PermissionGate for Gate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             PermissionDecision::Deny
         }

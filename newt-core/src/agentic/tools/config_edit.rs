@@ -134,6 +134,13 @@ mod tests {
     }
 
     impl PermissionGate for ChoiceGate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(
             &mut self,
             _: &[crate::permissions::PermissionRequest],

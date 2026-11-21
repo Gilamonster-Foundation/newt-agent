@@ -37,6 +37,13 @@ fn repo() -> (tempfile::TempDir, PathBuf, Caveats) {
 #[derive(Default)]
 struct GrantExec(usize);
 impl PermissionGate for GrantExec {
+    fn ask_dependency_fetch(
+        &mut self,
+        _prepared: &crate::caveats::Caveats,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::PermissionDecision {
+        crate::permissions::PermissionDecision::Deny
+    }
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
         assert!(requests.iter().all(|r| r.kind == DenialKind::Exec));
         self.0 += 1;

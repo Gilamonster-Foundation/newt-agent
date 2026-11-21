@@ -104,6 +104,19 @@ impl PermissionGate for Guard<'_, '_> {
             });
         self.checked(decision)
     }
+    fn ask_dependency_fetch(
+        &mut self,
+        prepared: &Caveats,
+        request: &PermissionRequest,
+    ) -> PermissionDecision {
+        let decision = self
+            .inner
+            .as_deref_mut()
+            .map_or(PermissionDecision::Deny, |g| {
+                g.ask_dependency_fetch(prepared, request)
+            });
+        self.checked(decision)
+    }
     fn ask_question(&mut self, q: &str) -> HumanQuestionOutcome {
         self.inner
             .as_deref_mut()

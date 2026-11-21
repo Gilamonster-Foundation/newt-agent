@@ -149,15 +149,17 @@ fn approve_network_read_with(
                 // The exact helper paths were unknown before consent. Reuse the
                 // non-interactive gate refresh to enforce preset/delegation bounds
                 // on them, retaining only this invocation's prepared authority.
-                if !matches!(gate.refresh_caveats(&prepared), PermissionDecision::Allow(bounded) if prepared.leq(&bounded)) {
+                if !matches!(gate.refresh_caveats(&prepared), PermissionDecision::Allow(bounded) if prepared.leq(&bounded))
+                {
                     return Err("denied: Git transport helpers exceed the session's authority ceiling. No network command ran.".into());
                 }
             }
             Ok(Some(prepared))
-        },
+        }
         _ => Err(format!(
-            "denied: the operator declined network access for this `git {verb}`, or the session's \
-             authority ceiling forbids it. No command ran. Do not retry it; take a different approach."
+            "denied: network access for this `git {verb}` was not granted: the operator declined \
+             it, no operator could be asked, or the session's authority ceiling forbids it. No \
+             command ran. Do not retry it; take a different approach."
         )),
     }
 }
@@ -183,12 +185,15 @@ fn dispatch_network_read_with(
     source: &str,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
-    broker: impl FnOnce(&mut Option<&mut dyn PermissionGate>) -> Option<String>,
+    broker: impl FnOnce(&mut Option<&mut dyn PermissionGate>) -> Option<fetch::Brokered>,
     helpers: impl FnOnce() -> Vec<String>,
 ) -> std::ops::ControlFlow<String, Option<Caveats>> {
     if fetch::wanted(source, caveats) {
-        if let Some(result) = broker(gate) {
-            return std::ops::ControlFlow::Break(result);
+        match broker(gate) {
+            Some(fetch::Brokered::Answered(result)) => return std::ops::ControlFlow::Break(result),
+            // A local-path remote reads no network: run it in the fence, no prompt.
+            Some(fetch::Brokered::LocalRemote) => return std::ops::ControlFlow::Continue(None),
+            None => {}
         }
     }
     match approve_network_read_with(source, caveats, gate, helpers) {
@@ -1416,6 +1421,32 @@ mod tests {
         assert_eq!(gate.seen.len(), 1);
     }
 
+    /// #3148: a broker verdict of "local-path remote" runs the fetch in the fence
+    /// with no network prompt, as before #3097's prompt, instead of asking for
+    /// unrestricted egress the command does not use. Fully mocked: no Git, no
+    /// filesystem; the real-repo twin is `a_local_path_remote_..._real_repo`.
+    #[test]
+    fn a_local_remote_verdict_runs_in_the_fence_without_a_network_prompt() {
+        let caveats = Caveats {
+            net: crate::Scope::none(),
+            exec: crate::Scope::only(["git".to_string()]),
+            ..Caveats::top()
+        };
+        let mut gate = EgressGate::default();
+        let flow = dispatch_network_read_with(
+            "git fetch upstream",
+            &caveats,
+            &mut Some(&mut gate),
+            |_| Some(fetch::Brokered::LocalRemote),
+            Vec::new,
+        );
+        assert!(
+            matches!(flow, std::ops::ControlFlow::Continue(None)),
+            "{flow:?}"
+        );
+        assert!(gate.seen.is_empty(), "no network prompt for a local path");
+    }
+
     /// The transport helper grant remains bounded after discovery, and a gate
     /// returning broader standing authority cannot widen unrelated limits.
     #[test]
@@ -1466,9 +1497,11 @@ mod tests {
         let refusal =
             approve("git fetch origin", crate::Scope::none(), Some(&mut gate)).unwrap_err();
         assert!(
-            refusal.starts_with("denied: the operator declined"),
+            refusal.starts_with("denied: network access for this `git fetch` was not granted"),
             "{refusal}"
         );
+        // #3148: it names every cause, not only a decline no one was asked for.
+        assert!(refusal.contains("no operator could be asked"), "{refusal}");
         assert!(refusal.contains("No command ran"), "{refusal}");
     }
 
@@ -1562,6 +1595,13 @@ mod tests {
     }
 
     impl PermissionGate for Gate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.requests.extend_from_slice(requests);
             if self.allow {
@@ -1692,6 +1732,13 @@ mod tests {
             requests: Vec<PermissionRequest>,
         }
         impl PermissionGate for RecalledWorkspaceGrant {
+            fn ask_dependency_fetch(
+                &mut self,
+                _prepared: &crate::caveats::Caveats,
+                _request: &crate::permissions::PermissionRequest,
+            ) -> crate::permissions::PermissionDecision {
+                crate::permissions::PermissionDecision::Deny
+            }
             fn refresh_caveats(&mut self, baseline: &Caveats) -> PermissionDecision {
                 self.refreshes += 1;
                 let mut current = baseline.clone();
@@ -2164,6 +2211,13 @@ mod governed_push_tests {
     }
 
     impl PermissionGate for Gate {
+        fn ask_dependency_fetch(
+            &mut self,
+            _prepared: &crate::caveats::Caveats,
+            _request: &crate::permissions::PermissionRequest,
+        ) -> crate::permissions::PermissionDecision {
+            crate::permissions::PermissionDecision::Deny
+        }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.requests.extend_from_slice(requests);
             if self.allow {
@@ -2729,6 +2783,13 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         struct WrongHostGate;
         impl PermissionGate for WrongHostGate {
+            fn ask_dependency_fetch(
+                &mut self,
+                _prepared: &crate::caveats::Caveats,
+                _request: &crate::permissions::PermissionRequest,
+            ) -> crate::permissions::PermissionDecision {
+                crate::permissions::PermissionDecision::Deny
+            }
             fn ask(&mut self, _requests: &[PermissionRequest]) -> PermissionDecision {
                 PermissionDecision::Allow(Caveats {
                     net: Scope::only(["other.example".to_string()]),
@@ -3413,7 +3474,7 @@ mod governed_push_tests {
             assert_eq!(dialed, allow, "allow={allow}: {output} / {seen:?}");
             if !allow {
                 assert!(
-                    output.contains("operator declined network access"),
+                    output.contains("network access for this `git fetch` was not granted"),
                     "{output}"
                 );
             }
@@ -3456,7 +3517,7 @@ mod governed_push_tests {
             Some(&mut gate),
         );
         assert!(
-            output.contains("operator declined network access"),
+            output.contains("network access for this `git fetch` was not granted"),
             "{output}"
         );
         assert_eq!(gate.seen.len(), 1);
@@ -3652,7 +3713,8 @@ mod governed_push_tests {
         let result = fetch::execute_with("git fetch", repo.path(), &caveats, &mut None, |_| {
             Some("forge.example".into())
         })
-        .unwrap();
+        .unwrap()
+        .answer();
         let after = refs(repo.path());
         assert!(
             after.contains("refs/remotes/origin/good"),
@@ -3666,6 +3728,66 @@ mod governed_push_tests {
         assert!(
             !result.contains("Nothing in the repository changed"),
             "{result}"
+        );
+    }
+
+    /// #3148 real-repo twin of `a_local_remote_verdict_runs_in_the_fence_..`: a
+    /// configured remote whose URL is a path on this machine resolves, through the
+    /// production URL reader and host rule, to the local-remote verdict and no
+    /// prompt, while a configured https remote is not waved through. Grounds the
+    /// mocked dispatch test in real remote configuration.
+    #[test]
+    #[ignore = "real Git; weekly/release real-resource tier"]
+    fn a_local_path_remote_is_fetched_in_the_fence_without_a_network_prompt_real_repo() {
+        let _env = BrokerEnv::new();
+        let repo = repo_on_feature_branch();
+        let local = tempdir();
+        git(local.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            repo.path(),
+            &["remote", "add", "upstream", local.path().to_str().unwrap()],
+        );
+        git(
+            repo.path(),
+            &["remote", "add", "forge", "https://forge.example/o/r.git"],
+        );
+        let caveats = Caveats {
+            fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
+            ..with_net(Scope::none())
+        };
+        let verdict = |command: &str| {
+            fetch::execute_with(command, repo.path(), &caveats, &mut None, |url| {
+                crate::git_hardening::push_url_host(url).ok()
+            })
+        };
+        assert_eq!(
+            verdict("git fetch upstream"),
+            Some(fetch::Brokered::LocalRemote)
+        );
+        // An adopted worktree cannot write the shared git directory. A dial needs
+        // that; a local path does not, so it still reaches the verdict.
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats.clone()
+        };
+        assert_eq!(
+            fetch::execute_with(
+                "git fetch upstream",
+                repo.path(),
+                &read_only,
+                &mut None,
+                |url| { crate::git_hardening::push_url_host(url).ok() }
+            ),
+            Some(fetch::Brokered::LocalRemote),
+            "a local path needs no write access to the git directory"
+        );
+        assert_eq!(
+            verdict("git fetch forge").and_then(|v| match v {
+                fetch::Brokered::LocalRemote => Some(()),
+                fetch::Brokered::Answered(_) => None,
+            }),
+            None,
+            "a network remote is brokered or prompted, never waved through"
         );
     }
 
@@ -3704,6 +3826,7 @@ mod governed_push_tests {
                 Some("forge.example".to_string())
             })
             .expect("the broker handles this fetch")
+            .answer()
         };
 
         let first = fetch("git fetch");
