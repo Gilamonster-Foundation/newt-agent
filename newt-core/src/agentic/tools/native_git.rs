@@ -132,29 +132,37 @@ fn other_data_loss_op(verb: &str, args: &[String]) -> Option<&'static str> {
 /// their quotes, so git text inside an interpreter string (`sh -c '…'`) stays
 /// the confined executor's, as does an obfuscated command.
 fn hides_git_delete(source: &str) -> bool {
-    source
-        .split(['|', ';', '&', '\n', '(', ')', '`', '<', '>'])
-        .map(|segment| {
-            segment
-                .split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .any(|words| {
-            words.iter().enumerate().any(|(at, word)| {
-                is_git(word)
-                    && invocation(&words[at..]).is_ok_and(|(verb, args, _)| {
-                        other_data_loss_op(verb, args).is_some()
-                            || match verb {
-                                "branch" => has_option(args, "dD", &["--delete"]),
-                                "stash" => args.first().is_some_and(|action| {
-                                    matches!(action.as_str(), "drop" | "clear")
-                                }),
-                                _ => false,
-                            }
-                    })
-            })
-        })
+    bare_git_invocations(source).iter().any(|(verb, args)| {
+        other_data_loss_op(verb, args).is_some()
+            || match verb.as_str() {
+                "branch" => has_option(args, "dD", &["--delete"]),
+                "stash" => args
+                    .first()
+                    .is_some_and(|action| matches!(action.as_str(), "drop" | "clear")),
+                _ => false,
+            }
+    })
+}
+
+/// Every `git` invocation `source` makes, as `(verb, arguments)`, read from its bare
+/// words without Bridle: segments split at shell punctuation, and `git` taken
+/// anywhere in a segment, so `then git commit -m x` and `xargs git branch -d` count.
+/// A tripwire, not a boundary: words keep their quotes, so git text inside an
+/// interpreter string (`sh -c '…'`) stays the confined executor's, as does an
+/// obfuscated command.
+fn bare_git_invocations(source: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    for segment in source.split(['|', ';', '&', '\n', '(', ')', '`', '<', '>']) {
+        let words: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+        for (at, word) in words.iter().enumerate() {
+            if is_git(word) {
+                if let Ok((verb, args, _)) = invocation(&words[at..]) {
+                    found.push((verb.to_string(), args.to_vec()));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// What to do instead when a delete names what it destroys only at runtime.
@@ -187,7 +195,17 @@ fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
                     .find_map(|construct| find(construct.inspection.as_deref()?, verbs))
             })
     }
-    find(&inspect_shell(source).ok()?, verbs)
+    match inspect_shell(source) {
+        Ok(inspection) => find(&inspection, verbs),
+        // #3146: Bridle errors on an `if`, `while`, `until`, `case`, subshell or brace
+        // group, and one anywhere in a command hid every git verb from the triggers
+        // that use this (the network prompt and the commit and push brokers). Read the
+        // bare words instead, as the delete tripwire does.
+        Err(_) => bare_git_invocations(source)
+            .into_iter()
+            .filter_map(|(verb, _)| literal(&verb))
+            .find(|verb| verbs.contains(&verb.as_str())),
+    }
 }
 
 pub(super) fn needs_commit_broker(source: &str) -> bool {
@@ -2335,6 +2353,91 @@ mod tests {
         let reason = &gate.requests[0].reason;
         assert!(reason.contains("would drop"), "{reason}");
         assert!(reason.contains("worktrees/gone"), "{reason}");
+    }
+
+    /// #3146, found live: a fetch followed by a loop holding an `if` died at the fence
+    /// with no network prompt, because Bridle cannot inspect an `if` and the command
+    /// was read as having no git verb. The verb is now read from the bare words.
+    #[test]
+    fn a_git_verb_in_a_command_bridle_cannot_inspect_is_still_seen() {
+        let live = "git fetch --prune origin 2>&1 | head -5; echo \"=== local branches ===\"; \
+                    for b in $(git for-each-ref refs/heads); do merged=$(git log -1 $b); \
+                    if [ -z \"$merged\" ]; then echo $b; fi; done";
+        assert!(
+            inspect_shell(live).is_err(),
+            "the premise: Bridle cannot read it"
+        );
+        assert_eq!(
+            git_verb_in(live, NETWORK_READ_VERBS).as_deref(),
+            Some("fetch")
+        );
+        for (source, verb) in [
+            ("git fetch; if [ -z \"$x\" ]; then echo a; fi", "fetch"),
+            ("if [ -n \"$x\" ]; then git pull --ff-only; fi", "pull"),
+            (
+                "while read r; do git ls-remote $r; done < remotes; if true; then :; fi",
+                "ls-remote",
+            ),
+            ("case $x in a) git clone u d;; esac", "clone"),
+            ("(cd sub && git fetch origin)", "fetch"),
+        ] {
+            assert_eq!(
+                git_verb_in(source, NETWORK_READ_VERBS).as_deref(),
+                Some(verb),
+                "{source}"
+            );
+        }
+        for source in [
+            "if true; then git status; fi",
+            "if true; then echo \"git fetch\"; fi",
+            "case x in a) git log --oneline;; esac",
+            "if true; then python -c 'print(\"git fetch\")'; fi",
+        ] {
+            assert_eq!(git_verb_in(source, NETWORK_READ_VERBS), None, "{source}");
+        }
+    }
+
+    /// #3146: the triggers that key on `git_verb_in` now fire inside a construct Bridle
+    /// cannot inspect: a commit gets the attribution broker instead of reaching the
+    /// confined shell without one, and a push goes to the push broker, which refuses
+    /// what is not a standalone push with a retry that works.
+    #[test]
+    fn the_brokers_are_chosen_inside_a_construct_bridle_cannot_inspect() {
+        for source in [
+            "if [ -z \"$x\" ]; then git commit -m x; fi",
+            "while true; do git commit -am wip; break; done",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+            assert!(needs_commit_broker(source), "{source}");
+            assert!(!needs_push_broker(source), "{source}");
+        }
+        for source in [
+            "if [ -z \"$x\" ]; then git push origin HEAD; fi",
+            "case $b in main) git push;; esac",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+            assert!(needs_push_broker(source), "{source}");
+            assert!(!needs_commit_broker(source), "{source}");
+        }
+        assert!(!needs_commit_broker("if true; then git status; fi"));
+        assert!(!needs_push_broker("if true; then git status; fi"));
+    }
+
+    /// #3146: the prompt itself, end to end: a declined network read refuses the whole
+    /// command and nothing runs.
+    #[test]
+    fn a_network_read_inside_an_if_asks_the_operator() {
+        let source = "git fetch origin; if [ -z \"$x\" ]; then echo a; fi";
+        let mut gate = EgressGate {
+            allow: false,
+            ..Default::default()
+        };
+        let refusal = approve(source, crate::Scope::none(), Some(&mut gate)).unwrap_err();
+        assert!(
+            refusal.starts_with("denied: the operator declined"),
+            "{refusal}"
+        );
+        assert_eq!(gate.seen.len(), 1, "asked once");
     }
 
     /// #3145: the tripwire sees the new ops behind a dispatcher, as it does a delete.
