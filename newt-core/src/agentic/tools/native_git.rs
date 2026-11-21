@@ -2480,10 +2480,11 @@ mod tests {
             ..Default::default()
         };
         let refusal = approve(source, crate::Scope::none(), Some(&mut gate)).unwrap_err();
-        assert!(
-            refusal.starts_with("denied: the operator declined"),
-            "{refusal}"
-        );
+        // Not the cause wording (#3148 reworded it): that it was refused, that the verb was
+        // found inside the `if`, and that nothing ran.
+        assert!(refusal.starts_with("denied:"), "{refusal}");
+        assert!(refusal.contains("`git fetch`"), "{refusal}");
+        assert!(refusal.contains("No command ran"), "{refusal}");
         assert_eq!(gate.seen.len(), 1, "asked once");
     }
 
