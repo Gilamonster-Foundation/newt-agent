@@ -218,7 +218,10 @@ class PrePushTests(unittest.TestCase):
         base, local, _ = self.release_matrix_omission()
         setup = (
             'python3() { [ "$2" = "import tomllib, yaml" ] && return 1; command python3 "$@"; }\n'
-            'uv() { printf "%s\\n" "$*" >> "$PRE_PUSH_TEST_LOG.uv"; command uv "$@"; }\n'
+            # Hermetic uv: log the call, drop uv's own args up to the literal
+            # `python`, and run the script on the real python3 (no uv, no network).
+            'uv() { printf "%s\\n" "$*" >> "$PRE_PUSH_TEST_LOG.uv"; '
+            'while [ "$1" != python ]; do shift; done; shift; command python3 "$@"; }\n'
             "export -f python3 uv"
         )
         result, calls = self.hook(local, base, setup)

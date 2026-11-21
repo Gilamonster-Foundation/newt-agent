@@ -454,8 +454,8 @@ if [ -f .github/workflows/release.yml ] && printf '%s\n' "$_changed" | grep -Eq 
         elif command -v uv >/dev/null 2>&1; then
             uv run --quiet --no-project --python '>=3.11' --with pyyaml python "$@"
         else
-            echo "[pre-push] $1 needs Python 3.11+ with PyYAML, and python3 has not both." >&2
-            echo "[pre-push] Install uv (https://docs.astral.sh/uv/) and the hook supplies them." >&2
+            echo "[pre-push] $1 needs Python 3.11+ with PyYAML, and python3 lacks one of them." >&2
+            echo "[pre-push] Install uv (https://docs.astral.sh/uv/), or put it on PATH, and the hook supplies them." >&2
             return 1
         fi
     }

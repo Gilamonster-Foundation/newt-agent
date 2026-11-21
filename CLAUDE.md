@@ -296,8 +296,8 @@ green before opening any PR.
   --all -- --check` (whole tree, cheap), `cargo clippy -D warnings` and
   `cargo nextest run -E 'rdeps(<crate>)'` scoped to the changed crates (or
   `--workspace` on ALL), plus `scripts/spawn_inventory.py` and `just
-  docs-check` (both sub-second). A push that changes a `Cargo.toml` or a
-  workflow also runs the publish-order checks, which need Python 3.11+ with
+  docs-check` (both sub-second). A push that changes a `Cargo.toml`,
+  `release.yml` or `ci.yml` also runs the publish-order checks, which need Python 3.11+ with
   PyYAML: the hook runs them through `uv` when `python3` lacks either, so
   install uv on a machine whose `python3` is older or externally managed.
   Coverage, MSRV, audit, the
