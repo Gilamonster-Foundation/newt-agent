@@ -8,6 +8,7 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    newt_core::answer_nextest_listing("native_git_commit");
     if !std::env::args().any(|arg| arg == "--ignored") {
         eprintln!("native_git_commit ... ignored (real native Git and confinement)");
         return;
