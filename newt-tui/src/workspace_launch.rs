@@ -211,6 +211,15 @@ impl WorkspaceSession {
         Ok(())
     }
 
+    /// The startup line when protection could not be installed and no saved
+    /// profile failed closed (#3149): the session runs without it, and says so
+    /// instead of leaving the reason for the settings editor to show later.
+    pub(crate) fn unprotected_notice(&self) -> Option<String> {
+        self.unavailable
+            .as_ref()
+            .map(|reason| format!("Workspace protection is not active: {reason}"))
+    }
+
     fn make_protection(&self) -> anyhow::Result<WorkspaceProtection> {
         let config = self
             .config_path

@@ -151,6 +151,29 @@ pub struct OwnGitGrant {
     pub write: Vec<String>,
 }
 
+/// `path` in the one spelling a containment test compares: on macOS the fixed
+/// aliases (`/var` for `/private/var`) rewritten, as `lock_fs_to_workspace` stores
+/// them; on Windows a `\\?\` verbatim prefix simplified to the ordinary drive path,
+/// since `Path::starts_with` takes the two prefixes for different locations; unchanged
+/// elsewhere.
+#[cfg(target_os = "macos")]
+fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+    crate::fs_aliases::rewrite(path)
+}
+
+#[cfg(windows)]
+fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+    match dunce::simplified(std::path::Path::new(path)).to_str() {
+        Some(simple) if simple != path => std::borrow::Cow::Owned(simple.to_owned()),
+        _ => std::borrow::Cow::Borrowed(path),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
 /// `NEWT_WRITE_PATHS` and the `--net` hosts, widening `fs_read` by what `discover`
 /// returns for the workspace's own git metadata. The session entry point every
@@ -191,8 +214,25 @@ pub fn apply_cli_fs_grants_with(
     // to make.
     let own_git = discover(std::path::Path::new(workspace));
     let mut read = parse("NEWT_READ_PATHS");
-    read.extend(own_git.read);
     let write = parse("NEWT_WRITE_PATHS");
+    // A git directory already inside a granted root needs no root of its own.
+    // In a main checkout it is `<repo>/.git`, inside the writable workspace:
+    // granting it again nests a root under a model-writable ancestor, which the
+    // workspace-protection anchor check refuses, so protection was lost (#3149).
+    // Only a linked worktree's, outside every root, is added. Compared in one
+    // spelling: git reports `/private/var/..` for a workspace spelled `/var/..`
+    // on macOS, and `C:/..` for a workspace canonicalised to `\\?\C:\..` on Windows.
+    let granted = Scope::only(
+        std::iter::once(workspace)
+            .chain(read.iter().chain(&write).map(String::as_str))
+            .map(|root| comparable_spelling(root).into_owned()),
+    );
+    read.extend(
+        own_git
+            .read
+            .into_iter()
+            .filter(|dir| !permits_path(&granted, &comparable_spelling(dir))),
+    );
 
     lock_fs_to_workspace(caveats, workspace, &read, &write);
     grant_net_hosts(caveats, &cli_net_hosts());
@@ -553,6 +593,76 @@ mod tests {
         assert!(c.permits_net("github.com"));
         assert!(c.permits_net("doi.org"));
         assert!(!c.permits_net("example.com"));
+    }
+
+    /// #3149: the workspace's own git directory is granted as a read root only
+    /// when it lies outside every granted root. A main checkout's `<repo>/.git`
+    /// is inside the workspace, so a second root nested under it is dropped;
+    /// a linked worktree's admin directory, outside, is kept. A launch grant
+    /// that already covers it drops it too.
+    #[test]
+    fn own_git_grants_are_added_only_outside_the_granted_roots() {
+        let _g = crate::process_env::lock();
+        let grant = |dirs: &[&str]| {
+            let dirs: Vec<String> = dirs.iter().map(ToString::to_string).collect();
+            move |_: &std::path::Path| OwnGitGrant {
+                read: dirs,
+                write: Vec::new(),
+            }
+        };
+        let read_roots = |c: &Caveats| match &c.fs_read {
+            Scope::Only(set) => set.iter().cloned().collect::<Vec<_>>(),
+            Scope::All => vec!["<all>".to_string()],
+        };
+
+        let mut main = Caveats::top();
+        apply_cli_fs_grants_with(&mut main, "/ws", grant(&["/ws/.git"]));
+        assert_eq!(
+            read_roots(&main),
+            ["/ws"],
+            "main checkout adds no nested root"
+        );
+
+        let mut linked = Caveats::top();
+        apply_cli_fs_grants_with(
+            &mut linked,
+            "/ws",
+            grant(&["/repo/.git/worktrees/ws", "/repo/.git"]),
+        );
+        assert_eq!(
+            read_roots(&linked),
+            ["/repo/.git", "/repo/.git/worktrees/ws", "/ws"],
+            "a linked worktree's git directories lie outside the workspace"
+        );
+
+        crate::process_env::set_var("NEWT_READ_PATHS", "/repo");
+        let mut covered = Caveats::top();
+        apply_cli_fs_grants_with(&mut covered, "/ws", grant(&["/repo/.git"]));
+        crate::process_env::remove_var("NEWT_READ_PATHS");
+        assert_eq!(
+            read_roots(&covered),
+            ["/repo", "/ws"],
+            "a launch grant that covers the git directory makes its own root redundant"
+        );
+    }
+
+    /// #3149 on Windows: git prints the git directory as `C:/ws/.git` while a
+    /// canonical workspace is `\\?\C:\ws`. `Path::starts_with` takes the two
+    /// prefixes for different locations, so the main checkout's `.git` was not seen
+    /// as inside the workspace, was granted as a nested root, and protection was lost.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_workspace_contains_the_git_directory_git_prints_plainly() {
+        let _g = crate::process_env::lock();
+        let mut c = Caveats::top();
+        apply_cli_fs_grants_with(&mut c, r"\\?\C:\ws", |_: &std::path::Path| OwnGitGrant {
+            read: vec!["C:/ws/.git".to_string(), r"\\?\C:\ws\.git".to_string()],
+            write: Vec::new(),
+        });
+        match &c.fs_read {
+            Scope::Only(set) => assert_eq!(set.len(), 1, "no nested root: {set:?}"),
+            Scope::All => panic!("fs_read must be restricted"),
+        }
     }
 
     /// #3089: `--net` takes a bare host — the `[tui.permissions].net` grammar
