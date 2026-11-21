@@ -39,11 +39,7 @@ NO_NEXTEST_GATE = ["docs-check", "fmt", "clippy", "test"]
 # time out under the hook's parallelism on a loaded dev box). The hook's
 # header names each one with its reason; a change there updates this pin.
 NEXTEST_CI_ONLY = [
-    "newt-core::brush_build_pipeline",
-    "newt-core::native_git_broker_pipeline",
-    "newt-core::macos_exec_basenames",
     "newt-harness::writer_inheritance",
-    "newt-git::native_git_commit",
     "newt-agent::lean_surface_purity",
     "newt-agent::stdout_purity",
     "newt-agent::posture_turn",

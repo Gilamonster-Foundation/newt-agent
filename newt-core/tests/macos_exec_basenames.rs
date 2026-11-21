@@ -4,6 +4,7 @@ fn main() {
     if let Some(code) = newt_core::maybe_dispatch() {
         std::process::exit(code);
     }
+    newt_core::answer_nextest_listing("macos_exec_basenames");
     #[cfg(target_os = "macos")]
     if std::env::args().any(|arg| arg == "--ignored") {
         run();
