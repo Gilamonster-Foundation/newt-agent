@@ -453,6 +453,8 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("smart-harness"), "{error}");
+        // #3149: the finding says what to change, not only what is wrong.
+        assert!(error.contains("or remove this grant"), "{error}");
         assert!(error.ends_with(crate::ocap_store::REPAIR_HINT), "{error}");
         assert_eq!(std::fs::read_link(&alias).unwrap(), public);
     }
