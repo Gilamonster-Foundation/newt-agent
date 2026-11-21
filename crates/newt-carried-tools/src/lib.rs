@@ -3,7 +3,7 @@ mod basic;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
-const SUPPORTED: &str = "supported: -r -R -E -F -n -c -v -i -l -w -o -H -h -e PATTERN and --";
+const SUPPORTED: &str = "supported: -r -R -E -F -P -n -c -v -i -l -w -o -H -h -e PATTERN and --";
 fn refusal(reason: &str) -> String {
     format!("{reason}; {SUPPORTED}. Use rg directly for ripgrep-specific syntax.")
 }
@@ -16,7 +16,8 @@ pub struct Invocation {
 }
 
 /// Parse grep argv without a shell. File operands retain their OS-native bytes.
-/// Default regex is the documented BRE subset; -E selects rg's ERE subset.
+/// Default regex is the documented BRE subset; -E selects rg's ERE subset; -P passes
+/// the pattern untranslated to rg's PCRE2 engine.
 pub fn translate(args: &[OsString]) -> Result<Invocation, String> {
     let mut flags: Vec<OsString> = [
         "--no-config",
@@ -56,7 +57,7 @@ pub fn translate(args: &[OsString]) -> Result<Invocation, String> {
                         recursive = true;
                         Some("--follow")
                     }
-                    'E' | 'F' => {
+                    'E' | 'F' | 'P' => {
                         if mode != 'B' && mode != flag {
                             return Err(refusal("conflicting regex modes"));
                         }
@@ -117,6 +118,11 @@ pub fn translate(args: &[OsString]) -> Result<Invocation, String> {
     let suppress_stdout = only && invert && !lists && !counts;
     if mode == 'F' {
         flags.push("--fixed-strings".into());
+    }
+    // -P (#3151): ripgrep's PCRE2 engine, which takes the pattern as written
+    // (`\K`, lookarounds); it needs a ripgrep built with PCRE2.
+    if mode == 'P' {
+        flags.push("--pcre2".into());
     }
     for pattern in patterns {
         let text = pattern
