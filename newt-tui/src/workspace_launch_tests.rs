@@ -227,3 +227,63 @@ fn signed_workspace_settings_resolve_default_and_apply_only_to_a_new_session() {
     assert!(resolve_code_workspace(None).is_err());
     assert!(WorkspaceSession::load(&workspace).is_err());
 }
+
+/// #3149: in a main checkout the workspace's own git directory is `<repo>/.git`,
+/// inside the writable workspace root. Granting it again as a nested read root
+/// failed the protection anchor check ("model-writable ancestor"), so
+/// interactive startup stored the error as `unavailable` and ran without
+/// protection. Grounds the mocked `own_gitdir_grants` unit tests in a real
+/// git checkout, the shape the issue was seen in.
+#[test]
+fn a_main_git_checkout_keeps_workspace_protection_installed() {
+    let _lock = crate::test_env_guard::env_write_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let operator = root.join("operator");
+    let workspace = root.join("workspace");
+    for path in [&operator, &workspace] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    // The minimal layout git recognises as a repository (what `git init`
+    // writes), so no `git` is spawned from this test; production still
+    // resolves the git directory through a real `git rev-parse`.
+    let git_dir = workspace.join(".git");
+    std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+    std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let _env = Environment::isolated(&operator);
+    let key_path = newt_identity::default_key_path().unwrap();
+    newt_identity::load_or_generate(&key_path).unwrap();
+
+    let workspace_str = workspace.to_str().unwrap();
+    let mut caveats = ToolPermissions::default().to_caveats(workspace_str);
+    newt_core::git_hardening::apply_cli_fs_grants(&mut caveats, workspace_str);
+    let mut session = WorkspaceSession::load(&workspace).unwrap();
+    session.protect(&caveats).unwrap();
+
+    assert_eq!(
+        session.unavailable, None,
+        "protection must not be lost in a main checkout"
+    );
+    assert!(session.protection.is_some());
+    assert_eq!(session.unprotected_notice(), None);
+}
+
+/// #3149: a session that could not install protection says so at startup.
+#[test]
+fn a_session_without_protection_names_the_reason_at_startup() {
+    let _lock = crate::test_env_guard::env_write_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let _env = Environment::isolated(&root.join("operator"));
+    let mut session = WorkspaceSession::load(&workspace).unwrap();
+    session.unavailable = Some("no operator signing key path".to_string());
+    assert_eq!(
+        session.unprotected_notice().as_deref(),
+        Some("Workspace protection is not active: no operator signing key path")
+    );
+    session.unavailable = None;
+    assert_eq!(session.unprotected_notice(), None);
+}
