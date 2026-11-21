@@ -67,6 +67,10 @@ impl Brokered {
 /// scheme (`https://`, `ssh://`) or an scp-like `host:path` is not local, and
 /// neither is a `transport::address` helper (`ext::`): those keep the prompt.
 fn is_local_remote(url: &str) -> bool {
+    // Empty, or shaped like an option: never a path to read.
+    if url.is_empty() || url.starts_with('-') {
+        return false;
+    }
     if url.starts_with("file://") {
         return true;
     }
@@ -76,7 +80,12 @@ fn is_local_remote(url: &str) -> bool {
     match url.find([':', '/', '\\']) {
         // `host:path` and `transport::address` have a colon before any slash.
         Some(i) if url.as_bytes()[i] == b':' => {
-            i == 1 && url.as_bytes()[0].is_ascii_alphabetic() && url[2..].starts_with(['/', '\\'])
+            // A drive letter is a path only on Windows; elsewhere git reads
+            // `x:/y` as ssh to a host named `x`.
+            cfg!(windows)
+                && i == 1
+                && url.as_bytes()[0].is_ascii_alphabetic()
+                && url[2..].starts_with(['/', '\\'])
         }
         _ => true,
     }
@@ -155,11 +164,21 @@ pub(super) fn execute_with(
         return None;
     }
     let held = staging::HeldRoots::bind(&caveats.fs_read).ok()?;
+    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &held).ok()?;
+    // The LITERAL url, as for a push: what the operator approves is dialed.
+    let url = staging::literal_remote_url(&common_dir, &fetch.remote, &held).ok()?;
+    let Some(host) = dialable_host(&url) else {
+        // A path on this machine needs no network: the shell's own git reads
+        // it in the fence, as before #3097's prompt, instead of asking for
+        // egress the command does not use (#3148). Decided before the gates
+        // below, which only a dial needs: an adopted worktree cannot write the
+        // shared git directory, yet still has nothing to ask for.
+        return is_local_remote(&url).then_some(Brokered::LocalRemote);
+    };
     let tools =
         staging::TrustedTools::authenticate(staging::TrustContext::bind(&caveats.fs_write).ok()?)
             .map_err(|refusal| unavailable_notice(&refusal, std::io::stdout()))
             .ok()?;
-    let (common_dir, git_dir) = staging::discover_git_dirs(cwd, &held).ok()?;
     let writable = [&common_dir, &git_dir].map(|dir| dir.to_string_lossy().into_owned());
     if !writable
         .iter()
@@ -167,14 +186,6 @@ pub(super) fn execute_with(
     {
         return None;
     }
-    // The LITERAL url, as for a push: what the operator approves is dialed.
-    let url = staging::literal_remote_url(&common_dir, &fetch.remote, &held).ok()?;
-    let Some(host) = dialable_host(&url) else {
-        // A path on this machine needs no network: the shell's own git reads
-        // it in the fence, as before #3097's prompt, instead of asking for
-        // egress the command does not use (#3148).
-        return is_local_remote(&url).then_some(Brokered::LocalRemote);
-    };
 
     // From here the broker owns the command: it answers, it never falls back.
     let result = ensure_net_granted(caveats, gate, &host, &format!("fetch from {host} ({url})"))
@@ -444,10 +455,12 @@ mod tests {
             "./repo",
             "repo",
             "file:///srv/git/repo.git",
-            "C:\\work\\repo",
-            "C:/work/repo",
         ] {
             assert!(is_local_remote(local), "{local} is a path");
+        }
+        // A drive letter is a path on Windows only; on Unix git dials host `C`.
+        for drive in ["C:\\work\\repo", "C:/work/repo", "x:/y"] {
+            assert_eq!(is_local_remote(drive), cfg!(windows), "{drive}");
         }
         for network in [
             "https://forge.example/o/r.git",
@@ -457,6 +470,9 @@ mod tests {
             "ext::sh -c evil",
             "fd::3",
             "git://forge.example/o/r.git",
+            "a:b/c",
+            "-oProxyCommand=evil",
+            "",
         ] {
             assert!(!is_local_remote(network), "{network} is not a path");
         }

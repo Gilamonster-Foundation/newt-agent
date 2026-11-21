@@ -3764,6 +3764,23 @@ mod governed_push_tests {
             verdict("git fetch upstream"),
             Some(fetch::Brokered::LocalRemote)
         );
+        // An adopted worktree cannot write the shared git directory. A dial needs
+        // that; a local path does not, so it still reaches the verdict.
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats.clone()
+        };
+        assert_eq!(
+            fetch::execute_with(
+                "git fetch upstream",
+                repo.path(),
+                &read_only,
+                &mut None,
+                |url| { crate::git_hardening::push_url_host(url).ok() }
+            ),
+            Some(fetch::Brokered::LocalRemote),
+            "a local path needs no write access to the git directory"
+        );
         assert_eq!(
             verdict("git fetch forge").and_then(|v| match v {
                 fetch::Brokered::LocalRemote => Some(()),
