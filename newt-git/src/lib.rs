@@ -15,6 +15,9 @@
 
 use newt_core::caveats::{Caveats, Scope};
 use newt_core::git_caveats::GitCaveats;
+use newt_core::git_hardening::{
+    checked_git_read, checked_optional_git_read, scoped_repository_paths, ScopedGitReadError,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -74,6 +77,18 @@ pub enum GitError {
     /// The rebase plan was malformed (e.g. a squash before any pick).
     #[error("bad rebase plan: {0}")]
     BadPlan(String),
+}
+
+/// The scoped metadata readers moved down to newt-core keep their variants.
+impl From<ScopedGitReadError> for GitError {
+    fn from(error: ScopedGitReadError) -> Self {
+        match error {
+            ScopedGitReadError::Engine(error) => Self::Engine(error),
+            ScopedGitReadError::Io(error) => Self::Io(error),
+            ScopedGitReadError::Unsupported(what) => Self::Unsupported(what),
+            ScopedGitReadError::Refused(why) => Self::Refused(why),
+        }
+    }
 }
 
 /// What a [rebase](GitEngine::rebase) step does with its commit.
@@ -2068,74 +2083,6 @@ fn checked_dispatch_root(
         return Err("Git cwd must be a directory inside the session workspace".into());
     }
     Ok(target)
-}
-
-fn checked_git_read(path: &Path, scope: &Scope<String>) -> Result<PathBuf, GitError> {
-    let canonical = path.canonicalize()?;
-    if !newt_core::caveats::permits_path(scope, &canonical.to_string_lossy()) {
-        return Err(GitError::Refused(format!(
-            "capability denied: fs_read for Git path {}",
-            path.display()
-        )));
-    }
-    let metadata = canonical.metadata()?;
-    if !metadata.is_dir() && !metadata.is_file() {
-        return Err(GitError::Unsupported(
-            "non-regular Git input cannot be read",
-        ));
-    }
-    Ok(canonical)
-}
-
-fn checked_optional_git_read(path: &Path, scope: &Scope<String>) -> Result<bool, GitError> {
-    match path.symlink_metadata() {
-        Ok(_) => {
-            checked_git_read(path, scope)?;
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Discover only inside authorized ancestors, then authorize both the resolved
-/// gitfile target and the shared worktree metadata before any engine read.
-fn scoped_repository_paths(
-    root: &Path,
-    scope: &Scope<String>,
-) -> Result<(PathBuf, PathBuf, Option<PathBuf>), GitError> {
-    let mut current = checked_git_read(root, scope)?;
-    let (git_dir, worktree) = loop {
-        let dot_git = current.join(".git");
-        if checked_optional_git_read(&dot_git, scope)? {
-            break (
-                checked_git_read(&grit_lib::repo::resolve_dot_git(&dot_git)?, scope)?,
-                Some(current),
-            );
-        }
-        if current.join("HEAD").exists() && current.join("objects").is_dir() {
-            break (current, None);
-        }
-        current = checked_git_read(
-            current
-                .parent()
-                .ok_or(GitError::Unsupported("not a Git repository"))?,
-            scope,
-        )?;
-    };
-    if !checked_optional_git_read(&git_dir.join("HEAD"), scope)? {
-        return Err(GitError::Unsupported("Git directory has no HEAD"));
-    }
-    let common_dir = if checked_optional_git_read(&git_dir.join("commondir"), scope)? {
-        checked_git_read(
-            &grit_lib::refs::common_dir(&git_dir)
-                .ok_or(GitError::Unsupported("invalid Git commondir"))?,
-            scope,
-        )?
-    } else {
-        git_dir.clone()
-    };
-    Ok((git_dir, common_dir, worktree))
 }
 
 fn render_branch_list(git_dir: &Path, args: &serde_json::Value) -> Result<String, GitError> {

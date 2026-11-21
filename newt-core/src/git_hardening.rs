@@ -42,7 +42,12 @@
 mod branch;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod ref_namespace;
+mod scoped_read;
 pub(crate) use branch::create_worktree_branch;
+pub use scoped_read::{
+    checked_git_read, checked_optional_git_read, remote_default_branch, scoped_repository_paths,
+    ScopedGitReadError,
+};
 
 use crate::caveats::{apply_cli_fs_grants_with, Caveats, OwnGitGrant};
 use std::collections::HashMap;
