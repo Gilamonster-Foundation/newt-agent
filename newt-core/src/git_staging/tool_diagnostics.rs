@@ -204,7 +204,10 @@ pub fn diagnose_tool_paths() -> ToolTrustReport {
 
 /// #3152: the same tool-path walk for exec grants that stayed basenames because
 /// a directory on their path is writable, with the same consented `chmod g-w`
-/// repair `git`, `gh` and `ssh` already get. Toolchain wrappers (cargo, rustc,
+/// repair `git`, `gh` and `ssh` already get. A name refused for a reason with no
+/// writable directory to repair (a tree the session can write, a relative PATH
+/// entry, an uninspectable path) is reported as such and offered no repair.
+/// Toolchain wrappers (cargo, rustc,
 /// ...) are the exception: no path or `chmod` makes them run in a confined
 /// `run_command`, so they are sent to `lifecycle action=build` and offered no
 /// repair. Names that are simply not installed are not this report's business.
@@ -220,13 +223,29 @@ pub fn diagnose_exec_grants(
         let ctx = TrustContext::bind(&Scope::none()).expect("empty write scope");
         for entry in unpinned
             .iter()
-            .filter(|u| matches!(u.reason, UnpinnedReason::Refused(_)))
+            .filter(|u| {
+                matches!(
+                    u.reason,
+                    UnpinnedReason::Refused(_) | UnpinnedReason::Untrusted
+                )
+            })
             // Already inspected above, with git's own trust context.
             .filter(|u| !matches!(u.name.as_str(), "git" | "gh" | "ssh"))
         {
             if is_toolchain_proxy(&entry.name) {
                 report.lines.push(format!(
                     "{}: a toolchain wrapper; no path or chmod makes it run confined. Run builds and tests with `lifecycle action=build`.",
+                    entry.name
+                ));
+                continue;
+            }
+            if matches!(entry.reason, UnpinnedReason::Untrusted) {
+                // No writable directory for a chmod to repair. The session refused
+                // it for a tree it can write, a relative PATH entry, or a path it
+                // could not inspect; this walk cannot see the session's write
+                // grants, so it would only say "trusted".
+                report.lines.push(format!(
+                    "{}: not trusted for the session (inside a tree it can write, a relative PATH entry, or a path that could not be inspected); no chmod repair applies.",
                     entry.name
                 ));
                 continue;
@@ -344,6 +363,10 @@ mod tests {
                     name: "absent".into(),
                     reason: UnpinnedReason::NotFound,
                 },
+                Unpinned {
+                    name: "inner".into(),
+                    reason: UnpinnedReason::Untrusted,
+                },
             ],
             Some(bin.as_os_str()),
         );
@@ -356,6 +379,10 @@ mod tests {
         assert!(text.contains("cargo: a toolchain wrapper"), "{text}");
         assert!(text.contains("lifecycle action=build"), "{text}");
         assert!(!text.contains("absent"), "{text}");
+        assert!(
+            text.contains("inner: not trusted for the session") && text.contains("no chmod repair"),
+            "an untrusted name is explained, not walked as trusted: {text}"
+        );
         // The wrapper adds no repair of its own: the hints are those of the
         // ordinary tool alone (a temp directory's ancestors may add more, by platform).
         let alone = diagnose_exec_grants(&[refused("tool")], Some(bin.as_os_str()));

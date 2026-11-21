@@ -12,31 +12,52 @@ pub(crate) fn trusted_program(path: &OsStr, caveats: &Caveats, name: &str) -> Re
     classify_program(path, caveats, name).map_err(|_| ())
 }
 
-/// [`trusted_program`], keeping why it failed: `Err(dirs)` with the group- or
-/// other-writable components when trust refused a program that was found, and
-/// an empty `Err` when there was nothing to trust (not found, or a relative
-/// PATH entry).
-fn classify_program(path: &OsStr, caveats: &Caveats, name: &str) -> Result<PathBuf, Vec<PathBuf>> {
+/// Why a program could not be trusted for exec (#3152).
+#[derive(Debug)]
+enum ProgramFailure {
+    /// No program of that name on the PATH, or one that cannot be resolved.
+    NotFound,
+    /// Found, and trust refused it, but with no writable directory to name: it
+    /// sits inside a tree this session can write, or could not be inspected, or
+    /// the PATH has a relative entry.
+    Untrusted,
+    /// Found, and trust refused it because these path components are group- or
+    /// other-writable.
+    Writable(Vec<PathBuf>),
+}
+
+/// [`trusted_program`], keeping why it failed.
+fn classify_program(
+    path: &OsStr,
+    caveats: &Caveats,
+    name: &str,
+) -> Result<PathBuf, ProgramFailure> {
+    use ProgramFailure::{NotFound, Untrusted, Writable};
     if std::env::split_paths(path).any(|dir| !dir.is_absolute()) {
-        return Err(Vec::new());
+        return Err(Untrusted);
     }
     let program = crate::git_hardening::resolve_trusted_program(Path::new("."), Some(path), name)
-        .map_err(|_| Vec::new())?;
+        .map_err(|_| NotFound)?;
     if !program.is_absolute() {
-        return Err(Vec::new());
+        return Err(Untrusted);
     }
-    let resolved = program.canonicalize().map_err(|_| Vec::new())?;
+    let resolved = program.canonicalize().map_err(|_| NotFound)?;
     let mut trust =
-        crate::git_staging::TrustContext::bind(&caveats.fs_write).map_err(|_| Vec::new())?;
+        crate::git_staging::TrustContext::bind(&caveats.fs_write).map_err(|_| Untrusted)?;
     if name == "git" {
         trust = trust.with_git(&resolved);
     }
     crate::git_staging::trust_check(&program, &trust).map_err(|refusal| {
-        refusal
+        let dirs: Vec<PathBuf> = refusal
             .hints()
             .iter()
             .map(|hint| hint.path.clone())
-            .collect::<Vec<_>>()
+            .collect();
+        if dirs.is_empty() {
+            Untrusted
+        } else {
+            Writable(dirs)
+        }
     })?;
     Ok(resolved)
 }
@@ -74,6 +95,11 @@ pub enum UnpinnedReason {
     /// A program was found, and trust refused it: these path components are
     /// group- or other-writable.
     Refused(Vec<PathBuf>),
+    /// A program was found, and trust refused it with no writable directory to
+    /// name: it sits inside a tree this session can write, could not be
+    /// inspected, or the PATH has a relative entry. `newt doctor` cannot repair
+    /// this with a `chmod`.
+    Untrusted,
     /// Pins are declined outright under unrestricted writes.
     Declined,
 }
@@ -119,7 +145,9 @@ pub fn resolve_basenames_detailed(
                         .insert(name.clone(), path.to_string_lossy().into_owned());
                     continue;
                 }
-                Some(Err(writable)) if !writable.is_empty() => UnpinnedReason::Refused(writable),
+                // Trusted, but not representable as a grant path.
+                Some(Ok(_)) | Some(Err(ProgramFailure::Untrusted)) => UnpinnedReason::Untrusted,
+                Some(Err(ProgramFailure::Writable(dirs))) => UnpinnedReason::Refused(dirs),
                 _ if matches!(caveats.fs_write, Scope::All) => UnpinnedReason::Declined,
                 _ => UnpinnedReason::NotFound,
             };
@@ -158,10 +186,16 @@ pub fn is_toolchain_proxy(target: &str) -> bool {
 /// each get their own short clause so the causes are not mixed in one list.
 #[must_use]
 pub fn startup_notice(unpinned: &[Unpinned]) -> Option<String> {
-    let refused = unpinned
-        .iter()
-        .filter(|u| matches!(u.reason, UnpinnedReason::Refused(_)));
-    let (proxies, others): (Vec<_>, Vec<_>) = refused.partition(|u| is_toolchain_proxy(&u.name));
+    let blocked = unpinned.iter().filter(|u| {
+        matches!(
+            u.reason,
+            UnpinnedReason::Refused(_) | UnpinnedReason::Untrusted
+        )
+    });
+    let (proxies, others): (Vec<_>, Vec<_>) = blocked.partition(|u| is_toolchain_proxy(&u.name));
+    let (writable, untrusted): (Vec<_>, Vec<_>) = others
+        .into_iter()
+        .partition(|u| matches!(u.reason, UnpinnedReason::Refused(_)));
     let names = |group: &[&Unpinned]| {
         group
             .iter()
@@ -176,16 +210,22 @@ pub fn startup_notice(unpinned: &[Unpinned]) -> Option<String> {
             .collect::<Vec<_>>()
     };
     let mut parts = Vec::new();
-    if !others.is_empty() {
-        let dirs: std::collections::BTreeSet<String> = others
+    if !writable.is_empty() {
+        let dirs: std::collections::BTreeSet<String> = writable
             .iter()
             .flat_map(|u| u.writable())
             .map(|dir| dir.display().to_string())
             .collect();
         parts.push(format!(
             "Executable grants kept as basenames because a directory on their path is group- or other-writable: {} (writable: {}). `newt doctor` shows the repair.",
-            names(&others),
+            names(&writable),
             dirs.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !untrusted.is_empty() {
+        parts.push(format!(
+            "Executable grants kept as basenames because the program is not trusted for this session (inside a tree it can write, a relative PATH entry, or a path that could not be inspected): {}.",
+            names(&untrusted)
         ));
     }
     if !proxies.is_empty() {
@@ -366,6 +406,38 @@ mod unpinned_tests {
         // The plain-name view is unchanged.
         let (_, names) = resolve_basenames(&mut caveats, Some(bin.as_os_str()));
         assert_eq!(names, ["absent", "tool"]);
+        // A program inside a tree the SESSION can write is found but untrusted: it
+        // is not "not found", and there is no writable directory to name (#3152
+        // review). A relative PATH entry is untrusted too.
+        let inner = workspace.join("inner");
+        std::fs::write(&inner, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut writable_tree = Caveats {
+            exec: Scope::only(["inner".into()]),
+            fs_write: Scope::only([workspace.to_string_lossy().into_owned()]),
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let (_, untrusted) =
+            resolve_basenames_detailed(&mut writable_tree, Some(workspace.as_os_str()));
+        assert_eq!(
+            untrusted[0].reason,
+            UnpinnedReason::Untrusted,
+            "{untrusted:?}"
+        );
+        let (_, relative) = resolve_basenames_detailed(
+            &mut writable_tree,
+            Some(
+                std::env::join_paths([Path::new("."), &bin])
+                    .unwrap()
+                    .as_os_str(),
+            ),
+        );
+        assert_eq!(
+            relative[0].reason,
+            UnpinnedReason::Untrusted,
+            "{relative:?}"
+        );
         // Unrestricted writes decline pins outright: its own reason.
         let mut ambient = Caveats {
             exec: Scope::only(["echo".into()]),
@@ -404,6 +476,31 @@ mod unpinned_tests {
             declined,
             "Executable grants stay basenames under unrestricted writes: echo."
         );
+    }
+
+    /// A found-but-untrusted name is never reported as not found (#3152 review):
+    /// it gets its own clause, with no directory and no chmod promise.
+    #[test]
+    fn an_untrusted_name_is_not_reported_as_not_found() {
+        let untrusted = |name: &str| Unpinned {
+            name: name.into(),
+            reason: UnpinnedReason::Untrusted,
+        };
+        let notice = startup_notice(&[untrusted("gh"), unpinned("fd", &[])]).unwrap();
+        assert!(notice.contains("not trusted for this session"), "{notice}");
+        assert!(
+            notice.contains("gh") && notice.contains("Not found on PATH: fd."),
+            "{notice}"
+        );
+        assert!(!notice.contains("Not found on PATH: gh"), "{notice}");
+        assert!(
+            !notice.contains("chmod") && !notice.contains("newt doctor"),
+            "{notice}"
+        );
+        // A wrapper that is untrusted is sent to the build lane like a refused one.
+        let proxy = startup_notice(&[untrusted("cargo")]).unwrap();
+        assert!(proxy.contains("lifecycle action=build"), "{proxy}");
+        assert!(!proxy.contains("not trusted for this session"), "{proxy}");
     }
 
     /// A refused name gets its directory and the way to the fix.

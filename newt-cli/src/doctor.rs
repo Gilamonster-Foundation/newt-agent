@@ -23,8 +23,10 @@ fn security_posture_lines(report: &SecurityReport) -> Vec<String> {
 
 /// #3152: exec grants a session would keep as bare names because a directory on
 /// their path is group- or other-writable, with the same repair hint `gh` gets.
-/// Derived the way a session derives them (the configured permissions, then the
-/// same resolver), so this and the startup notice cannot disagree.
+/// Derived from the CONFIGURED permissions and the same resolver a session uses.
+/// A session also applies launch-time overrides (`--exec`, `NEWT_EXEC_PATHS`,
+/// `--full-access`, the venv on PATH) that this does not see, so it is an
+/// approximation of the startup notice, not a replica.
 fn diagnose_exec_grants(config: &Config) {
     let Some(tui) = config.tui.as_ref() else {
         return;
@@ -41,7 +43,7 @@ fn diagnose_exec_grants(config: &Config) {
     if report.lines.is_empty() {
         return;
     }
-    println!("\nExecutable grants refused for a writable directory:");
+    println!("\nExecutable grants refused (for the configured permissions):");
     for line in report.lines {
         println!("  {line}");
     }
