@@ -331,25 +331,28 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
         println!("test apple_system_git_exec_transition_keeps_native_command ... ok");
     }
 
+    // #2720: an ambient (unrestricted-write) session is not the commit child's
+    // write grant. The broker bounds writes to the workspace and its git
+    // directory for the invocation, so the helpers stay immutable and the commit
+    // proceeds under the narrower authority instead of being refused. (This step
+    // once asserted a refusal; #2720 replaced that with attenuation, and nothing
+    // ran this proof to notice.)
     let before = git(&repo, &["rev-parse", "HEAD"]).stdout;
     let output = execute(
         &repo,
         &tool,
         &newt_core::Caveats::top(),
-        "git commit --allow-empty -m 'unprotectable grant'",
+        "git commit --allow-empty -m 'ambient grant is bounded'",
     )
     .await;
-    assert_eq!(
+    assert_succeeded(&output);
+    assert_ne!(
         git(&repo, &["rev-parse", "HEAD"]).stdout,
         before,
         "{output}"
     );
-    assert_eq!(tool.drain_commit_success(), 0);
-    assert!(
-        output.contains("protect") || output.contains("write"),
-        "{output}"
-    );
-    println!("test unrestricted_write_cannot_claim_protected_helpers ... ok");
+    assert_eq!(tool.drain_commit_success(), 1);
+    println!("test ambient_write_grant_is_bounded_for_the_commit ... ok");
 
     // Ordinary native commands retain the same ref policy as the embedded
     // engine, including a nonstandard origin default and an unborn default
