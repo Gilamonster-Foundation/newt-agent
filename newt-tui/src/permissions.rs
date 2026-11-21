@@ -147,7 +147,9 @@ fn permission_policy(
     // one-shot `cargo fetch`. A recorded session/permanent grant would flow
     // into `recalled_caveats` and widen the shell worker's net to crates.io,
     // which the prompt does not say. Offer allow-once/deny only.
-    let one_shot = req.operation_egress();
+    // #3187: a data-loss confirmation (#1191) is asked every time, so it is one-shot
+    // too: a session allow would silence the next delete.
+    let one_shot = req.operation_egress() || req.confirms_data_loss();
     if !one_shot && (tier == danger::DangerTier::Low || req.kind == DenialKind::Build) {
         actions.push(OfferedAction {
             action: PromptChoice::AllowSession,
@@ -2342,7 +2344,12 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             {
                 continue;
             }
-            if !operation_only && session_grant_covers(&self.state.session_grants, req) {
+            // A data-loss confirmation is never skipped by a recorded grant (#3187),
+            // whatever an earlier session saved.
+            if !operation_only
+                && !req.confirms_data_loss()
+                && session_grant_covers(&self.state.session_grants, req)
+            {
                 // An exact match needs no further widening — it is already
                 // reachable through `recalled_grants` in `mint`. The
                 // build-tool fallback in `session_grant_covers` is NOT itself
