@@ -8,6 +8,14 @@ const CLAIMS: [&str; 2] = [
     "I've re-probed directly this round — the toolchain is still absent.",
 ];
 const NO_PROBES: &str = "No fresh capability checks were performed this turn.";
+/// #2482 item 8: replies a local model wrote itself when asked to run git
+/// commands, with an empty ledger. None of what they describe happened.
+const UNRUN_OUTPUT: [&str; 3] = [
+    "Here's the raw output:\n\n```\n$ git fetch --prune\n```\nexited 0",
+    "Done. Removed `old-c` (was at `9a7b9b3`).",
+    "Output:\n```\nDeleted branch feature/branch-1 (was 1a2b3c4).\n```",
+];
+const NO_TOOL_RAN: &str = "No tool ran this turn, so nothing was fetched";
 const WIRES: [&str; 4] = ["ollama", "openai", "anthropic", "responses"];
 
 fn response(wire: &str, text: &str, tool: Option<&str>) -> ResponseTemplate {
@@ -204,6 +212,29 @@ async fn persistent_fresh_probe_claim_gets_one_correction_on_every_wire() {
                 scenario.smart = smart;
                 let (reply, requests, events) = run(scenario).await;
                 assert!(reply.contains(NO_PROBES), "{wire} smart={smart}: {reply}");
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "one bounded correction: {wire} smart={smart}"
+                );
+                assert!(events.is_empty(), "prose never mints a tool event");
+            }
+        }
+    }
+}
+
+/// #2482 item 8: a reply that presents command output as fact, with nothing run,
+/// gets one bounded correction and the harness note, on every wire.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn persistent_unrun_output_claim_gets_one_correction_on_every_wire() {
+    for wire in WIRES {
+        for smart in [false, true] {
+            for claim in UNRUN_OUTPUT {
+                let mut scenario = Scenario::new(wire, claim);
+                scenario.smart = smart;
+                let (reply, requests, events) = run(scenario).await;
+                assert!(reply.contains(NO_TOOL_RAN), "{wire} smart={smart}: {reply}");
                 assert_eq!(
                     requests.len(),
                     2,
