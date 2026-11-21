@@ -86,8 +86,12 @@ fn carried_tools_dir() -> Option<std::path::PathBuf> {
     carried_tools_dir_beside(&std::env::current_exe().ok()?)
 }
 
+/// `tools` beside `executable`, looked up through any symlink: a package manager that
+/// links `newt` into a shared `bin` keeps the pack beside the real file, and macOS
+/// reports the link's own path for `current_exe`.
 fn carried_tools_dir_beside(executable: &std::path::Path) -> Option<std::path::PathBuf> {
-    let dir = executable.parent()?.join("tools");
+    let real = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let dir = real.parent()?.join("tools");
     dir.is_dir().then_some(dir)
 }
 
@@ -3882,6 +3886,25 @@ mod carried_tools_path_tests {
         assert_eq!(
             carried_tools_dir_beside(&executable),
             Some(root.path().join("tools"))
+        );
+    }
+
+    /// #3151: Homebrew links `newt` into a shared `bin` and keeps `tools` in the keg, and
+    /// macOS reports the link's own path for `current_exe`, so the pack is found only by
+    /// looking through the link to the real file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_executable_finds_the_pack_beside_the_real_file() {
+        let root = tempfile::tempdir().unwrap();
+        let keg = root.path().join("keg/bin");
+        let shared = root.path().join("shared/bin");
+        std::fs::create_dir_all(keg.join("tools")).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(keg.join("newt"), b"").unwrap();
+        std::os::unix::fs::symlink(keg.join("newt"), shared.join("newt")).unwrap();
+        assert_eq!(
+            carried_tools_dir_beside(&shared.join("newt")),
+            Some(std::fs::canonicalize(keg.join("tools")).unwrap())
         );
     }
 
