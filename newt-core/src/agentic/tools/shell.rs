@@ -19,29 +19,21 @@ pub fn venv_cmd_prefix() -> Option<String> {
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
         .ok();
     let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
+    let tools = carried_tools_dir();
 
-    if venv.is_none() && exec_paths.is_none() {
+    if venv.is_none() && exec_paths.is_none() && tools.is_none() {
         return None;
     }
 
     // sh single-quoting: wrap in '', escape any ' as '\''
     let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
 
-    // Build a list of dirs to prepend to PATH (venv/bin first, then exec-paths).
-    let mut path_dirs: Vec<String> = Vec::new();
+    // The dirs to prepend to PATH: venv/bin, then exec-paths, then the carried tools.
+    let path_dirs = exec_path_dirs(venv.as_deref(), exec_paths.as_deref(), tools.as_deref());
     let mut prefix = String::new();
 
     if let Some(ref venv) = venv {
-        let venv_bin = format!("{venv}/bin");
         prefix.push_str(&format!("export VIRTUAL_ENV={}; ", q(venv)));
-        path_dirs.push(venv_bin);
-    }
-    if let Some(ref paths) = exec_paths {
-        for dir in paths.split(':') {
-            if !dir.is_empty() {
-                path_dirs.push(dir.to_string());
-            }
-        }
     }
 
     if !path_dirs.is_empty() {
@@ -54,6 +46,49 @@ pub fn venv_cmd_prefix() -> Option<String> {
     } else {
         Some(prefix)
     }
+}
+
+/// The directories a shell puts ahead of the host's `PATH`, in order (#3151): the venv's
+/// `bin`, then the operator's explicit `NEWT_EXEC_PATHS` roots, then the carried tools
+/// installed beside newt, so an explicit root keeps precedence over the pack. One list
+/// for the host shell, the confined shell and the grant resolution, which all read it.
+fn exec_path_dirs(
+    venv: Option<&str>,
+    exec_paths: Option<&str>,
+    tools: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(venv) = venv {
+        dirs.push(format!("{venv}/bin"));
+    }
+    if let Some(paths) = exec_paths {
+        dirs.extend(
+            paths
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(tools) = tools {
+        dirs.push(tools.to_string_lossy().into_owned());
+    }
+    dirs
+}
+
+/// The pack of carried commands installed beside the newt executable (`<dir>/tools`), if
+/// there is one (#3151): GNU-compatible `date` and `grep -P`, for a host whose own are BSD.
+/// Windows' ambient Brush route puts the same directory first on its own `PATH`, so this
+/// is the Unix half. No directory, no change.
+fn carried_tools_dir() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    carried_tools_dir_beside(&std::env::current_exe().ok()?)
+}
+
+fn carried_tools_dir_beside(executable: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = executable.parent()?.join("tools");
+    dir.is_dir().then_some(dir)
 }
 
 /// Build the venv/exec-path environment as a `{KEY:VALUE}` map for the confined
@@ -129,20 +164,18 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
         .ok();
     let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
 
-    // Dirs to prepend to PATH (venv/bin first, then any exec-paths), mirroring
-    // venv_cmd_prefix's ordering.
-    let mut path_dirs: Vec<String> = Vec::new();
+    // Dirs to prepend to PATH (venv/bin first, then any exec-paths, then the carried
+    // tools), the same list venv_cmd_prefix builds.
     if let Some(ref venv) = venv {
         map.insert("VIRTUAL_ENV".to_string(), venv.clone());
-        path_dirs.push(format!("{venv}/bin"));
     }
-    if let Some(ref paths) = exec_paths {
-        for dir in paths.split(':') {
-            if !dir.is_empty() {
-                path_dirs.push(dir.to_string());
-            }
-        }
-    }
+    // `mut` only for the macOS developer-tools block below.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut path_dirs = exec_path_dirs(
+        venv.as_deref(),
+        exec_paths.as_deref(),
+        carried_tools_dir().as_deref(),
+    );
 
     // Resolve Apple's real developer tools before the /usr/bin xcrun shims.
     // The shims need ambient per-user caches; direct tools keep workspace-only
@@ -3814,5 +3847,48 @@ mod missing_ambient_runner_tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carried_tools_path_tests {
+    use super::*;
+
+    /// #3151: the carried tools come after the venv and the operator's explicit roots, so
+    /// an explicit root keeps precedence over the pack, and every input is optional.
+    #[test]
+    fn the_carried_tools_follow_the_venv_and_the_explicit_roots() {
+        let tools = std::path::Path::new("/opt/newt/tools");
+        assert_eq!(
+            exec_path_dirs(Some("/v"), Some("/a::/b"), Some(tools)),
+            ["/v/bin", "/a", "/b", "/opt/newt/tools"]
+        );
+        assert_eq!(exec_path_dirs(None, None, Some(tools)), ["/opt/newt/tools"]);
+        assert_eq!(exec_path_dirs(Some("/v"), None, None), ["/v/bin"]);
+        assert!(exec_path_dirs(None, None, None).is_empty());
+    }
+
+    /// #3151: a directory named `tools` beside the executable is the pack; a file of that
+    /// name, or none, is not.
+    #[test]
+    fn the_pack_is_a_tools_directory_beside_the_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("newt");
+        assert_eq!(carried_tools_dir_beside(&executable), None);
+        std::fs::write(root.path().join("tools"), b"not a directory").unwrap();
+        assert_eq!(carried_tools_dir_beside(&executable), None);
+        std::fs::remove_file(root.path().join("tools")).unwrap();
+        std::fs::create_dir(root.path().join("tools")).unwrap();
+        assert_eq!(
+            carried_tools_dir_beside(&executable),
+            Some(root.path().join("tools"))
+        );
+    }
+
+    /// This test binary has no `tools` directory beside it, so the shells' `PATH` is
+    /// exactly what it was before the pack existed.
+    #[test]
+    fn without_a_pack_the_path_is_unchanged() {
+        assert_eq!(carried_tools_dir(), None);
     }
 }
