@@ -151,15 +151,26 @@ pub struct OwnGitGrant {
     pub write: Vec<String>,
 }
 
-/// `path` in the spelling `lock_fs_to_workspace` stores it: the fixed macOS
-/// aliases (`/var` for `/private/var`) rewritten, and unchanged elsewhere.
+/// `path` in the one spelling a containment test compares: on macOS the fixed
+/// aliases (`/var` for `/private/var`) rewritten, as `lock_fs_to_workspace` stores
+/// them; on Windows a `\\?\` verbatim prefix simplified to the ordinary drive path,
+/// since `Path::starts_with` takes the two prefixes for different locations; unchanged
+/// elsewhere.
 #[cfg(target_os = "macos")]
-fn alias_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
     crate::fs_aliases::rewrite(path)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn alias_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+#[cfg(windows)]
+fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+    match dunce::simplified(std::path::Path::new(path)).to_str() {
+        Some(simple) if simple != path => std::borrow::Cow::Owned(simple.to_owned()),
+        _ => std::borrow::Cow::Borrowed(path),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
 
@@ -208,19 +219,19 @@ pub fn apply_cli_fs_grants_with(
     // In a main checkout it is `<repo>/.git`, inside the writable workspace:
     // granting it again nests a root under a model-writable ancestor, which the
     // workspace-protection anchor check refuses, so protection was lost (#3149).
-    // Only a linked worktree's, outside every root, is added. Compared after the
-    // macOS alias rewrite `lock_fs_to_workspace` applies, since git reports
-    // `/private/var/..` for a workspace spelled `/var/..`.
+    // Only a linked worktree's, outside every root, is added. Compared in one
+    // spelling: git reports `/private/var/..` for a workspace spelled `/var/..`
+    // on macOS, and `C:/..` for a workspace canonicalised to `\\?\C:\..` on Windows.
     let granted = Scope::only(
         std::iter::once(workspace)
             .chain(read.iter().chain(&write).map(String::as_str))
-            .map(|root| alias_spelling(root).into_owned()),
+            .map(|root| comparable_spelling(root).into_owned()),
     );
     read.extend(
         own_git
             .read
             .into_iter()
-            .filter(|dir| !permits_path(&granted, &alias_spelling(dir))),
+            .filter(|dir| !permits_path(&granted, &comparable_spelling(dir))),
     );
 
     lock_fs_to_workspace(caveats, workspace, &read, &write);
@@ -633,6 +644,25 @@ mod tests {
             ["/repo", "/ws"],
             "a launch grant that covers the git directory makes its own root redundant"
         );
+    }
+
+    /// #3149 on Windows: git prints the git directory as `C:/ws/.git` while a
+    /// canonical workspace is `\\?\C:\ws`. `Path::starts_with` takes the two
+    /// prefixes for different locations, so the main checkout's `.git` was not seen
+    /// as inside the workspace, was granted as a nested root, and protection was lost.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_workspace_contains_the_git_directory_git_prints_plainly() {
+        let _g = crate::process_env::lock();
+        let mut c = Caveats::top();
+        apply_cli_fs_grants_with(&mut c, r"\\?\C:\ws", |_: &std::path::Path| OwnGitGrant {
+            read: vec!["C:/ws/.git".to_string(), r"\\?\C:\ws\.git".to_string()],
+            write: Vec::new(),
+        });
+        match &c.fs_read {
+            Scope::Only(set) => assert_eq!(set.len(), 1, "no nested root: {set:?}"),
+            Scope::All => panic!("fs_read must be restricted"),
+        }
     }
 
     /// #3089: `--net` takes a bare host — the `[tui.permissions].net` grammar
