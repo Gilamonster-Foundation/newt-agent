@@ -36,6 +36,9 @@ pub(crate) struct WorkerPayload {
     max_output: usize,
     #[serde(default)]
     pub(crate) broker: bool,
+    /// Host-supplied directory of the real developer tools (#3156).
+    #[serde(default)]
+    launcher_image_dir: Option<std::path::PathBuf>,
 }
 
 impl WorkerPayload {
@@ -53,7 +56,14 @@ impl WorkerPayload {
             env,
             max_output,
             broker: false,
+            launcher_image_dir: None,
         }
+    }
+
+    /// Carry the host's developer-tool directory to the worker (#3156).
+    pub(crate) fn with_launcher_image_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.launcher_image_dir = dir;
+        self
     }
 }
 
@@ -130,8 +140,9 @@ fn run(request: WorkerPayload, cx: ToolContext, endpoint: Option<WorkerEndpoint>
 
     let sink: DenialSink = Arc::new(Mutex::new(Vec::new()));
     let cancel = Arc::new(AtomicBool::new(false));
-    let interceptor =
-        CaveatInterceptor::new(cx, Arc::clone(&sink)).with_cancel(Arc::clone(&cancel));
+    let interceptor = CaveatInterceptor::new(cx, Arc::clone(&sink))
+        .with_cancel(Arc::clone(&cancel))
+        .with_launcher_image_dir(request.launcher_image_dir.clone());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let interceptor = match endpoint {
         Some(endpoint) => {

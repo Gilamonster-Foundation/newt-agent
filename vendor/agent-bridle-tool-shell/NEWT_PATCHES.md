@@ -94,3 +94,25 @@ read scope. This retains the existing Landlock descriptor rule through shell
 execution without extending tool authority or changing the wire protocol.
 Unsupported backends refuse nonempty handle sets. Newt's Seatbelt build route
 supplies no handles and explicitly documents its remaining pathname race.
+
+## Locator-stub substitution (#3156)
+
+`BrushShellTool::with_launcher_image_dir` takes the host's own selected
+developer-tool directory. When a command names a platform locator stub by
+absolute path (Apple's `/usr/bin/git`, `python3`, ...), the worker starts the
+same-named tool from that directory instead, provided the exec grant already
+admits it. The stub only locates and re-execs the selected toolchain, and inside
+the kernel fence it cannot: it needs a per-user cache and a helper the fence
+hides, so every absolute-path call exited 71 while a bare name, resolved to the
+real tool through the host's PATH, worked.
+
+The engine stays ignorant of the developer directory (no `xcode-select` exec, no
+`DEVELOPER_DIR` read, no fixed roots, per `agent-bridle-core`'s trust rules): the
+host supplies the directory, the stub is recognised by `is_xcselect_stub` (its
+Mach-O imports), the image must be a regular file that is neither the stub nor
+another launcher, and the final program is still admitted by
+`authorize_external_cmd`. The directory rides the existing authenticated worker
+payload as one optional field. Broker preparation and this substitution share
+one `rebuild_command` so neither drops argv[0], the environment, the working
+directory or a descriptor delegation. Retire this section if the mechanism is
+upstreamed.

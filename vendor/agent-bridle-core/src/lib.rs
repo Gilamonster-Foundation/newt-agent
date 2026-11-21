@@ -61,6 +61,9 @@ mod tool;
 mod unbridle;
 mod xcselect;
 
+// Newt patch (NEWT_PATCHES.md): the host-side launcher substitution in the shell
+// tool recognises the stub by identity, so the recogniser is public.
+pub use xcselect::is_xcselect_stub;
 pub use admitted::{
     AdmittedFence, AdmittedFenceBody, AdmittedFenceId, BackendProjection, RuntimeClosure,
 };

@@ -314,6 +314,18 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
 
     #[cfg(target_os = "macos")]
     {
+        // #3156: Apple's `/usr/bin/git` is a locator stub that cannot reach its
+        // toolchain inside the fence, so every absolute-path call exited 71 with
+        // xcrun and xcodebuild errors while bare `git` worked. The real tool
+        // from the host's developer directory is started instead.
+        for command in ["/usr/bin/git status --short", "/usr/bin/git rev-parse HEAD"] {
+            assert_succeeded(&execute(&repo, &tool, &authority, command).await);
+        }
+        println!("test apple_system_git_absolute_path_runs_the_real_tool ... ok");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
         let before = git(&repo, &["rev-parse", "HEAD"]).stdout;
         let output = execute(
             &repo,

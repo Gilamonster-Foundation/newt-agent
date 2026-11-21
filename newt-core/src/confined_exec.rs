@@ -1156,6 +1156,15 @@ pub(crate) fn selected_developer_directory() -> Option<&'static str> {
         .as_deref()
 }
 
+/// The selected toolchain's tool directory, where the real developer tools live
+/// that Apple's locator stubs (`/usr/bin/git`, `python3`, ...) only forward to.
+/// Derived from [`selected_developer_directory`]: the host's own `xcode-select`
+/// answer, never a fixed path and never read from the confined child (#3156).
+#[cfg(target_os = "macos")]
+pub(crate) fn developer_tool_directory() -> Option<PathBuf> {
+    selected_developer_directory().map(|developer| Path::new(developer).join("usr/bin"))
+}
+
 /// A `Caveats` fence for an attacker-influenced subprocess confined to
 /// `workspace`: it may read and write **only** beneath the workspace root, run
 /// any program (an interpreter's *identity* is admitted; its behavior is bounded
