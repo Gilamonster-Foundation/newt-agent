@@ -197,6 +197,9 @@ pub mod probe;
 pub mod terminal_hyperlink;
 mod window_discovery;
 mod workspace_state;
+
+// Re-exports for the core TUI functionality
+pub use core::*;
 // The TTY rich inline input surface (issue #416). Feature-gated so the default
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
