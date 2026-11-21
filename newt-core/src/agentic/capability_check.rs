@@ -97,6 +97,15 @@ impl Evidence {
             )
     }
 
+    /// #2482 item 8: nothing ran this turn, yet the reply presents command
+    /// output or a completed git action as fact. Stricter than the probe claim
+    /// on the evidence side (an EMPTY ledger, not merely no execution), so a
+    /// turn that read a file and then described a command is left to the
+    /// other checks.
+    pub(crate) fn unsupported_output_claim(&self, text: &str) -> bool {
+        self.is_silent() && claims_unrun_command_output(text)
+    }
+
     pub(crate) fn correction(
         &self,
         text: &str,
@@ -104,10 +113,16 @@ impl Evidence {
         used: &mut bool,
         allowed: bool,
     ) -> Option<String> {
-        if !allowed || *used || !self.unsupported_probe_claim(text) {
+        if !allowed || *used {
             return None;
         }
-        let nudge = probe_correction(tools)?;
+        let nudge = if self.unsupported_probe_claim(text) {
+            probe_correction(tools)?
+        } else if self.unsupported_output_claim(text) {
+            output_correction(tools)?
+        } else {
+            return None;
+        };
         *used = true;
         Some(nudge)
     }
@@ -118,6 +133,121 @@ impl Evidence {
     pub(crate) fn is_silent(&self) -> bool {
         self.invoked.is_empty()
     }
+}
+
+/// A line that is not an assertion that something just ran: a quotation, a
+/// condition, a negation, history, or an example. Shared by the probe claim and
+/// the presented-output claim so the two cannot drift on what counts as prose.
+fn disclaims(line: &str) -> bool {
+    line.starts_with(['>', '"'])
+        || line
+            .trim_start_matches(['-', '*', '•', ' '])
+            .starts_with("if ")
+        || [
+            "not re-probed",
+            "not reprobed",
+            "haven't re-probed",
+            "haven't reprobed",
+            "not probed",
+            "haven't probed",
+            "not checked",
+            "haven't checked",
+            "not attempted",
+            "haven't attempted",
+            "before execution",
+            "no command ran",
+            "would be denied",
+            "might be denied",
+            "could be denied",
+            "did not",
+            "didn't",
+            "previous",
+            "earlier",
+            "last session",
+            "saved state",
+            "history says",
+            "you said",
+            "user said",
+            "for example",
+            "example:",
+            "have not run",
+            "haven't run",
+            "not run",
+            "will run",
+            "would print",
+            "you'll see",
+        ]
+        .iter()
+        .any(|phrase| line.contains(phrase))
+}
+
+/// Programs whose command line or completed run is a claim worth checking. A
+/// short fixed list on purpose: this recognises a presented transcript, not
+/// every command a reply might mention.
+const PRESENTED_PROGRAMS: &[&str] = &[
+    "git", "cargo", "rustc", "gh", "npm", "make", "just", "rm", "mv", "cp", "ls", "cat", "grep",
+    "rg", "pytest", "python", "python3", "curl", "sed", "awk",
+];
+
+/// #2482 item 8: the reply presents command output or a completed git action
+/// as fact: a `$ <program> ..` line shown with an exit status, git's own
+/// `Deleted branch x (was sha)` result, a `removed `x` (was at ..)` summary, or
+/// "I ran `<program> ..`". Deliberately narrow, like the probe claim: an
+/// instruction (`$ git fetch` with no result), a quotation, a condition, a
+/// negation, or history is ordinary text. Meaningful only against an empty
+/// ledger, where nothing could have produced it ([`Evidence::is_silent`]).
+fn claims_unrun_command_output(text: &str) -> bool {
+    let lower = text.to_lowercase().replace('’', "'");
+    let mut shows_command = false;
+    let mut shows_status = false;
+    for line in lower.lines() {
+        let line = line.trim();
+        if disclaims(line) {
+            continue;
+        }
+        let program_after = |rest: &str| {
+            let word = rest
+                .trim_start_matches('`')
+                .split([' ', '`'])
+                .next()
+                .unwrap_or("");
+            PRESENTED_PROGRAMS.contains(&word)
+        };
+        // git's own delete result, or a summary of one.
+        if (line.starts_with("deleted branch ") && line.contains("(was "))
+            || (line.contains("(was at")
+                && (line.contains("removed `") || line.contains("deleted `")))
+        {
+            return true;
+        }
+        // "I ran `git ..`", "Done - ran `git ..`".
+        if [
+            "i ran ",
+            "i've run ",
+            "i have run ",
+            "done — ran ",
+            "done - ran ",
+            "done. ran ",
+        ]
+        .iter()
+        .any(|lead| {
+            line.split_once(lead)
+                .is_some_and(|(_, rest)| program_after(rest))
+        }) {
+            return true;
+        }
+        if line.strip_prefix("$ ").is_some_and(program_after) {
+            shows_command = true;
+        }
+        // Past tense only: "returns exit code 0" in an explanation is not a result.
+        if ["exited 0", "(exit 0)"]
+            .iter()
+            .any(|status| line.contains(status))
+        {
+            shows_status = true;
+        }
+    }
+    shows_command && shows_status
 }
 
 /// Deliberately narrow: completed execution probes, including negative results.
@@ -147,42 +277,7 @@ fn claims_fresh_execution_probe(text: &str, permission_requested: bool) -> bool 
             fenced = !fenced;
             return false;
         }
-        if fenced
-            || line.starts_with(['>', '"'])
-            || line
-                .trim_start_matches(['-', '*', '•', ' '])
-                .starts_with("if ")
-            || [
-                "not re-probed",
-                "not reprobed",
-                "haven't re-probed",
-                "haven't reprobed",
-                "not probed",
-                "haven't probed",
-                "not checked",
-                "haven't checked",
-                "not attempted",
-                "haven't attempted",
-                "before execution",
-                "no command ran",
-                "would be denied",
-                "might be denied",
-                "could be denied",
-                "did not",
-                "didn't",
-                "previous",
-                "earlier",
-                "last session",
-                "saved state",
-                "history says",
-                "you said",
-                "user said",
-                "for example",
-                "example:",
-            ]
-            .iter()
-            .any(|phrase| line.contains(phrase))
-        {
+        if fenced || disclaims(line) {
             return false;
         }
         [
@@ -228,6 +323,13 @@ fn claims_fresh_execution_probe(text: &str, permission_requested: bool) -> bool 
 /// an earlier failed call must not refute a subsequently repaired test run.
 pub(crate) fn annotate_unobserved_probe(text: String, evidence: &Evidence) -> String {
     if !evidence.unsupported_probe_claim(&text) {
+        if evidence.unsupported_output_claim(&text) {
+            return format!(
+                "{text}\n\n⚠ Harness evidence: No tool ran this turn. The command output or \
+                completed action described above did not come from a command: nothing was \
+                fetched, deleted or changed by this turn."
+            );
+        }
         return text;
     }
     format!(
@@ -240,6 +342,24 @@ pub(crate) fn annotate_unobserved_probe(text: String, evidence: &Evidence) -> St
 /// Show only current advertised schemas, never resurrecting a remembered tool
 /// or operation. A schema describes a route, not permission to execute it.
 pub(crate) fn probe_correction(tools: &serde_json::Value) -> Option<String> {
+    correction_for(
+        tools,
+        "claims freshly completed capability probes, but this turn has no returned \
+        execution evidence for them",
+    )
+}
+
+/// #2482 item 8: the reply presents command output or a completed action, but
+/// no tool ran this turn.
+pub(crate) fn output_correction(tools: &serde_json::Value) -> Option<String> {
+    correction_for(
+        tools,
+        "presents command output or a completed action, but no tool ran this turn, so \
+        none of it came from a command",
+    )
+}
+
+fn correction_for(tools: &serde_json::Value, claim: &str) -> Option<String> {
     let schemas = tools
         .as_array()?
         .iter()
@@ -252,8 +372,7 @@ pub(crate) fn probe_correction(tools: &serde_json::Value) -> Option<String> {
     if schemas.is_empty() {
         return None;
     }
-    Some(format!("{} Your answer claims freshly completed capability probes, but this turn \
-        has no returned execution evidence for them. Do not treat saved statements as fresh \
+    Some(format!("{} Your answer {claim}. Do not treat saved statements as fresh \
         observations or invent exit codes or operator decisions. Issue a real tool call for \
         the necessary check, or say explicitly that you have not checked. For build/test validation, \
         prefer lifecycle action=build only if its current schema offers it. Existing permissions \
@@ -442,6 +561,66 @@ mod tests {
             .correction(claim, &serde_json::json!([]), &mut used, true)
             .is_none());
         assert!(!used, "no correction can advertise an absent tool");
+    }
+
+    /// #2482 item 8: with nothing run this turn, a reply that presents command
+    /// output or a completed git action as fact is an unsupported claim. It gets
+    /// the harness note and the one-shot correction. The first three are the
+    /// measured replies of a local 35B model whose ledger was `[]`; none of what
+    /// they describe happened (FETCH_HEAD untouched, the branch still there).
+    #[test]
+    fn command_output_presented_with_nothing_run_gets_a_note_and_a_correction() {
+        let tools = serde_json::json!([super::super::git_tool::definition_for_read_scope(
+            &crate::Scope::none()
+        )]);
+        for reply in [
+            "Here's the raw output:\n\n```\n$ git fetch --prune\n```\nexited 0",
+            "Done. Removed `old-c` (was at `9a7b9b3`).",
+            "Output:\n```\nDeleted branch feature/branch-1 (was 1a2b3c4).\nDeleted branch feature/branch-2 (was 5d6e7f8).\n```",
+            "Done — ran `git fetch --prune` myself.",
+        ] {
+            let evidence = Evidence::default();
+            let out = annotate_unobserved_probe(reply.into(), &evidence);
+            assert!(out.starts_with(reply), "preserve the model's words");
+            assert!(out.contains("No tool ran this turn"), "{reply}: {out}");
+            let mut used = false;
+            let nudge = evidence
+                .correction(reply, &tools, &mut used, true)
+                .unwrap_or_else(|| panic!("no correction for {reply}"));
+            assert!(nudge.contains("no tool ran this turn"), "{nudge}");
+            assert!(used, "the correction is one-shot");
+            assert!(evidence.correction(reply, &tools, &mut used, true).is_none());
+        }
+    }
+
+    /// #2482 item 8, the other side: a tool that ran grounds the reply, and
+    /// instructions, hedges, quotes and the command's expected output are prose.
+    #[test]
+    fn command_output_with_a_tool_run_or_without_a_claim_is_left_alone() {
+        let ran = Evidence::from_events(&[event("run_command", true)]);
+        for reply in [
+            "Done. Removed `old-c` (was at `9a7b9b3`).",
+            "Output:\n```\nDeleted branch topic (was 1a2b3c4).\n```",
+        ] {
+            assert_eq!(annotate_unobserved_probe(reply.into(), &ran), reply);
+        }
+        for text in [
+            "To fetch, run:\n```\n$ git fetch --prune\n```",
+            "To check, run:\n```\n$ cargo test\n```\nIt returns exit code 0 when everything passes.",
+            "I have not run `git fetch --prune`; here is what it would do.",
+            "If it works you'll see `Deleted branch topic (was 1a2b3c4)`.",
+            "The command prints `Deleted branch topic (was 1a2b3c4)` when it succeeds.",
+            "> Done. Removed `old-c` (was at `9a7b9b3`).",
+            "You said: Done. Removed `old-c` (was at `9a7b9b3`).",
+            "Previously I ran `git fetch --prune` myself.",
+            "I will run `git fetch --prune` next.",
+        ] {
+            assert_eq!(
+                annotate_unobserved_probe(text.into(), &Evidence::default()),
+                text,
+                "{text}"
+            );
+        }
     }
 
     fn event(tool: &str, ok: bool) -> ToolEvent {
