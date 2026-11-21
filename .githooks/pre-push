@@ -445,10 +445,24 @@ fi
 # manifest and gate changes must pass the same publish check as release CI.
 if [ -f .github/workflows/release.yml ] && printf '%s\n' "$_changed" | grep -Eq '(^|/)Cargo\.toml$|^\.github/workflows/(release|ci)\.yml$|^scripts/(check|test)_publish_order\.py$|^\.githooks/pre-push$'; then
     echo "[pre-push] checking release matrix coverage and dependency order..."
-    python3 scripts/test_publish_order.py
+    # Both scripts import tomllib (Python 3.11+) and PyYAML. A python3 that
+    # lacks either (stock macOS, a PEP 668 Homebrew Python) runs them through
+    # uv, which supplies both; with neither, stop and say what is missing (#3153).
+    _publish_py() {
+        if python3 -c 'import tomllib, yaml' 2>/dev/null; then
+            python3 "$@"
+        elif command -v uv >/dev/null 2>&1; then
+            uv run --quiet --no-project --python '>=3.11' --with pyyaml python "$@"
+        else
+            echo "[pre-push] $1 needs Python 3.11+ with PyYAML, and python3 has not both." >&2
+            echo "[pre-push] Install uv (https://docs.astral.sh/uv/) and the hook supplies them." >&2
+            return 1
+        fi
+    }
+    _publish_py scripts/test_publish_order.py
     (
         set -o pipefail
-        cargo metadata --no-deps --format-version 1 | python3 scripts/check_publish_order.py -
+        cargo metadata --no-deps --format-version 1 | _publish_py scripts/check_publish_order.py -
     )
 fi
 

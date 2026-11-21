@@ -192,8 +192,9 @@ class PrePushTests(unittest.TestCase):
         self.git("update-ref", "refs/remotes/origin/main", base)
         return base
 
-    def test_release_matrix_omission_blocks_push_before_build(self):
-        """Release regression: the actual hook rejects an omitted publishable leaf."""
+    def release_matrix_omission(self):
+        """A pushed release workflow that omits publishable `crate-c`.
+        Returns (base, local, workflow)."""
         base = self.cargo_chain()
         for script in ("check_publish_order.py", "test_publish_order.py"):
             (self.root / "scripts" / script).symlink_to(REPO_ROOT / "scripts" / script)
@@ -208,7 +209,44 @@ class PrePushTests(unittest.TestCase):
             + "".join(f"  {job}:\n    needs: [setup-acceptance, mcp-import-acceptance]\n" for job in ("github-release", "sbom-attest"))
             + f"  publish-crates:\n    needs: {gates}\n    strategy:\n      matrix:\n        crate: [crate-a, crate-b]\n"
         )
-        local = self.commit(".github/workflows/release.yml", workflow)
+        return base, self.commit(".github/workflows/release.yml", workflow), workflow
+
+    def test_publish_check_runs_under_uv_when_python3_lacks_a_module(self):
+        """#3153: a python3 that cannot import tomllib and yaml (stock macOS, a
+        PEP 668 Homebrew Python) must not kill the push: the hook supplies both
+        through uv, and the check still refuses the omitted leaf."""
+        base, local, _ = self.release_matrix_omission()
+        setup = (
+            'python3() { [ "$2" = "import tomllib, yaml" ] && return 1; command python3 "$@"; }\n'
+            'uv() { printf "%s\\n" "$*" >> "$PRE_PUSH_TEST_LOG.uv"; command uv "$@"; }\n'
+            "export -f python3 uv"
+        )
+        result, calls = self.hook(local, base, setup)
+        uv_calls = Path(str(self.log) + ".uv").read_text().splitlines()
+        self.assertEqual(len(uv_calls), 2, uv_calls)
+        self.assertTrue(all("--with pyyaml" in line for line in uv_calls), uv_calls)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("crate-c' is publishable but missing", result.stdout)
+        self.assertEqual(calls, [], "release refusal must precede expensive build gates")
+
+    def test_publish_check_names_the_requirement_when_python3_and_uv_both_lack_it(self):
+        """#3153: with neither a capable python3 nor uv the hook stops with one
+        line that names what is missing, not a Python traceback."""
+        base, local, _ = self.release_matrix_omission()
+        setup = (
+            'python3() { [ "$2" = "import tomllib, yaml" ] && return 1; command python3 "$@"; }\n'
+            'command() { [ "$1" = -v ] && [ "$2" = uv ] && return 1; builtin command "$@"; }\n'
+            "export -f python3 command"
+        )
+        result, calls = self.hook(local, base, setup)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PyYAML", result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertEqual(calls, [], "the requirement refusal must precede build gates")
+
+    def test_release_matrix_omission_blocks_push_before_build(self):
+        """Release regression: the actual hook rejects an omitted publishable leaf."""
+        base, local, workflow = self.release_matrix_omission()
         result, calls = self.hook(local, base)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("crate-c' is publishable but missing", result.stdout)
