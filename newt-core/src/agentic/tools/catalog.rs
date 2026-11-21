@@ -342,7 +342,7 @@ pub(crate) fn merged_tool_definitions(
     with_save_note: bool,
     with_recall: bool,
     with_memory_fetch: bool,
-    git_read_scope: Option<&crate::caveats::Scope<String>>,
+    git_read_scope: Option<&newt_policy::caveats::Scope<String>>,
     with_team: bool,
     with_scratchpad: bool,
     with_code_search: bool,

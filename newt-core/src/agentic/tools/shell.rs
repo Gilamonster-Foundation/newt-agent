@@ -11,8 +11,8 @@ use super::{
     denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
     permission_granted_result, requests_are_replay_safe, resolve_tool_alias, AliasOutcome,
 };
-use crate::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::ExecOutcome;
+use newt_policy::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 
 pub fn venv_cmd_prefix() -> Option<String> {
     let venv = std::env::var("NEWT_VENV")
@@ -364,7 +364,7 @@ fn parse_cd_path(s: &str) -> (String, &str) {
 /// regardless of any redirect (`sort f | tee f`). Paths are resolved against
 /// `cwd` via [`resolve_exec_cwd`] — the SAME #2551 resolution
 /// `run_command`/`lifecycle` already use, not a second one — then
-/// lexically normalized (`crate::caveats::lexically_normalize`) so `cat ./f
+/// lexically normalized (`newt_policy::caveats::lexically_normalize`) so `cat ./f
 /// > f` compares equal to `cat f > f`.
 ///
 /// Deliberately NOT a shell parser: a single pipeline of plain tokens, with
@@ -623,8 +623,9 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
     // — `ws/./f` != `ws/f` by string equality. `lexically_normalize` (the
     // same normalizer `caveats::permits_path` already uses for containment)
     // collapses `.`/`..` components on BOTH sides before comparing.
-    let normalized =
-        |token: &str| crate::caveats::lexically_normalize(&resolve_exec_cwd(cwd, Some(token)));
+    let normalized = |token: &str| {
+        newt_policy::caveats::lexically_normalize(&resolve_exec_cwd(cwd, Some(token)))
+    };
     // Empty operands and tokenizer placeholders do not name files. In
     // particular, an unsupported descriptor operation must not become cwd
     // through resolve_exec_cwd(None/empty) and collide with a real `.` operand.
@@ -973,8 +974,11 @@ pub(super) fn shadow_records(host_bypass: bool, full_access: bool) -> bool {
 /// The denied command isn't refused outright — it falls to the confined-shell
 /// path, which enforces the already-composed effective `caveats`. Every active
 /// exec floor therefore keeps its ceiling even under `--yolo`.
-pub(super) fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) -> bool {
-    use crate::caveats::ScopeExt as _;
+pub(super) fn exec_floor_permits(
+    floor: Option<&newt_policy::caveats::Scope<String>>,
+    cmd: &str,
+) -> bool {
+    use newt_policy::caveats::ScopeExt as _;
     let Some(scope) = floor else {
         return true; // no effective exec floor ⇒ bypass unchanged
     };
@@ -1011,7 +1015,7 @@ pub(super) fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, 
 #[cfg(all(test, any(not(windows), feature = "windows-appcontainer")))]
 pub(super) async fn dispatch_bridled_shell(
     args: serde_json::Value,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     dispatch_bridled_shell_with_floor(
@@ -1032,7 +1036,7 @@ pub(super) async fn dispatch_bridled_shell(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_bridled_build_shell(
     args: serde_json::Value,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     execution_lease: std::sync::Arc<dyn Send + Sync>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
@@ -1055,7 +1059,7 @@ pub(super) async fn dispatch_bridled_build_shell(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_bridled_shell_with_floor(
     mut args: serde_json::Value,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     strength_floor: Option<agent_bridle::AxisEnforcement>,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
@@ -1204,7 +1208,7 @@ pub(super) fn declared_filesystem_requests(
 }
 
 pub(super) fn permits_filesystem_request(
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     request: &PermissionRequest,
 ) -> bool {
     let scope = match request.kind {
@@ -1212,7 +1216,7 @@ pub(super) fn permits_filesystem_request(
         DenialKind::FsWrite => &caveats.fs_write,
         _ => return false,
     };
-    crate::caveats::permits_path(scope, &request.target)
+    newt_policy::caveats::permits_path(scope, &request.target)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1224,9 +1228,9 @@ pub(super) async fn exec_confined_command(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     filesystem_requests: &[PermissionRequest],
-    exec_floor: Option<&crate::caveats::Scope<String>>,
+    exec_floor: Option<&newt_policy::caveats::Scope<String>>,
     // F19: `&mut Option<&mut dyn PermissionGate>`, not `Option<&mut dyn
     // PermissionGate>` — the double indirection is what lets a caller
     // reborrow (`permission_gate` in the `lifecycle action=run` escalation)
@@ -1294,9 +1298,9 @@ pub(super) async fn exec_confined_command_with_broker(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     filesystem_requests: &[PermissionRequest],
-    exec_floor: Option<&crate::caveats::Scope<String>>,
+    exec_floor: Option<&newt_policy::caveats::Scope<String>>,
     permission_gate: &mut Option<&mut dyn PermissionGate>,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
@@ -1574,7 +1578,7 @@ pub(super) async fn exec_confined_command_with_broker(
                         {
                             // #2691: Allow is not evidence that every requested axis/target
                             // was granted. Never mint a pending grant from an insufficient reply.
-                            use crate::caveats::CaveatsExt as _;
+                            use newt_policy::caveats::CaveatsExt as _;
                             if !requests.iter().all(|request| match request.kind {
                                 DenialKind::Exec => widened.permits_exec(&request.target),
                                 DenialKind::Net => widened.permits_net(&request.target),
@@ -1748,7 +1752,7 @@ fn with_denial_context(
     (mut text, outcome): (String, ExecOutcome),
     workspace: &str,
     cwd: &str,
-    caveats: Option<&crate::caveats::Caveats>,
+    caveats: Option<&newt_policy::caveats::Caveats>,
 ) -> (String, ExecOutcome) {
     if outcome == ExecOutcome::Denied {
         text.push('\n');
@@ -1786,7 +1790,7 @@ pub(super) fn envelope_outcome(envelope: &serde_json::Value) -> ExecOutcome {
 pub(super) fn confined_result(
     cmd: &str,
     envelope: &serde_json::Value,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     color: bool,
     render: impl FnOnce(&serde_json::Value) -> String,
     command_budget: crate::RunCommandBudget,
@@ -2952,7 +2956,7 @@ fn open_denial_axis(reason: &str) -> Option<&'static str> {
 /// separate "installed, but not reachable from in here" from "not installed".
 pub(crate) fn absent_binary_refusal(
     envelope: &serde_json::Value,
-    exec: &crate::caveats::Scope<String>,
+    exec: &newt_policy::caveats::Scope<String>,
 ) -> Option<String> {
     // 127 = brush's `ExecutionExitCode::NotFound`: the program was never
     // resolved, so the interceptor was never consulted.
@@ -2983,7 +2987,7 @@ pub(crate) fn absent_binary_refusal(
 /// invocation-bound refusal (the leash's `denials`) may name a target.
 fn absent_program_note(
     envelope: &serde_json::Value,
-    exec: &crate::caveats::Scope<String>,
+    exec: &newt_policy::caveats::Scope<String>,
 ) -> Option<String> {
     // A structured refusal is a DENIAL, not an absence. Relabelling one as the
     // other would send the model to the wrong remedy.
@@ -3149,10 +3153,10 @@ fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'
 pub(super) fn dispatch_caveats_for_git_shell(
     cmd: &str,
     workspace: &str,
-    caveats: &crate::caveats::Caveats,
-) -> crate::caveats::Caveats {
+    caveats: &newt_policy::caveats::Caveats,
+) -> newt_policy::caveats::Caveats {
     if leading_program(cmd) != Some("git")
-        || !crate::caveats::permits_path(&caveats.fs_write, workspace)
+        || !newt_policy::caveats::permits_path(&caveats.fs_write, workspace)
     {
         return caveats.clone();
     }
@@ -3166,9 +3170,9 @@ pub(super) fn dispatch_caveats_for_git_shell(
     }
     let mut widened = caveats.clone();
     widened.fs_write = match &widened.fs_write {
-        crate::caveats::Scope::All => crate::caveats::Scope::All,
-        crate::caveats::Scope::Only(set) => {
-            crate::caveats::Scope::only(set.iter().cloned().chain(write))
+        newt_policy::caveats::Scope::All => newt_policy::caveats::Scope::All,
+        newt_policy::caveats::Scope::Only(set) => {
+            newt_policy::caveats::Scope::only(set.iter().cloned().chain(write))
         }
     };
     // Real git ALWAYS tries to read the system config (`/etc/gitconfig`),
@@ -3181,8 +3185,8 @@ pub(super) fn dispatch_caveats_for_git_shell(
     // non-secret, well-known system path, granted only on this ONE widened
     // dispatch, same as the write grant above.
     widened.fs_read = match &widened.fs_read {
-        crate::caveats::Scope::All => crate::caveats::Scope::All,
-        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(
+        newt_policy::caveats::Scope::All => newt_policy::caveats::Scope::All,
+        newt_policy::caveats::Scope::Only(set) => newt_policy::caveats::Scope::only(
             set.iter()
                 .cloned()
                 .chain(std::iter::once("/etc/gitconfig".to_string())),
@@ -3211,8 +3215,8 @@ pub(super) fn leading_program(cmd: &str) -> Option<&str> {
 /// cargo process resolve its own toolchain and nothing else gains the read.
 fn dispatch_caveats_for_command(
     cmd: &str,
-    caveats: &crate::caveats::Caveats,
-) -> crate::caveats::Caveats {
+    caveats: &newt_policy::caveats::Caveats,
+) -> newt_policy::caveats::Caveats {
     let mut widened = caveats.clone();
     // #2596 round 3: a host-scoped `net` grant (from `[tui.permissions] net =
     // [...]` or a session-widened net prompt) is `Unknown` to agent-bridle
@@ -3226,13 +3230,13 @@ fn dispatch_caveats_for_command(
     // preserved. See
     // `caveats::spawn_net_scope` doc comment for why narrowing loses nothing
     // a spawned shell child could enforce anyway.
-    widened.net = crate::caveats::spawn_net_scope(&widened.net);
-    if let crate::caveats::Scope::Only(exec) = &mut widened.exec {
+    widened.net = newt_policy::caveats::spawn_net_scope(&widened.net);
+    if let newt_policy::caveats::Scope::Only(exec) = &mut widened.exec {
         let twins = crate::confined_exec::developer_exec_twins(exec.iter());
         exec.extend(twins);
     }
     if leading_program(cmd).is_some_and(crate::confined_exec::is_build_tool_exec) {
-        if let crate::caveats::Scope::Only(reads) = &mut widened.fs_read {
+        if let newt_policy::caveats::Scope::Only(reads) = &mut widened.fs_read {
             reads.extend(crate::confined_exec::toolchain_read_roots());
         }
     }
@@ -3241,11 +3245,11 @@ fn dispatch_caveats_for_command(
 
 /// The exec grants in force, for the refusal's second line. Naming what IS
 /// granted turns "no" into a question the operator can answer in one line.
-fn granted_host_binaries(exec: &crate::caveats::Scope<String>) -> String {
+fn granted_host_binaries(exec: &newt_policy::caveats::Scope<String>) -> String {
     match exec {
-        crate::caveats::Scope::All => "(unrestricted)".to_string(),
-        crate::caveats::Scope::Only(set) if set.is_empty() => "(none)".to_string(),
-        crate::caveats::Scope::Only(set) => set
+        newt_policy::caveats::Scope::All => "(unrestricted)".to_string(),
+        newt_policy::caveats::Scope::Only(set) if set.is_empty() => "(none)".to_string(),
+        newt_policy::caveats::Scope::Only(set) => set
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
@@ -3591,7 +3595,7 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
 #[cfg(test)]
 mod dispatch_caveats_tests {
     use super::*;
-    use crate::caveats::{Caveats, CaveatsExt as _, CountBound, Scope};
+    use newt_policy::caveats::{Caveats, CaveatsExt as _, CountBound, Scope};
 
     fn base(ws: &str) -> Caveats {
         Caveats {
@@ -3651,11 +3655,11 @@ mod dispatch_caveats_tests {
     #[test]
     fn a_host_scoped_net_grant_is_narrowed_to_none_for_the_dispatch() {
         let mut caveats = base("/ws");
-        caveats.net = crate::caveats::Scope::only(["api.example.com".to_string()]);
+        caveats.net = newt_policy::caveats::Scope::only(["api.example.com".to_string()]);
         let widened = dispatch_caveats_for_command("cargo --version", &caveats);
         assert_eq!(
             widened.net,
-            crate::caveats::Scope::none(),
+            newt_policy::caveats::Scope::none(),
             "a host-scoped net grant cannot be bound by a spawn backend and \
              must be narrowed, not passed through as an Unknown scope"
         );
@@ -3666,7 +3670,7 @@ mod dispatch_caveats_tests {
     #[test]
     fn dispatch_caveats_for_command_does_not_mutate_session() {
         let mut original = base("/ws");
-        original.net = crate::caveats::Scope::only(["api.example.com".to_string()]);
+        original.net = newt_policy::caveats::Scope::only(["api.example.com".to_string()]);
         let original_net = original.net.clone();
         let _ = dispatch_caveats_for_command("cargo --version", &original);
         assert_eq!(
@@ -3681,14 +3685,14 @@ mod dispatch_caveats_tests {
     #[test]
     fn all_and_none_net_scopes_pass_through_the_dispatch_unchanged() {
         let mut all_caveats = base("/ws");
-        all_caveats.net = crate::caveats::Scope::All;
+        all_caveats.net = newt_policy::caveats::Scope::All;
         let widened = dispatch_caveats_for_command("cargo --version", &all_caveats);
-        assert_eq!(widened.net, crate::caveats::Scope::All);
+        assert_eq!(widened.net, newt_policy::caveats::Scope::All);
 
         let mut none_caveats = base("/ws");
-        none_caveats.net = crate::caveats::Scope::none();
+        none_caveats.net = newt_policy::caveats::Scope::none();
         let widened = dispatch_caveats_for_command("cargo --version", &none_caveats);
-        assert_eq!(widened.net, crate::caveats::Scope::none());
+        assert_eq!(widened.net, newt_policy::caveats::Scope::none());
     }
 }
 

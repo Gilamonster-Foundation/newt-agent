@@ -93,7 +93,7 @@ async fn connect_persona(
     let caveats = profile
         .caveats
         .as_ref()
-        .map(newt_core::CaveatProfile::to_caveats)
+        .map(newt_policy::CaveatProfile::to_caveats)
         .unwrap_or_else(|| {
             newt_core::ToolPermissions {
                 preset: newt_core::PermissionPreset::ReadOnly,

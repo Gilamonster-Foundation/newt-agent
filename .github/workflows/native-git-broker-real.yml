@@ -37,6 +37,7 @@ on:
     branches: [main]
     paths:
       - "newt-core/**"
+      - "newt-policy/**"
       - "agent-toolchain/**"
       - "Cargo.lock"
       - ".github/workflows/native-git-broker-real.yml"

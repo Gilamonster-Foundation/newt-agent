@@ -46,7 +46,9 @@ pub(super) fn creation(
             return Err("worktree destination was not approved".into());
         };
         let grants: Vec<_> = missing.iter().map(|r| (r.kind, r.target.clone())).collect();
-        authority = allowed.meet(&crate::permissions::widen_caveats(&authority, &grants));
+        authority = allowed.meet(&newt_policy::permissions::widen_caveats(
+            &authority, &grants,
+        ));
         if !requests
             .iter()
             .all(|request| shell::permits_filesystem_request(&authority, request))

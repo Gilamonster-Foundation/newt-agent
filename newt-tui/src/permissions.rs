@@ -17,10 +17,10 @@ use newt_core::tty::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, Echo, PromptLine as ModalLine,
     PromptWindow, Terminal, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
-use newt_core::HumanQuestionOutcome;
+use newt_policy::HumanQuestionOutcome;
 #[path = "permission_workflow.rs"]
 mod workflow;
-pub(crate) use newt_core::PermissionAction as PromptChoice;
+pub(crate) use newt_policy::PermissionAction as PromptChoice;
 pub(crate) use workflow::{load_session_grants, PermissionWorkflow};
 // D0 (#1878): the legacy form is not named here at all any more. C0a moved
 // rendering off it; C3c removed the web card's reconstruction; D0 moved the
@@ -80,7 +80,7 @@ pub(crate) fn should_prompt_permissions(
 #[cfg(unix)]
 pub(crate) use newt_core::tty::try_watch_stdin;
 
-pub(crate) fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bool {
+pub(crate) fn reason_is_model_authored(req: &newt_policy::PermissionRequest) -> bool {
     // #2636 finding 4: use the typed harness_bound field, not the string prefix
     // check. The model can forge BOUND_REASON_PREFIX in its reason text; it
     // cannot set harness_bound, which is only set by execute_request_permissions.
@@ -119,11 +119,11 @@ struct OfferedAction {
 /// text, and the durable grants are terminal-only, so tier and audience
 /// must still be known simultaneously.
 fn permission_policy(
-    req: &newt_core::PermissionRequest,
+    req: &newt_policy::PermissionRequest,
     danger: &danger::DangerTable,
     audience: Audience,
 ) -> (Vec<OfferedAction>, Option<String>) {
-    use newt_core::DenialKind;
+    use newt_policy::DenialKind;
     let tier = danger.classify(req.kind, &req.target);
     // ONE audience test, bound once. The A0 shape asked it twice; the two
     // asks were always the same question, so the ratchet baseline goes
@@ -217,7 +217,7 @@ fn permission_policy(
 /// This is the single form both surfaces build. The prompt text itself is
 /// audience-independent; only the action list and the note are not.
 pub(crate) fn permission_definition(
-    req: &newt_core::PermissionRequest,
+    req: &newt_policy::PermissionRequest,
     danger: &danger::DangerTable,
     audience: Audience,
 ) -> InteractionDefinition {
@@ -225,11 +225,12 @@ pub(crate) fn permission_definition(
 }
 
 pub(crate) fn permission_interaction(
-    req: &newt_core::PermissionRequest,
+    req: &newt_policy::PermissionRequest,
     danger: &danger::DangerTable,
     configured_default: PromptChoice,
 ) -> SurfaceInteraction {
-    let configured_default = if req.tool == "mcp connect" && req.kind == newt_core::DenialKind::Net
+    let configured_default = if req.tool == "mcp connect"
+        && req.kind == newt_policy::DenialKind::Net
         || matches!(
             configured_default,
             PromptChoice::AllowOnce | PromptChoice::Deny
@@ -251,12 +252,12 @@ pub(crate) fn permission_interaction(
 }
 
 fn permission_definition_with_default(
-    req: &newt_core::PermissionRequest,
+    req: &newt_policy::PermissionRequest,
     danger: &danger::DangerTable,
     audience: Audience,
     default: PromptChoice,
 ) -> (InteractionDefinition, PromptChoice) {
-    use newt_core::DenialKind;
+    use newt_policy::DenialKind;
     let (verb, axis) = match req.kind {
         DenialKind::Exec => ("run", "outside the granted exec allowlist"),
         DenialKind::FsRead => ("read", "outside the granted fs_read scope"),
@@ -269,7 +270,7 @@ fn permission_definition_with_default(
         DenialKind::Build => ("build/test", "requires confined build authority"),
         // #3147: a data-loss confirmation (#1191) is asked even with git-write
         // authority, so it is neither a commit nor "outside the grant".
-        DenialKind::GitWrite => match newt_core::permissions::git_data_loss_action(&req.target) {
+        DenialKind::GitWrite => match newt_policy::permissions::git_data_loss_action(&req.target) {
             Some(action) => (action, "asked even with git-write authority"),
             None => (
                 "commit/stage via git",
@@ -439,9 +440,9 @@ pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::Capability
     let table = production_danger_table();
     move |class, target| {
         let kind = match class {
-            newt_core::ocap_store::CapabilityClass::Exec => newt_core::DenialKind::Exec,
-            newt_core::ocap_store::CapabilityClass::Fs => newt_core::DenialKind::FsWrite,
-            newt_core::ocap_store::CapabilityClass::Net => newt_core::DenialKind::Net,
+            newt_core::ocap_store::CapabilityClass::Exec => newt_policy::DenialKind::Exec,
+            newt_core::ocap_store::CapabilityClass::Fs => newt_policy::DenialKind::FsWrite,
+            newt_core::ocap_store::CapabilityClass::Net => newt_policy::DenialKind::Net,
         };
         table.classify(kind, target) == danger::DangerTier::High
     }
@@ -563,12 +564,12 @@ fn lost_to_web_message(mine: PromptChoice, winner: PromptChoice) -> String {
 /// relative path like `./build.sh` would silently mean "whatever `./` is at
 /// match time", never what the operator approved.
 fn approve_entry_for(
-    kind: newt_core::DenialKind,
+    kind: newt_policy::DenialKind,
     target: &str,
 ) -> Option<Result<newt_core::ocap_store::ApproveEntry, String>> {
     use newt_core::ocap_store::ApproveEntry;
     match kind {
-        newt_core::DenialKind::Exec => {
+        newt_policy::DenialKind::Exec => {
             let is_path = target.contains('/') || target.contains('\\');
             if is_path && !std::path::Path::new(target).is_absolute() {
                 return Some(Err(format!(
@@ -580,20 +581,20 @@ fn approve_entry_for(
                 target: target.to_string(),
             }))
         }
-        newt_core::DenialKind::FsRead => Some(Ok(ApproveEntry::Fs {
+        newt_policy::DenialKind::FsRead => Some(Ok(ApproveEntry::Fs {
             path: target.to_string(),
             write: false,
         })),
-        newt_core::DenialKind::FsWrite => Some(Ok(ApproveEntry::Fs {
+        newt_policy::DenialKind::FsWrite => Some(Ok(ApproveEntry::Fs {
             path: target.to_string(),
             write: true,
         })),
-        newt_core::DenialKind::Net => Some(Ok(ApproveEntry::Net {
+        newt_policy::DenialKind::Net => Some(Ok(ApproveEntry::Net {
             host: target.to_string(),
         })),
-        newt_core::DenialKind::RemoteTool
-        | newt_core::DenialKind::GitWrite
-        | newt_core::DenialKind::Build => None,
+        newt_policy::DenialKind::RemoteTool
+        | newt_policy::DenialKind::GitWrite
+        | newt_policy::DenialKind::Build => None,
     }
 }
 
@@ -606,9 +607,9 @@ fn approve_entry_for(
 /// fails (a relative or climbing path) — that case is refused downstream by
 /// `persist_approve`'s own check, with its own message. Exec/net targets are
 /// not paths and pass through unchanged.
-fn normalized_danger_target(kind: newt_core::DenialKind, target: &str) -> String {
+fn normalized_danger_target(kind: newt_policy::DenialKind, target: &str) -> String {
     match kind {
-        newt_core::DenialKind::FsRead | newt_core::DenialKind::FsWrite => {
+        newt_policy::DenialKind::FsRead | newt_policy::DenialKind::FsWrite => {
             newt_core::ocap_store::normalize_fs_path(target).unwrap_or_else(|_| target.to_string())
         }
         _ => target.to_string(),
@@ -631,15 +632,15 @@ fn no_key_notice(key_path: Option<&std::path::Path>) -> String {
 }
 
 /// Operator-facing axis name for the "permanently allowed" notice.
-fn axis_label(kind: newt_core::DenialKind) -> &'static str {
+fn axis_label(kind: newt_policy::DenialKind) -> &'static str {
     match kind {
-        newt_core::DenialKind::Exec => "exec",
-        newt_core::DenialKind::FsRead => "fs (read)",
-        newt_core::DenialKind::FsWrite => "fs (write)",
-        newt_core::DenialKind::Net => "net",
-        newt_core::DenialKind::RemoteTool => "remote tool",
-        newt_core::DenialKind::GitWrite => "git write",
-        newt_core::DenialKind::Build => "build",
+        newt_policy::DenialKind::Exec => "exec",
+        newt_policy::DenialKind::FsRead => "fs (read)",
+        newt_policy::DenialKind::FsWrite => "fs (write)",
+        newt_policy::DenialKind::Net => "net",
+        newt_policy::DenialKind::RemoteTool => "remote tool",
+        newt_policy::DenialKind::GitWrite => "git write",
+        newt_policy::DenialKind::Build => "build",
     }
 }
 
@@ -661,7 +662,7 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
 /// the default a blank submission resolves to.
 pub(crate) fn choice_form(
     question: &str,
-    options: &[newt_core::permissions::ChoiceSpec],
+    options: &[newt_policy::permissions::ChoiceSpec],
 ) -> SurfaceInteraction {
     let choices: Vec<ChoiceOption> = options
         .iter()
@@ -861,16 +862,16 @@ pub(crate) struct PermissionPromptState {
     /// fence, which is why `authorize` compares two independently
     /// supplied values instead of one value with itself.
     pub(crate) workspace_key: String,
-    session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    session_grants: std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
     pub(crate) durable_grants: newt_core::durable_grants::GrantSet,
     /// Invalid recalled approvals stay quarantined until the next session.
     rejected_durable_grants: std::cell::RefCell<newt_core::durable_grants::GrantSet>,
-    session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    session_denials: std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
     /// Durable deny-only entries loaded at session start.
-    persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    persistent_denials: std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
     /// One-shot grants carried from `request_permissions` to its retry.
-    pending_once_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    pub(crate) decisions: Vec<newt_core::PermissionRecord>,
+    pending_once_grants: std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
+    pub(crate) decisions: Vec<newt_policy::PermissionRecord>,
     /// Durable approve/deny policy, read-only during the session.
     pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
 }
@@ -900,20 +901,20 @@ pub(crate) fn exec_grant_basename(cmd: &str) -> &str {
 /// expressible, this is the one place that changes.
 fn ceiling_permits(
     ceiling: &newt_core::Caveats,
-    kind: newt_core::DenialKind,
+    kind: newt_policy::DenialKind,
     target: &str,
 ) -> bool {
-    use newt_core::caveats::CaveatsExt as _;
+    use newt_policy::caveats::CaveatsExt as _;
     match kind {
-        newt_core::DenialKind::Exec => ceiling.permits_exec(target),
-        newt_core::DenialKind::FsRead => ceiling.permits_fs_read(target),
-        newt_core::DenialKind::FsWrite => ceiling.permits_fs_write(target),
-        newt_core::DenialKind::Net => ceiling.permits_net(target),
-        newt_core::DenialKind::GitWrite => {
+        newt_policy::DenialKind::Exec => ceiling.permits_exec(target),
+        newt_policy::DenialKind::FsRead => ceiling.permits_fs_read(target),
+        newt_policy::DenialKind::FsWrite => ceiling.permits_fs_write(target),
+        newt_policy::DenialKind::Net => ceiling.permits_net(target),
+        newt_policy::DenialKind::GitWrite => {
             newt_core::git_caveats::GitCaveats::from_session(ceiling).permits_commit()
         }
-        newt_core::DenialKind::RemoteTool => false,
-        newt_core::DenialKind::Build => {
+        newt_policy::DenialKind::RemoteTool => false,
+        newt_policy::DenialKind::Build => {
             newt_core::confined_exec::build_tool_caveats(std::path::Path::new(target)).leq(ceiling)
         }
     }
@@ -932,15 +933,15 @@ fn ceiling_permits(
 /// through the `run_command` / routed-`build_exec` lane. One session grant,
 /// not three.
 pub(crate) fn session_grant_covers(
-    grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    req: &newt_core::PermissionRequest,
+    grants: &std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
+    req: &newt_policy::PermissionRequest,
 ) -> bool {
     grants.contains(&(req.kind, req.target.clone()))
-        || (req.kind == newt_core::DenialKind::Exec
+        || (req.kind == newt_policy::DenialKind::Exec
             && newt_core::confined_exec::is_build_tool_exec(&req.target)
             && grants
                 .iter()
-                .any(|(kind, _)| *kind == newt_core::DenialKind::Build))
+                .any(|(kind, _)| *kind == newt_policy::DenialKind::Build))
 }
 
 /// dec1-build-grant round 2 (Reviewer, item 3): which session `Build` grant
@@ -955,7 +956,7 @@ pub(crate) fn session_grant_covers(
 /// first `Build` grant found when nothing matches (the prior behavior) —
 /// better an approximate clamp than none.
 fn covering_build_grant_workspace<'a>(
-    grants: &'a std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    grants: &'a std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
     baseline: &newt_core::Caveats,
 ) -> Option<&'a str> {
     let cwd_roots: Vec<&str> = match &baseline.fs_write {
@@ -965,7 +966,7 @@ fn covering_build_grant_workspace<'a>(
     let build_workspaces = || {
         grants
             .iter()
-            .filter(|(kind, _)| *kind == newt_core::DenialKind::Build)
+            .filter(|(kind, _)| *kind == newt_policy::DenialKind::Build)
             .map(|(_, ws)| ws.as_str())
     };
     build_workspaces()
@@ -979,14 +980,14 @@ fn covering_build_grant_workspace<'a>(
 
 /// Consume only the exact pending target; other requests leave it available.
 pub(crate) fn take_pending_once(
-    pending: &mut std::collections::BTreeSet<(newt_core::DenialKind, String)>,
-    req: &newt_core::PermissionRequest,
-) -> Option<(newt_core::DenialKind, String)> {
+    pending: &mut std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
+    req: &newt_policy::PermissionRequest,
+) -> Option<(newt_policy::DenialKind, String)> {
     pending.take(&(req.kind, req.target.clone()))
 }
 
 impl PermissionPromptState {
-    fn denied(&self, kind: newt_core::DenialKind, target: &str) -> bool {
+    fn denied(&self, kind: newt_policy::DenialKind, target: &str) -> bool {
         let denied = |target: &str| {
             let key = (kind, target.to_string());
             self.rejected_durable_grants.borrow().contains(&key)
@@ -998,17 +999,18 @@ impl PermissionPromptState {
         // Older exec prompts stored basenames. Preserve those refusals when a
         // new prompt names an exact path, without widening any approval.
         denied(target)
-            || (kind == newt_core::DenialKind::Exec && denied(exec_grant_basename(target)))
+            || (kind == newt_policy::DenialKind::Exec && denied(exec_grant_basename(target)))
     }
 
     /// Scope has no exclusions. Do not recall a broad grant that would let a
     /// denied target bypass the gate; leave independently configured authority
     /// unchanged. The same check rejects an unreplayable promotion snapshot.
-    fn recall_conflicts_with_denial(&self, kind: newt_core::DenialKind, target: &str) -> bool {
-        use newt_core::{ocap_store::Verdict, DenialKind};
+    fn recall_conflicts_with_denial(&self, kind: newt_policy::DenialKind, target: &str) -> bool {
+        use newt_core::ocap_store::Verdict;
+        use newt_policy::DenialKind;
         let overlaps = |denied: &str| match kind {
-            DenialKind::FsRead | DenialKind::FsWrite => newt_core::caveats::permits_path(
-                &newt_core::caveats::Scope::only([target.to_string()]),
+            DenialKind::FsRead | DenialKind::FsWrite => newt_policy::caveats::permits_path(
+                &newt_policy::caveats::Scope::only([target.to_string()]),
                 denied,
             ),
             DenialKind::Exec => {
@@ -1038,7 +1040,7 @@ impl PermissionPromptState {
     fn recalled_grants<'a>(
         &'a self,
         danger: &'a danger::DangerTable,
-    ) -> impl Iterator<Item = &'a (newt_core::DenialKind, String)> {
+    ) -> impl Iterator<Item = &'a (newt_policy::DenialKind, String)> {
         self.recalled_grants_with(danger, true)
     }
 
@@ -1048,7 +1050,7 @@ impl PermissionPromptState {
         &'a self,
         danger: &'a danger::DangerTable,
         quarantine: bool,
-    ) -> impl Iterator<Item = &'a (newt_core::DenialKind, String)> {
+    ) -> impl Iterator<Item = &'a (newt_policy::DenialKind, String)> {
         self.session_grants
             .iter()
             .chain(&self.durable_grants)
@@ -1144,7 +1146,7 @@ impl PermissionPromptState {
         let mut policy = clamp(base.clone());
         self.validate_caveats(&policy)?;
         for (kind, target) in self.recalled_grants_with(&production_danger_table(), quarantine) {
-            let candidate = clamp(newt_core::widen_caveats(
+            let candidate = clamp(newt_policy::widen_caveats(
                 &policy,
                 &[(*kind, target.clone())],
             ));
@@ -1161,7 +1163,7 @@ impl PermissionPromptState {
 
     fn reject_durable_grant(
         &self,
-        kind: newt_core::DenialKind,
+        kind: newt_policy::DenialKind,
         target: &str,
         error: &anyhow::Error,
     ) -> bool {
@@ -1184,9 +1186,9 @@ impl PermissionPromptState {
     fn widen_caveats(
         &self,
         base: &newt_core::Caveats,
-        grants: &[(newt_core::DenialKind, String)],
+        grants: &[(newt_policy::DenialKind, String)],
     ) -> newt_core::Caveats {
-        newt_core::widen_caveats(base, grants)
+        newt_policy::widen_caveats(base, grants)
     }
 
     fn validate_caveats(&self, caveats: &newt_core::Caveats) -> anyhow::Result<()> {
@@ -1198,7 +1200,7 @@ impl PermissionPromptState {
 
     pub(crate) fn retained_net_hosts(&self) -> Vec<String> {
         self.recalled_grants(&production_danger_table())
-            .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
+            .filter(|(kind, _)| *kind == newt_policy::DenialKind::Net)
             .map(|(_, target)| target.clone())
             .collect()
     }
@@ -1215,7 +1217,7 @@ impl PermissionPromptState {
     /// missing file yields an empty denylist. Called once at session start.
     pub(crate) fn with_persistent_denials(path: Option<&std::path::Path>) -> Self {
         let persistent_denials = path
-            .map(|p| newt_core::load_denials(p).into_iter().collect())
+            .map(|p| newt_policy::load_denials(p).into_iter().collect())
             .unwrap_or_default();
         Self {
             persistent_denials,
@@ -1233,7 +1235,7 @@ pub(crate) struct PromptPermissionGate<
     /// Exact command/cwd content identities, never basename aliases or standing grants.
     pub(crate) pending_command_retries: std::collections::BTreeMap<
         (newt_identity::RawContentId, newt_identity::RawContentId),
-        Vec<(newt_core::DenialKind, String)>,
+        Vec<(newt_policy::DenialKind, String)>,
     >,
     pub(crate) state: &'a mut PermissionPromptState,
     /// Enforced caveats at turn start.
@@ -1296,21 +1298,21 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     /// the operator's grant without changing the session capability.
     pub(crate) fn ask_mcp_net_grant(
         &mut self,
-        request: &newt_core::PermissionRequest,
+        request: &newt_policy::PermissionRequest,
     ) -> Option<(newt_core::Caveats, Vec<String>, bool)> {
-        if request.kind != newt_core::DenialKind::Net {
+        if request.kind != newt_policy::DenialKind::Net {
             return None;
         }
-        match newt_core::PermissionGate::ask(self, std::slice::from_ref(request)) {
-            newt_core::PermissionDecision::Allow(caveats) => {
-                use newt_core::CaveatsExt as _;
+        match newt_policy::PermissionGate::ask(self, std::slice::from_ref(request)) {
+            newt_policy::PermissionDecision::Allow(caveats) => {
+                use newt_policy::CaveatsExt as _;
                 if !caveats.permits_net(&request.target) {
                     return None;
                 }
                 let mut hosts: Vec<_> = self
                     .state
                     .recalled_grants(&self.danger)
-                    .filter(|(kind, _)| *kind == newt_core::DenialKind::Net)
+                    .filter(|(kind, _)| *kind == newt_policy::DenialKind::Net)
                     .filter(|(_, host)| caveats.permits_net(host))
                     .map(|(_, host)| host.clone())
                     .collect();
@@ -1327,7 +1329,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                             .contains(&(request.kind, request.target.clone())),
                 ))
             }
-            newt_core::PermissionDecision::Deny => None,
+            newt_policy::PermissionDecision::Deny => None,
         }
     }
 
@@ -1335,8 +1337,8 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     /// appended to the durable log. A log-write failure is reported but
     /// never blocks the decision — the record is a review artifact, not a
     /// gate.
-    fn record(&mut self, req: &newt_core::PermissionRequest, decision: &str, scope: &str) {
-        let rec = newt_core::PermissionRecord::new(
+    fn record(&mut self, req: &newt_policy::PermissionRequest, decision: &str, scope: &str) {
+        let rec = newt_policy::PermissionRecord::new(
             &self.conversation_id,
             &req.tool,
             req.kind,
@@ -1360,9 +1362,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     fn policy_with_grants(
         &self,
         base: &newt_core::Caveats,
-        once_grants: &[(newt_core::DenialKind, String)],
+        once_grants: &[(newt_policy::DenialKind, String)],
     ) -> anyhow::Result<newt_core::Caveats> {
-        let mut grants: Vec<(newt_core::DenialKind, String)> =
+        let mut grants: Vec<(newt_policy::DenialKind, String)> =
             self.state.recalled_grants(&self.danger).cloned().collect();
         grants.extend(once_grants.iter().cloned());
         let mut policy = self.state.widen_caveats(base, &grants);
@@ -1390,7 +1392,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     fn mint(
         &self,
         base: &newt_core::Caveats,
-        once_grants: &[(newt_core::DenialKind, String)],
+        once_grants: &[(newt_policy::DenialKind, String)],
     ) -> anyhow::Result<newt_core::Caveats> {
         let policy = self.policy_with_grants(base, once_grants)?;
         // A delegated session never re-roots a grant through the operator key.
@@ -1420,7 +1422,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     fn await_web_decision(
         &self,
         store: &newt_core::ConversationStore,
-        req: &newt_core::PermissionRequest,
+        req: &newt_policy::PermissionRequest,
     ) -> (PromptChoice, &'static str) {
         // B0b-2 (#1846): publish the OFFER — the definition AND the instance
         // that binds it — so the answer is validated against the offer that
@@ -1851,7 +1853,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     fn note_refusal(
         &mut self,
         w: Option<&PromptWindow>,
-        req: &newt_core::PermissionRequest,
+        req: &newt_policy::PermissionRequest,
         decoded: PromptChoice,
         refusal: &newt_interaction::Refusal,
     ) {
@@ -1973,34 +1975,40 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     }
 }
 
-impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::PermissionGate
+impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::PermissionGate
     for PromptPermissionGate<'_, F>
 {
-    fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
+    fn refresh_caveats(
+        &mut self,
+        baseline: &newt_core::Caveats,
+    ) -> newt_policy::PermissionDecision {
         self.mint(baseline, &[]).map_or(
-            newt_core::PermissionDecision::Deny,
-            newt_core::PermissionDecision::Allow,
+            newt_policy::PermissionDecision::Deny,
+            newt_policy::PermissionDecision::Allow,
         )
     }
 
-    fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+    fn ask(
+        &mut self,
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         self.ask_with_caveats(&self.base.clone(), requests)
     }
 
     fn ask_full_access(
         &mut self,
-        requests: &[newt_core::PermissionRequest],
-    ) -> newt_core::PermissionDecision {
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         self.ask_scoped(&self.base.clone(), requests, false, true)
     }
 
-    fn consume_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
+    fn consume_pending_once(&mut self, kind: newt_policy::DenialKind, target: &str) {
         self.state
             .pending_once_grants
             .remove(&(kind, target.to_string()));
     }
 
-    fn queue_pending_once(&mut self, kind: newt_core::DenialKind, target: &str) {
+    fn queue_pending_once(&mut self, kind: newt_policy::DenialKind, target: &str) {
         self.state
             .pending_once_grants
             .insert((kind, target.to_string()));
@@ -2010,7 +2018,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         &mut self,
         command: &str,
         cwd: &str,
-        requests: &[newt_core::PermissionRequest],
+        requests: &[newt_policy::PermissionRequest],
     ) {
         let key = (
             newt_identity::RawContentId::from_content(command.as_bytes()),
@@ -2048,9 +2056,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
         let Ok(policy) = self.mint(base, grants) else {
             return base.clone();
         };
-        use newt_core::CaveatsExt as _;
+        use newt_policy::CaveatsExt as _;
         if !grants.iter().all(|(kind, target)| {
-            *kind == newt_core::DenialKind::Exec && policy.permits_exec(target)
+            *kind == newt_policy::DenialKind::Exec && policy.permits_exec(target)
         }) {
             return base.clone();
         }
@@ -2060,7 +2068,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
 
     fn apply_pending_once(
         &mut self,
-        kind: newt_core::DenialKind,
+        kind: newt_policy::DenialKind,
         target: &str,
         baseline: &newt_core::Caveats,
     ) -> newt_core::Caveats {
@@ -2084,16 +2092,16 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
     fn ask_with_caveats(
         &mut self,
         baseline: &newt_core::Caveats,
-        requests: &[newt_core::PermissionRequest],
-    ) -> newt_core::PermissionDecision {
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         self.ask_scoped(baseline, requests, false, false)
     }
 
     fn ask_dependency_fetch(
         &mut self,
         prepared: &newt_core::Caveats,
-        request: &newt_core::PermissionRequest,
-    ) -> newt_core::PermissionDecision {
+        request: &newt_policy::PermissionRequest,
+    ) -> newt_policy::PermissionDecision {
         self.ask_scoped(prepared, std::slice::from_ref(request), true, false)
     }
 
@@ -2140,7 +2148,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_core::Pe
     fn ask_choice(
         &mut self,
         question: &str,
-        options: &[newt_core::permissions::ChoiceSpec],
+        options: &[newt_policy::permissions::ChoiceSpec],
     ) -> HumanQuestionOutcome {
         // Same seam as `ask_question`: the session builds the form, whichever
         // surface owns the terminal renders and reads it, and the control
@@ -2178,11 +2186,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     fn ask_scoped(
         &mut self,
         baseline: &newt_core::Caveats,
-        requests: &[newt_core::PermissionRequest],
+        requests: &[newt_policy::PermissionRequest],
         operation_only: bool,
         preapproved: bool,
-    ) -> newt_core::PermissionDecision {
-        use newt_core::PermissionDecision::{Allow, Deny};
+    ) -> newt_policy::PermissionDecision {
+        use newt_policy::PermissionDecision::{Allow, Deny};
         if operation_only
             && (requests.len() != 1
                 || !requests[0].operation_egress()
@@ -2218,7 +2226,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         if (operation_only
             || requests
                 .iter()
-                .any(|request| request.kind == newt_core::DenialKind::Build))
+                .any(|request| request.kind == newt_policy::DenialKind::Build))
             && (self
                 .preset_clamp
                 .as_ref()
@@ -2234,7 +2242,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         let filesystem_batch = requests.iter().any(|request| {
             matches!(
                 request.kind,
-                newt_core::DenialKind::FsRead | newt_core::DenialKind::FsWrite
+                newt_policy::DenialKind::FsRead | newt_policy::DenialKind::FsWrite
             )
         });
         if let Some(clamp) = &self.preset_clamp {
@@ -2242,10 +2250,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                 && requests.iter().any(|request| {
                     matches!(
                         request.kind,
-                        newt_core::DenialKind::FsRead
-                            | newt_core::DenialKind::FsWrite
-                            | newt_core::DenialKind::Exec
-                            | newt_core::DenialKind::Net
+                        newt_policy::DenialKind::FsRead
+                            | newt_policy::DenialKind::FsWrite
+                            | newt_policy::DenialKind::Exec
+                            | newt_policy::DenialKind::Net
                     ) && !ceiling_permits(clamp, request.kind, &request.target)
                 })
             {
@@ -2291,7 +2299,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             }
             return Allow(minted);
         }
-        let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
+        let mut once_grants: Vec<(newt_policy::DenialKind, String)> = Vec::new();
         // dec1-build-grant round 2: a request covered by the Build-grant
         // fallback in `session_grant_covers` (an Exec of a build tool, e.g.
         // `cargo`, covered by a session Build grant rather than an exact
@@ -2305,7 +2313,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         for req in requests {
             // Build grants are non-axis but still bounded by an explicit
             // posture ceiling; a prompt cannot expand that ceiling.
-            if req.kind == newt_core::DenialKind::Build
+            if req.kind == newt_policy::DenialKind::Build
                 && self
                     .preset_clamp
                     .as_ref()
@@ -2315,7 +2323,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                 return Deny;
             }
             // GitWrite is non-axis, so enforce the readonly preset before minting.
-            if req.kind == newt_core::DenialKind::GitWrite {
+            if req.kind == newt_policy::DenialKind::GitWrite {
                 if let Some(clamp) = &self.preset_clamp {
                     if !newt_core::git_caveats::GitCaveats::from_session(clamp).permits_commit() {
                         self.record(req, "deny", "preset-floor-git-readonly");
@@ -2331,10 +2339,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                 && !req.harness_bound
                 && matches!(
                     req.kind,
-                    newt_core::DenialKind::Exec
-                        | newt_core::DenialKind::Net
-                        | newt_core::DenialKind::FsRead
-                        | newt_core::DenialKind::FsWrite
+                    newt_policy::DenialKind::Exec
+                        | newt_policy::DenialKind::Net
+                        | newt_policy::DenialKind::FsRead
+                        | newt_policy::DenialKind::FsWrite
                 )
                 && self
                     .policy_with_grants(baseline, &[])
@@ -2405,7 +2413,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             // denial many times (e.g. a loop). Reuse this batch's exact-path
             // approval; nothing survives this call or changes replay policy.
             if req.tool == "run_command"
-                && req.kind == newt_core::DenialKind::Exec
+                && req.kind == newt_policy::DenialKind::Exec
                 && std::path::Path::new(&req.target).is_absolute()
                 && once_grants
                     .iter()
@@ -2450,7 +2458,8 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                         req,
                         &self.danger,
                         self.state.prompt_default.unwrap_or_else(|| {
-                            if req.tool == "mcp connect" && req.kind == newt_core::DenialKind::Net {
+                            if req.tool == "mcp connect" && req.kind == newt_policy::DenialKind::Net
+                            {
                                 self.state.mcp_net_prompt_default.unwrap_or(
                                     newt_core::ToolPermissions::default().mcp_net_prompt_default,
                                 )
@@ -2502,7 +2511,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     // form DOES offer for session scope: it is bounded by the
                     // calibrated `build_tool_caveats` fence, not open-ended.
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High
-                        && req.kind != newt_core::DenialKind::Build
+                        && req.kind != newt_policy::DenialKind::Build
                     {
                         self.record(req, "deny", "session-allow-refused-high-danger");
                         self.notice(
@@ -2685,7 +2694,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                 PromptChoice::DenyPermanent => {
                     self.record(req, "deny", "permanent");
                     if let Some(path) = self.denials_path.as_deref() {
-                        if let Err(e) = newt_core::append_denial(path, req.kind, &req.target) {
+                        if let Err(e) = newt_policy::append_denial(path, req.kind, &req.target) {
                             print_newt(
                                 &format!("warning: permission denylist write failed: {e}"),
                                 self.color,

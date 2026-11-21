@@ -285,7 +285,7 @@ impl WorkspaceSession {
         // coding boundary, including implicit runtime/toolchain reads.
         guard
             .validate_request(
-                newt_core::DenialKind::Build,
+                newt_policy::DenialKind::Build,
                 workspace.to_str().ok_or("workspace must be valid UTF-8")?,
             )
             .map_err(|error| error.to_string())

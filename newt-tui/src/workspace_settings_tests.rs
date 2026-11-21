@@ -43,7 +43,7 @@ impl Fixture {
             ..Default::default()
         };
         let mut active = permissions.to_caveats(workspace.to_str().unwrap());
-        newt_core::caveats::lock_fs_to_workspace(
+        newt_policy::caveats::lock_fs_to_workspace(
             &mut active,
             workspace.to_str().unwrap(),
             &[],
@@ -265,7 +265,7 @@ fn removing_a_profile_reviews_fallback_and_preserves_separate_approvals() {
     let root = newt_identity::UserKey::generate();
     let identity = newt_core::secrets::TokenIdentity::generate();
     let grants = durable_grants::GrantSet::from([(
-        newt_core::DenialKind::FsWrite,
+        newt_policy::DenialKind::FsWrite,
         fx.workspace.to_string_lossy().into_owned(),
     )]);
     durable_grants::merge(&path, &fx.workspace, &grants, &root, &identity).unwrap();

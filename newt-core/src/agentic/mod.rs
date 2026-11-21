@@ -365,7 +365,6 @@ pub use trim::{ollama_usage, openai_usage, trim_for_summary};
 pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
-use crate::permissions::PermissionGate;
 use crate::retry::{with_backoff_notify_error, RetryPolicy};
 use compress::{
     compression_trigger, CompressAction, CompressRequest, CompressTrigger,
@@ -381,6 +380,7 @@ use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
     TurnHeartbeat,
 };
+use newt_policy::permissions::PermissionGate;
 use send_budget::estimate_responses_request_tokens;
 use send_budget::{
     authoritative_request_budget, calibrate_down, calibrate_up, capped_accepted_prompt_tokens,
@@ -905,7 +905,7 @@ pub struct ChatCtx<'a> {
     /// Plan ledger for the update_plan tool (Step 26.6b). `None` = the tool is
     /// not advertised (scheduled off). Shared `&dyn` (interior mut).
     pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
-    pub caveats: &'a crate::caveats::Caveats,
+    pub caveats: &'a newt_policy::caveats::Caveats,
     /// Preferred tools from the active persona's `tools:` metadata. This only
     /// ranks discovery; it never hides a tool or grants/denies its execution.
     pub persona_tools: Option<&'a [String]>,
@@ -1165,7 +1165,7 @@ pub struct ChatCtx<'a> {
     /// bypass bit-for-bit. The floor is also already `meet`-ed into `caveats`,
     /// so the confined-shell and gate paths enforce it too; this field is the
     /// one extra place the otherwise caveats-blind bypass must consult.
-    pub exec_floor: Option<&'a crate::caveats::Scope<String>>,
+    pub exec_floor: Option<&'a newt_policy::caveats::Scope<String>>,
     /// `retry` technique (R2 action arm): a turn-scoped copy-on-first-write ledger
     /// ([`crate::verify_gate::WriteLedger`]) the file-write tools record into before
     /// each `write_file` / `edit_file`, so the caller can revert exactly the files
@@ -4090,7 +4090,7 @@ enum RepeatMemo {
 #[derive(Clone, Copy)]
 struct ReadScope<'a> {
     workspace: &'a str,
-    caveats: &'a crate::caveats::Caveats,
+    caveats: &'a newt_policy::caveats::Caveats,
 }
 
 impl ReadScope<'_> {
@@ -4435,7 +4435,7 @@ async fn progress_workspace_state(
     name: &str,
     args: &serde_json::Value,
     workspace: &str,
-    fs_read: &crate::caveats::Scope<String>,
+    fs_read: &newt_policy::caveats::Scope<String>,
 ) -> Option<ProgressSnapshot> {
     if !matches!(
         name,
@@ -4472,7 +4472,7 @@ async fn progress_workspace_state(
                 ));
             }
         }
-        if !crate::caveats::permits_path(&fs_read, &root.to_string_lossy()) {
+        if !newt_policy::caveats::permits_path(&fs_read, &root.to_string_lossy()) {
             return None;
         }
         self_verify::workspace_tree_state(&root).map(ProgressSnapshot::Tree)

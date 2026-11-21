@@ -1,5 +1,5 @@
 use super::{apply_chat_prompt_policy, is_slash_command_at_prompt, SLASH_COMMAND_PROMPT_NOTICE};
-use newt_core::HumanQuestionOutcome;
+use newt_policy::HumanQuestionOutcome;
 
 #[test]
 fn refuses_slash_commands_as_tool_answers() {

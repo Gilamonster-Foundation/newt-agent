@@ -94,7 +94,7 @@ fn workspace_editor_is_advertised_with_its_signed_policy_receipt() {
 /// # 25 → 24: `/posture` pays, and the ledger's exit opens (#2009 PR10c)
 ///
 /// The last of the relocations §5.1 named. `ActivePosture` and
-/// `build_posture` moved to `newt_core::posture`, so the value lives where
+/// `build_posture` moved to `newt_policy::posture`, so the value lives where
 /// a pure `settings_form::apply` can install it and `apply_and_record` can
 /// read a real from→to.
 ///

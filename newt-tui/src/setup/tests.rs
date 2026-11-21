@@ -3146,22 +3146,22 @@ fn offer_caveat_pack_signs_low_danger_defers_high_danger_excludes_git() {
     assert!(warnings.is_empty(), "{warnings:?}");
 
     assert_eq!(
-        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "cat"),
+        newt_core::ocap_store::evaluate_request(&set, newt_policy::DenialKind::Exec, "cat"),
         Some(newt_core::ocap_store::Verdict::Approve),
         "a listed tool is durably granted"
     );
     assert_eq!(
-        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Net, "127.0.0.1"),
+        newt_core::ocap_store::evaluate_request(&set, newt_policy::DenialKind::Net, "127.0.0.1"),
         Some(newt_core::ocap_store::Verdict::Approve),
         "the configured host is durably granted"
     );
     assert_eq!(
-        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "awk"),
+        newt_core::ocap_store::evaluate_request(&set, newt_policy::DenialKind::Exec, "awk"),
         None,
         "a named high-danger target is never durably signed"
     );
     assert_eq!(
-        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "git"),
+        newt_core::ocap_store::evaluate_request(&set, newt_policy::DenialKind::Exec, "git"),
         None,
         "an unlisted tool still falls through to the interactive gate"
     );
@@ -3278,7 +3278,7 @@ fn offer_caveat_pack_excludes_a_drop_in_git_path_spelling() {
         newt_core::ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
-        newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, "git"),
+        newt_core::ocap_store::evaluate_request(&set, newt_policy::DenialKind::Exec, "git"),
         None,
         "a drop-in git spelling must never be durably signed"
     );
@@ -3326,7 +3326,7 @@ fn offer_caveat_pack_drop_in_addition_attempt_is_ignored_with_notice() {
     assert!(warnings.is_empty(), "{warnings:?}");
     for never in ["sed", "find", "sort", "git"] {
         assert_eq!(
-            newt_core::ocap_store::evaluate_request(&set, newt_core::DenialKind::Exec, never),
+            newt_core::ocap_store::evaluate_request(&set, newt_policy::DenialKind::Exec, never),
             None,
             "an attempted drop-in addition must never be durably signed: {never}"
         );

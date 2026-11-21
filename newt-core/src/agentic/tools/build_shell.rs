@@ -5,9 +5,9 @@ use super::super::content_spill::SpillStore;
 use super::super::display::ToolPresentation;
 use super::super::smart_harness::SmartHarness;
 use super::{shell, PermissionDecision, PermissionGate, PermissionRequest};
-use crate::caveats::Caveats;
 use crate::confined_exec::build_tool_request;
 use crate::ExecOutcome;
+use newt_policy::caveats::Caveats;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

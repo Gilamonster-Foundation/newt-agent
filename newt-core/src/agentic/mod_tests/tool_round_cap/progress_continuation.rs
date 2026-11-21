@@ -339,7 +339,7 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         // cwd is rejected before spawn. AppContainer evidence lives in the
         // dedicated Windows evidence lane.
         #[cfg(windows)]
-        let caveats = crate::caveats::Caveats::top();
+        let caveats = newt_policy::caveats::Caveats::top();
         // Everywhere else: exercise the invalid cwd under the same confined
         // caveats (network excepted) this scenario runs under in practice,
         // so the non-Windows lane still covers "confined except network"
@@ -347,7 +347,7 @@ async fn recovered_command_error_does_not_invent_a_repair_task_on_any_provider()
         #[cfg(not(windows))]
         let caveats = {
             let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-            caveats.net = crate::caveats::Scope::All;
+            caveats.net = newt_policy::caveats::Scope::All;
             caveats
         };
         let uri = server.uri();

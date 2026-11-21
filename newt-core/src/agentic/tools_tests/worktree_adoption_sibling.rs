@@ -1,8 +1,8 @@
 //! #2757: ground destination approvals in real confined Git with bounded reads.
 use super::*;
-use crate::permissions::widen_caveats;
 use crate::worktree_adoption::WorktreeSession;
 use crate::{ExecOutcome, Scope};
+use newt_policy::permissions::widen_caveats;
 
 #[derive(Default)]
 struct AllowOnce(
@@ -14,10 +14,10 @@ struct AllowOnce(
 impl PermissionGate for AllowOnce {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("approval must preserve the caller baseline")
@@ -66,10 +66,10 @@ struct ReadOnly;
 impl PermissionGate for ReadOnly {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn refresh_caveats(&mut self, base: &Caveats) -> PermissionDecision {
         PermissionDecision::Allow(Caveats {
@@ -123,7 +123,7 @@ async fn plan_release_preserves_worktree_adoption() {
         }
         let mut base = Caveats::top();
         base.net = Scope::none();
-        crate::caveats::lock_fs_to_workspace(&mut base, root.to_str().unwrap(), &[], &[]);
+        newt_policy::caveats::lock_fs_to_workspace(&mut base, root.to_str().unwrap(), &[], &[]);
         let session = WorktreeSession::default();
         for refuse_exec in [false, true] {
             let mut failed_gate = AllowOnce::default();

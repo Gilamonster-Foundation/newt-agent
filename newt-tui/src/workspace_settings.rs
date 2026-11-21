@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use newt_core::durable_grants::{self, ReviewedWorkspaceEdit, VerifiedSnapshot, WorkspaceProfile};
 use newt_core::interaction_form::{self, NO, YES};
 use newt_core::interaction_surface::SurfaceInteraction;
-use newt_core::{Caveats, HumanQuestionOutcome, PermissionPreset, Scope, ToolPermissions};
+use newt_core::{Caveats, PermissionPreset, Scope, ToolPermissions};
 use newt_interaction::OptionId;
+use newt_policy::HumanQuestionOutcome;
 
 pub(crate) struct WorkspaceSettingsContext<'a> {
     pub workspace: &'a Path,

@@ -14,7 +14,7 @@ use crate::agentic::prompt_read::PromptReadContext;
 use crate::agentic::recall::RecallSource;
 use crate::agentic::tools::live_output::ToolSpinner;
 use crate::agentic::tools::{execute_tool_inner, shell, tool_presentation};
-use crate::permissions::PermissionGate;
+use newt_policy::permissions::PermissionGate;
 
 #[allow(clippy::too_many_arguments)]
 /// The optional collaborator seams a tool dispatch may carry, bundled into ONE
@@ -60,7 +60,7 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     pub(crate) artifact_context: Option<ArtifactReadContext<'a>>,
     pub(crate) artifact_sink: Option<&'a dyn agentic::artifact_read::PromptArtifactSink>,
     pub(crate) permission_gate: Option<&'gate mut dyn PermissionGate>,
-    pub(crate) exec_floor: Option<&'a crate::caveats::Scope<String>>,
+    pub(crate) exec_floor: Option<&'a newt_policy::caveats::Scope<String>>,
     pub(crate) git_tool: Option<&'a dyn GitTool>,
     pub(crate) crew_runner: Option<&'a dyn CrewRunner>,
     pub(crate) scratchpad_store: Option<&'a dyn agentic::scratchpad::ScratchpadStore>,
@@ -126,14 +126,14 @@ pub async fn execute_tool(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     build_check_cmd: Option<&str>,
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
     memory_source: Option<&dyn MemorySource>,
     permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
+    exec_floor: Option<&newt_policy::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn agentic::scratchpad::ScratchpadStore>,
@@ -188,14 +188,14 @@ pub async fn execute_tool_with_offload(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     build_check_cmd: Option<&str>,
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
     memory_source: Option<&dyn MemorySource>,
     permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
+    exec_floor: Option<&newt_policy::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn agentic::scratchpad::ScratchpadStore>,
@@ -254,7 +254,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     build_check_cmd: Option<&str>,
     note_sink: Option<&mut dyn NoteSink>,
@@ -264,7 +264,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     artifact_context: Option<ArtifactReadContext<'_>>,
     artifact_sink: Option<&dyn agentic::artifact_read::PromptArtifactSink>,
     permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
+    exec_floor: Option<&newt_policy::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn agentic::scratchpad::ScratchpadStore>,
@@ -327,7 +327,7 @@ pub async fn execute_tool_quiet(
     name: &str,
     args: &serde_json::Value,
     workspace: &str,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
 ) -> (String, bool) {
     let slot = std::sync::OnceLock::new();
     let collab = ToolCollaborators {
@@ -367,7 +367,7 @@ pub(crate) async fn execute_tool_with_collaborators(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
@@ -421,7 +421,7 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,

@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 
 use newt_core::config::Crew;
 use newt_core::interaction_surface::SurfaceInteraction;
-use newt_core::{Config, HumanQuestionOutcome};
+use newt_core::Config;
 use newt_interaction::InteractionDefinition;
+use newt_policy::HumanQuestionOutcome;
 
 use state::{CrewForm, Fold};
 

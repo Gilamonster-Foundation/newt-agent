@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::config::{backup_path, Config, ConfigEdit};
-use crate::permissions::{ChoiceSpec, HumanQuestionOutcome, PermissionGate};
+use newt_policy::permissions::{ChoiceSpec, HumanQuestionOutcome, PermissionGate};
 
 /// `no` first: a blank submission is the default, and the default declines.
 const CONFIG_EDIT_CHOICES: &[ChoiceSpec] = &[
@@ -136,16 +136,16 @@ mod tests {
     impl PermissionGate for ChoiceGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(
             &mut self,
-            _: &[crate::permissions::PermissionRequest],
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _: &[newt_policy::permissions::PermissionRequest],
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             panic!("a config edit is a choice, not free text")

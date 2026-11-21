@@ -15,7 +15,7 @@ async fn mac_tmp_alias_dispatch_and_adoption_persist() {
     assert!(crate::confined_exec::kernel_fs_fence_available());
     for alias in ["/tmp", "/var", "/etc"] {
         assert_eq!(
-            crate::caveats::lexically_normalize(alias),
+            newt_policy::caveats::lexically_normalize(alias),
             std::path::PathBuf::from(format!("/private{alias}"))
         );
     }
@@ -57,7 +57,7 @@ async fn mac_tmp_alias_dispatch_and_adoption_persist() {
             fs_write: Scope::only([root.to_str().unwrap().into()]),
             ..Caveats::top()
         };
-        let authority = crate::widen_caveats(
+        let authority = newt_policy::widen_caveats(
             &base,
             &[(DenialKind::FsWrite, grant.to_str().unwrap().into())],
         );

@@ -47,7 +47,7 @@ use newt_interaction::{
 };
 
 use crate::tty::Question;
-use crate::PermissionAction;
+use newt_policy::PermissionAction;
 
 /// The single control every adapted question carries.
 ///

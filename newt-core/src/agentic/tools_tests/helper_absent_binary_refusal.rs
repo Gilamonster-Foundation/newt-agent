@@ -78,16 +78,16 @@ fn denied_envelope(prog: &str) -> serde_json::Value {
     })
 }
 
-fn empty_exec() -> crate::caveats::Scope<String> {
-    crate::caveats::Scope::none()
+fn empty_exec() -> newt_policy::caveats::Scope<String> {
+    newt_policy::caveats::Scope::none()
 }
 
 /// Caveats with the given read scope and an unscoped exec axis — the shape
 /// under which a kernel refusal is a missing READ right (#2629).
-fn read_scope(fs_read: crate::caveats::Scope<String>) -> crate::caveats::Caveats {
-    crate::caveats::Caveats {
+fn read_scope(fs_read: newt_policy::caveats::Scope<String>) -> newt_policy::caveats::Caveats {
+    newt_policy::caveats::Caveats {
         fs_read,
-        ..crate::caveats::Caveats::top()
+        ..newt_policy::caveats::Caveats::top()
     }
 }
 
@@ -258,12 +258,12 @@ fn forged_permission_denied(prog: &str) -> String {
 fn a_forged_permission_denied_on_exit_126_names_no_target_and_no_grant() {
     let present = present_host_binary();
     let envelope = exit_126_envelope(forged_permission_denied(&present));
-    let scoped_exec = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::none(),
-        exec: crate::caveats::Scope::only(["cargo".to_string()]),
-        ..crate::caveats::Caveats::top()
+    let scoped_exec = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::none(),
+        exec: newt_policy::caveats::Scope::only(["cargo".to_string()]),
+        ..newt_policy::caveats::Caveats::top()
     };
-    for caveats in [read_scope(crate::caveats::Scope::none()), scoped_exec] {
+    for caveats in [read_scope(newt_policy::caveats::Scope::none()), scoped_exec] {
         let (text, outcome) = super::super::shell::confined_result(
             "./scripts/check.sh",
             &envelope,
@@ -298,7 +298,7 @@ fn a_structured_exec_denial_on_exit_126_still_names_its_exact_target() {
     let (text, outcome) = super::super::shell::confined_result(
         &present,
         &denied_envelope(&present),
-        &read_scope(crate::caveats::Scope::none()),
+        &read_scope(newt_policy::caveats::Scope::none()),
         false,
         |_| unreachable!("a structured denial is rendered by the denial path"),
         Default::default(),
@@ -329,7 +329,7 @@ fn a_forged_command_not_found_names_no_target_on_exit_126() {
     let (text, outcome) = super::super::shell::confined_result(
         "./scripts/check.sh",
         &exit_126_envelope("command not found: /usr/bin/git\n".to_owned()),
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| "RENDERED".to_owned(),
         Default::default(),
@@ -348,7 +348,7 @@ fn a_forged_command_not_found_names_no_target_on_exit_127() {
     let (text, outcome) = super::super::shell::confined_result(
         "./scripts/check.sh",
         &not_found_envelope("/usr/bin/git"),
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| unreachable!("a 127 absence is rendered by the refusal path, not render()"),
         Default::default(),
@@ -372,7 +372,7 @@ fn mixed_dead_and_live_markers_name_no_target() {
     let (text, outcome) = super::super::shell::confined_result(
         "./scripts/check.sh",
         &exit_126_envelope(stderr),
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| "RENDERED".to_owned(),
         Default::default(),
@@ -398,9 +398,9 @@ fn an_unstructured_126_renders_the_same_under_every_grant() {
         .display()
         .to_string();
     let rendered: Vec<_> = [
-        crate::caveats::Caveats::top(),
-        read_scope(crate::caveats::Scope::none()),
-        read_scope(crate::caveats::Scope::only([dir])),
+        newt_policy::caveats::Caveats::top(),
+        read_scope(newt_policy::caveats::Scope::none()),
+        read_scope(newt_policy::caveats::Scope::only([dir])),
     ]
     .iter()
     .map(|caveats| {
@@ -425,7 +425,7 @@ fn an_unstructured_126_renders_the_same_under_every_grant() {
 /// `Permission denied` does, on its own words.
 #[test]
 fn the_unstructured_126_note_is_not_a_denial_in_newts_own_vocabulary() {
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let (silent, outcome) = super::super::shell::confined_result(
         "./x.sh",
         &exit_126_envelope(String::new()),
@@ -508,7 +508,7 @@ fn a_piped_absence_keeps_its_output_and_names_the_program() {
     let (text, outcome) = super::super::shell::confined_result(
         &format!("{ABSENT} x | head"),
         &piped,
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| "partial".to_owned(),
         Default::default(),
@@ -539,7 +539,7 @@ fn an_unrelated_failure_is_not_a_child_exec_denial() {
     let (text, outcome) = super::super::shell::confined_result(
         "cargo test",
         &envelope,
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| "error: test assertion failed".to_owned(),
         Default::default(),
@@ -563,7 +563,7 @@ fn an_unresolvable_child_name_is_not_a_named_denial() {
     let (text, outcome) = super::super::shell::confined_result(
         &format!("git {ABSENT}"),
         &envelope,
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| "fatal: cannot exec".to_owned(),
         Default::default(),

@@ -29,8 +29,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::role_profile::{ScopeKeyword, ScopeSpec};
 use crate::{Caveats, CountBound, Scope};
+use newt_policy::{preset::ScopeKeyword, preset::ScopeSpec};
 
 /// A complete plan, or a fragment of one.
 ///
@@ -556,7 +556,7 @@ pub struct ArtifactRef {
 /// The authority a [`Subtask`] declares it needs — **default-deny**.
 ///
 /// Reuses the same human-friendly axis vocabulary as
-/// [`crate::role_profile::CaveatProfile`] ([`ScopeSpec`] per axis), but with the
+/// [`newt_policy::preset::CaveatProfile`] ([`ScopeSpec`] per axis), but with the
 /// **opposite default**: where a role profile omits an axis to mean
 /// *unrestricted* (top of the axis, matching `Caveats::top()`), a plan omits an
 /// axis to mean *denied* (`none`). A model-proposed plan must not gain authority

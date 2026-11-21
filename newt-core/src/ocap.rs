@@ -1022,7 +1022,7 @@ pub fn verify_fail_closed_execution() -> Verification {
 /// cannot be established.
 ///
 /// `Verified` iff both halves are enforceable on this host: the seccomp filter
-/// ([`crate::netguard::egress_deny_supported`]) and the Landlock fs fence
+/// ([`newt_policy::netguard::egress_deny_supported`]) and the Landlock fs fence
 /// ([`crate::confined_exec::kernel_fs_fence_available`]).
 ///
 /// **This does NOT claim the child cannot reach the network at all.** The
@@ -1038,7 +1038,7 @@ pub fn verify_fail_closed_execution() -> Verification {
 pub fn verify_network_confinement() -> Verification {
     #[cfg(target_os = "linux")]
     {
-        if crate::netguard::egress_deny_supported()
+        if newt_policy::netguard::egress_deny_supported()
             && crate::confined_exec::kernel_fs_fence_available()
         {
             Verification::Verified {

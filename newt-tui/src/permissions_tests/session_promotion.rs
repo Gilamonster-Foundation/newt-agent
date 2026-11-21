@@ -1,7 +1,8 @@
 use super::workflow::{load_session_grants, review_session_grants, store_session_grants};
 use super::*;
 use crate::mcp::Mcp;
-use newt_core::{Caveats, CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
+use newt_core::Caveats;
+use newt_policy::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -121,7 +122,7 @@ fn a_nonreplayable_session_snapshot_is_rejected_before_confirmation() {
             state.session_denials.insert(grant);
         }
         let floor = Caveats {
-            exec: newt_core::caveats::Scope::none(),
+            exec: newt_policy::caveats::Scope::none(),
             ..Caveats::top()
         };
         let result = review_session_grants(
@@ -151,7 +152,7 @@ fn durable_allows_are_exact_and_denials_still_win() {
         harness_bound: false,
     };
     let base = Caveats {
-        net: newt_core::caveats::Scope::none(),
+        net: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     {
@@ -187,7 +188,7 @@ fn durable_allows_are_exact_and_denials_still_win() {
     );
     assert!(matches!(
         gate.ask(&[request]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert!(!gate
         .mint(&gate.base, &[])
@@ -216,8 +217,8 @@ async fn recalled_directory_grants_do_not_bypass_permanent_child_denials() {
             .persistent_denials
             .insert((kind, child.display().to_string()));
         let base = Caveats {
-            fs_read: newt_core::caveats::Scope::none(),
-            fs_write: newt_core::caveats::Scope::none(),
+            fs_read: newt_policy::caveats::Scope::none(),
+            fs_write: newt_policy::caveats::Scope::none(),
             ..Caveats::top()
         };
         let caveats = state.recalled_caveats(&base, None).unwrap();
@@ -272,7 +273,7 @@ fn recalled_basename_exec_grant_excludes_a_permanently_denied_path() {
         .persistent_denials
         .insert((DenialKind::Exec, "/fixture/bin/inspect".into()));
     let base = Caveats {
-        exec: newt_core::caveats::Scope::none(),
+        exec: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     assert!(!state
@@ -280,7 +281,7 @@ fn recalled_basename_exec_grant_excludes_a_permanently_denied_path() {
         .unwrap()
         .permits_exec("inspect"));
     let configured = Caveats {
-        exec: newt_core::caveats::Scope::only(["inspect".into()]),
+        exec: newt_policy::caveats::Scope::only(["inspect".into()]),
         ..base
     };
     assert!(
@@ -339,9 +340,9 @@ fn recall_overlap_checks_all_deny_sources_without_removing_unrelated_authority()
                 }
             }
             let base = Caveats {
-                fs_read: newt_core::caveats::Scope::none(),
-                fs_write: newt_core::caveats::Scope::none(),
-                exec: newt_core::caveats::Scope::none(),
+                fs_read: newt_policy::caveats::Scope::none(),
+                fs_write: newt_policy::caveats::Scope::none(),
+                exec: newt_policy::caveats::Scope::none(),
                 ..Caveats::top()
             };
             let recalled = state.recalled_caveats(&base, None).unwrap();
@@ -353,7 +354,7 @@ fn recall_overlap_checks_all_deny_sources_without_removing_unrelated_authority()
                 ceiling_permits(&recalled, kind, unrelated),
                 "{source} {kind:?}"
             );
-            let configured = newt_core::widen_caveats(&base, &[(kind, allowed.into())]);
+            let configured = newt_policy::widen_caveats(&base, &[(kind, allowed.into())]);
             assert!(ceiling_permits(
                 &state.recalled_caveats(&configured, None).unwrap(),
                 kind,
@@ -416,7 +417,7 @@ fn durable_remote_allow_works_with_new_prompts_disabled() {
     gate.authorization_prompts_enabled = false;
     assert!(matches!(
         gate.ask(std::slice::from_ref(&request)),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     let missing = PermissionRequest {
         target: "server__other".into(),
@@ -424,7 +425,7 @@ fn durable_remote_allow_works_with_new_prompts_disabled() {
     };
     assert!(matches!(
         gate.ask(&[missing]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
 }

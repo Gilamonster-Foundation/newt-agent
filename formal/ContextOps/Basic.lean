@@ -144,7 +144,7 @@ inductive Root where
   | operatorPrompt
   /-- The human DID: intent expressed as control. Unambiguous by construction,
       and non-repudiable via the verdict-bound challenge in
-      `newt-core/src/permission_challenge.rs`. -/
+      `newt-policy/src/permission_challenge.rs`. -/
   | userAction
   /-- The machine decided: a budget threshold, a retry, an automatic seal. -/
   | harnessEvent

@@ -139,7 +139,7 @@ pub(crate) enum SurfaceRequest {
     /// layering is the epic's non-goal made structural rather than stated.
     Interact {
         interaction: Box<newt_core::interaction_surface::SurfaceInteraction>,
-        reply: SyncSender<newt_core::HumanQuestionOutcome>,
+        reply: SyncSender<newt_policy::HumanQuestionOutcome>,
     },
     /// **Lend this session rows on the REAL terminal, for a panel.**
     ///
@@ -544,7 +544,7 @@ impl crate::chat::InputSurface for RemoteSurface {
     fn present_interaction(
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
-    ) -> newt_core::HumanQuestionOutcome {
+    ) -> newt_policy::HumanQuestionOutcome {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let interaction = Box::new(interaction.clone());
         // A dead or silent UI thread means nobody can be asked — which is
@@ -555,7 +555,7 @@ impl crate::chat::InputSurface for RemoteSurface {
             rx,
             tx,
         )
-        .unwrap_or(newt_core::HumanQuestionOutcome::Unavailable)
+        .unwrap_or(newt_policy::HumanQuestionOutcome::Unavailable)
     }
 }
 
@@ -1018,7 +1018,7 @@ mod tests {
             for request in &from_session {
                 if let SurfaceRequest::Interact { interaction, reply } = request {
                     seen = Some((*interaction).clone());
-                    let _ = reply.send(newt_core::HumanQuestionOutcome::Answer("ok".into()));
+                    let _ = reply.send(newt_policy::HumanQuestionOutcome::Answer("ok".into()));
                 }
             }
             seen
@@ -1030,7 +1030,7 @@ mod tests {
         };
         assert_eq!(
             outcome,
-            newt_core::HumanQuestionOutcome::Answer("ok".into())
+            newt_policy::HumanQuestionOutcome::Answer("ok".into())
         );
 
         let arrived = served
@@ -1234,9 +1234,9 @@ mod tests {
         fn present_interaction(
             &mut self,
             _interaction: &newt_core::interaction_surface::SurfaceInteraction,
-        ) -> newt_core::HumanQuestionOutcome {
+        ) -> newt_policy::HumanQuestionOutcome {
             self.present_interaction += 1;
-            newt_core::HumanQuestionOutcome::Answer("served".into())
+            newt_policy::HumanQuestionOutcome::Answer("served".into())
         }
 
         fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
@@ -1441,8 +1441,8 @@ mod tests {
         fn present_interaction(
             &mut self,
             _interaction: &newt_core::interaction_surface::SurfaceInteraction,
-        ) -> newt_core::HumanQuestionOutcome {
-            newt_core::HumanQuestionOutcome::Unavailable
+        ) -> newt_policy::HumanQuestionOutcome {
+            newt_policy::HumanQuestionOutcome::Unavailable
         }
 
         fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {

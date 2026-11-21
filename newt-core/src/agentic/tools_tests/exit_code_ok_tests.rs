@@ -209,13 +209,13 @@ use crate::ExecOutcome;
 fn confined_with(
     cmd: &str,
     envelope: serde_json::Value,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
 ) -> (String, ExecOutcome) {
     super::shell::confined_result(cmd, &envelope, caveats, false, render, Default::default())
 }
 
 fn confined(cmd: &str, envelope: serde_json::Value) -> (String, ExecOutcome) {
-    confined_with(cmd, envelope, &crate::caveats::Caveats::top())
+    confined_with(cmd, envelope, &newt_policy::caveats::Caveats::top())
 }
 
 fn host(envelope: serde_json::Value) -> (String, ExecOutcome) {
@@ -323,9 +323,9 @@ fn host_lane_127_is_unavailable_only_when_the_program_does_not_resolve() {
 /// grant. (Before: `Denied`, `capability denied: exec of sh at …`.)
 #[test]
 fn an_unstructured_126_is_a_failure_not_a_denial() {
-    let no_reads = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let no_reads = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let (text, class) = confined_with(
         "sh -c true",
@@ -548,7 +548,7 @@ fn none_execution_falls_back_to_text_classifier() {
 #[tokio::test]
 async fn a_real_read_file_enoent_dispatch_ledgers_as_ok() {
     use crate::agentic::NoMcp;
-    use crate::caveats::{Caveats, CountBound, Scope};
+    use newt_policy::caveats::{Caveats, CountBound, Scope};
 
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats {
@@ -602,7 +602,7 @@ async fn a_real_read_file_enoent_dispatch_ledgers_as_ok() {
 #[tokio::test]
 async fn a_real_read_file_success_with_error_prefixed_content_ledgers_as_ok() {
     use crate::agentic::NoMcp;
-    use crate::caveats::{Caveats, CountBound, Scope};
+    use newt_policy::caveats::{Caveats, CountBound, Scope};
 
     let ws = tempfile::TempDir::new().unwrap();
     std::fs::write(

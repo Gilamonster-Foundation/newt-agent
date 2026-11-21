@@ -1,7 +1,7 @@
 use super::*;
 use newt_core::agentic::openai_chat_complete;
-use newt_core::caveats::Caveats;
 use newt_core::{BackendKind, MemMessage};
+use newt_policy::caveats::Caveats;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use wiremock::matchers::{method, path};

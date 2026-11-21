@@ -65,7 +65,7 @@ fn normal_checkout(cwd: &Path, read: &crate::Scope<String>) -> Option<()> {
     let cwd = cwd.canonicalize().ok()?;
     for dir in cwd.ancestors() {
         let dot_git = dir.join(".git");
-        if !crate::permits_path(read, &dot_git.to_string_lossy()) {
+        if !newt_policy::permits_path(read, &dot_git.to_string_lossy()) {
             return None;
         }
         match std::fs::symlink_metadata(&dot_git) {
@@ -74,7 +74,7 @@ fn normal_checkout(cwd: &Path, read: &crate::Scope<String>) -> Option<()> {
                     return None;
                 }
                 let common = dot_git.join("commondir");
-                if !crate::permits_path(read, &common.to_string_lossy()) {
+                if !newt_policy::permits_path(read, &common.to_string_lossy()) {
                     return None;
                 }
                 return match std::fs::symlink_metadata(common) {

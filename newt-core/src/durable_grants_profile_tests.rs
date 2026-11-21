@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{PermissionPreset, ToolPermissions};
-use crate::{Scope, ScopeExt as _};
+use crate::Scope;
+use newt_policy::ScopeExt as _;
 
 fn profile(workspace: &Path) -> WorkspaceProfile {
     WorkspaceProfile::new(
@@ -317,15 +318,15 @@ fn redundant_profile_directories_preserve_effective_access_and_pass_protection()
         protection
             .validate_caveats(&caveats)
             .expect("redundant in-workspace roots must not invalidate the admitted fence");
-        assert!(crate::permits_path(
+        assert!(newt_policy::permits_path(
             &caveats.fs_write,
             nested.join("output").to_str().unwrap()
         ));
-        assert!(!crate::permits_path(
+        assert!(!newt_policy::permits_path(
             &caveats.fs_write,
             operator.join("output").to_str().unwrap()
         ));
-        assert!(!crate::permits_path(
+        assert!(!newt_policy::permits_path(
             &caveats.fs_read,
             operator.join("identity.pem").to_str().unwrap()
         ));

@@ -19,8 +19,8 @@
 //! operator narrows it — #749 step 8). The `/team` toggle is the operator's on/off;
 //! the `meet` is the structural bound. See `docs/design/crew-swarm-overseer.md`.
 
-use crate::caveats::Caveats;
 use async_trait::async_trait;
+use newt_policy::caveats::Caveats;
 use serde_json::Value;
 
 /// The injected crew/team capability. Object-safe and shareable (the loop holds

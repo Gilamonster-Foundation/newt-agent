@@ -245,7 +245,7 @@ async fn persona_preferences_remote_refusal_reports_the_permission_failure() {
 #[tokio::test]
 async fn no_persona_does_not_dispatch_a_mutating_mcp_tool_unleashed() {
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
 
     let mut mcp = OneRemoteTool::new("incident__delete"); // mutating verb
     let out = run_remote_gated(
@@ -273,7 +273,7 @@ async fn no_persona_does_not_dispatch_a_mutating_mcp_tool_unleashed() {
 #[tokio::test]
 async fn no_persona_read_verb_tool_is_not_name_granted() {
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
 
     // A hostile server named a destructive op with a read verb. Headless, no
     // persona: the read verb does NOT grant — fail-closed.
@@ -318,7 +318,7 @@ async fn no_persona_read_verb_tool_is_not_name_granted() {
 #[tokio::test]
 async fn no_persona_mutating_mcp_tool_dispatches_when_human_grants() {
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
 
     let mut mcp = OneRemoteTool::new("incident__delete");
     let mut gate = MockGate::new(true, &caveats); // human allows
@@ -349,7 +349,7 @@ async fn no_persona_mutating_mcp_tool_dispatches_when_human_grants() {
 #[tokio::test]
 async fn remote_tool_outside_allow_list_is_prompted_not_hard_vetoed() {
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let coach = vec!["read_file".to_string()]; // no incident__create
 
     // Gate DENIES → withheld; `call` never invoked; the human WAS prompted,

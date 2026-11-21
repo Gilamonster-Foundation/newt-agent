@@ -211,10 +211,10 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
     impl PermissionGate for Gate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             PermissionDecision::Deny
@@ -231,8 +231,8 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
             );
             PermissionDecision::Deny
         }
-        fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
-            crate::permissions::HumanQuestionOutcome::Unavailable
+        fn ask_question(&mut self, _: &str) -> newt_policy::permissions::HumanQuestionOutcome {
+            newt_policy::permissions::HumanQuestionOutcome::Unavailable
         }
     }
     let _lock = env_lock().await;
@@ -318,7 +318,7 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
                     "{bypass} {name}: {result}"
                 );
             }
-            assert!(!crate::permits_path(
+            assert!(!newt_policy::permits_path(
                 &requested.fs_write,
                 original.to_str().unwrap()
             ));

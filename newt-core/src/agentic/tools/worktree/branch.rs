@@ -1,7 +1,8 @@
 //! #2748: exact new-branch commands use bounded native writes, never broad
 //! refs-directory grants to a shell. All other commands retain the fence.
 use super::super::{native_git::push_command::GovernedCommand, shell, PermissionRequest};
-use crate::{caveats::CaveatsExt, worktree_adoption::AdoptedWorktree, Caveats, ExecOutcome};
+use crate::{worktree_adoption::AdoptedWorktree, Caveats, ExecOutcome};
+use newt_policy::caveats::CaveatsExt;
 use std::path::Path;
 
 #[path = "branch_intent.rs"]
@@ -76,7 +77,7 @@ fn known_operand(cwd: &Path, caveats: &Caveats, name: &str, checkout: bool) -> b
     // Recognition only: the command still runs under its original fence.
     // Reuse a bounded nonblocking open; never stat an escaping operand.
     checkout
-        && held.is_regular_file(&crate::caveats::lexically_normalize(
+        && held.is_regular_file(&newt_policy::caveats::lexically_normalize(
             &cwd.join(name).to_string_lossy(),
         ))
 }

@@ -9,7 +9,7 @@ fn local_git_tool_log_lists_commits() {
             "log",
             &serde_json::json!({"limit": 5}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("first commit"), "got: {out}");
@@ -24,7 +24,7 @@ fn local_git_tool_add_then_commit_succeeds_when_permitted() {
             "add",
             &serde_json::json!({"paths": ["b.txt"]}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(staged.contains("b.txt"), "got: {staged}");
@@ -33,7 +33,7 @@ fn local_git_tool_add_then_commit_succeeds_when_permitted() {
             "commit",
             &serde_json::json!({"message": "add b"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(committed.starts_with("committed "), "got: {committed}");
@@ -48,14 +48,14 @@ fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
         "add",
         &serde_json::json!({"paths": ["d.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "add d"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let count_before = commit_count(dir.path());
@@ -66,7 +66,7 @@ fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
             "amend",
             &serde_json::json!({"message": "add d (reworded)"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.starts_with("amended "), "got: {out}");
@@ -89,7 +89,7 @@ fn local_git_tool_amend_keeps_message_when_omitted() {
         "amend",
         &serde_json::json!({}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     assert!(head_message(dir.path()).contains("first commit"));
@@ -103,7 +103,7 @@ fn local_git_tool_amend_denied_on_read_only() {
             "amend",
             &serde_json::json!({"message": "x"}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -121,7 +121,7 @@ fn local_git_tool_commit_denied_on_read_only_caveats() {
             "commit",
             &serde_json::json!({"message": "nope"}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -134,7 +134,7 @@ fn local_git_tool_commit_denied_on_read_only_caveats() {
             "status",
             &serde_json::json!({}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top()
+            &newt_policy::caveats::Caveats::top()
         )
         .is_ok());
 }
@@ -156,7 +156,7 @@ fn commit_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
         "add",
         &serde_json::json!({"paths": ["b.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let err = t
@@ -164,7 +164,7 @@ fn commit_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
             "commit",
             &serde_json::json!({"message": "should not land"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("default branch"), "got: {err}");
@@ -190,7 +190,7 @@ fn amend_on_the_default_branch_is_refused_and_leaves_the_ref_unmoved() {
             "amend",
             &serde_json::json!({"message": "should not land"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("default branch"), "got: {err}");
@@ -214,7 +214,7 @@ fn branch_delete_of_the_default_branch_is_refused() {
             "branch-delete",
             &serde_json::json!({"name": "main"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("default branch"), "got: {err}");
@@ -252,7 +252,7 @@ fn commit_onto_a_deleted_and_recreated_default_branch_is_still_refused() {
             "commit",
             &serde_json::json!({"message": "should not land"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("default branch"), "got: {err}");

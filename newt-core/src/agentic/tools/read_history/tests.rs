@@ -194,7 +194,7 @@ async fn native_dispatch_maps_only_authorized_reads() {
         tools::{execute_tool_with_collaborators, ToolCollaborators},
         NoMcp,
     };
-    use crate::caveats::{Caveats, Scope};
+    use newt_policy::caveats::{Caveats, Scope};
     let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
     let ws = tempfile::tempdir().unwrap();
     std::fs::write(ws.path().join("large.rs"), large_rust()).unwrap();

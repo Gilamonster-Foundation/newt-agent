@@ -21,9 +21,9 @@
 //! ↔ a future panel/tournament) the same way it swaps the `Dispatcher` transport.
 
 use crate::{BackendPool, ChatRequest, Dispatcher};
-use newt_core::caveats::{Caveats, CaveatsExt, CountBoundExt};
 use newt_core::lazy_emission::lazy_emission_reason;
 use newt_core::TokenUsage;
+use newt_policy::caveats::{Caveats, CaveatsExt, CountBoundExt};
 use newt_router::Tier;
 use serde::Deserialize;
 
@@ -1020,7 +1020,7 @@ mod tests {
             &HangingDispatcher,
             &mut ws,
             &cc,
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "modify target.rs to be GOOD",
             &[],
         )
@@ -1082,7 +1082,7 @@ mod tests {
             &AlwaysEditGoodMock,
             &mut ws,
             &cfg(1),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &["other.rs".to_string()],
         )
@@ -1112,7 +1112,7 @@ mod tests {
             &AlwaysEditGoodMock,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &[],
         )
@@ -1145,7 +1145,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &[],
         )
@@ -1167,7 +1167,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(1),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &[],
         )
@@ -1236,7 +1236,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &scope,
         )
@@ -1263,7 +1263,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &[],
         )
@@ -1320,7 +1320,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &scope,
         )
@@ -1393,7 +1393,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(1),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &scope,
         )
@@ -1426,7 +1426,7 @@ mod tests {
             &d2,
             &mut ws2,
             &cfg(1),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &[],
         )
@@ -1447,9 +1447,9 @@ mod tests {
         let p = pool();
         let d = RoleMock::new();
         let mut ws = MemWs::new();
-        let read_only = newt_core::caveats::Caveats {
-            fs_write: newt_core::caveats::Scope::none(),
-            ..newt_core::caveats::Caveats::top()
+        let read_only = newt_policy::caveats::Caveats {
+            fs_write: newt_policy::caveats::Scope::none(),
+            ..newt_policy::caveats::Caveats::top()
         };
         let out = run_crew(
             &p,
@@ -1543,9 +1543,9 @@ mod tests {
             ]),
             reads: std::cell::RefCell::new(Vec::new()),
         };
-        let read_clamped = newt_core::caveats::Caveats {
-            fs_read: newt_core::caveats::Scope::only(["docs/x.rs".to_string()]),
-            ..newt_core::caveats::Caveats::top()
+        let read_clamped = newt_policy::caveats::Caveats {
+            fs_read: newt_policy::caveats::Scope::only(["docs/x.rs".to_string()]),
+            ..newt_policy::caveats::Caveats::top()
         };
         let out = run_crew(
             &p,
@@ -1608,7 +1608,7 @@ mod tests {
             &LazyMock,
             &mut ws,
             &cfg(2),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "make target.rs GOOD",
             &[],
         )
@@ -1637,7 +1637,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "task",
             &[],
         )
@@ -1703,7 +1703,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "modify target.rs to be GOOD",
             &[],
         )
@@ -1759,7 +1759,7 @@ mod tests {
             &AlwaysZeroEditMock,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "modify target.rs to be GOOD",
             &[],
         )
@@ -1780,7 +1780,7 @@ mod tests {
             &AlwaysZeroEditMock,
             &mut ws,
             &cfg(3),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "ensure target.rs still validates",
             &[],
         )
@@ -1855,9 +1855,9 @@ mod tests {
             dispatches: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let budget = newt_core::caveats::Caveats {
-            max_calls: newt_core::caveats::CountBound::AtMost(3),
-            ..newt_core::caveats::Caveats::top()
+        let budget = newt_policy::caveats::Caveats {
+            max_calls: newt_policy::caveats::CountBound::AtMost(3),
+            ..newt_policy::caveats::Caveats::top()
         };
         let out = run_crew(
             &p,
@@ -1888,9 +1888,9 @@ mod tests {
             dispatches: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let budget = newt_core::caveats::Caveats {
-            max_calls: newt_core::caveats::CountBound::AtMost(0),
-            ..newt_core::caveats::Caveats::top()
+        let budget = newt_policy::caveats::Caveats {
+            max_calls: newt_policy::caveats::CountBound::AtMost(0),
+            ..newt_policy::caveats::Caveats::top()
         };
         let out = run_crew(&p, &d, &mut ws, &cfg(5), &budget, "modify target.rs", &[]).await;
         assert_eq!(

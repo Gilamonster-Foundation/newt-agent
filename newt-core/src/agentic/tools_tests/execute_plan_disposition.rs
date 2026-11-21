@@ -54,7 +54,7 @@ async fn run_scheduled_tool_with_disposition(
 /// a `git_write` capability.
 #[test]
 fn plan_phase_seam_and_clamp() {
-    use crate::caveats::ScopeExt as _;
+    use newt_policy::caveats::ScopeExt as _;
     // The clamp is read-only: reads yes, writes/exec/net no.
     let c = plan_phase_clamp();
     assert!(c.fs_read.permits(&"/anything".to_string()));
@@ -62,7 +62,7 @@ fn plan_phase_seam_and_clamp() {
     assert!(!c.exec.permits(&"cargo".to_string()));
     assert!(!c.net.permits(&"github.com".to_string()));
     // MEETing it into a full grant yields read-only (never widens).
-    let full = crate::caveats::Caveats::top();
+    let full = newt_policy::caveats::Caveats::top();
     let planned = full.meet(&c);
     assert!(
         !planned.fs_write.permits(&"/x".to_string()),
@@ -770,7 +770,7 @@ async fn auto_mode_selector_dispatches_through_session_control_without_current_w
 async fn web_reads_respect_explicit_plan_and_operator_network_decisions() {
     let ws = tempfile::TempDir::new().unwrap();
     let mut caveats = Caveats::top();
-    caveats.net = crate::caveats::Scope::none();
+    caveats.net = newt_policy::caveats::Scope::none();
     let mut mcp = NoMcp;
     for (disposition, questions) in [
         (PromptDisposition::Plan, 0),

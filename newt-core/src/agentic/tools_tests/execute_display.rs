@@ -97,7 +97,7 @@ fn lifecycle_audit_names_the_resolved_command() {
         "lifecycle",
         &serde_json::json!({"phase": "test", "action": "run"}),
         ws.path(),
-        &crate::caveats::Scope::All,
+        &newt_policy::caveats::Scope::All,
     );
     let resolved = crate::tooling::resolved_phase_commands(ws.path(), crate::tooling::Phase::Test);
 
@@ -114,7 +114,7 @@ fn a_question_is_not_echoed_on_its_tool_call_line() {
         "request_user_input",
         &serde_json::json!({"question": "Which branches should go?"}),
         std::path::Path::new("ws"),
-        &crate::caveats::Scope::All,
+        &newt_policy::caveats::Scope::All,
     );
     assert_eq!((name.as_str(), detail.as_str()), ("request_user_input", ""));
 }
@@ -126,7 +126,7 @@ fn audit_preserves_whitespace_in_real_paths() {
         "read_file",
         &serde_json::json!({"path": " leading and trailing "}),
         ws.path(),
-        &crate::caveats::Scope::All,
+        &newt_policy::caveats::Scope::All,
     );
 
     assert_eq!(name, "read_file");
@@ -136,7 +136,7 @@ fn audit_preserves_whitespace_in_real_paths() {
         "run_command",
         &serde_json::json!({"command": "cd nested && printf exact-command"}),
         ws.path(),
-        &crate::caveats::Scope::All,
+        &newt_policy::caveats::Scope::All,
     );
     assert_eq!(name, "run_command");
     assert_eq!(detail, "cd nested && printf exact-command");
@@ -456,10 +456,10 @@ async fn live_shell_observation_does_not_change_headless_completion_bytes() {
 
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = Caveats {
-        exec: crate::caveats::Scope::only(["echo".to_string()]),
+        exec: newt_policy::caveats::Scope::only(["echo".to_string()]),
         // This fixture checks streaming bytes, with explicit authority for a
         // real native child on platforms without restricted-network proof.
-        net: crate::caveats::Scope::All,
+        net: newt_policy::caveats::Scope::All,
         ..caveats_rw(ws.path())
     };
     let args = serde_json::json!({"command": "echo byte-stable"});

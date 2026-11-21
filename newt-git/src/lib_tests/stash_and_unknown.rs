@@ -46,7 +46,7 @@ fn stash_is_a_known_op_and_write_gated() {
             "stash-list",
             &serde_json::json!({}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(
@@ -60,7 +60,7 @@ fn stash_is_a_known_op_and_write_gated() {
             "stash",
             &serde_json::json!({}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(

@@ -120,7 +120,7 @@ pub enum Attention {
 /// are correct there. They are what a thread-shaped adapter is FOR; they are
 /// simply not what a semantic type may contain.
 ///
-/// [`HumanQuestionOutcome`]: crate::HumanQuestionOutcome
+/// [`HumanQuestionOutcome`]: newt_policy::HumanQuestionOutcome
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurfaceInteraction {

@@ -26,7 +26,7 @@ pub(crate) struct SessionCapability {
     /// The live operating key. `None` if the per-user key is unavailable; the
     /// capability then degrades to a plain caveats floor (still narrowing-only).
     op: Option<newt_identity::AgentKey>,
-    caveats: newt_core::caveats::Caveats,
+    caveats: newt_policy::caveats::Caveats,
     delegation: Option<newt_identity::VerifiedDelegation>,
     frozen_at_launch: bool,
     #[cfg(target_os = "macos")]
@@ -152,7 +152,7 @@ impl SessionCapability {
     }
 
     /// The active enforcement caveats the tool loop consults.
-    pub(crate) fn caveats(&self) -> &newt_core::caveats::Caveats {
+    pub(crate) fn caveats(&self) -> &newt_policy::caveats::Caveats {
         &self.caveats
     }
 
@@ -305,7 +305,8 @@ fn pin_exec_policy(
 #[cfg(all(test, unix))]
 mod pin_tests {
     use super::*;
-    use newt_core::{Caveats, DenialKind, Scope};
+    use newt_core::{Caveats, Scope};
+    use newt_policy::DenialKind;
     use std::os::unix::fs::PermissionsExt;
 
     /// PR #2816: a recalled saved write approval must exclude its executable
@@ -337,7 +338,7 @@ mod pin_tests {
             .durable_grants
             .insert((DenialKind::FsWrite, bin.to_string_lossy().into_owned()));
         let writes = state.recalled_caveats(&policy, None).unwrap().fs_write;
-        assert!(newt_core::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &writes,
             program.to_str().unwrap()
         ));

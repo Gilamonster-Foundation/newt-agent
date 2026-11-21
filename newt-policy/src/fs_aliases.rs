@@ -58,11 +58,11 @@ fn trusted_link(uid: u32, symlink: bool, target: Option<&Path>, expected: &Path)
     uid == 0 && symlink && (target == Some(expected) || target == expected.strip_prefix("/").ok())
 }
 
-pub(crate) fn initialize() {
+pub fn initialize() {
     TABLE.get_or_init(|| Table::verify(trusted_alias));
 }
 
-pub(crate) fn rewrite(path: &str) -> Cow<'_, str> {
+pub fn rewrite(path: &str) -> Cow<'_, str> {
     // Embedders that do not use the process entry point still authenticate
     // once. Unavailable or unexpected aliases remain disabled for this process.
     initialize();

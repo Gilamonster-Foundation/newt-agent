@@ -12,8 +12,8 @@
 //! on the `anthropic_loop_env` lane.
 
 use super::*;
-use crate::caveats::Caveats;
 use crate::{BackendKind, MemMessage};
+use newt_policy::caveats::Caveats;
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};

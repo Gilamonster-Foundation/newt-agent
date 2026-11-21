@@ -432,7 +432,7 @@ const DEBT: &[Unit] = &[
         Wire,
         "terminal-echo authority helper is claimed as live but has no production caller.",
         [site(
-            "newt-core/src/permission_challenge.rs",
+            "newt-policy/src/permission_challenge.rs",
             "pub fn requires_terminal_echo"
         ),]
     ),

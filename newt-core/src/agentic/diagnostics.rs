@@ -110,7 +110,7 @@ pub(super) fn present_synthetic_tool_result<W: std::io::Write>(
     // this call originally ran, so an unrestricted fence here costs
     // nothing and avoids threading `Caveats` through a display-only path.
     let (name, detail) =
-        tools::tool_presentation(name, args, workspace, &crate::caveats::Scope::All);
+        tools::tool_presentation(name, args, workspace, &newt_policy::caveats::Scope::All);
     display.call(&name, &detail);
     display.result(result);
 }

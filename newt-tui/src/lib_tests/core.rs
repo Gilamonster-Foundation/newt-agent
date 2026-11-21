@@ -1562,10 +1562,10 @@ fn permission_audit_lines_lists_newest_entries_and_reports_bad_lines_as_breaks()
     let path = dir.path().join("permission-log.jsonl");
     newt_core::permission_journal::append_record(
         &path,
-        newt_core::PermissionRecord::new(
+        newt_policy::PermissionRecord::new(
             "c",
             "run_command",
-            newt_core::DenialKind::Exec,
+            newt_policy::DenialKind::Exec,
             "/bin/echo",
             "allow",
             "session",
@@ -1586,10 +1586,10 @@ fn permission_audit_lines_lists_newest_entries_and_reports_bad_lines_as_breaks()
     }
     newt_core::permission_journal::append_record(
         &path,
-        newt_core::PermissionRecord::new(
+        newt_policy::PermissionRecord::new(
             "c",
             "run_command",
-            newt_core::DenialKind::Net,
+            newt_policy::DenialKind::Net,
             "https://example.com",
             "deny",
             "once",
@@ -1630,10 +1630,10 @@ fn permission_audit_lines_surfaces_the_pre_chain_sibling() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("permission-log.jsonl");
     let pre_chain = newt_core::permission_journal::pre_chain_path(&path);
-    let legacy = newt_core::PermissionRecord::new(
+    let legacy = newt_policy::PermissionRecord::new(
         "c",
         "run_command",
-        newt_core::DenialKind::Exec,
+        newt_policy::DenialKind::Exec,
         "/bin/legacy",
         "allow",
         "once",
@@ -1645,10 +1645,10 @@ fn permission_audit_lines_surfaces_the_pre_chain_sibling() {
     .unwrap();
     newt_core::permission_journal::append_record(
         &path,
-        newt_core::PermissionRecord::new(
+        newt_policy::PermissionRecord::new(
             "c",
             "run_command",
-            newt_core::DenialKind::Exec,
+            newt_policy::DenialKind::Exec,
             "/bin/new",
             "allow",
             "once",
@@ -1679,10 +1679,10 @@ fn permission_audit_lines_surfaces_the_pre_chain_sibling() {
 fn permission_audit_lines_reads_an_unrotated_flat_log() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("permission-log.jsonl");
-    let legacy = newt_core::PermissionRecord::new(
+    let legacy = newt_policy::PermissionRecord::new(
         "c",
         "run_command",
-        newt_core::DenialKind::Exec,
+        newt_policy::DenialKind::Exec,
         "/bin/legacy",
         "allow",
         "once",

@@ -27,7 +27,7 @@ fn names(directory: &Path) -> Option<BTreeSet<OsString>> {
 impl Snapshot {
     pub(super) fn before(workspace: &Path, read: &crate::Scope<String>) -> Option<Self> {
         let directory = common_git_dir(workspace)?.join("worktrees");
-        if !crate::permits_path(read, &directory.to_string_lossy()) {
+        if !newt_policy::permits_path(read, &directory.to_string_lossy()) {
             return None;
         }
         Some(Self {

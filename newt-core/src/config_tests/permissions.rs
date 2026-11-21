@@ -1,7 +1,7 @@
 use super::*;
 // The `permits_*` adaptors live on `CaveatsExt` (post-#95 the
 // upstream `agent-mesh-protocol::Caveats` ships algebra only).
-use crate::caveats::CaveatsExt;
+use newt_policy::caveats::CaveatsExt;
 
 // Permission presets, caveat lowering, and persistent network grants.
 
@@ -46,7 +46,7 @@ fn terminal_prompt_default_rejects_standing_grants_denials_and_controls() {
 
 #[test]
 fn mcp_net_prompt_default_is_typed_and_roundtrips() {
-    use crate::PermissionAction;
+    use newt_policy::PermissionAction;
     let default: ToolPermissions = toml::from_str("").unwrap();
     assert_eq!(default.mcp_net_prompt_default, PermissionAction::AllowOnce);
     assert_eq!(default, ToolPermissions::default());
@@ -163,7 +163,7 @@ fn workspace_edit_allows_write_blocks_exec() {
     assert!(!cav.permits_exec("cargo"));
     // The caveat stores workspace root; prefix matching is in the TUI layer.
     // Here we just verify the lattice is set up correctly (not All, not none).
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     assert!(matches!(cav.fs_write, Scope::Only(_)));
 }
 
@@ -195,7 +195,7 @@ fn mcp_probe_caveats_honors_the_configured_preset() {
     };
     let cav = cfg.mcp_probe_caveats(std::path::Path::new("/ws"));
     assert!(cav.permits_exec("cargo"), "configured preset respected");
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     assert!(matches!(cav.fs_write, Scope::Only(_)));
 }
 
@@ -209,7 +209,7 @@ fn full_access_is_top() {
         ..Default::default()
     };
     let cav = perms.to_caveats("/workspace");
-    assert_eq!(cav, crate::caveats::Caveats::top());
+    assert_eq!(cav, newt_policy::caveats::Caveats::top());
 }
 
 #[test]
@@ -223,11 +223,11 @@ fn workspace_full_access_keeps_directory_and_network_authority_separate() {
     assert_eq!(baseline, confined);
     assert!(baseline.permits_exec("rm"));
     assert!(baseline.permits_exec("any-program"));
-    assert!(crate::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &baseline.fs_write,
         workspace.join("new/nested/file").to_str().unwrap()
     ));
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &baseline.fs_write,
         workspace.join("../outside").to_str().unwrap()
     ));
@@ -238,7 +238,7 @@ fn workspace_full_access_keeps_directory_and_network_authority_separate() {
     assert_eq!(with_network.exec, baseline.exec);
     assert_eq!(
         with_network.net,
-        crate::caveats::Scope::only(["docs.rs".into()])
+        newt_policy::caveats::Scope::only(["docs.rs".into()])
     );
     let serialized = toml::to_string(&permissions).unwrap();
     assert_eq!(
@@ -249,7 +249,7 @@ fn workspace_full_access_keeps_directory_and_network_authority_separate() {
 
 #[test]
 fn net_allowlist_controls_the_net_axis() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     // Default (empty `net`) => no network: web_fetch is denied.
     let none = ToolPermissions::default().to_caveats("/ws");
@@ -304,7 +304,7 @@ fn custom_is_workspace_dev_not_top() {
     .to_caveats("/workspace");
     assert_ne!(
         custom,
-        crate::caveats::Caveats::top(),
+        newt_policy::caveats::Caveats::top(),
         "Custom must not be full access"
     );
     assert!(custom.permits_exec("cargo"), "workspace-dev tools allowed");
@@ -375,7 +375,7 @@ fn with_net_host_creates_table_from_empty_and_scope_includes_host() {
     let perms = cfg.tui.unwrap().permissions;
     assert!(perms.net.contains(&"github.com".to_string()));
     assert!(
-        matches!(perms.net_scope(), crate::caveats::Scope::Only(ref s) if s.contains("github.com")),
+        matches!(perms.net_scope(), newt_policy::caveats::Scope::Only(ref s) if s.contains("github.com")),
         "net_scope must permit the granted host"
     );
 }
@@ -449,7 +449,7 @@ fn set_permission_prompt_default_preserves_config_and_comments() {
     let original = "# operator config\n[tui.permissions]\npreset = \"read_only\"\nnet = [\"docs.example\"]\nprompt_default = \"deny\" # deliberate choice\n[unmodeled]\nretain = true\n";
     std::fs::write(&path, original).unwrap();
     let before: Config = toml::from_str(original).unwrap();
-    Config::set_permission_prompt_default(&path, crate::PermissionAction::AllowOnce).unwrap();
+    Config::set_permission_prompt_default(&path, newt_policy::PermissionAction::AllowOnce).unwrap();
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("# operator config"));
     assert!(saved.contains("# deliberate choice"));
@@ -459,14 +459,14 @@ fn set_permission_prompt_default_preserves_config_and_comments() {
     let after = after.tui.unwrap().permissions;
     assert_eq!(
         after.prompt_default,
-        Some(crate::PermissionAction::AllowOnce)
+        Some(newt_policy::PermissionAction::AllowOnce)
     );
     assert_eq!(after.to_caveats("/ws"), before.to_caveats("/ws"));
-    Config::set_permission_prompt_default(&path, crate::PermissionAction::Deny).unwrap();
+    Config::set_permission_prompt_default(&path, newt_policy::PermissionAction::Deny).unwrap();
     let saved: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(
         saved.tui.unwrap().permissions.prompt_default,
-        Some(crate::PermissionAction::Deny)
+        Some(newt_policy::PermissionAction::Deny)
     );
 }
 
@@ -475,12 +475,12 @@ fn set_permission_prompt_default_rejects_invalid_actions_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing/config.toml");
     for action in [
-        crate::PermissionAction::AllowSession,
-        crate::PermissionAction::AllowPermanent,
-        crate::PermissionAction::DenyAlways,
-        crate::PermissionAction::DenyPermanent,
-        crate::PermissionAction::Back,
-        crate::PermissionAction::Exit,
+        newt_policy::PermissionAction::AllowSession,
+        newt_policy::PermissionAction::AllowPermanent,
+        newt_policy::PermissionAction::DenyAlways,
+        newt_policy::PermissionAction::DenyPermanent,
+        newt_policy::PermissionAction::Back,
+        newt_policy::PermissionAction::Exit,
     ] {
         assert!(Config::set_permission_prompt_default(&path, action).is_err());
         assert!(!path.parent().unwrap().exists());
@@ -488,7 +488,8 @@ fn set_permission_prompt_default_rejects_invalid_actions_without_writing() {
     std::fs::create_dir(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "broken = = toml").unwrap();
     assert!(
-        Config::set_permission_prompt_default(&path, crate::PermissionAction::AllowOnce).is_err()
+        Config::set_permission_prompt_default(&path, newt_policy::PermissionAction::AllowOnce)
+            .is_err()
     );
     assert_eq!(std::fs::read_to_string(path).unwrap(), "broken = = toml");
 }
@@ -500,7 +501,8 @@ fn set_permission_prompt_default_and_net_updates_share_the_locked_writer() {
     std::thread::scope(|scope| {
         let path = &path;
         scope.spawn(move || {
-            Config::set_permission_prompt_default(path, crate::PermissionAction::Deny).unwrap();
+            Config::set_permission_prompt_default(path, newt_policy::PermissionAction::Deny)
+                .unwrap();
         });
         scope.spawn(move || Config::append_permission_net_host(path, "docs.example").unwrap());
     });
@@ -508,7 +510,7 @@ fn set_permission_prompt_default_and_net_updates_share_the_locked_writer() {
     let permissions = saved.tui.unwrap().permissions;
     assert_eq!(
         permissions.prompt_default,
-        Some(crate::PermissionAction::Deny)
+        Some(newt_policy::PermissionAction::Deny)
     );
     assert_eq!(permissions.net, vec!["docs.example"]);
 }

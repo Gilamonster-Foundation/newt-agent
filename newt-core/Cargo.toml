@@ -112,6 +112,7 @@ uuid.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
 newt-interaction.workspace = true
+newt-policy.workspace = true
 newt-router.workspace = true
 newt-skills.workspace = true
 reqwest.workspace = true
@@ -211,7 +212,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 # Object-bound workspace fs capability (src/fs_cap.rs): Linux uses openat2;
 # macOS enables the same dependency below for descriptor-relative openat.
 rustix.workspace = true
-seccompiler = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rustix.workspace = true

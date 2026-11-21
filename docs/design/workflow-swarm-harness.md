@@ -133,7 +133,7 @@ below is cited at the file:symbol the harness will consume.
   `delegate` **refuses to amplify** and `CertChain::verify` re-checks attenuation
   at every link. So a child can only ever *narrow* the authority it was handed,
   never widen it — cryptographically, not by convention.
-- `newt-core/src/caveats.rs` — the **`Caveats` / `Scope` / `CountBound`** lattice
+- `newt-policy/src/caveats.rs` — the **`Caveats` / `Scope` / `CountBound`** lattice
   (re-exported from `agent-mesh-protocol`) plus the dispatch-site `permits_*`
   adaptors and `permits_one_more` budget check. This is the *shape* of a child's
   curated authority: `fs_read`/`fs_write`/`exec`/`net` scopes + a `max_calls`

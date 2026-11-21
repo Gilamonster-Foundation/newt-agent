@@ -494,7 +494,7 @@ impl AcpServer {
         // fs_read/fs_write to this session's workspace (`Scope::only([ws])`)
         // instead of the open `Scope::All` default, so the dispatched authority
         // is workspace-bound. The coder's fs predicates now gate by PREFIX
-        // containment (`newt_core::permits_path`) against the same workspace, so
+        // containment (`newt_policy::permits_path`) against the same workspace, so
         // the fence permits the coder's own in-workspace writes and denies any
         // `..`/absolute escape — belt to #522's object-binding suspenders. The
         // root is passed as the same lossy string the coder joins against, so the

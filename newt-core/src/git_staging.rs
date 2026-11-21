@@ -41,8 +41,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::caveats::{permits_path, Caveats};
 use agent_mesh_protocol::caveats::Scope;
+use newt_policy::caveats::{permits_path, Caveats};
 
 /// Why the staging broker refuses before any process runs.
 #[derive(Debug, PartialEq, Eq)]

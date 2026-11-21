@@ -36,7 +36,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 use newt_interaction::{Audience, InteractionDefinition, InteractionInstance, Lifecycle, Response};
 
 use crate::store::{AnswerOutcome, ConversationStore};
-use crate::PermissionAction;
+use newt_policy::PermissionAction;
 
 /// The danger tier a gate stamped on an offer.
 ///

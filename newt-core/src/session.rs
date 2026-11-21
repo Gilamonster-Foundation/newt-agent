@@ -1,4 +1,4 @@
-use crate::caveats::Caveats;
+use newt_policy::caveats::Caveats;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -443,7 +443,7 @@ mod tests {
 #[cfg(test)]
 mod attach_tests {
     use super::*;
-    use crate::caveats::{CaveatsExt, Scope};
+    use newt_policy::caveats::{CaveatsExt, Scope};
     use std::sync::{Arc, Mutex};
 
     /// An in-memory attachment sink that records everything fanned to it.

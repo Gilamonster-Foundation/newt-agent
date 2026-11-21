@@ -43,7 +43,7 @@ fn repository(spec: &str) -> Result<(String, String), &'static str> {
         [host, owner, name] => (*host, *owner, *name),
         _ => return Err("expected [host/]owner/repo"),
     };
-    let host = crate::caveats::parse_net_host(host).map_err(|_| "invalid forge host")?;
+    let host = newt_policy::caveats::parse_net_host(host).map_err(|_| "invalid forge host")?;
     // go-gh NormalizeHostname collapses GitHub subdomains and nested tenancy
     // names. Refuse aliases so approval and the argv name the SAME authority.
     // https://github.com/cli/go-gh/blob/trunk/pkg/auth/auth.go
@@ -184,7 +184,7 @@ pub(in crate::agentic::tools) fn execute(
     let mut run = || -> Result<ReadOutcome, String> {
         let (mut argv, repo) = arguments(&command.argv).map_err(str::to_owned)?;
         if !caveats.permits_exec("gh")
-            || !crate::caveats::permits_path(&caveats.fs_read, &cwd.to_string_lossy())
+            || !newt_policy::caveats::permits_path(&caveats.fs_read, &cwd.to_string_lossy())
         {
             return Err("gh execution and workspace read authority are required".into());
         }

@@ -34,7 +34,7 @@ pub use agent_bridle::policy::{
     PolicyFile, PolicySet, Verdict,
 };
 
-use crate::permissions::DenialKind;
+use newt_policy::permissions::DenialKind;
 
 /// Shared recovery nudge for startup grant/protection diagnostics.
 pub const REPAIR_HINT: &str = "run `newt doctor` to inspect and repair";
@@ -159,14 +159,14 @@ pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Opti
     // resolve a signed pathname against the mutable filesystem at match time.
     #[cfg(target_os = "macos")]
     if matches!(kind, DenialKind::FsRead | DenialKind::FsWrite) {
-        let target = crate::fs_aliases::rewrite(target);
+        let target = newt_policy::fs_aliases::rewrite(target);
         return request_policy
             .files
             .iter()
             .filter(|(_, file)| {
                 file.fs
                     .iter()
-                    .any(|entry| crate::fs_aliases::rewrite(&entry.path) == target)
+                    .any(|entry| newt_policy::fs_aliases::rewrite(&entry.path) == target)
             })
             .map(|(verdict, _)| *verdict)
             .min_by_key(|verdict| verdict.precedence());
@@ -175,7 +175,7 @@ pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Opti
 }
 
 /// Fold a VERIFIED store's `approve.toml` entries into `(DenialKind, target)`
-/// grants — the shape [`crate::widen_caveats`] / a session's `durable_grants`
+/// grants — the shape [`newt_policy::widen_caveats`] / a session's `durable_grants`
 /// set already consumes (#2524 item 1). Only the `Approve` verdict grants
 /// anything (deny/ask/passkey never widen); callers MUST pass a `set` that has
 /// already gone through [`verify_approves`] with a real verifier, so an
@@ -188,7 +188,7 @@ pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Opti
 /// implies read, matching [`lock_fs_to_workspace`]'s convention). `exec`/`net`
 /// entries map 1:1 onto their axis. This NEVER widens past what the signature
 /// covers: it is a pure re-listing of exactly the verified entries, and the
-/// caller composes the result with [`crate::widen_caveats`] (which only
+/// caller composes the result with [`newt_policy::widen_caveats`] (which only
 /// inserts into an already-`Only` scope — an axis already `All` is untouched,
 /// so folding can never turn a fenced axis open).
 pub fn approved_grants(set: &PolicySet) -> Vec<(DenialKind, String)> {
@@ -408,7 +408,7 @@ pub fn lock_approve_file(
 
 /// Normalize an [`ApproveEntry::Fs`] target before it ever reaches
 /// `validate_approve` (#2524 round 2 item 2): require an absolute path, run
-/// it through the SAME [`crate::caveats::lexically_normalize`] the read/write
+/// it through the SAME [`newt_policy::caveats::lexically_normalize`] the read/write
 /// fences already use (one normalizer, not a second one for the durable
 /// store), and refuse any `..` that survives — a relative or climbing target
 /// like `../../` must never durably widen to whatever directory happens to
@@ -425,7 +425,7 @@ fn normalize_fs_target(entry: ApproveEntry) -> anyhow::Result<ApproveEntry> {
 
 /// The string-level normalization [`normalize_fs_target`] applies to an
 /// `[[fs]]` target: require an absolute path, run it through the SAME
-/// [`crate::caveats::lexically_normalize`] the read/write fences use, and
+/// [`newt_policy::caveats::lexically_normalize`] the read/write fences use, and
 /// refuse any `..` that survives. Exposed `pub` (#2524 follow-up item 2) so
 /// the gate can classify danger and phrase a refusal against the SAME
 /// normalized target the writer would actually persist — never a second
@@ -435,7 +435,7 @@ pub fn normalize_fs_path(path: &str) -> anyhow::Result<String> {
     if !Path::new(path).is_absolute() {
         anyhow::bail!("permanent allow refused: fs target `{path}` must be an absolute path");
     }
-    let normalized = crate::caveats::lexically_normalize(path);
+    let normalized = newt_policy::caveats::lexically_normalize(path);
     if normalized
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))

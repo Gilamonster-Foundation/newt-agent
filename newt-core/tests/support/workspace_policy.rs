@@ -8,7 +8,8 @@ use agent_mesh_protocol::UserKey;
 use newt_core::durable_grants::{self, VerifiedSnapshot, WorkspaceProfile};
 use newt_core::secrets::TokenIdentity;
 use newt_core::workspace_protection::WorkspaceProtection;
-use newt_core::{execute_tool, Caveats, DenialKind, NoMcp, PermissionPreset, ToolPermissions};
+use newt_core::{execute_tool, Caveats, NoMcp, PermissionPreset, ToolPermissions};
+use newt_policy::DenialKind;
 
 async fn command(workspace: &Path, source: &str, caveats: &Caveats) -> String {
     execute_tool(

@@ -291,7 +291,7 @@ pub fn parse_net_host(raw: &str) -> Result<String, String> {
 /// granted root can still point out — the object-bound `WorkspaceDir` resolver
 /// (`openat2 RESOLVE_BENEATH`) is what closes that. What this DOES close are the
 /// string-only escapes — `..` traversal and sibling-prefix collisions.
-pub(crate) fn lexically_normalize(path: &str) -> std::path::PathBuf {
+pub fn lexically_normalize(path: &str) -> std::path::PathBuf {
     #[cfg(target_os = "macos")]
     let path = crate::fs_aliases::rewrite(path);
     #[cfg(target_os = "macos")]
@@ -383,6 +383,16 @@ pub fn spawn_net_scope(net: &Scope<String>) -> Scope<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One lock over the process environment for this crate's tests; `newt-core`'s
+    /// `process_env` lock is not visible from here, and these tests are the only
+    /// writers in this crate's test binary.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn scope_all_permits_everything() {
@@ -582,14 +592,14 @@ mod tests {
     /// `NEWT_NET_HOSTS`, as it reads `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS`.
     #[test]
     fn apply_cli_grants_reads_net_hosts_env() {
-        let _g = crate::process_env::lock();
-        crate::process_env::set_var(NEWT_NET_HOSTS_ENV, "github.com,doi.org");
+        let _g = env_lock();
+        std::env::set_var(NEWT_NET_HOSTS_ENV, "github.com,doi.org");
         let mut c = Caveats {
             net: Scope::none(),
             ..Caveats::top()
         };
         apply_cli_fs_grants_with(&mut c, "/ws", |_| Default::default());
-        crate::process_env::remove_var(NEWT_NET_HOSTS_ENV);
+        std::env::remove_var(NEWT_NET_HOSTS_ENV);
         assert!(c.permits_net("github.com"));
         assert!(c.permits_net("doi.org"));
         assert!(!c.permits_net("example.com"));
@@ -602,7 +612,7 @@ mod tests {
     /// that already covers it drops it too.
     #[test]
     fn own_git_grants_are_added_only_outside_the_granted_roots() {
-        let _g = crate::process_env::lock();
+        let _g = env_lock();
         let grant = |dirs: &[&str]| {
             let dirs: Vec<String> = dirs.iter().map(ToString::to_string).collect();
             move |_: &std::path::Path| OwnGitGrant {
@@ -635,10 +645,10 @@ mod tests {
             "a linked worktree's git directories lie outside the workspace"
         );
 
-        crate::process_env::set_var("NEWT_READ_PATHS", "/repo");
+        std::env::set_var("NEWT_READ_PATHS", "/repo");
         let mut covered = Caveats::top();
         apply_cli_fs_grants_with(&mut covered, "/ws", grant(&["/repo/.git"]));
-        crate::process_env::remove_var("NEWT_READ_PATHS");
+        std::env::remove_var("NEWT_READ_PATHS");
         assert_eq!(
             read_roots(&covered),
             ["/repo", "/ws"],
@@ -653,7 +663,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_verbatim_workspace_contains_the_git_directory_git_prints_plainly() {
-        let _g = crate::process_env::lock();
+        let _g = env_lock();
         let mut c = Caveats::top();
         apply_cli_fs_grants_with(&mut c, r"\\?\C:\ws", |_: &std::path::Path| OwnGitGrant {
             read: vec!["C:/ws/.git".to_string(), r"\\?\C:\ws\.git".to_string()],
