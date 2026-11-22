@@ -26,8 +26,8 @@ fn resolve_program(caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
     }
 }
 
-/// A dot is an operand here, not the shell's source builtin. Bridle refuses
-/// inspecting it as a standalone program; admit only these literal spellings.
+/// A dot is an operand here, not the shell's source builtin. The shell inspector
+/// refuses it as a standalone program; admit only these literal spellings.
 pub(super) fn argument(word: &str) -> Option<String> {
     if matches!(word, "." | "'.'" | "\".\"") {
         Some(".".into())

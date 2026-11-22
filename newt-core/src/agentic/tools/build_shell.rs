@@ -11,7 +11,7 @@ use crate::ExecOutcome;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Identify a build tool through Bridle's structural inventory. This selects
+/// Identify a build tool through the shell inspector's structural inventory. This selects
 /// an existing capability; it never interprets Cargo flags or rewrites source.
 pub(super) fn build_program(source: &str) -> Option<String> {
     find_build_program(source, |program, _| {
