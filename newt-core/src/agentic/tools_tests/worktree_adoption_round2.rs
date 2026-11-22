@@ -355,7 +355,7 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
             .is_some(),
             cfg!(unix),
             "{suffix}: {:?}",
-            agent_bridle::inspect_shell(args["command"].as_str().unwrap())
+            crate::shell_inspect::inspect_shell(args["command"].as_str().unwrap())
         );
         assert!(
             !creation_batch_is_read_only_after_add(&args, crate::ShellEngine::Brush),

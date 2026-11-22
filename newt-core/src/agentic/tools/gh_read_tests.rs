@@ -438,7 +438,7 @@ fn gh_read_literal_arguments_are_not_classified_as_commands() {
         ("''", ""),
     ] {
         assert_eq!(
-            agent_bridle_tool_shell::literal_shell_word(source).unwrap(),
+            crate::shell_inspect::literal_shell_word(source).unwrap(),
             expected
         );
     }
@@ -457,7 +457,7 @@ fn gh_read_literal_arguments_are_not_classified_as_commands() {
         "`id`",
     ] {
         assert!(
-            agent_bridle_tool_shell::literal_shell_word(source).is_err(),
+            crate::shell_inspect::literal_shell_word(source).is_err(),
             "{source}"
         );
     }

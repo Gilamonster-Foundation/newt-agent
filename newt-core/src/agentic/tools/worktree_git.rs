@@ -26,8 +26,8 @@ fn resolve_program(caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
     }
 }
 
-/// A dot is an operand here, not the shell's source builtin. Bridle refuses
-/// inspecting it as a standalone program; admit only these literal spellings.
+/// A dot is an operand here, not the shell's source builtin. The shell inspector
+/// refuses it as a standalone program; admit only these literal spellings.
 pub(super) fn argument(word: &str) -> Option<String> {
     if matches!(word, "." | "'.'" | "\".\"") {
         Some(".".into())
@@ -55,7 +55,7 @@ pub(super) fn read_only(args: &[&str]) -> bool {
 /// Only the explicit start operand of the ordinary -b form treats `.` as HEAD.
 /// Never rewrite a cwd, branch name, destination, sibling, or quoted prose.
 fn creation_source(
-    command: &agent_bridle::InspectedCommand,
+    command: &crate::shell_inspect::InspectedCommand,
     words: &[String],
 ) -> Result<String, ()> {
     let Some(args) = super::worktree_add_args(words) else {
@@ -87,7 +87,7 @@ pub(super) fn pin(source: &str, git: &Path, caveats: &Caveats) -> Result<String,
         regex::Regex::new(r"\A(?:\s|;|&&|\|\||\||[0-9]*[<>]&[0-9]+)*\z")
             .expect("fixed shell gap pattern")
     });
-    let inspection = agent_bridle::inspect_shell(source).map_err(|_| ())?;
+    let inspection = crate::shell_inspect::inspect_shell(source).map_err(|_| ())?;
     if !inspection.constructs.is_empty() {
         return Err(());
     }

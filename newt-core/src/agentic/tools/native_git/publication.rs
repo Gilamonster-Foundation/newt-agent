@@ -23,6 +23,7 @@ fn route(
 ) -> bool {
     if bypass
         && (super::needs_commit_broker(source)
+            || super::commit_in_an_uninspectable_source(source)
             || super::needs_push_broker(source)
             || super::needs_pr_create_broker(source))
     {

@@ -22,7 +22,7 @@ impl Capture {
     fn select(&mut self, command: &str, cwd: &str) {
         // Inventory the retained source, never lifecycle resolution again. The
         // recorded exit is the entire command's exit, not a pipeline child's.
-        let check = agent_bridle::inspect_shell(command)
+        let check = crate::shell_inspect::inspect_shell(command)
             .ok()
             .is_some_and(|inspection| {
                 inspection.commands.iter().any(|c| {

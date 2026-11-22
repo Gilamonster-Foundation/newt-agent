@@ -83,16 +83,17 @@ mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
 #[cfg(test)]
 pub(crate) use shell::absent_binary_refusal;
+pub(crate) use shell::carried_tools_dir;
 pub use shell::venv_cmd_prefix;
 /// newt's control plane, which no host child receives (also what `--ambient` strips from
 /// the full environment it hands run_command and stdio MCP servers).
 pub use shell::CHILD_STRIPPED_AUTHORITY_ENV;
 #[cfg(test)]
 use shell::{
-    confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
-    envelope_denial_reason, envelope_denied, exec_denial_requests, exec_floor_permits,
-    net_denial_requests, pr_creation_url, same_file_redirect_refusal, shadow_records, shell_engine,
-    shell_envelope_output, venv_env_map,
+    confined_dispatch_args, confined_dispatch_args_with, confined_tools, decode_shell_stream,
+    denial_recovery_hints, denied_run_command_result, envelope_denial_reason, envelope_denied,
+    exec_denial_requests, exec_floor_permits, net_denial_requests, pr_creation_url,
+    same_file_redirect_refusal, shadow_records, shell_engine, shell_envelope_output, venv_env_map,
 };
 use shell::{
     declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,
@@ -2062,7 +2063,7 @@ fn single_grant_covers_missing(
 /// its entirety, is a single simple command with no dynamic content and no
 /// redirect that can itself mutate state. Round 2's "denied spawn is the
 /// FIRST command in source order" check conflated SOURCE order with
-/// EXECUTION order: `agent_bridle::inspect_shell` is a non-executing,
+/// EXECUTION order: `crate::shell_inspect::inspect_shell` is a non-executing,
 /// source-order inventory, and source order is not a safety witness for
 /// several shapes it still has to represent faithfully —
 /// a command substitution's inner command expands (and can run arbitrary
@@ -2086,7 +2087,7 @@ fn single_grant_covers_missing(
 /// command itself — the existing, always-safe fallback. Fails closed on an
 /// inspection error.
 fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
-    let Ok(inspection) = agent_bridle::inspect_shell(cmd) else {
+    let Ok(inspection) = crate::shell_inspect::inspect_shell(cmd) else {
         return false;
     };
     if !inspection.warnings.is_empty() || !inspection.constructs.is_empty() {
@@ -2137,15 +2138,15 @@ fn requests_are_replay_safe(requests: &[PermissionRequest], cmd: &str) -> bool {
 /// shell engine opens a redirect relative to its exec-authority check, so
 /// [`exec_denial_is_replay_safe`] treats a write-shaped redirect as
 /// disqualifying on principle rather than assuming today's engine order.
-fn redirect_has_effect(redirect: &agent_bridle::InspectedRedirect) -> bool {
+fn redirect_has_effect(redirect: &crate::shell_inspect::InspectedRedirect) -> bool {
     matches!(
         redirect.operation,
-        agent_bridle::RedirectOperation::Write
-            | agent_bridle::RedirectOperation::Append
-            | agent_bridle::RedirectOperation::ReadWrite
-            | agent_bridle::RedirectOperation::Clobber
-            | agent_bridle::RedirectOperation::OutputAndError
-            | agent_bridle::RedirectOperation::AppendOutputAndError
+        crate::shell_inspect::RedirectOperation::Write
+            | crate::shell_inspect::RedirectOperation::Append
+            | crate::shell_inspect::RedirectOperation::ReadWrite
+            | crate::shell_inspect::RedirectOperation::Clobber
+            | crate::shell_inspect::RedirectOperation::OutputAndError
+            | crate::shell_inspect::RedirectOperation::AppendOutputAndError
     )
 }
 
@@ -4677,9 +4678,13 @@ async fn execute_authorized_tool(
 
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
-            if let Some(tool) = run_command_redirect(cmd)
-                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "find" | "grep"))
-            {
+            // `find`/`grep` are real binaries: once the command names a directory
+            // (a folded `cd`, or `cwd`) the tool cannot honour it, and outside the
+            // workspace it refuses and points back here — so run the shell.
+            let has_dir = cd_path.is_some() || args.get("cwd").is_some_and(|c| !c.is_null());
+            if let Some(tool) = run_command_redirect(cmd).filter(|tool| {
+                (smart_harness.is_none() && !has_dir) || !matches!(*tool, "find" | "grep")
+            }) {
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
@@ -4706,8 +4711,12 @@ async fn execute_authorized_tool(
             } else {
                 None
             };
-            if governed_git && run_command_creates_shell_git_commit(cmd) && commit_broker.is_none() {
-                let reason = match agent_bridle::inspect_shell(cmd) {
+            // #3146: the lexical check misses a commit behind a shell keyword (`then git
+            // commit`), and a source the inspector cannot read gets no broker, so the
+            // bare-word trigger sends that source to the same refusal.
+            let commit_named = run_command_creates_shell_git_commit(cmd) || native_git::commit_in_an_uninspectable_source(cmd);
+            if governed_git && commit_named && commit_broker.is_none() {
+                let reason = match crate::shell_inspect::inspect_shell(cmd) {
                     Err(error) => format!("shell inspection failed: {error}"),
                     Ok(_) if commit_requested => "native commit attribution/signing policy is unavailable in this session".to_owned(),
                     Ok(_) => "this commit-producing Git operation is not supported by the native broker".to_owned(),

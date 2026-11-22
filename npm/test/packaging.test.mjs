@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -140,4 +140,71 @@ test('every platform package packs the release bytes and license', async (t) => 
       }
     }
   }
+});
+
+// #3151: `npm install` silently drops hardlinks and symlinks, and the release archive
+// hardlinks the carried command pack under every tool name. The package must carry each
+// name as its own file, and every name must still be there after a real install.
+test('a tools directory ships as independent files that survive npm install', {
+  skip: process.platform === 'win32' ? 'the pack is macOS-only and hardlinks need Unix' : false,
+}, (t) => {
+  assert.ok(process.env.npm_execpath, 'Run packaging tests through npm test; npm_execpath must identify the npm CLI');
+  const root = fixture(t);
+  const tools = join(root, 'tools');
+  const names = ['date', 'grep', 'rg'];
+  mkdirSync(tools);
+  writeFileSync(join(tools, 'newt-carried-tools'), 'multicall fixture\n');
+  chmodSync(join(tools, 'newt-carried-tools'), 0o755);
+  for (const name of names) linkSync(join(tools, 'newt-carried-tools'), join(tools, name));
+  assert.equal(statSync(join(tools, 'date')).nlink, 4, 'the fixture is hardlinked like the release archive');
+
+  const platform = { linux: 'linux-x64', darwin: 'darwin-arm64' }[process.platform] ?? 'linux-x64';
+  const built = script(root, 'build-platform-package.mjs', [
+    '--name', '@gilamonster/newt', '--binary', join(root, 'binary'),
+    '--key', platform, '--version', '1.2.3', '--out', join(root, 'out'), '--tools', tools,
+  ]);
+  assert.equal(built.status, 0, built.stderr);
+  const out = join(root, 'out');
+  assert.ok(JSON.parse(readFileSync(join(out, 'package.json'), 'utf8')).files.includes('tools'));
+  for (const name of ['newt-carried-tools', ...names]) {
+    assert.equal(statSync(join(out, 'tools', name)).nlink, 1, `${name} is a copy, not a link`);
+  }
+
+  const npm = (args, cwd) => spawnSync(process.execPath, [process.env.npm_execpath, ...args], { cwd, encoding: 'utf8' });
+  const pack = npm(['pack', '--json', '--ignore-scripts'], out);
+  assert.equal(pack.status, 0, pack.stderr);
+  const [tarball] = JSON.parse(pack.stdout);
+  const project = join(root, 'project');
+  mkdirSync(project);
+  writeFileSync(join(project, 'package.json'), '{"name":"project","version":"1.0.0"}\n');
+  // --force: the package is for another OS or CPU on some hosts; the platform check is not under test.
+  const install = npm(['install', '--offline', '--force', '--no-audit', '--no-fund', '--ignore-scripts', join(out, tarball.filename)], project);
+  assert.equal(install.status, 0, install.stderr);
+  const installed = join(project, 'node_modules', '@gilamonster', `newt-${platform}`, 'tools');
+  for (const name of ['newt-carried-tools', ...names]) {
+    assert.ok(existsSync(join(installed, name)), `${name} survives npm install`);
+    assert.equal(statSync(join(installed, name)).mode & 0o111, 0o111, `${name} stays executable`);
+  }
+});
+
+test('without --tools the package carries no tools directory', (t) => {
+  const root = fixture(t);
+  const built = build(root);
+  assert.equal(built.status, 0, built.stderr);
+  assert.equal(existsSync(join(root, 'out', 'tools')), false);
+  assert.deepEqual(JSON.parse(readFileSync(join(root, 'out', 'package.json'), 'utf8')).files, ['newt', 'README.md', 'LICENSE']);
+  const refuse = (toolsArgs) => script(root, 'build-platform-package.mjs', [
+    '--name', '@gilamonster/newt', '--binary', join(root, 'binary'), '--key', 'linux-x64',
+    '--version', '1.2.3', '--out', join(root, 'out2'), ...toolsArgs,
+  ]);
+  for (const [what, path] of [['a missing path', join(root, 'no-such-directory')], ['a regular file', join(root, 'binary')]]) {
+    const refused = refuse(['--tools', path]);
+    assert.equal(refused.status, 2, `${what} is refused`);
+    assert.match(refused.stderr, /--tools must name a directory/, what);
+  }
+  // A trailing --tools with no value is an error, not "no pack".
+  const valueless = refuse(['--tools']);
+  assert.equal(valueless.status, 2, 'a valueless --tools is refused');
+  assert.match(valueless.stderr, /--tools needs a value/);
+  assert.equal(existsSync(join(root, 'out2')), false, 'a refusal builds nothing');
 });

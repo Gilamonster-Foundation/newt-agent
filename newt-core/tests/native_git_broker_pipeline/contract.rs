@@ -12,6 +12,7 @@ mod siblings;
 
 use super::native::{real_git, real_git_output, TrailerGitTool};
 use newt_core::{worktree_adoption::WorktreeSession, Caveats, Scope};
+use newt_policy::{PermissionDecision, PermissionGate, PermissionRequest};
 use std::path::{Path, PathBuf};
 
 pub fn run() {
@@ -113,6 +114,60 @@ async fn dispatch(
         caveats,
         command,
         Some(&TrailerGitTool(false)),
+    )
+    .await
+}
+
+/// An operator who answers every confirmation the same way and records what was asked
+/// (#3145).
+struct Operator {
+    allow: bool,
+    asked: Vec<String>,
+}
+
+impl Operator {
+    fn new(allow: bool) -> Self {
+        Self {
+            allow,
+            asked: Vec::new(),
+        }
+    }
+}
+
+impl PermissionGate for Operator {
+    fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+        self.asked
+            .extend(requests.iter().map(|request| request.target.clone()));
+        if self.allow {
+            PermissionDecision::Allow(Caveats::top())
+        } else {
+            PermissionDecision::Deny
+        }
+    }
+
+    fn ask_dependency_fetch(&mut self, _: &Caveats, _: &PermissionRequest) -> PermissionDecision {
+        PermissionDecision::Deny
+    }
+
+    fn ask_question(&mut self, _: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
+    }
+}
+
+async fn dispatch_with_operator(
+    session: &WorktreeSession,
+    main: &Path,
+    caveats: &Caveats,
+    command: &str,
+    operator: &mut Operator,
+) -> String {
+    chat::dispatch_gated(
+        session,
+        main,
+        caveats,
+        command,
+        Some(&TrailerGitTool(false)),
+        Some(operator),
     )
     .await
 }

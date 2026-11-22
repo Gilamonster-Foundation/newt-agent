@@ -11,7 +11,7 @@ use newt_policy::caveats::Caveats;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Identify a build tool through Bridle's structural inventory. This selects
+/// Identify a build tool through the shell inspector's structural inventory. This selects
 /// an existing capability; it never interprets Cargo flags or rewrites source.
 pub(super) fn build_program(source: &str) -> Option<String> {
     find_build_program(source, |program, _| {
@@ -47,7 +47,7 @@ pub(super) fn has_build_work(source: &str) -> bool {
 
 fn find_build_program(source: &str, predicate: fn(&str, &[String]) -> bool) -> Option<String> {
     fn find(
-        inspection: &agent_bridle::ShellInspection,
+        inspection: &crate::shell_inspect::ShellInspection,
         predicate: fn(&str, &[String]) -> bool,
     ) -> Option<String> {
         for command in &inspection.commands {
@@ -70,7 +70,10 @@ fn find_build_program(source: &str, predicate: fn(&str, &[String]) -> bool) -> O
             .filter_map(|construct| construct.inspection.as_ref())
             .find_map(|nested| find(nested, predicate))
     }
-    find(&agent_bridle::inspect_shell(source).ok()?, predicate)
+    find(
+        &crate::shell_inspect::inspect_shell(source).ok()?,
+        predicate,
+    )
 }
 
 /// #2723: select the build fence from existing filesystem authority, not a

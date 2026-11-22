@@ -65,7 +65,7 @@ pub(super) fn creation_failure_hint(
 
 /// Literal standalone Git argv, shared by advisory notices and task recording.
 fn standalone_git_words(source: &str) -> Option<Vec<String>> {
-    let inspection = agent_bridle::inspect_shell(source).ok()?;
+    let inspection = crate::shell_inspect::inspect_shell(source).ok()?;
     let [command] = inspection.commands.as_slice() else {
         return None;
     };
@@ -106,7 +106,7 @@ fn possible_creation(source: &str) -> bool {
                     && literal(&pair[1]).as_deref() == Some("add")
             })
     }
-    fn contains(inspection: &agent_bridle::ShellInspection) -> bool {
+    fn contains(inspection: &crate::shell_inspect::ShellInspection) -> bool {
         inspection.commands.iter().any(|command| {
             words(command.program.as_deref(), &command.argv)
                 || command
@@ -118,7 +118,7 @@ fn possible_creation(source: &str) -> bool {
             .iter()
             .any(|construct| construct.inspection.as_deref().is_some_and(contains))
     }
-    match agent_bridle::inspect_shell(source) {
+    match crate::shell_inspect::inspect_shell(source) {
         Ok(inspection) => contains(&inspection),
         Err(_) => {
             // An opaque sibling or malformed syntax can prevent ANY inventory.
@@ -183,7 +183,7 @@ fn creation(
     let (cd, cmd) = split_leading_cd(args.get("command")?.as_str()?);
     let cwd = resolve_exec_cwd(workspace, args.get("cwd").and_then(|v| v.as_str()));
     let cwd = resolve_exec_cwd(&cwd, cd.as_deref());
-    let inspection = agent_bridle::inspect_shell(&cmd).ok()?;
+    let inspection = crate::shell_inspect::inspect_shell(&cmd).ok()?;
     for command in inspection.commands {
         if command.program.as_deref() == Some("cd") {
             return None;
@@ -257,7 +257,7 @@ fn creation_batch_is_read_only_after_add(
         return false;
     };
     let (_, command) = split_leading_cd(command);
-    let Ok(inspection) = agent_bridle::inspect_shell(&command) else {
+    let Ok(inspection) = crate::shell_inspect::inspect_shell(&command) else {
         return false;
     };
     if !inspection.constructs.is_empty() {
@@ -288,7 +288,8 @@ fn creation_batch_is_read_only_after_add(
                     additions += 1;
                     c.redirects.iter().all(|r| {
                         r.fd == Some(2)
-                            && r.operation == agent_bridle::RedirectOperation::DuplicateOutput
+                            && r.operation
+                                == crate::shell_inspect::RedirectOperation::DuplicateOutput
                             && r.target == "1"
                     })
                 } else {

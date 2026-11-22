@@ -99,7 +99,7 @@ fn destination_matches(args: &serde_json::Value, workspace: &Path, root: &Path) 
         args.get("cwd").and_then(|v| v.as_str()),
     );
     let cwd = PathBuf::from(shell::resolve_exec_cwd(&base, cd.as_deref()));
-    let Ok(inspection) = agent_bridle::inspect_shell(&source) else {
+    let Ok(inspection) = crate::shell_inspect::inspect_shell(&source) else {
         return false;
     };
     // Topology warnings are expected for pipelines and &&/||; the

@@ -7,12 +7,17 @@ pub struct RunCommandBudget(u64);
 
 impl Default for RunCommandBudget {
     fn default() -> Self {
-        Self(agent_bridle::LimitsPolicy::default().default_timeout_secs)
+        Self(Self::DEFAULT_SECS)
     }
 }
 
 impl RunCommandBudget {
     pub const MAX_SECS: u64 = 300;
+
+    /// The wall for an ordinary command, in seconds: the default agent-bridle's
+    /// `LimitsPolicy` carries, held here so this file needs no bridle crate (#3160, the
+    /// `confine` feature). `the_default_wall_is_the_one_bridle_carries` keeps the two equal.
+    pub const DEFAULT_SECS: u64 = 60;
 
     /// Capture the operator override once when constructing session configuration.
     pub fn from_env() -> Self {
@@ -40,6 +45,16 @@ impl RunCommandBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3160: the constant is bridle's own default, copied so the default needs no bridle
+    /// crate; while bridle is a dependency the two must agree.
+    #[test]
+    fn the_default_wall_is_the_one_bridle_carries() {
+        assert_eq!(
+            RunCommandBudget::DEFAULT_SECS,
+            agent_bridle::LimitsPolicy::default().default_timeout_secs
+        );
+    }
 
     /// #2747: independent configurations keep their captured budget and bounds.
     #[test]

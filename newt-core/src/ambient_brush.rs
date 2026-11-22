@@ -1,14 +1,18 @@
 //! Location contract for the ordinary ambient runner, independent of the host
 //! binary's entrypoints. Never search cwd, PATH, or workspace configuration.
 
+/// The `tools` directory beside a host executable: where the carried commands live, for the
+/// ambient runner on Windows and the macOS command pack alike.
+pub fn tools_dir(host_executable: &std::path::Path) -> std::path::PathBuf {
+    dunce::simplified(host_executable).with_file_name("tools")
+}
+
 /// The sole installation location for the carried ambient interpreter.
 pub fn runner_path(host_executable: &std::path::Path) -> std::path::PathBuf {
-    dunce::simplified(host_executable)
-        .with_file_name("tools")
-        .join(format!(
-            "newt-ambient-brush{}",
-            std::env::consts::EXE_SUFFIX
-        ))
+    tools_dir(host_executable).join(format!(
+        "newt-ambient-brush{}",
+        std::env::consts::EXE_SUFFIX
+    ))
 }
 
 /// Whether this embedding host has the separately installed runner.

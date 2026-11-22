@@ -4,7 +4,7 @@
 //!
 //! The accumulation loop's memory: prompt → decision → **stored policy** →
 //! fewer prompts. Four per-verdict TOML files under `~/.newt/ocap/` —
-//! `approve.toml` / `deny.toml` / `ask.toml` / `passkey.toml` — each a bridle
+//! `approve.toml` / `deny.toml` / `ask.toml` / `passkey.toml` — each a
 //! [`PolicyFile`] of per-class entries (exec / fs / net). This module LOADS
 //! them into a [`PolicySet`] and answers the one question the permission gate
 //! asks: *"is there a durable verdict for this capability + target?"*
@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-pub use agent_bridle::policy::{
+pub use crate::ocap_policy::{
     ApproveVerifier, CapabilityClass, Ed25519ApproveVerifier, ExecEntry, FsEntry, NetEntry,
     PolicyFile, PolicySet, Verdict,
 };
@@ -80,7 +80,7 @@ pub fn build_store(files: &[(Verdict, Option<String>)]) -> (PolicySet, Vec<Strin
 }
 
 /// Sanitize the LOOSENING verdict (pure; #1207): run `approve.toml` through
-/// bridle's fail-closed [`PolicyFile::verified_approves`] with the trusted
+/// the policy contract's fail-closed [`PolicyFile::verified_approves`] with the trusted
 /// verifier. `None` (no root key this session) drops ALL approve entries with
 /// one loud warning — an unverifiable grant is no grant. The narrowing
 /// verdicts pass through untouched (see the module docs for why).
@@ -293,7 +293,7 @@ impl ApproveEntry {
 /// (bulk re-bless) and [`persist_approve`] (one freshly-answered grant) route
 /// through, so there is exactly one place that turns bytes into a hex `sig`.
 pub fn sign_entry(payload: &[u8], sign: &impl Fn(&[u8]) -> [u8; 64]) -> String {
-    agent_bridle::policy::hex_encode(&sign(payload))
+    crate::ocap_policy::hex_encode(&sign(payload))
 }
 
 /// Append ONE operator-answered grant to `approve.toml` under the config file

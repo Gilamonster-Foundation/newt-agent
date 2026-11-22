@@ -28,7 +28,7 @@ fn totals(check: &super::super::Check) -> Option<[i64; 4]> {
     {
         return None;
     }
-    let inspection = agent_bridle::inspect_shell(&check.command).ok()?;
+    let inspection = crate::shell_inspect::inspect_shell(&check.command).ok()?;
     if inspection.commands.len() != 1
         || !inspection.constructs.is_empty()
         || !inspection.commands[0].redirects.is_empty()

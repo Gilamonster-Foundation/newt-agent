@@ -56,6 +56,22 @@ version, archive pin and native evidence together. Other architectures are not
 packaged by this installer. This PR provides staging; wiring release distribution
 and default-on shell selection belongs to the following integration.
 
+## macOS (#3151)
+
+The macOS release archive carries the pack as `tools/` beside `newt`, and the Homebrew
+formula installs it there. `newt` finds it through any symlink and puts it ahead of the
+host's BSD commands on its shells' `PATH`. To stage it by hand:
+
+```sh
+cargo build -p newt-carried-tools --release --locked
+./scripts/unix/install-carried-tools.sh \
+  --binary target/release/newt-carried-tools --newt-directory <release-dir>
+./scripts/unix/test-carried-tools.sh <release-dir>/tools
+```
+
+The script verifies the pinned ripgrep archive first and moves `tools/` into place only
+if it does not exist yet.
+
 ## Added commands (#2795)
 
 BusyBox-w32 **FRP-6075-g169694ebd**, x64 Unicode build (Windows 10 1903+),

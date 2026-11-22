@@ -100,6 +100,11 @@ pub mod notes;
 pub mod notes_scan;
 pub mod nudger;
 pub mod ocap;
+pub mod ocap_policy;
+#[cfg(test)]
+mod ocap_policy_parity_tests;
+#[cfg(test)]
+mod ocap_policy_tests;
 pub mod ocap_propose;
 pub mod ocap_store;
 pub mod operating_mode;
@@ -145,6 +150,9 @@ pub mod session;
 pub mod settings;
 pub mod settings_receipt;
 pub mod shell_env;
+pub mod shell_inspect;
+#[cfg(test)]
+mod shell_inspect_parity_tests;
 pub mod ssh_caveats;
 pub mod stack;
 pub mod store;

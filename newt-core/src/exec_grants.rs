@@ -3,9 +3,58 @@ use crate::{Caveats, Scope};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-/// The same PATH (venv, explicit exec roots, developer tools) used by dispatch.
+/// The candidate PATH dispatch resolves against: the venv, explicit exec roots, the carried
+/// command pack beside newt (#3151) and developer tools, ahead of the host's own.
 pub fn dispatch_path() -> Option<std::ffi::OsString> {
     crate::agentic::tools::dispatch_exec_path()
+}
+
+/// Whether a session holding `exec` may run the carried command pack at `dir` (#3151). On
+/// macOS a bare-name grant covers only the system directories, so a pack tool runs only when
+/// its exact path was pinned at startup, and pinning refuses an untrusted directory (group-
+/// or other-writable, or inside a tree the session can write). A pack ahead of the host's
+/// `PATH` that was not pinned would shadow a tool the kernel lets run with one it refuses.
+#[must_use]
+pub(crate) fn pack_is_granted(dir: &Path, exec: &Scope<String>) -> bool {
+    match exec {
+        Scope::All => true,
+        Scope::Only(grants) => grants.iter().any(|grant| Path::new(grant).starts_with(dir)),
+    }
+}
+
+/// The startup notice for a session: [`startup_notice`], plus one sentence when a carried
+/// pack sits beside newt, trust refused a pin, and none of the pack could be pinned, so the
+/// host's own commands run instead.
+#[must_use]
+pub fn session_exec_notice(unpinned: &[Unpinned], exec: &Scope<String>) -> Option<String> {
+    session_exec_notice_with(
+        unpinned,
+        exec,
+        crate::agentic::tools::carried_tools_dir().as_deref(),
+    )
+}
+
+fn session_exec_notice_with(
+    unpinned: &[Unpinned],
+    exec: &Scope<String>,
+    pack: Option<&Path>,
+) -> Option<String> {
+    let base = startup_notice(unpinned);
+    let refused = unpinned.iter().any(|u| {
+        matches!(
+            u.reason,
+            UnpinnedReason::Refused(_) | UnpinnedReason::Untrusted
+        )
+    });
+    let Some(dir) = pack.filter(|dir| refused && !pack_is_granted(dir, exec)) else {
+        return base;
+    };
+    let sentence = format!(
+        "The carried commands in {} are not on the shell's PATH: none could be pinned for \
+         this session, so the host's own run instead.",
+        dir.display()
+    );
+    Some(base.map_or(sentence.clone(), |base| format!("{base} {sentence}")))
 }
 
 pub(crate) fn trusted_program(path: &OsStr, caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
@@ -248,6 +297,82 @@ pub fn startup_notice(unpinned: &[Unpinned]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    fn only(grants: &[&str]) -> Scope<String> {
+        Scope::only(grants.iter().map(|grant| (*grant).to_string()))
+    }
+
+    /// #3151: on macOS a bare name grants only the system directories, so the pack is
+    /// usable only through a pinned exact path inside it.
+    #[test]
+    fn a_pack_is_granted_only_by_a_pinned_path_inside_it() {
+        let dir = Path::new("/opt/newt/tools");
+        assert!(pack_is_granted(dir, &Scope::All));
+        assert!(pack_is_granted(
+            dir,
+            &only(&["tail", "/opt/newt/tools/tail"])
+        ));
+        assert!(
+            !pack_is_granted(dir, &only(&["tail", "grep"])),
+            "bare names do not reach it"
+        );
+        assert!(!pack_is_granted(dir, &only(&["/usr/bin/tail"])));
+        assert!(
+            !pack_is_granted(dir, &only(&["/opt/newt/tools2/tail"])),
+            "a sibling directory is not the pack"
+        );
+        assert!(!pack_is_granted(dir, &Scope::none()));
+    }
+
+    /// #3151: the startup notice says an ungranted pack is off the PATH only when trust
+    /// refused a pin, and leaves the existing notice untouched otherwise.
+    #[test]
+    fn the_notice_names_an_ungranted_pack_only_after_a_refused_pin() {
+        let pack = Path::new("/opt/newt/tools");
+        let refused = [Unpinned {
+            name: "tail".into(),
+            reason: UnpinnedReason::Refused(vec!["/opt/homebrew/Cellar".into()]),
+        }];
+        let notice = session_exec_notice_with(&refused, &only(&["tail"]), Some(pack)).unwrap();
+        assert!(
+            notice.starts_with(&startup_notice(&refused).unwrap()),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("/opt/newt/tools") && notice.contains("host's own"),
+            "{notice}"
+        );
+
+        let pinned = only(&["tail", "/opt/newt/tools/tail"]);
+        assert_eq!(
+            session_exec_notice_with(&refused, &pinned, Some(pack)),
+            startup_notice(&refused),
+            "a granted pack is not mentioned"
+        );
+        let missing = [Unpinned {
+            name: "rg".into(),
+            reason: UnpinnedReason::NotFound,
+        }];
+        assert_eq!(
+            session_exec_notice_with(&missing, &only(&["rg"]), Some(pack)),
+            startup_notice(&missing),
+            "nothing was refused, so the pack is not mentioned"
+        );
+        assert_eq!(
+            session_exec_notice_with(&refused, &only(&["tail"]), None),
+            startup_notice(&refused),
+            "no pack, the notice is unchanged"
+        );
+        assert_eq!(
+            session_exec_notice_with(&[], &only(&["tail"]), Some(pack)),
+            None
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -266,6 +391,59 @@ mod tests {
             ["sh"]
         );
         assert_eq!(policy, before);
+    }
+
+    /// Grounds `a_pack_is_granted_only_by_a_pinned_path_inside_it` (and the confined
+    /// gate built on it, #3151): with real directories and modes, pinning grants a pack
+    /// in an owner-only directory, and leaves one ungranted when a group-writable
+    /// directory or a session write root refuses it, so the gate keeps it off the PATH.
+    #[test]
+    #[ignore = "real filesystem and permissions; weekly/release real-resource tier"]
+    fn pinning_grants_a_trusted_pack_and_refuses_an_untrusted_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let mode = |path: &Path, bits: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+        };
+        mode(temp.path(), 0o700);
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        mode(&workspace, 0o700);
+        // A pack at `<root>/tools/tail`, the directory made with `directory_mode`.
+        let pack = |root: &Path, directory_mode: u32| {
+            std::fs::create_dir_all(root.join("tools")).unwrap();
+            mode(root, directory_mode);
+            mode(&root.join("tools"), directory_mode);
+            let tool = root.join("tools/tail");
+            std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+            mode(&tool, 0o700);
+            std::fs::canonicalize(root.join("tools")).unwrap()
+        };
+        let trusted = pack(&temp.path().join("trusted"), 0o700);
+        let group_writable = pack(&temp.path().join("keg"), 0o770);
+        let under_workspace = pack(&workspace.join("newt"), 0o700);
+
+        let granted = |dir: &Path| {
+            let mut caveats = Caveats {
+                exec: Scope::only(["tail".into()]),
+                fs_write: Scope::only([workspace.to_string_lossy().into_owned()]),
+                net: Scope::none(),
+                ..Caveats::top()
+            };
+            resolve_basenames(&mut caveats, Some(dir.as_os_str()));
+            pack_is_granted(dir, &caveats.exec)
+        };
+        assert!(
+            granted(&trusted),
+            "an owner-only pack is pinned, so it is granted"
+        );
+        assert!(
+            !granted(&group_writable),
+            "a group-writable keg refuses the pin"
+        );
+        assert!(
+            !granted(&under_workspace),
+            "a pack inside a write root refuses the pin"
+        );
     }
 
     /// agent-bridle #421: a logical basename must gain its exact trusted path,

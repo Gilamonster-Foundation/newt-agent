@@ -13,7 +13,7 @@ use push_failure::classify_failure;
 
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::git_caveats::GitCaveats;
-use agent_bridle::{inspect_shell, ShellInspection};
+use crate::shell_inspect::{inspect_shell, ShellInspection};
 use newt_policy::caveats::{Caveats, CaveatsExt};
 use std::path::{Path, PathBuf};
 
@@ -26,13 +26,13 @@ pub(super) fn preflight(
 ) -> Result<(), String> {
     let inspection = match inspect_shell(source) {
         Ok(inspection) => inspection,
-        // Bridle cannot see into xargs, sh -c, env and the like, so a delete
+        // The shell inspector cannot see into xargs, sh -c, env and the like, so a delete
         // behind one would run without the confirmation below. Refuse it.
         Err(_) if hides_git_delete(source) => {
             return Err(format!(
                 "refused: this command uses a program newt cannot see into (xargs, \
-                 env, nice), so newt cannot show the operator what its git delete \
-                 removes. {NAME_IT_LITERALLY}"
+                 env, nice), so newt cannot show the operator what its git command \
+                 destroys. {NAME_IT_LITERALLY}"
             ))
         }
         // Other interpreter/dispatcher execution remains the confined
@@ -67,7 +67,10 @@ pub(super) fn preflight(
             "refused: git {ops} needs an operator to confirm it, and none is available"
         ));
     };
-    let subject = format!("{source}\n(run in {})", cwd.display());
+    let mut subject = format!("{source}\n(run in {})", cwd.display());
+    if destroys.contains(&"worktree-prune") {
+        subject.push_str(&prune_listing(cwd));
+    }
     if super::git_data_loss_confirmed(gate, &destroys, &subject) {
         Ok(())
     } else {
@@ -75,42 +78,108 @@ pub(super) fn preflight(
     }
 }
 
-/// Whether `source`, which Bridle could not inspect, runs a branch or stash
-/// delete as a bare word, as `xargs git branch -d` does. Without this,
+/// What the host's own `git worktree prune --dry-run --verbose` would drop (#3145),
+/// as lines to append to the prompt. The confined git sees only part of the
+/// repository, so the operator is shown the host's list, not its own. git writes
+/// the list to stderr.
+fn prune_listing(cwd: &Path) -> String {
+    let listed =
+        crate::git_hardening::hardened_git(cwd, &["worktree", "prune", "--dry-run", "--verbose"])
+            .ok()
+            .and_then(|mut command| command.output().ok())
+            .filter(|output| output.status.success());
+    match listed {
+        Some(output) => {
+            let text = String::from_utf8_lossy(&output.stderr);
+            let lines: Vec<&str> = text.lines().take(20).collect();
+            if lines.is_empty() {
+                "\n(git worktree prune would drop nothing)".to_string()
+            } else {
+                format!("\n(git worktree prune would drop:\n{})", lines.join("\n"))
+            }
+        }
+        None => "\n(git could not list what a prune would drop)".to_string(),
+    }
+}
+
+/// The work-destroying git ops beyond a branch or stash delete (#3145), by what the
+/// command names: `worktree remove`, `worktree prune` without `--dry-run`, `reset
+/// --hard`, and `clean -f` without `-n`. A tripwire on literal words, like the
+/// delete checks beside it: a word it cannot read is not seen.
+fn other_data_loss_op(verb: &str, args: &[String]) -> Option<&'static str> {
+    let words: Vec<String> = args.iter().filter_map(|arg| literal(arg)).collect();
+    match verb {
+        "worktree" => match words.first().map(String::as_str) {
+            Some("remove") => Some("worktree-remove"),
+            Some("prune") => {
+                (!has_option(&words[1..], "n", &["--dry-run"])).then_some("worktree-prune")
+            }
+            _ => None,
+        },
+        "reset" => has_option(&words, "", &["--hard"]).then_some("reset-hard"),
+        "clean" => (has_option(&words, "f", &["--force"])
+            && !has_option(&words, "n", &["--dry-run"]))
+        .then_some("clean"),
+        _ => None,
+    }
+}
+
+/// Whether `source`, which the shell inspector could not inspect, runs a branch or stash
+/// delete, or another work-destroying op, as a bare word, as `xargs git branch -d`
+/// does. Without this,
 /// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
-/// tripwire, not a boundary: like the commit check in `catalog.rs`, words keep
-/// their quotes, so git text inside an interpreter string (`sh -c '…'`) stays
-/// the confined executor's, as does an obfuscated command.
+/// tripwire, not a boundary: it reads the bare words of [`bare_git_invocations`],
+/// which says what that sees and what it does not.
 fn hides_git_delete(source: &str) -> bool {
-    source
-        .split(['|', ';', '&', '\n', '(', ')', '`', '<', '>'])
-        .map(|segment| {
-            segment
-                .split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .any(|words| {
-            words.iter().enumerate().any(|(at, word)| {
-                is_git(word)
-                    && invocation(&words[at..]).is_ok_and(|(verb, args, _)| match verb {
-                        "branch" => has_option(args, "dD", &["--delete"]),
-                        "stash" => args
-                            .first()
-                            .is_some_and(|action| matches!(action.as_str(), "drop" | "clear")),
-                        _ => false,
-                    })
-            })
-        })
+    bare_git_invocations(source).iter().any(|(verb, args)| {
+        other_data_loss_op(verb, args).is_some()
+            || match verb.as_str() {
+                "branch" => has_option(args, "dD", &["--delete"]),
+                "stash" => args
+                    .first()
+                    .is_some_and(|action| matches!(action.as_str(), "drop" | "clear")),
+                _ => false,
+            }
+    })
+}
+
+/// Every `git` invocation `source` makes, as `(verb, arguments)`, read from its bare
+/// words without the shell inspector: segments split at shell punctuation, and `git` taken
+/// anywhere in a segment, so `then git commit -m x` and `xargs git branch -d` count.
+/// A tripwire, not a boundary. Words are split at white space and keep their quotes,
+/// so `'git fetch'` or `"git` is not git, but git text inside a longer quoted
+/// string, a comment or a here-document is read as an invocation wherever no quote
+/// touches the `git` or the verb. An obfuscated command stays the confined
+/// executor's.
+fn bare_git_invocations(source: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    for segment in source.split(['|', ';', '&', '\n', '(', ')', '`', '<', '>']) {
+        let words: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+        for (at, word) in words.iter().enumerate() {
+            if is_git(word) {
+                if let Ok((verb, args, _)) = invocation(&words[at..]) {
+                    found.push((verb.to_string(), args.to_vec()));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// What to do instead when a delete names what it destroys only at runtime.
-const NAME_IT_LITERALLY: &str = "Retry with run_command naming each branch or stash \
-    literally, for example `git branch -D old-a old-b`; newt then asks the operator.";
+const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out \
+    literally, for example `git branch -D old-a old-b` or `git worktree remove ../old`; \
+    newt then asks the operator.";
 
 /// The first `git` verb in `verbs` that `source` invokes anywhere, nested
-/// constructs included. A loose trigger: text that merely mentions Git is not
-/// an invocation, and a source Bridle cannot inspect names none.
+/// constructs included. A loose trigger. In a source the inspector can read, text
+/// that merely mentions Git is not an invocation. In one it cannot read (#3146) the
+/// verb is read from the bare words, see [`bare_git_invocations`], and git text
+/// that no quote touches counts even when nothing would run it. A false hit costs:
+/// one network prompt the command did not need (a decline refuses the command), or
+/// for a push or a commit a refusal of the whole command. Never a missed gate. The
+/// push refusal ends with the push retry text, so a command that only mentioned a
+/// push is told how to push.
 fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
     fn find(inspection: &ShellInspection, verbs: &[&str]) -> Option<String> {
         inspection
@@ -133,11 +202,32 @@ fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
                     .find_map(|construct| find(construct.inspection.as_deref()?, verbs))
             })
     }
-    find(&inspect_shell(source).ok()?, verbs)
+    match inspect_shell(source) {
+        Ok(inspection) => find(&inspection, verbs),
+        // #3146: the shell inspector errors on an `if`, `while`, `until`, `case`, subshell
+        // or brace group, and one anywhere in a command hid every git verb from the
+        // triggers that use this (the network prompt and the commit and push brokers).
+        // Read the bare words instead, as the delete tripwire does.
+        Err(_) => bare_git_invocations(source)
+            .into_iter()
+            .filter_map(|(verb, _)| literal(&verb))
+            .find(|verb| verbs.contains(&verb.as_str())),
+    }
 }
 
+/// Whether `run_command` binds the commit broker to `source`. Only for a source the
+/// inspector can read: the broker covers a commit the shell itself runs, not one a
+/// dispatcher runs (`find -exec`, `timeout`), and telling the two apart takes the inspection.
 pub(super) fn needs_commit_broker(source: &str) -> bool {
-    git_verb_in(source, &["commit"]).is_some()
+    inspect_shell(source).is_ok() && git_verb_in(source, &["commit"]).is_some()
+}
+
+/// #3146: whether `source`, which the inspector cannot read, runs `git commit` by its bare
+/// words. No broker can be bound to it (see [`needs_commit_broker`]), so `run_command`
+/// refuses the whole command before any of it runs. With the broker bound instead, a direct
+/// commit landed before the confined shell refused the commit a dispatcher ran beside it.
+pub(super) fn commit_in_an_uninspectable_source(source: &str) -> bool {
+    inspect_shell(source).is_err() && git_verb_in(source, &["commit"]).is_some()
 }
 
 /// Git verbs that read from a remote. Pure data: a three-Cs candidate for the
@@ -275,8 +365,9 @@ fn is_gh(program: &str) -> bool {
     name.eq_ignore_ascii_case("gh") || name.eq_ignore_ascii_case("gh.exe")
 }
 
-/// issue-1188: is `source` a `git push` invocation anywhere in it (loose
-/// trigger, same shape as [`needs_commit_broker`])? A `true` here routes the
+/// issue-1188: is `source` a `git push` invocation anywhere in it (a loose
+/// trigger; unlike [`needs_commit_broker`] it also fires on the bare words of a
+/// source the inspector cannot read)? A `true` here routes the
 /// WHOLE `run_command` call to [`execute_governed_push`] instead of the
 /// confined shell — that function applies the source-bound/fixed-argv
 /// check and refuses anything this loose scan admits but the broker cannot
@@ -1011,10 +1102,10 @@ pub(super) fn is_git(program: &str) -> bool {
     name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
 }
 
-/// Resolve a single argument with Bridle's word parser. Argument data is not
+/// Resolve a single argument with the shell inspector's word parser. Argument data is not
 /// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
 pub(super) fn literal(word: &str) -> Option<String> {
-    agent_bridle_tool_shell::literal_shell_word(word).ok()
+    crate::shell_inspect::literal_shell_word(word).ok()
 }
 
 /// Find the native verb without translating argv. Repository/config selectors
@@ -1101,10 +1192,22 @@ fn inspect_commands(
         let Some(verb) = literal(raw_verb) else {
             continue;
         };
+        // #3145: work-destroying ops beyond a branch or stash delete are confirmed
+        // the same way, and refused when newt cannot show what they run.
+        if let Some(op) = other_data_loss_op(&verb, args) {
+            if !top_level {
+                return Err(format!(
+                    "refused: git {verb} run by another program or inside a substitution \
+                     cannot show the operator what it destroys. {NAME_IT_LITERALLY}"
+                ));
+            }
+            destroys.push(op);
+            continue;
+        }
         match verb.as_str() {
             "commit" if native_commit_broker => continue,
             // Complement the preexisting lexical attribution guard for
-            // quoted executable/verb spellings resolved by Bridle.
+            // quoted executable/verb spellings resolved by the shell inspector.
             "commit" | "merge" | "rebase" | "cherry-pick" | "revert" => {
                 let aborting = verb != "commit"
                     && args
@@ -2155,6 +2258,306 @@ mod tests {
             .unwrap_err()
             .contains("protected default branch 'stable'"));
         assert_eq!(gate.requests.len(), 1);
+    }
+
+    /// #3145: the ops are named by their words, and a dry run or a soft reset is not one.
+    #[test]
+    fn other_work_destroying_ops_are_named_by_their_words() {
+        let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (verb, args, op) in [
+            ("worktree", &["remove", "../old"][..], "worktree-remove"),
+            (
+                "worktree",
+                &["remove", "--force", "../old"][..],
+                "worktree-remove",
+            ),
+            ("worktree", &["prune"][..], "worktree-prune"),
+            ("worktree", &["prune", "--verbose"][..], "worktree-prune"),
+            ("reset", &["--hard"][..], "reset-hard"),
+            ("reset", &["--hard", "HEAD~1"][..], "reset-hard"),
+            ("clean", &["-fd"][..], "clean"),
+            ("clean", &["--force", "-x"][..], "clean"),
+        ] {
+            assert_eq!(
+                other_data_loss_op(verb, &words(args)),
+                Some(op),
+                "{verb} {args:?}"
+            );
+        }
+        for (verb, args) in [
+            ("worktree", &["list"][..]),
+            ("worktree", &["add", "../new"][..]),
+            ("worktree", &["prune", "--dry-run"][..]),
+            ("worktree", &["prune", "-n"][..]),
+            ("worktree", &[][..]),
+            ("reset", &["--soft", "HEAD~1"][..]),
+            ("reset", &["HEAD", "file"][..]),
+            ("reset", &[][..]),
+            ("clean", &["-n"][..]),
+            ("clean", &["-nfd"][..]),
+            ("clean", &["--dry-run"][..]),
+            ("clean", &["-i"][..]),
+            ("status", &[][..]),
+        ] {
+            assert_eq!(
+                other_data_loss_op(verb, &words(args)),
+                None,
+                "{verb} {args:?}"
+            );
+        }
+    }
+
+    /// #3145, found live: a model removed twelve worktrees and the operator was never
+    /// asked. Each of these now reaches the operator, once, and is refused when
+    /// declined or when nobody can be asked; the harmless forms are not asked.
+    #[test]
+    fn work_destroying_ops_reach_the_operator() {
+        let repo = repository();
+        let root = repo.path().canonicalize().unwrap();
+        for (source, op) in [
+            ("git reset --hard", "reset-hard"),
+            ("git clean -fd", "clean"),
+            ("git worktree remove ../old", "worktree-remove"),
+            ("git worktree prune", "worktree-prune"),
+        ] {
+            let mut gate = Gate {
+                allow: false,
+                requests: vec![],
+            };
+            let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+            let err = preflight(source, &root, &Caveats::top(), &mut asked, false);
+            assert_eq!(
+                err,
+                Err(format!("refused: the operator declined git {op}")),
+                "{source}"
+            );
+            assert_eq!(gate.requests.len(), 1, "{source}");
+            assert_eq!(gate.requests[0].target, op, "{source}");
+            assert!(gate.requests[0].reason.contains(source), "{source}");
+
+            gate.allow = true;
+            let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+            assert_eq!(
+                preflight(source, &root, &Caveats::top(), &mut asked, false),
+                Ok(()),
+                "{source}"
+            );
+
+            let none = preflight(source, &root, &Caveats::top(), &mut None, false);
+            assert!(
+                none.unwrap_err()
+                    .contains("needs an operator to confirm it"),
+                "{source}"
+            );
+        }
+        for source in [
+            "git reset --soft HEAD~1",
+            "git reset HEAD file",
+            "git clean -n",
+            "git worktree list",
+            "git worktree prune --dry-run",
+            "git status",
+        ] {
+            let mut gate = Gate {
+                allow: false,
+                requests: vec![],
+            };
+            let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+            assert_eq!(
+                preflight(source, &root, &Caveats::top(), &mut asked, false),
+                Ok(()),
+                "{source}"
+            );
+            assert!(gate.requests.is_empty(), "{source} asked");
+        }
+        // In a loop or a substitution newt cannot show what runs: refused, with the retry.
+        let err = preflight(
+            "echo $(git reset --hard)",
+            &root,
+            &Caveats::top(),
+            &mut None,
+            false,
+        );
+        assert!(err
+            .unwrap_err()
+            .contains("cannot show the operator what it destroys"));
+    }
+
+    /// #3145: a prune prompt lists what the host's own dry run would drop, which the
+    /// confined git cannot see in full.
+    #[test]
+    fn a_prune_prompt_lists_what_the_host_would_drop() {
+        let repo = repository();
+        let root = repo.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let gone = outside.path().join("gone");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                gone.to_str().unwrap(),
+                "-b",
+                "gone-branch",
+            ],
+        );
+        std::fs::remove_dir_all(&gone).unwrap();
+        let mut gate = Gate {
+            allow: false,
+            requests: vec![],
+        };
+        let mut asked: Option<&mut dyn PermissionGate> = Some(&mut gate);
+        let err = preflight(
+            "git worktree prune",
+            &root,
+            &Caveats::top(),
+            &mut asked,
+            false,
+        );
+        assert_eq!(
+            err,
+            Err("refused: the operator declined git worktree-prune".into())
+        );
+        let reason = &gate.requests[0].reason;
+        assert!(reason.contains("would drop"), "{reason}");
+        assert!(reason.contains("worktrees/gone"), "{reason}");
+    }
+
+    /// #3146, found live: a fetch followed by a loop holding an `if` died at the fence
+    /// with no network prompt, because the shell inspector cannot read an `if` and the
+    /// command was read as having no git verb. The verb is now read from the bare words.
+    #[test]
+    fn a_git_verb_in_an_uninspectable_command_is_still_seen() {
+        let live = "git fetch --prune origin 2>&1 | head -5; echo \"=== local branches ===\"; \
+                    for b in $(git for-each-ref refs/heads); do merged=$(git log -1 $b); \
+                    if [ -z \"$merged\" ]; then echo $b; fi; done";
+        assert!(
+            inspect_shell(live).is_err(),
+            "the premise: the inspector cannot read it"
+        );
+        assert_eq!(
+            git_verb_in(live, NETWORK_READ_VERBS).as_deref(),
+            Some("fetch")
+        );
+        for (source, verb) in [
+            ("git fetch; if [ -z \"$x\" ]; then echo a; fi", "fetch"),
+            ("if [ -n \"$x\" ]; then git pull --ff-only; fi", "pull"),
+            (
+                "while read r; do git ls-remote $r; done < remotes; if true; then :; fi",
+                "ls-remote",
+            ),
+            ("case $x in a) git clone u d;; esac", "clone"),
+            ("(cd sub && git fetch origin)", "fetch"),
+        ] {
+            assert_eq!(
+                git_verb_in(source, NETWORK_READ_VERBS).as_deref(),
+                Some(verb),
+                "{source}"
+            );
+        }
+        for source in [
+            "if true; then git status; fi",
+            "if true; then echo \"git fetch\"; fi",
+            "case x in a) git log --oneline;; esac",
+            "if true; then python -c 'print(\"git fetch\")'; fi",
+        ] {
+            assert_eq!(git_verb_in(source, NETWORK_READ_VERBS), None, "{source}");
+        }
+        // The fallback's real reach, pinned so it cannot widen unnoticed. It runs on every
+        // source the inspector refuses, an interpreter or a dispatcher included, and git
+        // text counts wherever no quote touches the `git` or the verb: in a quoted
+        // sentence, in an interpreter string, in a comment, in a here-document.
+        for source in [
+            "python3 -c \"print('then run git fetch origin')\"",
+            "sh -c 'cd sub && git fetch origin'",
+            "if true; then :; fi # later: git fetch origin",
+            "if true; then cat <<EOF\nrun git fetch origin\nEOF\nfi",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+            assert_eq!(
+                git_verb_in(source, NETWORK_READ_VERBS).as_deref(),
+                Some("fetch"),
+                "{source}"
+            );
+        }
+    }
+
+    /// #3146: the triggers that key on `git_verb_in` now fire inside a construct the shell
+    /// inspector cannot read. A push goes to the push broker, which refuses what is not a
+    /// standalone push with a retry that works. A commit is named for refusal and gets NO
+    /// broker: the broker covers only a commit the inspection shows to be the shell's own,
+    /// and the third source is the `native_git_commit` proof's, where a broker bound on
+    /// the bare words let `direct` land before the dispatcher's commit was refused.
+    #[test]
+    fn a_push_in_an_uninspectable_construct_reaches_its_broker_and_a_commit_is_refused() {
+        for source in [
+            "if [ -z \"$x\" ]; then git commit -m x; fi",
+            "while true; do git commit -am wip; break; done",
+            "git commit --allow-empty -m direct; find . -maxdepth 0 -exec timeout 30 git commit --allow-empty -m delegated \\;",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+            assert!(commit_in_an_uninspectable_source(source), "{source}");
+            assert!(!needs_commit_broker(source), "{source}");
+            assert!(!needs_push_broker(source), "{source}");
+        }
+        // A commit the inspector can read keeps its broker and is not refused here.
+        for source in ["git commit -m x", "git add -A && git commit -m x"] {
+            assert!(needs_commit_broker(source), "{source}");
+            assert!(!commit_in_an_uninspectable_source(source), "{source}");
+        }
+        for source in [
+            "if [ -z \"$x\" ]; then git push origin HEAD; fi",
+            "case $b in main) git push;; esac",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+            assert!(needs_push_broker(source), "{source}");
+            assert!(!needs_commit_broker(source), "{source}");
+        }
+        assert!(!needs_commit_broker("if true; then git status; fi"));
+        assert!(!commit_in_an_uninspectable_source(
+            "if true; then git status; fi"
+        ));
+        assert!(!needs_push_broker("if true; then git status; fi"));
+    }
+
+    /// #3146: the prompt itself, end to end: a declined network read refuses the whole
+    /// command and nothing runs.
+    #[test]
+    fn a_network_read_inside_an_if_asks_the_operator() {
+        let source = "if [ -z \"$x\" ]; then git fetch origin; fi";
+        let mut gate = EgressGate {
+            allow: false,
+            ..Default::default()
+        };
+        let refusal = approve(source, crate::Scope::none(), Some(&mut gate)).unwrap_err();
+        // Not the cause wording (#3148 reworded it): that it was refused, that the verb was
+        // found inside the `if`, and that nothing ran.
+        assert!(refusal.starts_with("denied:"), "{refusal}");
+        assert!(refusal.contains("`git fetch`"), "{refusal}");
+        assert!(refusal.contains("No command ran"), "{refusal}");
+        assert_eq!(gate.seen.len(), 1, "asked once");
+    }
+
+    /// #3145: the tripwire sees the new ops behind a dispatcher, as it does a delete.
+    #[test]
+    fn other_work_destroying_ops_behind_a_dispatcher_are_seen() {
+        for source in [
+            "git worktree list | xargs -n1 git worktree remove",
+            "xargs git reset --hard",
+            "env GIT_TRACE=0 /usr/bin/git clean -fd",
+            "nice git worktree prune",
+        ] {
+            assert!(hides_git_delete(source), "{source}");
+        }
+        for source in [
+            "xargs git worktree list",
+            "env git reset --soft",
+            "nice git clean -n",
+            "git worktree prune --dry-run | xargs echo",
+        ] {
+            assert!(!hides_git_delete(source), "{source}");
+        }
     }
 
     /// Pure: the tripwire reads bare words, so it sees through a dispatcher,
@@ -3665,8 +4068,9 @@ mod governed_push_tests {
                 .any(|line| line.contains("/o/r.git/info/refs?service=git-upload-pack"));
             assert_eq!(dialed, allow, "allow={allow}: {output} / {seen:?}");
             if !allow {
+                // The refusal names the verb the command ran, `ls-remote` here.
                 assert!(
-                    output.contains("network access for this `git fetch` was not granted"),
+                    output.contains("network access for this `git ls-remote` was not granted"),
                     "{output}"
                 );
             }

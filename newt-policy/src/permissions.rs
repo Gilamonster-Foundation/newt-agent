@@ -277,9 +277,13 @@ impl PermissionRequest {
 /// calls it (#3147). One table: the gate asks about exactly these ops, and the
 /// prompt names the action from the same row, so a new data-loss op cannot be
 /// asked about under the commit label.
-const GIT_DATA_LOSS_ACTIONS: [(&str, &str); 2] = [
+const GIT_DATA_LOSS_ACTIONS: [(&str, &str); 6] = [
     ("branch-delete", "delete a branch via git"),
     ("stash-drop", "drop a stash via git"),
+    ("worktree-remove", "remove a worktree via git"),
+    ("worktree-prune", "prune worktrees via git"),
+    ("reset-hard", "discard uncommitted changes via git"),
+    ("clean", "delete untracked files via git"),
 ];
 
 /// What the git op `op` does when it destroys work, as a prompt names it, or
@@ -998,6 +1002,15 @@ not json at all
             git_data_loss_action("stash-drop"),
             Some("drop a stash via git")
         );
+        // #3145: the rest of what a `run_command` can do to work, not just a ref.
+        for (op, action) in [
+            ("worktree-remove", "remove a worktree via git"),
+            ("worktree-prune", "prune worktrees via git"),
+            ("reset-hard", "discard uncommitted changes via git"),
+            ("clean", "delete untracked files via git"),
+        ] {
+            assert_eq!(git_data_loss_action(op), Some(action), "{op}");
+        }
         for op in ["commit", "add", "checkout", "branch", "stash-pop", ""] {
             assert_eq!(git_data_loss_action(op), None, "{op:?}");
         }

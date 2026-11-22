@@ -23,7 +23,7 @@ fn resolve_exec_cwd_confines_to_workspace() {
     };
     assert_eq!(resolve_exec_cwd("/ws", Some(abs)), abs);
     // The dispatch args carry it verbatim.
-    let a = confined_dispatch_args("ls", &joined);
+    let a = confined_dispatch_args("ls", &joined, &newt_policy::caveats::Caveats::top());
     assert_eq!(a["cwd"], joined);
 }
 
@@ -426,4 +426,59 @@ fn commit_review_covers_a_commit_the_detector_cannot_see() {
     assert!(report.contains("oid-new"), "{report}");
     // No read authority over the cwd: no snapshot at all.
     assert!(start_commit_review(false, &repo, None).is_none());
+}
+
+/// A `cd`-folded or `cwd`-carrying `grep`/`find` is a shell program the direct
+/// tool cannot serve: the tool drops the directory, and outside the workspace
+/// it refuses and sends the model back to run_command, which then refused too.
+/// Measured: a 2026-11-21 sibling-worktree run hit that loop four times and
+/// never located its target. Bare forms keep the corrective redirect.
+#[tokio::test]
+async fn grep_and_find_with_a_directory_are_not_redirected() {
+    // A workspace that does not exist: nothing can execute, so the test
+    // spawns nothing and touches no filesystem. The redirect answers before
+    // cwd resolution, so its message alone tells the two paths apart.
+    let ws = "/nonexistent-newt-redirect-ws";
+    let run = |args: serde_json::Value| async move {
+        execute_tool(
+            "run_command",
+            &args,
+            ws,
+            false,
+            20,
+            &newt_policy::caveats::Caveats::top(),
+            &mut crate::NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    };
+    const REDIRECT: &str = "is a tool, not a shell command";
+    for args in [
+        serde_json::json!({ "command": "cd ../sibling && grep -n needle src/lib.rs" }),
+        serde_json::json!({ "command": "cd ../sibling && find . -name mod.rs" }),
+        serde_json::json!({ "command": "grep -n needle src/lib.rs", "cwd": "../sibling" }),
+    ] {
+        let out = run(args.clone()).await;
+        assert!(
+            !out.contains(REDIRECT),
+            "{args} must reach the shell: {out}"
+        );
+    }
+    let bare = run(serde_json::json!({ "command": "grep -n needle src/lib.rs" })).await;
+    assert!(
+        bare.contains(REDIRECT),
+        "a bare grep keeps the corrective: {bare}"
+    );
 }

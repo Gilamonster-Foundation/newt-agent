@@ -40,10 +40,14 @@ class Newt < Formula
     Dir.chdir(target) if target
     bin.install "newt"
     bin.install "newt-mcp-server"
+    # The carried command pack (#3151): GNU-compatible `date` and `grep -P` for a
+    # macOS host whose own are BSD. newt finds it beside its own executable.
+    bin.install "tools" if OS.mac?
   end
 
   test do
     system bin/"newt", "--version"
     system bin/"newt-mcp-server", "--version"
+    assert_equal "1", shell_output("#{bin}/tools/date -u -d @1 +%s").strip if OS.mac?
   end
 end

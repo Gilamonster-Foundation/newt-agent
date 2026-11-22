@@ -133,6 +133,13 @@ jobs:
         run: |
           cargo build --release --locked --target ${{ matrix.target }} -p newt-agent -p newt-mcp-server
 
+      # #3151: on macOS the host's own `date` and `grep` are BSD, so the carried
+      # command pack ships beside `newt` as `tools/`, staged below by the script a
+      # user runs by hand (scripts/unix/install-carried-tools.sh).
+      - name: Build the carried command pack (macOS)
+        if: matrix.label == 'macos-arm64'
+        run: cargo build --release --locked --target ${{ matrix.target }} -p newt-carried-tools
+
       # platforms.json declares the glibc floor the npm shim enforces; the
       # binary is built on the pinned image above. If the builder's glibc
       # ever exceeds the declared floor, the shim would admit hosts that die
@@ -164,7 +171,19 @@ jobs:
           cp target/${{ matrix.target }}/release/newt "$STAGE/"
           cp target/${{ matrix.target }}/release/newt-mcp-server "$STAGE/"
           cp LICENSE README.md "$STAGE/"
+          if [ "${{ matrix.label }}" = "macos-arm64" ]; then
+            scripts/unix/install-carried-tools.sh \
+              --binary "target/${{ matrix.target }}/release/newt-carried-tools" \
+              --newt-directory "$STAGE"
+          fi
           tar -czf "$STAGE.tar.gz" "$STAGE"
+          if [ "${{ matrix.label }}" = "macos-arm64" ]; then
+            # Test what ships: the pack as the archive extracts it, not the staging directory.
+            # A release without the pack, or with one that does not run, fails here.
+            verify="$(mktemp -d)"
+            tar -xzf "$STAGE.tar.gz" -C "$verify"
+            scripts/unix/test-carried-tools.sh "$verify/$STAGE/tools"
+          fi
           echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
 
       - name: Stage release contents (Windows)
@@ -765,10 +784,21 @@ jobs:
           for shim in "@gilamonster/newt" "@gilamonster/newt-mcp-server"; do
             bin="${shim##*/}"
             out="dist-npm/${bin}-${{ matrix.key }}"
+            # #3151: ship `date`, `grep` and `rg` from the carried command pack the archive
+            # holds (macOS only) beside newt: the two GNU behaviours the host lacks and the
+            # ripgrep `grep` needs. The rest of the pack stays out of the package for size.
+            pack="incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/tools"
+            tools=()
+            if [ "$bin" = newt ] && [ -d "$pack" ]; then
+              subset="$RUNNER_TEMP/newt-npm-tools"
+              mkdir -p "$subset"
+              cp "$pack/date" "$pack/grep" "$pack/rg" "$pack/LICENSE-uutils" "$pack"/ripgrep-* "$subset/"
+              tools=(--tools "$subset")
+            fi
             node npm/scripts/build-platform-package.mjs \
               --name "$shim" \
               --binary "incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/${bin}${{ matrix.binary_ext }}" \
-              --key "${{ matrix.key }}" --version "$VERSION" --out "$out"
+              --key "${{ matrix.key }}" --version "$VERSION" --out "$out" "${tools[@]}"
             ( cd "$out"
               PKG=$(node -p "require('./package.json').name")
               if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
