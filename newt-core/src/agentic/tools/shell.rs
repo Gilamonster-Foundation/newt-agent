@@ -2262,7 +2262,7 @@ fn bash_sh_argv(
     cmd: &str,
 ) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
     use crate::ambient_shell::AmbientShell;
-    let command = agent_bridle_tool_shell::with_posix_command_discovery(cmd);
+    let command = crate::ambient_shell::with_posix_command_discovery(cmd);
     match shell {
         AmbientShell::Login { program, args } if !fallback => {
             let mut argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
@@ -2371,7 +2371,7 @@ fn host_shell_command_at(
     } else if login.is_some() {
         // Already in the argv above.
     } else if route == ShellRoute::BashSh {
-        c.arg(agent_bridle_tool_shell::with_posix_command_discovery(cmd));
+        c.arg(crate::ambient_shell::with_posix_command_discovery(cmd));
     } else {
         c.arg(cmd);
     }

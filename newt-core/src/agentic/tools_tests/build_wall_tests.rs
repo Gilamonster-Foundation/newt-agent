@@ -7,7 +7,7 @@ fn build_wall() -> Duration {
 }
 
 fn default_wall() -> Duration {
-    Duration::from_secs(agent_bridle::LimitsPolicy::default().default_timeout_secs)
+    Duration::from_secs(crate::RunCommandBudget::DEFAULT_SECS)
 }
 
 /// #2732: prepared compound builds retain the build executor budget.

@@ -13,6 +13,15 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+/// Supply a portable `which` to a POSIX interpreter without an external utility: the
+/// shell's own `command -v`, including its current `PATH`. Apply only at a POSIX
+/// interpreter boundary, after inspecting the user command. Copied from agent-bridle's
+/// tool-shell so the host route needs no bridle crate (#3160, the `confine` feature);
+/// `the_which_shim_is_the_one_bridle_supplies` keeps the two equal.
+pub(crate) fn with_posix_command_discovery(command: &str) -> String {
+    format!("which() {{ command -v -- \"$@\"; }}\n{command}")
+}
+
 /// The login shells `--ambient` runs: POSIX-compatible ones only, so the POSIX guidance the
 /// model always gets is true. `(basename, interactive)`; interactive (`-i`) is what reads
 /// `~/.zshrc` / `~/.bashrc`, where aliases and functions live. Any other `$SHELL` (fish, nu,
@@ -165,6 +174,18 @@ pub fn strip_interactive_noise(stderr: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3160: the shim is bridle's own, copied so the host route needs no bridle crate;
+    /// while bridle is a dependency the two must agree, byte for byte.
+    #[test]
+    fn the_which_shim_is_the_one_bridle_supplies() {
+        for command in ["which cargo", "echo 'a b' | wc -c", ""] {
+            assert_eq!(
+                with_posix_command_discovery(command),
+                agent_bridle_tool_shell::with_posix_command_discovery(command)
+            );
+        }
+    }
 
     #[cfg(unix)]
     fn os(s: &str) -> Option<OsString> {
