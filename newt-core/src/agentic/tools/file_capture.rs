@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Read as _};
 use std::path::Path;
 
-use crate::caveats::Scope;
+use newt_policy::caveats::Scope;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::agentic) enum TextSnapshot {
@@ -42,9 +42,9 @@ pub(in crate::agentic) fn is_absent_leaf(path: &Path) -> bool {
 #[cfg(windows)]
 fn exact_scope_root(scope: &Scope<String>, path: &Path) -> bool {
     let path = path.to_string_lossy();
-    let normalized_path = crate::caveats::lexically_normalize(&path);
+    let normalized_path = newt_policy::caveats::lexically_normalize(&path);
     matches!(scope, Scope::Only(roots) if roots.iter().any(|root| {
-        crate::caveats::lexically_normalize(root) == normalized_path
+        newt_policy::caveats::lexically_normalize(root) == normalized_path
     }))
 }
 

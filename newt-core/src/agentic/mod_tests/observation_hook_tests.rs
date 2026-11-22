@@ -1,6 +1,6 @@
 use super::*;
-use crate::caveats::Caveats;
 use crate::{BackendKind, MemMessage};
+use newt_policy::caveats::Caveats;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use wiremock::matchers::{method, path};

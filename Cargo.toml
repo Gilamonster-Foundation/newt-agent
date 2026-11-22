@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "newt-core",
+    "newt-policy",
     "newt-router",
     "newt-data",
     "newt-inference",
@@ -44,6 +45,7 @@ members = [
 # (newt-flock/tests/default_build.rs asserts the split).
 default-members = [
     "newt-core",
+    "newt-policy",
     "newt-router",
     "newt-data",
     "newt-inference",
@@ -412,6 +414,7 @@ agent-mesh-protocol = "0.7"
 
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.8.6" }
+newt-policy       = { path = "newt-policy",       version = "=0.8.6" }
 newt-router       = { path = "newt-router",       version = "=0.8.6" }
 newt-data         = { path = "newt-data",         version = "=0.8.6" }
 newt-flock        = { path = "newt-flock",        version = "=0.8.6" }

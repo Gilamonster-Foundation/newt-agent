@@ -9,7 +9,7 @@ use super::*;
 fn read_memo_fixture(
     path: &str,
     content: &str,
-) -> (tempfile::TempDir, String, crate::caveats::Caveats) {
+) -> (tempfile::TempDir, String, newt_policy::caveats::Caveats) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let full = root.join(path);
@@ -1248,7 +1248,7 @@ fn the_carried_userland_refusal_remains_a_failed_tool_result() {
         "stdout": "",
         "stderr": "error: command not found: cargo\n",
     });
-    let rendered = tools::absent_binary_refusal(&envelope, &crate::caveats::Scope::none())
+    let rendered = tools::absent_binary_refusal(&envelope, &newt_policy::caveats::Scope::none())
         .expect("a 127 with no denials renders the refusal");
     assert!(rendered.contains(tools::ABSENT_BINARY_MARKER), "{rendered}");
     assert!(!tools::tool_result_ok(&rendered));
@@ -1554,8 +1554,8 @@ async fn workspace_progress_uses_real_bytes_without_reading_outside_authority() 
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().to_str().unwrap();
     let args = serde_json::json!({"command":"printf changed > output.txt"});
-    let denied = crate::caveats::Scope::none();
-    let allowed = crate::caveats::Scope::only([workspace.to_string()]);
+    let denied = newt_policy::caveats::Scope::none();
+    let allowed = newt_policy::caveats::Scope::only([workspace.to_string()]);
     assert!(
         progress_workspace_state("run_command", &args, workspace, &denied)
             .await
@@ -1586,7 +1586,7 @@ async fn named_mutation_progress_uses_exact_file_grants_and_absent_postimage() {
     let file = root.path().join("source.txt");
     let workspace = root.path().to_str().unwrap();
     let args = serde_json::json!({"path":"source.txt"});
-    let scope = crate::caveats::Scope::only([file.to_string_lossy().into_owned()]);
+    let scope = newt_policy::caveats::Scope::only([file.to_string_lossy().into_owned()]);
     std::fs::write(&file, "before").unwrap();
     let before = progress_workspace_state("edit_file", &args, workspace, &scope).await;
     assert!(matches!(before, Some(ProgressSnapshot::File(_))));
@@ -1971,7 +1971,7 @@ fn a_dispatch_time_non_route_never_counts_even_if_the_filesystem_changed_since()
         super::routing::RouteTable::builtin().classify(
             "cd target; cargo test",
             &root,
-            &crate::caveats::Scope::only([root.to_string_lossy().into_owned()]),
+            &newt_policy::caveats::Scope::only([root.to_string_lossy().into_owned()]),
         ),
         super::routing::RouteDecision::Route {
             tool: "build_exec",

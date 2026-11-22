@@ -603,7 +603,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Practical caveat (now):** none for the workspace-escape vector. step-4.3 ACTIVATED the fence:
   `handle_prompt_coder` passes the session workspace to `caveats_for_dispatch`, so the dispatched
   authority is `fs_read`/`fs_write = Scope::only([workspace])`, not `Scope::All`. The coder's fs
-  predicates gate by PREFIX containment (`newt_core::permits_path`) against that same workspace, so
+  predicates gate by PREFIX containment (`newt_policy::permits_path`) against that same workspace, so
   the fence permits the coder's own in-workspace writes and denies any `..`/absolute escape — and
   every write is additionally object-bound beneath the workspace fd at the two shared primitives
   (`apply_whole_files` / `apply_patch`, `newt-tools/src/patch.rs`).
@@ -617,7 +617,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   platform-independent.
 - **Compensating controls:** the object-bound `WorkspaceDir` fence (#522, the kernel-enforced
   containment); the prefix caveat gate shared with the interactive tool sites
-  (`newt_core::permits_path`); the crew/plan write path was already contained
+  (`newt_policy::permits_path`); the crew/plan write path was already contained
   (`is_safe_worktree_path`); throwaway git worktrees; the `b1` OS sandbox backstop.
 - **Closure criterion:** met — the dispatched worker's `fs_write`/`fs_read` are workspace-scoped
   (not `Scope::All`), the coder gate denies escapes by containment, and every write resolves
@@ -631,7 +631,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   file and reports a dispatch error); plus the object-bound `apply_whole_files_denies_symlink_escape_object_bound`
   et al. (`newt-tools/src/patch.rs`, #522).
 - **Status:** CLOSED — dispatch-site fence ACTIVATED (step-4.3) atop object-bound containment
-  (#522/step-52.7); the coder fs predicates are prefix-aware and share `newt_core::permits_path`
+  (#522/step-52.7); the coder fs predicates are prefix-aware and share `newt_policy::permits_path`
   with the interactive gate · owner: — · review-by: if a non-workspace write grant (e.g. `--write`)
   is ever threaded into ACP dispatch.
 
@@ -788,8 +788,9 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `from_env_reads_exactly_one_fail_closed` (`newt-core/src/launch_authority.rs`) — freeze a confined
   authority, set every switch env var afterward, and `current()` stays confined; plus the
   `ocap_check.py` source gate (`check_launch_authority_reads`) which FAILS the build if any
-  `newt-core/src` file other than `launch_authority.rs` reads an authority env twin with `env::var`
-  (a stray deep read re-opens the widen-mid-process hole — verified red on a probe).
+  `newt-core/src` or `newt-policy/src` file other than `launch_authority.rs` reads an authority env
+  twin with `env::var` (a stray deep read re-opens the widen-mid-process hole — verified red on a
+  probe; the self-test plants one in each crate).
 - **0.8.0 disposition:** already did not block v0.8.0; this now CLOSES the row entirely (the
   typed-authority follow-on is done, not deferred).
 - **Status:** CLOSED — `--non-interactive` decouple (step-3.1) + typed immutable `LaunchAuthority`

@@ -4,9 +4,9 @@
 //! checkout overwrites it. A test binary of its own, because setting
 //! `GIT_INDEX_FILE` inside the shared unit-test process would redirect every
 //! other test's index.
-use newt_core::caveats::Scope;
 use newt_core::git_caveats::GitCaveats;
 use newt_git::{GitEngine, GitError};
+use newt_policy::caveats::Scope;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;

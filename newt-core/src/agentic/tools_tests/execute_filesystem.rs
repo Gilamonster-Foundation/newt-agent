@@ -552,7 +552,7 @@ async fn cli_exact_file_read_grant_reads_only_the_named_object() {
         ..Default::default()
     }
     .to_caveats(&workspace);
-    crate::caveats::lock_fs_to_workspace(
+    newt_policy::caveats::lock_fs_to_workspace(
         &mut caveats,
         &workspace,
         &[granted.to_string_lossy().into_owned()],
@@ -611,7 +611,7 @@ async fn cli_exact_file_write_grant_creates_and_updates_only_the_named_object() 
         ..Default::default()
     }
     .to_caveats(&workspace);
-    crate::caveats::lock_fs_to_workspace(
+    newt_policy::caveats::lock_fs_to_workspace(
         &mut caveats,
         &workspace,
         &[],

@@ -96,7 +96,7 @@ impl WorkspaceDir {
         let path = path.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 authority root")
         })?;
-        let path = crate::caveats::lexically_normalize(path);
+        let path = newt_policy::caveats::lexically_normalize(path);
         let anchor = if path.is_absolute() { "/" } else { "." };
         let root = open(
             anchor,

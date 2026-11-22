@@ -228,13 +228,16 @@ async fn run_command_windows_appcontainer_allows_granted_write_denies_sibling_wr
     std::fs::write(&granted, "ORIG").unwrap();
     std::fs::write(&denied, "ORIG").unwrap();
 
-    let caveats = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([windows_path(&workspace), windows_path(&sibling)]),
-        fs_write: crate::caveats::Scope::only([windows_path(&workspace)]),
-        exec: crate::caveats::Scope::All,
-        net: crate::caveats::Scope::All,
-        max_calls: crate::caveats::CountBound::Unlimited,
-        valid_for_generation: crate::caveats::Scope::All,
+    let caveats = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([
+            windows_path(&workspace),
+            windows_path(&sibling),
+        ]),
+        fs_write: newt_policy::caveats::Scope::only([windows_path(&workspace)]),
+        exec: newt_policy::caveats::Scope::All,
+        net: newt_policy::caveats::Scope::All,
+        max_calls: newt_policy::caveats::CountBound::Unlimited,
+        valid_for_generation: newt_policy::caveats::Scope::All,
     };
 
     let mut granted_args = cmd_set_content(&granted, "GRANTED");
@@ -299,16 +302,16 @@ async fn run_command_windows_appcontainer_denies_direct_tcp() {
 
     let workspace = windows_low_dir("tcp");
     let (port, rx) = windows_tcp_listener();
-    let caveats = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([
+    let caveats = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([
             windows_path(workspace.path()),
             windows_path(probe_dir.path()),
         ]),
-        fs_write: crate::caveats::Scope::only([windows_path(workspace.path())]),
-        exec: crate::caveats::Scope::All,
-        net: crate::caveats::Scope::none(),
-        max_calls: crate::caveats::CountBound::Unlimited,
-        valid_for_generation: crate::caveats::Scope::All,
+        fs_write: newt_policy::caveats::Scope::only([windows_path(workspace.path())]),
+        exec: newt_policy::caveats::Scope::All,
+        net: newt_policy::caveats::Scope::none(),
+        max_calls: newt_policy::caveats::CountBound::Unlimited,
+        valid_for_generation: newt_policy::caveats::Scope::All,
     };
     let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({
@@ -351,13 +354,13 @@ async fn run_command_windows_provider_env_is_not_inherited() {
     }
     let workspace = windows_low_dir("env");
     windows_grant_all_appcontainers(workspace.path());
-    let caveats = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([windows_path(workspace.path())]),
-        fs_write: crate::caveats::Scope::only([windows_path(workspace.path())]),
-        exec: crate::caveats::Scope::All,
-        net: crate::caveats::Scope::All,
-        max_calls: crate::caveats::CountBound::Unlimited,
-        valid_for_generation: crate::caveats::Scope::All,
+    let caveats = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([windows_path(workspace.path())]),
+        fs_write: newt_policy::caveats::Scope::only([windows_path(workspace.path())]),
+        exec: newt_policy::caveats::Scope::All,
+        net: newt_policy::caveats::Scope::All,
+        max_calls: newt_policy::caveats::CountBound::Unlimited,
+        valid_for_generation: newt_policy::caveats::Scope::All,
     };
     let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({
@@ -415,13 +418,13 @@ async fn run_command_windows_missing_launcher_refuses_not_host_fallback() {
     let workspace = windows_low_dir("missing");
     let marker = workspace.path().join("fallback.txt");
     std::fs::write(&marker, "ORIG").unwrap();
-    let caveats = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([windows_path(workspace.path())]),
-        fs_write: crate::caveats::Scope::only([windows_path(workspace.path())]),
-        exec: crate::caveats::Scope::All,
-        net: crate::caveats::Scope::All,
-        max_calls: crate::caveats::CountBound::Unlimited,
-        valid_for_generation: crate::caveats::Scope::All,
+    let caveats = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([windows_path(workspace.path())]),
+        fs_write: newt_policy::caveats::Scope::only([windows_path(workspace.path())]),
+        exec: newt_policy::caveats::Scope::All,
+        net: newt_policy::caveats::Scope::All,
+        max_calls: newt_policy::caveats::CountBound::Unlimited,
+        valid_for_generation: newt_policy::caveats::Scope::All,
     };
     let result = super::shell::dispatch_bridled_shell(
             serde_json::json!({"cmd": "echo HOST-FALLBACK>fallback.txt", "cwd": windows_path(workspace.path())}),

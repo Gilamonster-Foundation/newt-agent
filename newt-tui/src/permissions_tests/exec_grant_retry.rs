@@ -5,7 +5,7 @@ async fn dispatch(
     command: &str,
     root: &std::path::Path,
     base: &Caveats,
-    gate: &mut dyn newt_core::PermissionGate,
+    gate: &mut dyn newt_policy::PermissionGate,
 ) -> String {
     newt_core::execute_tool(
         "run_command",

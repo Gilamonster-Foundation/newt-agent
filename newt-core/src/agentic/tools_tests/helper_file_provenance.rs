@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn tui_permits_path_prefix_semantics() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     assert!(tui_permits_path(&Scope::All, "/anything/at/all"));
     assert!(!tui_permits_path(&Scope::<String>::none(), "/ws/file"));
     let only = Scope::only(["/ws".to_string()]);
@@ -43,7 +43,7 @@ fn tui_permits_path_prefix_semantics() {
 #[cfg(unix)]
 #[test]
 fn tui_permits_path_is_a_lexical_prefilter_not_the_fence() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     let outside = tempfile::TempDir::new().unwrap();
     std::fs::write(outside.path().join("secret"), b"x").unwrap();
     let ws = tempfile::TempDir::new().unwrap();
@@ -117,13 +117,13 @@ fn artifact_file_streaming_hash_and_postcondition_are_exact() {
     std::fs::write(&path, &bytes).unwrap();
 
     assert_eq!(
-        artifact_preimage_state(&crate::caveats::Scope::All, &path, true),
+        artifact_preimage_state(&newt_policy::caveats::Scope::All, &path, true),
         crate::agentic::artifact_hooks::ArtifactFileState::from_bytes(&bytes)
     );
-    assert!(artifact_file_matches(&crate::caveats::Scope::All, &path, &bytes).unwrap());
+    assert!(artifact_file_matches(&newt_policy::caveats::Scope::All, &path, &bytes).unwrap());
     let mut different = bytes.clone();
     different[64 * 1024] ^= 1;
-    assert!(!artifact_file_matches(&crate::caveats::Scope::All, &path, &different).unwrap());
+    assert!(!artifact_file_matches(&newt_policy::caveats::Scope::All, &path, &different).unwrap());
 }
 
 #[cfg(unix)]
@@ -133,7 +133,7 @@ fn artifact_preimage_never_opens_non_regular_files() {
     let socket = ws.path().join("local.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     assert_eq!(
-        artifact_preimage_state(&crate::caveats::Scope::All, &socket, true),
+        artifact_preimage_state(&newt_policy::caveats::Scope::All, &socket, true),
         crate::agentic::artifact_hooks::ArtifactFileState::unavailable("preimage_not_regular_file")
     );
 }
@@ -147,7 +147,8 @@ fn artifact_capture_retains_the_file_scope() {
     let private = tempfile::tempdir().unwrap();
     std::fs::write(private.path().join("secret"), "private").unwrap();
     std::os::unix::fs::symlink(private.path(), workspace.path().join("link")).unwrap();
-    let scope = crate::caveats::Scope::only([workspace.path().to_string_lossy().into_owned()]);
+    let scope =
+        newt_policy::caveats::Scope::only([workspace.path().to_string_lossy().into_owned()]);
     let linked = workspace.path().join("link/secret");
     assert!(artifact_open_scoped_regular_file(&scope, &linked).is_err());
     assert!(artifact_file_matches(&scope, &linked, b"private").is_err());

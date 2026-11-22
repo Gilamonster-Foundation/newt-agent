@@ -30,7 +30,7 @@ fn newt_binary_carries_the_net_guard_and_the_floor_holds() {
         .assert();
     // Exit 0 = every off-box family denied with EACCES, AF_UNIX allowed. A
     // non-zero code would name the family the kernel failed to deny (see
-    // `newt_core::netguard::probe_code`); anything but 0 is a real floor failure
+    // `newt_policy::netguard::probe_code`); anything but 0 is a real floor failure
     // on a kernel that should support unprivileged seccomp.
     assert.success();
 }

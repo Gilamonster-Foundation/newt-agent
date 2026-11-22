@@ -194,11 +194,11 @@ fn signed_workspace_settings_resolve_default_and_apply_only_to_a_new_session() {
     assert!(live.protection.is_some());
     assert_eq!(live.profile.as_ref().unwrap().default_cwd, cwd);
     assert_eq!(authority.exec, Scope::All);
-    assert!(newt_core::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &authority.fs_read,
         reference.to_str().unwrap()
     ));
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &authority.fs_write,
         operator.to_str().unwrap()
     ));

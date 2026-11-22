@@ -49,7 +49,7 @@ pub use scoped_read::{
     ScopedGitReadError,
 };
 
-use crate::caveats::{apply_cli_fs_grants_with, Caveats, OwnGitGrant};
+use newt_policy::caveats::{apply_cli_fs_grants_with, Caveats, OwnGitGrant};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
@@ -192,7 +192,7 @@ pub fn own_gitdir_grants(workspace: &Path) -> OwnGitGrant {
     OwnGitGrant { read, write }
 }
 
-/// Apply [`crate::caveats::lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
+/// Apply [`newt_policy::caveats::lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
 /// `NEWT_WRITE_PATHS` (absolute paths that `newt-cli` sets from `--read` /
 /// `--write`, joined with the platform path-list separator). The single entry
 /// point every session path calls.
@@ -2328,7 +2328,7 @@ mod own_gitdir_grant_tests {
         assert!(!grant.write.is_empty(), "own branch must get write roots");
 
         std::fs::write(wt.join("f.txt"), "hi").unwrap();
-        let scope = crate::caveats::Scope::only(grant.write.clone());
+        let scope = newt_policy::caveats::Scope::only(grant.write.clone());
         let path = |rel: &str| main.join(".git").join(rel).to_string_lossy().into_owned();
         // What `git add` needs: the worktree's own admin dir + the common
         // `objects/` subtree. A commit's ref move is no longer in here at
@@ -2342,7 +2342,7 @@ mod own_gitdir_grant_tests {
             path("objects/pack/multi-pack-index"),
         ] {
             assert!(
-                crate::caveats::permits_path(&scope, &touched),
+                newt_policy::caveats::permits_path(&scope, &touched),
                 "{touched} must be permitted"
             );
         }
@@ -2360,7 +2360,7 @@ mod own_gitdir_grant_tests {
             path("hooks/pre-commit"),
         ] {
             assert!(
-                !crate::caveats::permits_path(&scope, &denied),
+                !newt_policy::caveats::permits_path(&scope, &denied),
                 "{denied} must stay denied"
             );
         }
@@ -3658,7 +3658,7 @@ mod commit_view_tests;
 #[cfg(all(test, unix))]
 mod session_grants_tests {
     use super::*;
-    use crate::caveats::permits_path;
+    use newt_policy::caveats::permits_path;
 
     /// PR #2577 round 2, item 2: `apply_cli_fs_grants` must extend `fs_read`
     /// with the workspace's own git metadata (F32/#2537) but NEVER `fs_write`

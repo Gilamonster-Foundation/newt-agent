@@ -152,7 +152,7 @@ async fn main() {
         &LocalDispatcher,
         &mut workspaces,
         &cfg,
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         goal,
         &no_grounding,
     )

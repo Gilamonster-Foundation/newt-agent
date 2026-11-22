@@ -13,6 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 newt-core.workspace = true
+newt-policy.workspace = true
 newt-router.workspace = true
 newt-inference.workspace = true
 newt-tools.workspace = true

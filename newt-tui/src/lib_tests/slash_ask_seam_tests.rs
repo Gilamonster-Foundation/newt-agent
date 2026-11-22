@@ -24,7 +24,7 @@
 use std::cell::RefCell;
 
 use newt_core::interaction_surface::SurfaceInteraction;
-use newt_core::HumanQuestionOutcome;
+use newt_policy::HumanQuestionOutcome;
 
 /// A fully mocked operator: records every interaction it is shown and answers
 /// with `Cancelled`, so the form unwinds without writing a setting anywhere.

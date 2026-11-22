@@ -44,7 +44,7 @@ pub use loadout::{Loadout, LoadoutSettings};
 pub use memory::{MemoryConfig, MemoryDisclosure, MemoryProviderKind};
 use newt_router::Tier;
 pub use newt_tuner::{ModelTuning, OverflowRetry};
-pub use permissions::{ModeConfig, PermissionPreset, ToolPermissions};
+pub use permissions::{PermissionPreset, ToolPermissions};
 pub use presentation::{
     markdown_is_session_pinned, session_markdown_mode, session_spill_lines,
     set_session_spill_lines, ColorMode, EditMode, FooterMode, MarkdownMode, ThinkingMode,
@@ -316,19 +316,19 @@ pub struct Config {
 
     /// Named permission presets (`[permission_presets.<name>]`, issue #307).
     /// Each maps onto the role-profile caveat mechanism (a
-    /// [`crate::NamedPermissionPreset`]) and, when applied via `/posture`, clamps
+    /// [`newt_policy::NamedPermissionPreset`]) and, when applied via `/posture`, clamps
     /// the session's authority as a hard floor. Empty by default — no preset,
     /// behavior unchanged.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub permission_presets: std::collections::BTreeMap<String, crate::NamedPermissionPreset>,
+    pub permission_presets: std::collections::BTreeMap<String, newt_policy::NamedPermissionPreset>,
 
     /// Named permission-posture bindings for `/posture` (issue #307). The
     /// `[modes.<name>]` key is retained for configuration compatibility. Each
     /// binding atomically preloads a skill body, applies a permission preset as
     /// an authority floor, and adds system-prompt framing. Empty by default.
-    /// See [`ModeConfig`].
+    /// See [`newt_policy::posture::ModeConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub modes: std::collections::BTreeMap<String, ModeConfig>,
+    pub modes: std::collections::BTreeMap<String, newt_policy::posture::ModeConfig>,
 
     /// Named profiles (`[profiles.<name>]`) — a composition of harness
     /// *techniques* plus each technique's tunable knob settings (the technique

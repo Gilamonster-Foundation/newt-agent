@@ -24,8 +24,8 @@
 use crate::interaction_surface::SurfaceInteraction;
 use crate::markup::plain;
 use crate::tty::{read_prompt_window_line, Echo, PromptLine, PromptWindow, MODAL_INPUT_GLYPH};
-use crate::HumanQuestionOutcome;
 use newt_interaction::{ControlKind, InteractionDefinition};
+use newt_policy::HumanQuestionOutcome;
 use std::io::{self, IsTerminal as _};
 
 /// **The echo policy is DERIVED, never passed in** (D1b-1, #1892).
@@ -272,7 +272,7 @@ mod width_layout {
 mod f0a_confirm {
     use super::confirm_from_outcome;
     use crate::interaction_form::confirm;
-    use crate::HumanQuestionOutcome;
+    use newt_policy::HumanQuestionOutcome;
 
     fn q() -> newt_interaction::InteractionDefinition {
         confirm("proceed?", "", "yes, do it", "no, stop")

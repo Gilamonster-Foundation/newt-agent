@@ -11,10 +11,10 @@ struct BuildGate(Vec<(Caveats, String)>);
 impl PermissionGate for BuildGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("build request must retain its fence")
@@ -170,11 +170,11 @@ async fn adopted_build_dispatch(source: &str) {
                 assert_eq!(gate.0.len(), 1, "nested={nested}: {text}");
                 let (fence, target) = &gate.0[0];
                 assert_eq!(target, policy.worktree.to_str().unwrap());
-                assert!(crate::caveats::permits_path(
+                assert!(newt_policy::caveats::permits_path(
                     &fence.fs_write,
                     policy.worktree.to_str().unwrap()
                 ));
-                assert!(!crate::caveats::permits_path(
+                assert!(!newt_policy::caveats::permits_path(
                     &fence.fs_write,
                     original.to_str().unwrap()
                 ));
@@ -266,10 +266,10 @@ async fn worktree_adoption_round2_native_builds_keep_original_read_only() {
     impl PermissionGate for ApproveBuild {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("expected scoped build approval")

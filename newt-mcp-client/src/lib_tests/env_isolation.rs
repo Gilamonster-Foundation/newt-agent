@@ -108,7 +108,7 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
         }
         let admitted = newt_core::mcp::admit(&entry).unwrap();
         let caveats = Caveats {
-            fs_write: newt_core::caveats::Scope::none(),
+            fs_write: newt_policy::caveats::Scope::none(),
             ..Caveats::top()
         };
         let mut transport = StdioTransport::spawn(&admitted, &caveats).unwrap();
@@ -155,7 +155,7 @@ async fn stdio_spawn_under_net_none_does_not_l3_bound_refuse() {
     };
     let admitted = newt_core::mcp::admit(&entry).unwrap();
     let caveats = Caveats {
-        net: newt_core::caveats::Scope::none(),
+        net: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     StdioTransport::spawn(&admitted, &caveats)
@@ -200,7 +200,7 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_
     };
     let admitted = newt_core::mcp::admit(&entry).unwrap();
     let caveats = Caveats {
-        net: newt_core::caveats::Scope::only(["api.github.com".to_string()]),
+        net: newt_policy::caveats::Scope::only(["api.github.com".to_string()]),
         ..Caveats::top()
     };
     StdioTransport::spawn(&admitted, &caveats).expect(
@@ -229,7 +229,7 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_
 #[ignore = "real Seatbelt stdio subprocess; macOS weekly/release lane, single-threaded"]
 async fn stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt() {
     use agent_bridle::{enforcement_report, AxisEnforcement, ConfinementMechanism, StdioPosture};
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     let entry = McpServerEntry {
         name: "seatbelt-net-none-probe".into(),
         enabled: true,

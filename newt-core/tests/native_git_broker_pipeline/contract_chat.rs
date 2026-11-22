@@ -4,8 +4,9 @@
 use newt_core::{
     agentic::{chat_complete, GitTool, PromptDisposition},
     worktree_adoption::WorktreeSession,
-    BackendKind, Caveats, ChatCtx, MemMessage, NoMcp, PermissionGate,
+    BackendKind, Caveats, ChatCtx, MemMessage, NoMcp,
 };
+use newt_policy::PermissionGate;
 use std::{
     path::Path,
     sync::{

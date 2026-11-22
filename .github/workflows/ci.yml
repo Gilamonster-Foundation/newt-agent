@@ -24,7 +24,9 @@ name: CI
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
 # Windows dev box), so it is deliberately outside hook parity. Same for the
 # `musl` job: it needs the musl cross target + `musl-tools` installed, which
-# a dev box does not carry by default.
+# a dev box does not carry by default. And the `macos` job: a Mac dev box's
+# hook runs the changed scope natively, so only the whole-tree clippy and
+# `cargo test --workspace` on a hosted macOS runner is CI's (#3154).
 # See docs/ROADMAP.md "Acceptance contract" for the gate definition.
 #
 # Patterned on scrybe's CI but simpler — no Tauri system deps (pure
@@ -848,3 +850,37 @@ jobs:
       - name: clippy (newt-core, confine off)
         if: always()
         run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings
+
+  macos:
+    name: macOS build + test
+    runs-on: macos-latest
+    # CI-ONLY job — .githooks/pre-push runs the changed scope on whatever box
+    # pushes, a Mac included; the whole-tree run on a hosted macOS runner is
+    # only here. Tests that fail only on macOS (Seatbelt admission, temp paths
+    # under the `/var` symlink, tools missing from `/bin`) reached main twice
+    # with every other check green (#2806, #3098); this job is the per-PR run
+    # that catches them. It mirrors the `windows` job's two commands.
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos
+      # Hosted images install versioned Xcode bundles outside the production
+      # Xcode.app exception. Narrow the ancestor's permissions, not the broker's
+      # trust policy, as macos-confined-contract.yml does for its Seatbelt rows.
+      - name: Make the system Git ancestor non-group-writable
+        run: sudo chmod g-w /Applications
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      # `cargo test`, not nextest, as in the `windows` job. `if: always()` so a
+      # clippy failure can't mask a test failure; `--no-fail-fast` so one run
+      # lists every failing binary.
+      - name: cargo test
+        if: always()
+        run: cargo test --workspace --no-fail-fast --features newt-data/kernel,newt-interaction/schema

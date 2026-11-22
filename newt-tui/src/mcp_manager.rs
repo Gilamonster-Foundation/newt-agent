@@ -166,7 +166,7 @@ fn failure_message(error: &anyhow::Error) -> String {
 fn confirm_login(
     surface: &mut dyn InputSurface,
     entry: &McpServerEntry,
-) -> newt_core::HumanQuestionOutcome {
+) -> newt_policy::HumanQuestionOutcome {
     let argv = entry.operator_login_argv().unwrap_or_default();
     let definition = newt_core::interaction_form::confirm(
         format!("Run the configured login for `{}`?\nProgram and literal arguments: {argv:?}", entry.name),
@@ -237,9 +237,9 @@ where
                 continue;
             };
             match confirm_login(surface, entry) {
-                newt_core::HumanQuestionOutcome::Answer(answer)
+                newt_policy::HumanQuestionOutcome::Answer(answer)
                     if answer == "yes" || answer.eq_ignore_ascii_case("y") => {}
-                newt_core::HumanQuestionOutcome::ExitRequested => {
+                newt_policy::HumanQuestionOutcome::ExitRequested => {
                     if let Some(exit) = gate.exit {
                         exit.store(true, Ordering::Relaxed);
                     }
@@ -339,7 +339,7 @@ where
         gate.color,
         gate.verbose,
     );
-    let mut grant_net = |request: &newt_core::PermissionRequest| gate.ask_mcp_net_grant(request);
+    let mut grant_net = |request: &newt_policy::PermissionRequest| gate.ask_mcp_net_grant(request);
     let result = crate::with_interrupt_watch(!context.terminal_owns_turn, &context.cancel, || {
         tokio::task::block_in_place(|| {
             context.runtime.block_on(async {

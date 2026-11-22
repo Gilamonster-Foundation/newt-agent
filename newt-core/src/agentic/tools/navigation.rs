@@ -3,9 +3,9 @@
 //! entire source workspace, rather than filtering already-derived answers.
 
 use super::*;
-use crate::caveats::lexically_normalize;
 use crate::navigator::NavToolCtx;
 use crate::{Caveats, Scope};
+use newt_policy::caveats::lexically_normalize;
 use std::path::{Component, Path, PathBuf};
 
 pub(super) fn execute(

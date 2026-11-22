@@ -382,7 +382,7 @@ impl InputSurface for LeanSurface {
     fn present_interaction(
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
-    ) -> newt_core::HumanQuestionOutcome {
+    ) -> newt_policy::HumanQuestionOutcome {
         let window = newt_core::tty::Terminal::suspend_for_prompt(
             newt_core::tty::TerminalTaker::LeanSurfaceModal,
         );

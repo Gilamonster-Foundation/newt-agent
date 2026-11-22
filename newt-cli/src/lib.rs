@@ -424,7 +424,7 @@ pub struct Cli {
     /// no scheme/port/wildcard), so it does not prompt. Adds to
     /// `[tui.permissions] net`; an ungranted host still prompts. May be
     /// repeated. Example: `newt --net github.com --net doi.org`.
-    #[arg(long = "net", global = true, value_name = "HOST", value_parser = newt_core::caveats::parse_net_host)]
+    #[arg(long = "net", global = true, value_name = "HOST", value_parser = newt_policy::caveats::parse_net_host)]
     pub net_hosts: Vec<String>,
 
     /// Backend override flags (`--backend-*`): pin the model backend from the
@@ -1334,7 +1334,7 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
     if !cli.net_hosts.is_empty() {
         unsafe {
             std::env::set_var(
-                newt_core::caveats::NEWT_NET_HOSTS_ENV,
+                newt_policy::caveats::NEWT_NET_HOSTS_ENV,
                 cli.net_hosts.join(","),
             );
         }

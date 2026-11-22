@@ -17,7 +17,7 @@ pub struct Advertise<'a> {
     pub recall: bool,
     pub memory_fetch: bool,
     /// `Some` advertises the embedded `git` tool, scoped to this read scope.
-    pub git_read_scope: Option<&'a crate::caveats::Scope<String>>,
+    pub git_read_scope: Option<&'a newt_policy::caveats::Scope<String>>,
     pub team: bool,
     pub scratchpad: bool,
     pub code_search: bool,

@@ -1,9 +1,11 @@
 //! The policy layer must not depend on the agent loop, the conversation store
-//! or the config (#3140). These modules are the cut a policy crate takes: they
-//! decide what is allowed, so they may use each other and the standard
-//! library, and nothing that runs a turn, stores a conversation or reads a
-//! user's settings. A new `crate::agentic`, `crate::store` or `crate::config`
-//! path in one of them fails here, in the change that adds it.
+//! or the config (#3140). Most of it is the `newt-policy` crate now, where the
+//! crate boundary enforces that: it cannot name `newt-core`. The modules here
+//! are the ones that stayed in `newt-core` but must stay free of those layers, so
+//! they can follow: `git_caveats` is a shim over `agent-toolchain`, and
+//! `redact` waits on `ocap` and `confined_exec`. A new `crate::agentic`,
+//! `crate::store` or `crate::config` path in one of them fails here, in the
+//! change that adds it.
 //!
 //! A module can name a layer's item without naming the layer: `lib.rs`
 //! re-exports items from all three at the crate root (`pub use config::{Config,
@@ -17,34 +19,18 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// The policy modules, by file name under `src/`. A module missing from the
-/// disk fails the test, so a rename cannot quietly drop it from the gate.
-const POLICY_MODULES: &[&str] = &[
-    "caveats",
-    "danger",
-    "fs_aliases",
-    "git_caveats",
-    "netguard",
-    "paths",
-    "permission_challenge",
-    "permissions",
-    "posture",
-    "redact",
-];
+/// The modules that stayed in `newt-core`, by file name under `src/`. A module
+/// missing from the disk fails the test, so a rename cannot quietly drop it from
+/// the gate.
+const POLICY_MODULES: &[&str] = &["git_caveats", "redact"];
 
 /// The layers a policy module must not name.
 const LAYERS: &[&str] = &["agentic", "store", "config"];
 
 /// Violations that exist today, as `(module, path)`. This is a ratchet: the
 /// list must match what the scan finds, so a new violation fails and a fixed
-/// one must be deleted here. It may only shrink.
-///
-/// `posture`: `build_posture` resolves a `/posture` name against
-/// `Config.modes` and `Config.permission_presets`. That is config resolution,
-/// not policy. Moving it means changing its signature to take config types,
-/// which is a rewrite, so it stays until the policy crate step decides where
-/// those types and that resolver live.
-const KNOWN_VIOLATIONS: &[(&str, &str)] = &[("posture", "crate::Config")];
+/// one must be deleted here. It may only shrink, and it is empty.
+const KNOWN_VIOLATIONS: &[(&str, &str)] = &[];
 
 fn production_code(src: &str) -> String {
     let mut out = String::new();

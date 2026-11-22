@@ -15,7 +15,7 @@
 //! an unauthenticated responder but cannot refuse a DOWNGRADE. B0 owns
 //! responder policy and should express it.
 
-use newt_core::permission_challenge::requires_terminal_echo;
+use newt_policy::permission_challenge::requires_terminal_echo;
 
 #[test]
 fn high_danger_demands_a_terminal_echo_and_unparseable_counts_as_high() {

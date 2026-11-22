@@ -334,9 +334,9 @@ fn apply_login_net_grant(
     let once = approved
         .iter()
         .cloned()
-        .map(|host| (newt_core::DenialKind::Net, host))
+        .map(|host| (newt_policy::DenialKind::Net, host))
         .collect::<Vec<_>>();
-    operation.0 = newt_core::widen_caveats(&granted, &once);
+    operation.0 = newt_policy::widen_caveats(&granted, &once);
     operation.1.extend(hosts);
     operation.1.sort();
     operation.1.dedup();
@@ -345,7 +345,7 @@ fn apply_login_net_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     /// #3037 review: refusals that end a connect before any dial (admission,
     /// a plaintext Authorization header, legacy SSE) still reach the recorder,

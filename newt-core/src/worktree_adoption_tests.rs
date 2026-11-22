@@ -48,15 +48,15 @@ fn adoption_removes_ancestor_authority_but_keeps_task_and_disjoint_roots() {
             unrelated.to_string_lossy().into_owned(),
         ]);
         let narrowed = policy.attenuate(&session);
-        assert!(!crate::caveats::permits_path(
+        assert!(!newt_policy::caveats::permits_path(
             &narrowed.fs_write,
             policy.original.join("source.rs").to_str().unwrap()
         ));
-        assert!(crate::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &narrowed.fs_write,
             policy.worktree.join("source.rs").to_str().unwrap()
         ));
-        assert!(crate::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &narrowed.fs_write,
             unrelated.to_str().unwrap()
         ));
@@ -69,7 +69,7 @@ fn adoption_removes_ancestor_authority_but_keeps_task_and_disjoint_roots() {
 fn adoption_narrows_all_and_preserves_explicit_git_admin_only() {
     let (_temp, policy, _) = fixture(false);
     let narrowed = policy.attenuate(&Caveats::top());
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &narrowed.fs_write,
         policy.original.to_str().unwrap()
     ));
@@ -84,7 +84,7 @@ fn adoption_narrows_all_and_preserves_explicit_git_admin_only() {
         .map(|p| p.to_string_lossy().into_owned()),
     );
     assert_eq!(policy.attenuate(&git).fs_write, git.fs_write);
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &git.fs_write,
         policy.common.join("HEAD").to_str().unwrap()
     ));
@@ -167,7 +167,7 @@ fn original_checkout_aliases_and_parent_traversal_are_blocked() {
     assert!(policy.blocked(&policy.worktree.join("../../source.rs")));
     let mut c = Caveats::top();
     c.fs_write = Scope::only([alias.to_string_lossy().into_owned()]);
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &policy.attenuate(&c).fs_write,
         &alias.join("source.rs").to_string_lossy()
     ));
@@ -249,7 +249,7 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
         let path = policy.common.join(relative);
         assert!(policy.blocked(&path), "{relative}");
         assert!(
-            !crate::caveats::permits_path(&narrowed.fs_write, &path.to_string_lossy()),
+            !newt_policy::caveats::permits_path(&narrowed.fs_write, &path.to_string_lossy()),
             "{relative}"
         );
     }
@@ -258,7 +258,7 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
         &policy.admin,
         &policy.common.join("objects"),
     ] {
-        assert!(crate::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &narrowed.fs_write,
             &path.to_string_lossy()
         ));
@@ -296,17 +296,17 @@ fn sibling_task_handoff_preserves_caller_bounds() {
     base.fs_read = Scope::only([policy.original.to_string_lossy().into_owned()]);
     base.fs_write = base.fs_read.clone();
     let task = policy.task_authority(&base);
-    assert!(crate::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &task.fs_read,
         &policy.worktree.to_string_lossy()
     ));
-    assert!(crate::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &task.fs_write,
         &policy.worktree.to_string_lossy()
     ));
     assert_eq!(task.exec, base.exec);
     assert_eq!(task.net, base.net);
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &policy.attenuate(&task).fs_write,
         &policy.original.to_string_lossy()
     ));

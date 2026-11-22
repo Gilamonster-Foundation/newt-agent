@@ -43,7 +43,7 @@ async fn stored_root_replacement_cannot_authorize_outside_dispatch() {
         std::fs::create_dir(&outside).unwrap();
         let sentinel = outside.join("sentinel");
         std::fs::write(&sentinel, "keep").unwrap();
-        let authority = crate::widen_caveats(
+        let authority = newt_policy::widen_caveats(
             &Caveats {
                 fs_write: Scope::none(),
                 ..Caveats::top()
@@ -125,7 +125,7 @@ async fn mac_stored_root_and_ancestor_swaps_fail_before_open() {
         std::fs::create_dir_all(&target).unwrap();
         let sentinel = target.join("sentinel");
         std::fs::write(&sentinel, "keep").unwrap();
-        let authority = crate::widen_caveats(
+        let authority = newt_policy::widen_caveats(
             &Caveats {
                 fs_write: Scope::none(),
                 ..Caveats::top()

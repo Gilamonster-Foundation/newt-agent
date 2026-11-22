@@ -122,11 +122,11 @@ fn test_offer(
     newt_interaction::InteractionDefinition,
     newt_interaction::InteractionInstance,
 ) {
-    let question = crate::Question::<crate::PermissionAction> {
+    let question = crate::Question::<newt_policy::PermissionAction> {
         markdown: "\u{2298} run_command wants to run `bash`".to_string(),
         actions: vec![
-            crate::Action::new(crate::PermissionAction::AllowOnce, "a", "allow once"),
-            crate::Action::new(crate::PermissionAction::Deny, "d", "deny (default)"),
+            crate::Action::new(newt_policy::PermissionAction::AllowOnce, "a", "allow once"),
+            crate::Action::new(newt_policy::PermissionAction::Deny, "d", "deny (default)"),
         ],
         note: None,
     };
@@ -180,7 +180,7 @@ fn interaction_offer_publish_answer_take_race_and_fence() {
             .answer_interaction_offer(
                 &conv,
                 &id,
-                crate::PermissionAction::AllowOnce,
+                newt_policy::PermissionAction::AllowOnce,
                 newt_interaction::Audience::Web
             )
             .unwrap(),
@@ -191,7 +191,7 @@ fn interaction_offer_publish_answer_take_race_and_fence() {
             .answer_interaction_offer(
                 &conv,
                 &id,
-                crate::PermissionAction::Deny,
+                newt_policy::PermissionAction::Deny,
                 newt_interaction::Audience::Web
             )
             .unwrap(),
@@ -199,7 +199,7 @@ fn interaction_offer_publish_answer_take_race_and_fence() {
     );
     assert_eq!(
         store.take_interaction_decision(&conv, &id).unwrap(),
-        Some(crate::PermissionAction::AllowOnce)
+        Some(newt_policy::PermissionAction::AllowOnce)
     );
     // ...and it is no longer pending.
     assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
@@ -231,7 +231,7 @@ fn an_unknown_persisted_option_reads_as_none_not_error() {
         .answer_interaction_offer(
             &conv,
             &id,
-            crate::PermissionAction::AllowOnce,
+            newt_policy::PermissionAction::AllowOnce,
             newt_interaction::Audience::Web,
         )
         .unwrap();

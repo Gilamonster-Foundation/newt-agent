@@ -618,7 +618,7 @@ pub(crate) fn acquire_run(path: &Path) -> io::Result<Option<ManagedRun>> {
 
 pub(crate) fn validate_grant(
     path: &Path,
-    writes: &crate::caveats::Scope<String>,
+    writes: &newt_policy::caveats::Scope<String>,
 ) -> io::Result<()> {
     if path.parent().and_then(Path::parent) != Some(plan().path.as_path()) {
         return Ok(());
@@ -626,10 +626,10 @@ pub(crate) fn validate_grant(
     // Existing grant aliases (notably macOS /tmp) cannot hide authority over
     // the private parent. Prospective, absent roots still get lexical checks;
     // the executor resolves their final filesystem authority at admission.
-    let overlaps = crate::caveats::permits_path(writes, &plan().path.to_string_lossy())
+    let overlaps = newt_policy::caveats::permits_path(writes, &plan().path.to_string_lossy())
         || match writes {
-            crate::caveats::Scope::All => true,
-            crate::caveats::Scope::Only(roots) => roots.iter().any(|root| {
+            newt_policy::caveats::Scope::All => true,
+            newt_policy::caveats::Scope::Only(roots) => roots.iter().any(|root| {
                 Path::new(root)
                     .canonicalize()
                     .is_ok_and(|root| plan().path.starts_with(root))
@@ -676,16 +676,16 @@ mod tests {
         let second = plan.partition(&second_id);
         assert_ne!(first, second);
         assert_eq!(first, plan.partition(&first_id));
-        let grant = crate::caveats::Scope::only([first.to_string_lossy().into_owned()]);
-        assert!(crate::caveats::permits_path(
+        let grant = newt_policy::caveats::Scope::only([first.to_string_lossy().into_owned()]);
+        assert!(newt_policy::caveats::permits_path(
             &grant,
             &first.join("run/file").to_string_lossy()
         ));
-        assert!(!crate::caveats::permits_path(
+        assert!(!newt_policy::caveats::permits_path(
             &grant,
             &second.to_string_lossy()
         ));
-        assert!(!crate::caveats::permits_path(
+        assert!(!newt_policy::caveats::permits_path(
             &grant,
             &plan.path.to_string_lossy()
         ));
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn managed_scratch_parent_is_never_part_of_the_build_write_grant() {
-        use crate::caveats::Scope;
+        use newt_policy::caveats::Scope;
         let path = default_base().join("workspace/run");
         assert!(validate_grant(&path, &Scope::All).is_err());
         assert!(validate_grant(

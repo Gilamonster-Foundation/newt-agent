@@ -264,8 +264,8 @@ pub(crate) fn annotate_in_context(
     roots.push(std::path::PathBuf::from(workspace));
     let uninspected = roots
         .iter()
-        .any(|root| !crate::caveats::permits_path(read_scope, &root.to_string_lossy()));
-    roots.retain(|root| crate::caveats::permits_path(read_scope, &root.to_string_lossy()));
+        .any(|root| !newt_policy::caveats::permits_path(read_scope, &root.to_string_lossy()));
+    roots.retain(|root| newt_policy::caveats::permits_path(read_scope, &root.to_string_lossy()));
     let mut resolvers: Vec<_> = roots
         .iter()
         .map(|root| workspace_claim_resolver(&root.to_string_lossy(), std::path::Path::exists))
@@ -424,7 +424,7 @@ fn is_repo_root(dir: &std::path::Path) -> bool {
 /// lister). Only called by the caller when `workspace` itself is NOT a repo;
 /// this function does not check that.
 ///
-/// The fs-read fence is checked PER REPO via [`crate::caveats::permits_path`]
+/// The fs-read fence is checked PER REPO via [`newt_policy::caveats::permits_path`]
 /// (prefix containment, the same check every other fs-read site uses) before
 /// even attempting the probe. In practice `git_in`'s own gate
 /// (`check_git_read_scope`'s "metadata" class) is coarser than this: a
@@ -461,7 +461,7 @@ pub fn snapshot_nested_repos(
         .filter_map(|dir| {
             let repo = dir.file_name()?.to_string_lossy().into_owned();
             let dir_str = dir.to_string_lossy().into_owned();
-            let status = crate::caveats::permits_path(read_scope, &dir_str)
+            let status = newt_policy::caveats::permits_path(read_scope, &dir_str)
                 .then(|| git_in(&dir_str, &SNAPSHOT_STATUS_ARGS, read_scope))
                 .flatten()
                 .map(|out| parse_porcelain_z(&out));

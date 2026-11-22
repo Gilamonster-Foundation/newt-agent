@@ -76,7 +76,7 @@ pub(crate) use persona_route::apply_persona_backend;
 mod commands;
 #[cfg(feature = "live-spill")]
 mod completed_spill;
-use newt_core::danger;
+use newt_policy::danger;
 pub mod dgx_probe;
 /// #2085 PR-E2: where a non-setting state mutator's journal event is named,
 /// and the registry gate that decides whether it may be written at all.
@@ -1253,7 +1253,7 @@ fn runtime_context_parts(
 
 /// Read-only enforcement caveats (read anything; no write/exec/net) — the safe
 /// default when nothing is configured or identity setup fails.
-fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
+fn read_only_caveats(workspace: &str) -> newt_policy::caveats::Caveats {
     newt_core::ToolPermissions {
         preset: newt_core::PermissionPreset::ReadOnly,
         extra_exec: Vec::new(),
@@ -1280,7 +1280,7 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
 /// `full_access` (which is `fs_write = All` — an explicit "no fence" choice).
 /// `--read <path>` adds a read path; `--write <path>` adds a read+write path
 /// (write implies read) and is also widened into the already-fenced `fs_write`.
-fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
+fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_policy::caveats::Caveats {
     policy_for_launch(tui, workspace, newt_core::launch_authority::current())
 }
 
@@ -1288,8 +1288,8 @@ fn policy_for_launch(
     tui: Option<newt_core::TuiConfig>,
     workspace: &str,
     authority: newt_core::launch_authority::LaunchAuthority,
-) -> newt_core::caveats::Caveats {
-    use newt_core::caveats::Scope;
+) -> newt_policy::caveats::Caveats {
+    use newt_policy::caveats::Scope;
     // --full-access / NEWT_FULL_ACCESS=1: per-invocation preset override —
     // build the policy from `full_access` (`Caveats::top()`, the exact value
     // `ToolPermissions::to_caveats` yields for that preset) regardless of the
@@ -1298,7 +1298,7 @@ fn policy_for_launch(
     // host-shell bypass covers every command. Surfaced loudly at session
     // start by `full_access_banner`.
     let mut caveats = if authority.full_access() {
-        newt_core::caveats::Caveats::top()
+        newt_policy::caveats::Caveats::top()
     } else if authority.workspace_access() {
         let mut permissions = tui.map(|t| t.permissions).unwrap_or_default();
         permissions.preset = newt_core::PermissionPreset::WorkspaceFullAccess;
@@ -1343,7 +1343,7 @@ fn resolve_tui(cfg: &newt_core::Config) -> Option<newt_core::TuiConfig> {
 /// full authority, and it can only ever delegate *narrower* children.
 pub(crate) fn mint_operating_key(
     key_path: &std::path::Path,
-    policy: &newt_core::caveats::Caveats,
+    policy: &newt_policy::caveats::Caveats,
 ) -> Result<newt_identity::AgentKey, newt_identity::IdentityError> {
     let user = newt_identity::load_or_generate(key_path)?;
     let root = newt_identity::session_root(&user);
@@ -1978,12 +1978,12 @@ fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) ->
 // Named permission presets + the `/posture` command (issue #307).
 // ---------------------------------------------------------------------------
 
-// `ActivePosture` and `build_posture` live in `newt_core::posture` since #2009
+// `ActivePosture` and `build_posture` live in `newt_policy::posture` since #2009
 // PR10c — §5.1's ledger named the posture as what blocked the Permissions
 // section's write half, and a pure `settings_form::apply` cannot read a
 // `run_chat` local. These aliases keep every reference in this crate reading
 // as it did.
-pub(crate) use newt_core::posture::{build_posture, ActivePosture};
+pub(crate) use newt_policy::posture::{build_posture, ActivePosture};
 
 /// Compose posture guidance from current session state on every turn. It is
 /// deliberately not appended to the frozen base prompt: switching or clearing
@@ -2095,10 +2095,10 @@ fn meet_persona_caveats(
 /// design-review F1 finding: the operator's exec clamp was not enforced by
 /// default on the bypass path.
 fn exec_floor_from(
-    effective_exec: &newt_core::caveats::Scope<String>,
+    effective_exec: &newt_policy::caveats::Scope<String>,
     posture_floor_active: bool,
-) -> Option<newt_core::caveats::Scope<String>> {
-    use newt_core::caveats::Scope;
+) -> Option<newt_policy::caveats::Scope<String>> {
+    use newt_policy::caveats::Scope;
     match effective_exec {
         // Unrestricted base, no posture preset ⇒ no floor (pre-#307 bypass).
         Scope::All if !posture_floor_active => None,
@@ -2191,7 +2191,7 @@ pub(crate) fn permission_panel_lines(
 /// (one JSON object per line, no [`newt_core::event_journal::JournalLine`]
 /// envelope). Unparseable lines are dropped — they are not part of a chain
 /// to report a break against, since this body predates the chain entirely.
-fn flat_permission_records(body: &str) -> Vec<newt_core::PermissionRecord> {
+fn flat_permission_records(body: &str) -> Vec<newt_policy::PermissionRecord> {
     body.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -2199,7 +2199,7 @@ fn flat_permission_records(body: &str) -> Vec<newt_core::PermissionRecord> {
 }
 
 /// One `/permissions audit` row; chained and unchained history share it.
-fn audit_row(rec: &newt_core::PermissionRecord) -> String {
+fn audit_row(rec: &newt_policy::PermissionRecord) -> String {
     format!(
         "  {:<7} {:<9} {:<8} {} via {}",
         rec.decision, rec.scope, rec.kind, rec.target, rec.tool
@@ -2401,7 +2401,7 @@ fn resolve_ocap_capture_path(capture: Option<PathBuf>, config_path: &Path) -> Pa
 
 /// Render up to `limit` flat records as unchained-history rows, newest last
 /// (append order) — matches the labelling the chained rows below it use.
-fn push_unchained(out: &mut Vec<String>, records: &[newt_core::PermissionRecord], limit: usize) {
+fn push_unchained(out: &mut Vec<String>, records: &[newt_policy::PermissionRecord], limit: usize) {
     let show = if limit == 0 { records.len() } else { limit };
     for rec in records.iter().take(show) {
         out.push(format!("{} (unchained)", audit_row(rec)));
@@ -2555,11 +2555,11 @@ fn ocap_disabled_banner() -> String {
 /// "session"` per the issue; the `*` target means the bypass is enabled for the
 /// session, while effective exec floors still decide each command. A record,
 /// not authority: nothing reads it back.
-fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
-    newt_core::PermissionRecord::new(
+fn ocap_disabled_record(conversation_id: &str) -> newt_policy::PermissionRecord {
+    newt_policy::PermissionRecord::new(
         conversation_id,
         "run_command",
-        newt_core::DenialKind::Exec,
+        newt_policy::DenialKind::Exec,
         "*",
         "ocap-disabled",
         "session",
@@ -2725,11 +2725,11 @@ mod ambient_banner_windows_tests {
 /// records one line keyed on the exec axis (the sharpest one), `target: "*"`,
 /// `scope: "session"` — the override is per-session, never per-command. A
 /// record, not authority: nothing reads it back.
-fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
-    newt_core::PermissionRecord::new(
+fn full_access_record(conversation_id: &str) -> newt_policy::PermissionRecord {
+    newt_policy::PermissionRecord::new(
         conversation_id,
         "session",
-        newt_core::DenialKind::Exec,
+        newt_policy::DenialKind::Exec,
         "*",
         "full-access",
         "session",
@@ -2749,11 +2749,11 @@ fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
 fn ocap_store_folded_record(
     conversation_id: &str,
     folded_count: usize,
-) -> newt_core::PermissionRecord {
-    newt_core::PermissionRecord::new(
+) -> newt_policy::PermissionRecord {
+    newt_policy::PermissionRecord::new(
         conversation_id,
         "session",
-        newt_core::DenialKind::Exec,
+        newt_policy::DenialKind::Exec,
         &format!("{folded_count} durable grant(s)"),
         "allow",
         "durable-store",
@@ -6011,7 +6011,7 @@ pub(crate) fn confirm_conversation_delete(ask: SlashAsk<'_>, prompt: &str) -> bo
     let interaction =
         newt_core::interaction_surface::SurfaceInteraction::blocking(definition.clone());
     match ask(&interaction) {
-        newt_core::HumanQuestionOutcome::Answer(answer) => {
+        newt_policy::HumanQuestionOutcome::Answer(answer) => {
             newt_core::interaction_form::resolve(&definition, answer.trim())
                 .is_some_and(|id| id.as_str() == newt_core::interaction_form::YES)
         }
@@ -6423,7 +6423,7 @@ pub async fn headless_system_prompt(
 /// `/posture`. Switching that skill off drops the body from the next turn; switching it on
 /// again reloads it. Returns whether the posture changed.
 pub(crate) fn reconcile_posture_skill(cfg: &newt_core::Config) -> bool {
-    let Some(mut posture) = newt_core::posture::active_posture() else {
+    let Some(mut posture) = newt_policy::posture::active_posture() else {
         return false;
     };
     // The skill bound AT ACTIVATION, not whatever the config maps the name to now.
@@ -6442,7 +6442,7 @@ pub(crate) fn reconcile_posture_skill(cfg: &newt_core::Config) -> bool {
     } else {
         return false;
     }
-    newt_core::posture::set_active_posture(Some(posture));
+    newt_policy::posture::set_active_posture(Some(posture));
     true
 }
 
@@ -6523,7 +6523,7 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
         let include_available = matches!(arg, "" | "list");
         let mut lines = posture_status_lines(
             cfg,
-            newt_core::posture::active_posture().as_ref(),
+            newt_policy::posture::active_posture().as_ref(),
             include_available,
         )
         .into_iter();
@@ -6538,8 +6538,8 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
 
     // Drop the clamp and its prompt guidance for the rest of the session.
     if matches!(arg, "off" | "clear" | "reset") {
-        let was_active = newt_core::posture::active_posture().is_some();
-        newt_core::posture::set_active_posture(None);
+        let was_active = newt_policy::posture::active_posture().is_some();
+        newt_policy::posture::set_active_posture(None);
         if was_active {
             print_newt(
                 "permission posture cleared — authority returns to the session base",
@@ -6555,7 +6555,9 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
     // Resolve + validate WITHOUT mutating. The skill loader reuses the SAME
     // `use_skill` path (`load_body_from` over the configured search dirs) —
     // skill dirs are config-rooted, exactly as the `use_skill` tool resolves.
-    let posture = build_posture(arg, cfg, |skill_name| cfg.load_skill_body(skill_name));
+    let posture = build_posture(arg, &cfg.modes, &cfg.permission_presets, |skill_name| {
+        cfg.load_skill_body(skill_name)
+    });
     let posture = match posture {
         Ok(posture) => posture,
         Err(e) => {
@@ -6582,7 +6584,7 @@ fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbo
             posture.name, posture.preset_name, posture.clamp_summary
         )
     };
-    newt_core::posture::set_active_posture(Some(posture));
+    newt_policy::posture::set_active_posture(Some(posture));
     print_newt(&report, color, verbose);
 }
 
@@ -10145,7 +10147,7 @@ fn help_request(task: &str) -> Option<String> {
 /// is what produced two live prompts on one screen.
 pub(crate) type SlashAsk<'a> = &'a dyn Fn(
     &newt_core::interaction_surface::SurfaceInteraction,
-) -> newt_core::HumanQuestionOutcome;
+) -> newt_policy::HumanQuestionOutcome;
 
 /// The fallback ask for a caller that owns the terminal outright (the plain
 /// CLI path, and every test). A cockpit session must NOT use this: it writes
@@ -10153,7 +10155,7 @@ pub(crate) type SlashAsk<'a> = &'a dyn Fn(
 /// chevron over the question. Sessions pass their surface seam instead.
 pub(crate) fn ask_on_this_terminal(
     interaction: &newt_core::interaction_surface::SurfaceInteraction,
-) -> newt_core::HumanQuestionOutcome {
+) -> newt_policy::HumanQuestionOutcome {
     let window =
         newt_core::tty::Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::SlashForm);
     crate::permissions::present_on_terminal(&window, interaction)

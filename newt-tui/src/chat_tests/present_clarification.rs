@@ -35,8 +35,8 @@ impl InputSurface for RecordingFake {
     fn present_interaction(
         &mut self,
         _interaction: &newt_core::interaction_surface::SurfaceInteraction,
-    ) -> newt_core::HumanQuestionOutcome {
-        newt_core::HumanQuestionOutcome::Unavailable
+    ) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
     }
 }
 

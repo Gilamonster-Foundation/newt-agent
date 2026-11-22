@@ -132,9 +132,9 @@ mod native {
     use std::time::{Duration, Instant};
 
     use newt_core::agentic::{execute_tool_with_offload, SpillCid};
-    use newt_core::{
-        execute_tool, Caveats, DenialKind, HumanQuestionOutcome, NoMcp, PermissionDecision,
-        PermissionGate, PermissionRequest, Scope, SessionSpillStore, SpillStore,
+    use newt_core::{execute_tool, Caveats, NoMcp, Scope, SessionSpillStore, SpillStore};
+    use newt_policy::{
+        DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
     };
 
     const MARKER: &str = "BRUSH_BUILD_PIPELINE_CONFIRMED";
@@ -150,10 +150,10 @@ mod native {
     impl PermissionGate for CachedBuildGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &newt_core::caveats::Caveats,
-            _request: &newt_core::permissions::PermissionRequest,
-        ) -> newt_core::permissions::PermissionDecision {
-            newt_core::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("build projection must retain the invocation baseline");

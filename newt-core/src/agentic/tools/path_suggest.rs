@@ -51,7 +51,7 @@ pub(crate) fn artifact_locator(workspace: &str, label: &str) -> String {
     )
 }
 
-use crate::caveats::Scope;
+use newt_policy::caveats::Scope;
 
 /// An ephemeral file-I/O failure retains the operation's kind and operand until
 /// the model-facing boundary. Refusals have no I/O kind and cannot suggest.

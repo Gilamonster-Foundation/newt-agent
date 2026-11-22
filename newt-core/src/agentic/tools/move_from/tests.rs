@@ -161,15 +161,15 @@ fn real_move_from_fixture_compiles_and_failed_check_restores() {
         &root,
         "move_fixture",
         &Caveats {
-            net: crate::caveats::Scope::none(),
+            net: newt_policy::caveats::Scope::none(),
             ..Caveats::top()
         },
     );
     let caveats = Caveats {
-        fs_read: crate::caveats::Scope::only([root.to_string_lossy().into_owned()]),
-        fs_write: crate::caveats::Scope::only([root.to_string_lossy().into_owned()]),
-        exec: crate::caveats::Scope::none(),
-        net: crate::caveats::Scope::none(),
+        fs_read: newt_policy::caveats::Scope::only([root.to_string_lossy().into_owned()]),
+        fs_write: newt_policy::caveats::Scope::only([root.to_string_lossy().into_owned()]),
+        exec: newt_policy::caveats::Scope::none(),
+        net: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     let args = serde_json::json!({"path":child, "content":"", "move_from":{"path":source, "items":["helper"]}});
@@ -184,20 +184,23 @@ fn real_move_from_fixture_compiles_and_failed_check_restores() {
     impl PermissionGate for ApproveBuild {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
-        fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+        fn ask_question(&mut self, _: &str) -> newt_policy::permissions::HumanQuestionOutcome {
             panic!("scoped fs_write needs only the Build authority prompt");
         }
         fn ask(
             &mut self,
-            requests: &[crate::permissions::PermissionRequest],
+            requests: &[newt_policy::permissions::PermissionRequest],
         ) -> PermissionDecision {
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].kind, crate::permissions::DenialKind::Build);
+            assert_eq!(
+                requests[0].kind,
+                newt_policy::permissions::DenialKind::Build
+            );
             self.0 += 1;
             PermissionDecision::Allow(Caveats::top())
         }

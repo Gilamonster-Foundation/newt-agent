@@ -158,7 +158,7 @@ pub fn serialize_for_plugin(
 ///
 /// # Why the JSON bridge
 ///
-/// Issue #95 collapsed the hand-mirrored `newt_core::caveats` into a
+/// Issue #95 collapsed the hand-mirrored `newt_policy::caveats` into a
 /// re-export of `agent_mesh_protocol::caveats`. `newt-mesh` keeps its
 /// path-dep on the local agent-mesh workspace (for `agent-mesh-bus` /
 /// `-discovery`, which aren't published), while default-workspace
@@ -198,7 +198,7 @@ mod tests {
     // The `permits_*` / `permits_one_more` adaptors live on `newt-core`'s
     // extension traits (`agent-mesh-protocol` itself ships algebra only);
     // bring them into scope so the round-trip assertions read as before.
-    use newt_core::{CaveatsExt, CountBoundExt};
+    use newt_policy::{CaveatsExt, CountBoundExt};
 
     fn fixture_metadata(role: &str, caveats: AmCaveats) -> AgentMetadata {
         AgentMetadata {

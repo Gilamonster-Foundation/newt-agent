@@ -558,7 +558,7 @@ fn unaddressed_debt() -> Vec<(&'static str, &'static str, &'static str)> {
              starts lying.",
         ),
         (
-            "newt-core/src/permissions.rs",
+            "newt-policy/src/permissions.rs",
             "PersistentDenial",
             "The persistent denylist is READ BACK by `load_denials` and \
              consulted as authority. Unaddressed evidence that re-enters an \

@@ -479,34 +479,40 @@ async fn composed_commit_is_native_attributed_and_signed(root: &std::path::Path)
 
 #[derive(Default)]
 struct DenyingParentGate {
-    requests: Vec<(newt_core::DenialKind, String)>,
+    requests: Vec<(newt_policy::DenialKind, String)>,
     refreshes: usize,
 }
 
-impl newt_core::PermissionGate for DenyingParentGate {
+impl newt_policy::PermissionGate for DenyingParentGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &newt_core::caveats::Caveats,
-        _request: &newt_core::permissions::PermissionRequest,
-    ) -> newt_core::permissions::PermissionDecision {
-        newt_core::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
-    fn refresh_caveats(&mut self, baseline: &newt_core::Caveats) -> newt_core::PermissionDecision {
+    fn refresh_caveats(
+        &mut self,
+        baseline: &newt_core::Caveats,
+    ) -> newt_policy::PermissionDecision {
         self.refreshes += 1;
-        newt_core::PermissionDecision::Allow(baseline.clone())
+        newt_policy::PermissionDecision::Allow(baseline.clone())
     }
 
-    fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+    fn ask(
+        &mut self,
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         self.requests.extend(
             requests
                 .iter()
                 .map(|request| (request.kind, request.target.clone())),
         );
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     }
 
-    fn ask_question(&mut self, _: &str) -> newt_core::HumanQuestionOutcome {
-        newt_core::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
     }
 }
 
@@ -523,22 +529,25 @@ struct CountingAllowGate {
     asks: usize,
 }
 
-impl newt_core::PermissionGate for CountingAllowGate {
+impl newt_policy::PermissionGate for CountingAllowGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &newt_core::caveats::Caveats,
-        _request: &newt_core::permissions::PermissionRequest,
-    ) -> newt_core::permissions::PermissionDecision {
-        newt_core::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
-    fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+    fn ask(
+        &mut self,
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         self.asks += 1;
         let _ = requests;
-        newt_core::PermissionDecision::Allow(newt_core::Caveats::top())
+        newt_policy::PermissionDecision::Allow(newt_core::Caveats::top())
     }
 
-    fn ask_question(&mut self, _: &str) -> newt_core::HumanQuestionOutcome {
-        newt_core::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
     }
 }
 
@@ -584,7 +593,7 @@ async fn broker_bearing_commit_denial_asks_the_gate_and_retries_with_attribution
         1,
         "first denial must reach the gate: {denied}"
     );
-    assert_eq!(deny_gate.requests[0].0, newt_core::DenialKind::Exec);
+    assert_eq!(deny_gate.requests[0].0, newt_policy::DenialKind::Exec);
     assert_eq!(git(repo, &["rev-parse", "HEAD"]).stdout, before_denial);
     assert_eq!(tool.drain_commit_success(), 0);
 
@@ -754,11 +763,11 @@ async fn denied_parent_keeps_child_authority(
         gate.requests,
         vec![
             (
-                newt_core::DenialKind::FsRead,
+                newt_policy::DenialKind::FsRead,
                 parent.to_string_lossy().into_owned()
             ),
             (
-                newt_core::DenialKind::FsWrite,
+                newt_policy::DenialKind::FsWrite,
                 parent.to_string_lossy().into_owned()
             ),
         ]
@@ -819,7 +828,7 @@ async fn execute_gated(
     authority: &newt_core::Caveats,
     name: &str,
     args: &serde_json::Value,
-    gate: &mut dyn newt_core::PermissionGate,
+    gate: &mut dyn newt_policy::PermissionGate,
 ) -> String {
     let mut mcp = newt_core::NoMcp;
     newt_core::execute_tool(

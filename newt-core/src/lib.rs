@@ -18,7 +18,6 @@ pub mod backend_probe;
 pub mod build_info;
 pub mod card_catalog;
 pub mod caveat_pack;
-pub mod caveats;
 pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a
 /// persona's `cognition:` (psyche sibling of [`tenacity`] and [`initiative`]).
@@ -41,7 +40,6 @@ pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;
 mod native_git_broker;
-pub mod netguard;
 pub mod owned_hosts;
 pub mod permission_journal;
 pub mod workspace_protection;
@@ -49,8 +47,6 @@ pub mod worktree_adoption;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
 // Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
-#[cfg(any(target_os = "macos", all(test, unix)))]
-mod fs_aliases;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs_cap;
 pub mod git_caveats;
@@ -82,7 +78,6 @@ pub mod interaction_surface;
 // `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
 // `markup::plain`, which stays unconditional for exactly this reason.
 pub mod ambient_shell;
-pub mod danger;
 #[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;
@@ -113,14 +108,7 @@ mod ocap_policy_tests;
 pub mod ocap_propose;
 pub mod ocap_store;
 pub mod operating_mode;
-mod paths;
-/// Danger-tier terminal-echo policy. Was `PermissionChallenge` too, until
-/// #1839 deleted that hand-rolled encoding in favour of the definition's
-/// `ContentId`.
-pub mod permission_challenge;
-pub mod permissions;
 pub mod plan;
-pub mod posture;
 pub mod pricing;
 /// The one lock over the process environment (#1850) — every newt writer of
 /// `NEWT_*` goes through it, production and tests alike.
@@ -198,7 +186,7 @@ pub mod pyo3_module;
 /// `ls`/`cat` shims re-exec against the newt binary itself.
 pub fn maybe_dispatch() -> Option<i32> {
     #[cfg(target_os = "macos")]
-    fs_aliases::initialize();
+    newt_policy::fs_aliases::initialize();
     native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
 }
 
@@ -273,7 +261,6 @@ pub use artifact::{
     ArtifactId, ArtifactKind, ArtifactRelation, NewPromptArtifact, PromptArtifact,
     MAX_ARTIFACT_BODY_BYTES, MAX_ARTIFACT_LOCATOR_BYTES, MAX_ARTIFACT_METADATA_BYTES,
 };
-pub use caveats::{permits_path, CaveatsExt, CountBoundExt, ScopeExt};
 pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
 };
@@ -311,11 +298,6 @@ pub use navigator::{
     GotoDefinitionArgs, GraphIndex, ImpactReport, NavHit, NavResult, NavToolCtx, NavigatorSession,
     RetrievalLedger, TurnRetrieval, UsageIndex, UsageSite, NAV_TOOL_NAMES,
 };
-pub use permissions::{
-    append_denial, load_denials, widen_caveats, DenialKind, HumanQuestionOutcome, PermissionAction,
-    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, Verdict,
-    BOUND_REASON_PREFIX,
-};
 pub use project_map::ProjectMapProvider;
 pub use runtime::{
     BackendAxisAction, BackendState, OperatorPreferencePin, PreferenceActions, PreferenceApplyPlan,
@@ -350,9 +332,7 @@ pub use prompt::{
     ActivePrompt, NewPrompt, PromptId, PromptOrigin, PromptReceipt, TurnPromptContext,
 };
 pub use reasoning::{split_reasoning, ThinkFilter};
-pub use role_profile::{
-    Altitude, CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
-};
+pub use role_profile::{Altitude, RoleProfile};
 pub use session::SessionId;
 // B0b-2 (#1846): the audience a surface answers from. Re-exported so
 // newt-web can name it without taking a direct newt-interaction

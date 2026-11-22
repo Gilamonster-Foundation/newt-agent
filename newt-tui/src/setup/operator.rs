@@ -38,8 +38,8 @@ use std::collections::VecDeque;
 use std::io;
 
 use newt_core::interaction_surface::SurfaceInteraction;
-use newt_core::HumanQuestionOutcome;
 use newt_interaction::InteractionDefinition;
+use newt_policy::HumanQuestionOutcome;
 
 /// How the wizard reaches the operator.
 ///

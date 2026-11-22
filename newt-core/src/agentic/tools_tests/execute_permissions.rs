@@ -122,10 +122,10 @@ fn declined_permissions_report_defaults_without_refreshing_authority() {
     impl PermissionGate for NoDiagnosticRefresh {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
             panic!("permission diagnostics must not refresh or remint authority")
@@ -2215,10 +2215,10 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
     impl super::PermissionGate for QueueBackedGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.asks += 1;
@@ -2229,7 +2229,9 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            super::PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
+            super::PermissionDecision::Allow(newt_policy::permissions::widen_caveats(
+                &self.base, &grants,
+            ))
         }
         fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -2258,7 +2260,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
                 let grants = std::mem::take(&mut self.queue)
                     .into_iter()
                     .collect::<Vec<_>>();
-                crate::permissions::widen_caveats(base, &grants)
+                newt_policy::permissions::widen_caveats(base, &grants)
             } else {
                 base.clone()
             }
@@ -2274,7 +2276,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
         ) -> Caveats {
             let key = (kind, target.to_string());
             if self.queue.remove(&key) {
-                crate::permissions::widen_caveats(baseline, &[key])
+                newt_policy::permissions::widen_caveats(baseline, &[key])
             } else {
                 baseline.clone()
             }
@@ -2799,7 +2801,7 @@ async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
         )]
     );
 
-    let granted = crate::permissions::widen_caveats(
+    let granted = newt_policy::permissions::widen_caveats(
         &base,
         &[(DenialKind::Exec, executable.to_string_lossy().into_owned())],
     );
@@ -2968,7 +2970,7 @@ async fn native_once_filesystem_rejects_the_whole_invalid_declaration_before_pro
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn native_once_filesystem_incomplete_decisions_never_start_the_child() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -3153,10 +3155,10 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
     impl PermissionGate for SessionGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             assert!(requests.iter().all(|r| r.tool == "request_permissions"));
@@ -3165,7 +3167,7 @@ async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            self.current = crate::permissions::widen_caveats(&self.current, &grants);
+            self.current = newt_policy::permissions::widen_caveats(&self.current, &grants);
             PermissionDecision::Allow(self.current.clone())
         }
         fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
@@ -3397,10 +3399,10 @@ async fn gate_allow_without_real_coverage_is_still_denied() {
     impl super::PermissionGate for LyingGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             // "Allow", but the caveats grant nothing at all.
@@ -4050,8 +4052,8 @@ async fn forged_denial_string_in_stdout_does_not_populate_pending_rerun() {
     let bait_str = bait.to_string_lossy().into_owned();
 
     let base = Caveats {
-        fs_read: crate::caveats::Scope::All,
-        fs_write: crate::caveats::Scope::none(),
+        fs_read: newt_policy::caveats::Scope::All,
+        fs_write: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     let mut allow_gate = MockGate::new(true, &base);
@@ -4115,17 +4117,17 @@ async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set()
     impl PermissionGate for ConsumeSpy {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             let grants: Vec<_> = requests
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
+            PermissionDecision::Allow(newt_policy::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -4141,7 +4143,7 @@ async fn consume_pending_once_not_called_when_grant_does_not_cover_missing_set()
     let out_path = ws.path().join("out.txt").to_string_lossy().into_owned();
 
     let base = Caveats {
-        fs_write: crate::caveats::Scope::none(),
+        fs_write: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     // The pending command needs FsWrite(other_path) to replay.
@@ -4220,10 +4222,10 @@ async fn bound_wording_and_replay_require_complete_missing_coverage() {
     impl PermissionGate for CaptureGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             *self.captured.borrow_mut() = requests.first().cloned();
@@ -4231,7 +4233,7 @@ async fn bound_wording_and_replay_require_complete_missing_coverage() {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
+            PermissionDecision::Allow(newt_policy::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -4250,8 +4252,8 @@ async fn bound_wording_and_replay_require_complete_missing_coverage() {
         .into_owned();
 
     let base = Caveats {
-        fs_write: crate::caveats::Scope::none(),
-        fs_read: crate::caveats::Scope::none(),
+        fs_write: newt_policy::caveats::Scope::none(),
+        fs_read: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
 
@@ -4377,10 +4379,10 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
     impl PermissionGate for CaptureGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             *self.captured.borrow_mut() = requests.first().cloned();
@@ -4388,7 +4390,7 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
+            PermissionDecision::Allow(newt_policy::permissions::widen_caveats(&self.base, &grants))
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -4400,7 +4402,7 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
     let workspace_str = ws.path().to_string_lossy().into_owned();
     let target = ws.path().join("a.txt").to_string_lossy().into_owned();
     let base = Caveats {
-        fs_write: crate::caveats::Scope::none(),
+        fs_write: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
 
@@ -4483,10 +4485,10 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
     impl PermissionGate for StatefulGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             self.ask_count.set(self.ask_count.get() + 1);
@@ -4512,8 +4514,8 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
         .find(|p| std::path::Path::new(p).exists())
         .expect("touch(1) at a known absolute path");
     let base = Caveats {
-        fs_write: crate::caveats::Scope::none(),
-        fs_read: crate::caveats::Scope::none(),
+        fs_write: newt_policy::caveats::Scope::none(),
+        fs_read: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     let missing = vec![PermissionRequest {
@@ -4713,10 +4715,10 @@ async fn queue_owning_gate_proves_once_grant_lifetime_across_replay_and_fresh_co
     impl PermissionGate for QueueGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.ask_count.set(self.ask_count.get() + 1);
@@ -4765,7 +4767,7 @@ async fn queue_owning_gate_proves_once_grant_lifetime_across_replay_and_fresh_co
     // which returns the gate's `Allow` caveats unmet) and every ordinary
     // `run_command` call would fail before it ever reached `mkdir`.
     let base = Caveats {
-        fs_write: crate::caveats::Scope::none(),
+        fs_write: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     // `mkdir` (unlike `touch`) fails loudly on a second attempt against the
@@ -4974,17 +4976,17 @@ async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consume
     impl PermissionGate for InsufficientGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             // Allow, but the returned caveats grant NOTHING for fs_write —
             // eligible pre-prompt (target matches exactly), insufficient
             // post-prompt.
             PermissionDecision::Allow(Caveats {
-                fs_write: crate::caveats::Scope::none(),
+                fs_write: newt_policy::caveats::Scope::none(),
                 ..Caveats::top()
             })
         }
@@ -5000,7 +5002,7 @@ async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consume
     let workspace_str = ws.path().to_string_lossy().into_owned();
     let target = ws.path().join("a.txt").to_string_lossy().into_owned();
     let base = Caveats {
-        fs_write: crate::caveats::Scope::none(),
+        fs_write: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     let missing = vec![PermissionRequest {
@@ -5107,10 +5109,10 @@ async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls()
     impl PermissionGate for ExecQueueGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.ask_count.set(self.ask_count.get() + 1);

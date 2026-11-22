@@ -14,11 +14,11 @@ mod inputs;
 
 use std::path::Path;
 
-use crate::caveats::{Caveats, CaveatsExt as _};
 use crate::confined_exec::{
     dependency_fetch_request, ConstrainedExecutor, ExecRequest, CRATES_IO_FETCH_HOSTS,
 };
-use crate::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+use newt_policy::caveats::{Caveats, CaveatsExt as _};
+use newt_policy::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 
 /// What cargo prints when the offline lane needs a crate the cache lacks.
 const OFFLINE_FETCH_NEEDED: &str = "but --offline was specified";
@@ -245,7 +245,7 @@ pub(super) fn blocked_note(reason: &str, cwd: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::HumanQuestionOutcome;
+    use newt_policy::permissions::HumanQuestionOutcome;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -525,10 +525,10 @@ checksum = "00"
     impl PermissionGate for Answer {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
             self.1 += 1;

@@ -7,8 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::validate_stable_anchor;
-use crate::paths::{normalize_path, resolve_uncreated_path};
-use crate::{Caveats, DenialKind, Scope};
+use crate::{Caveats, Scope};
+use newt_policy::paths::{normalize_path, resolve_uncreated_path};
+use newt_policy::DenialKind;
 
 #[derive(Clone, Debug)]
 struct Resource {
@@ -163,7 +164,10 @@ impl WorkspaceProtection {
             net: Scope::none(),
             ..Caveats::top()
         };
-        self.validate_caveats(&crate::widen_caveats(&none, &[(kind, target.to_owned())]))
+        self.validate_caveats(&newt_policy::widen_caveats(
+            &none,
+            &[(kind, target.to_owned())],
+        ))
     }
 }
 

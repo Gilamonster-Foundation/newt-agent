@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::BackendRef;
 use crate::agentic::smart_harness::AdjudicationSettings;
-use crate::caveats::{Caveats, Scope};
+use newt_policy::caveats::{Caveats, Scope};
 
 /// Opt-in accounted navigation and independent narration adjudication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,7 +498,7 @@ pub(crate) fn validate_stable_anchor(
     Ok(())
 }
 
-use crate::paths::{normalize_path, resolve_uncreated_path};
+use newt_policy::paths::{normalize_path, resolve_uncreated_path};
 
 fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
@@ -545,7 +545,7 @@ mod tests {
     fn frame_storage_refuses_model_visible_workspace_before_writing_records() {
         let workspace = tempfile::tempdir().unwrap();
         let mut caveats = Caveats::top();
-        crate::caveats::lock_fs_to_workspace(
+        newt_policy::caveats::lock_fs_to_workspace(
             &mut caveats,
             workspace.path().to_str().unwrap(),
             &[],
@@ -667,7 +667,7 @@ mod tests {
     fn frame_storage_excludes_automatic_build_cache_grants() {
         let workspace = tempfile::tempdir().unwrap();
         let mut caveats = Caveats::top();
-        crate::caveats::lock_fs_to_workspace(
+        newt_policy::caveats::lock_fs_to_workspace(
             &mut caveats,
             workspace.path().to_str().unwrap(),
             &[],

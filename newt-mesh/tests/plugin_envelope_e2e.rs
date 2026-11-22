@@ -26,9 +26,9 @@ use agent_mesh_core::{AgentKey, AgentMetadata, Caveats as AmCaveats, CountBound,
 use newt_router::Tier;
 // `permits_*` / `permits_one_more` live on newt-core's extension traits
 // (post-#95 agent-mesh-protocol exports only the lattice algebra).
-use newt_core::{CaveatsExt, CountBoundExt};
 use newt_inference::provider_plugin::ProviderPluginBackend;
 use newt_mesh::plugin_envelope::{caveats_from_envelope, serialize_for_plugin};
+use newt_policy::{CaveatsExt, CountBoundExt};
 use plugins_protocol::AGENT_KEY_ENV;
 
 fn fixture_metadata(role: &str, caveats: AmCaveats) -> AgentMetadata {

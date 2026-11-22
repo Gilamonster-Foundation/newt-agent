@@ -313,7 +313,7 @@ fn private_host_approval_never_overrides_special_address_fences() {
 
 #[test]
 fn exact_private_grant_is_canonical_but_never_url_shaped() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     let canonical = Caveats {
         net: Scope::only(["REVIEW.INTERNAL.EXAMPLE".to_string()]),
@@ -482,7 +482,7 @@ fn retained_private_names_cannot_widen_an_attenuated_scope() {
 
 #[test]
 fn public_host_outside_scope_fails_before_dns() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     let entry = private_http_entry("https://public.example/mcp".to_string());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted entry admits");
@@ -512,7 +512,7 @@ fn public_host_outside_scope_fails_before_dns() {
 
 #[test]
 fn localhost_must_resolve_only_to_loopback_even_when_explicitly_granted() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     let entry = private_http_entry("http://localhost:8443/mcp".to_string());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted entry admits");
@@ -544,7 +544,7 @@ fn localhost_must_resolve_only_to_loopback_even_when_explicitly_granted() {
 
 #[test]
 fn resolver_cannot_pivot_the_pinned_origin_to_another_port() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     let entry = private_http_entry("http://review.internal.example:8443/mcp".to_string());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted entry admits");
@@ -600,7 +600,7 @@ fn unsafe_http_url_shapes_fail_before_dns() {
 #[tokio::test]
 #[ignore = "real loopback private-host MCP lifecycle"]
 async fn exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use wiremock::matchers::{body_string_contains, header, method, path};

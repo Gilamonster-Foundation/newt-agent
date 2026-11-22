@@ -2,7 +2,8 @@
 //! Run explicitly with --ignored; no kernel skip and no ambient network concession.
 #[path = "exec_grant_retry_loop/turn.rs"]
 mod turn;
-use newt_core::{Caveats, PermissionAction, Scope};
+use newt_core::{Caveats, Scope};
+use newt_policy::PermissionAction;
 use newt_tui::native_permission_test::Session;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},

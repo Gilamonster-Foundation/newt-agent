@@ -74,7 +74,8 @@ async fn nudge_rounds(
         .await;
     let messages = msgs();
     let mut caveats = Caveats::top();
-    caveats.fs_write = crate::caveats::Scope::only([dir.path().to_string_lossy().into_owned()]);
+    caveats.fs_write =
+        newt_policy::caveats::Scope::only([dir.path().to_string_lossy().into_owned()]);
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.workspace = dir.path().to_str().unwrap();

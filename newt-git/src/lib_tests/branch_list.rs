@@ -39,7 +39,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
             "branch-list",
             &serde_json::json!({}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("local branches: 2"), "{out}");
@@ -83,7 +83,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
                 "branch-list",
                 &serde_json::json!({"scope": scope}),
                 &GitCaveats::read_only(),
-                &newt_core::caveats::Caveats::top(),
+                &newt_policy::caveats::Caveats::top(),
             )
             .unwrap();
         assert!(
@@ -96,7 +96,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
             "branch-list",
             &serde_json::json!({"scope": "everything"}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top()
+            &newt_policy::caveats::Caveats::top()
         )
         .is_err());
     assert!(t
@@ -104,7 +104,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
             "branch-list",
             &serde_json::json!({"scope": 1}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top()
+            &newt_policy::caveats::Caveats::top()
         )
         .is_err());
     assert!(t
@@ -112,7 +112,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
             "branch-list",
             &serde_json::json!({"name": "filtered"}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top()
+            &newt_policy::caveats::Caveats::top()
         )
         .is_err());
     assert!(t
@@ -120,7 +120,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
             "branch-list",
             &serde_json::json!({}),
             &GitCaveats::none(),
-            &newt_core::caveats::Caveats::top()
+            &newt_policy::caveats::Caveats::top()
         )
         .is_err());
 }
@@ -136,7 +136,7 @@ fn branch_list_handles_unborn_and_detached_head() {
             "branch-list",
             &serde_json::json!({}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("local branches: 0"), "{out}");
@@ -147,7 +147,7 @@ fn branch_list_handles_unborn_and_detached_head() {
             "branch-list",
             &serde_json::json!({}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("local branches: 1"), "{out}");

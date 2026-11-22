@@ -42,7 +42,7 @@ use newt_interaction::{
 };
 
 use crate::interaction_adapter::DECISION_CONTROL;
-use crate::PermissionAction;
+use newt_policy::PermissionAction;
 
 /// How long an offer stays answerable, in the same nanosecond ticks the
 /// store counts.

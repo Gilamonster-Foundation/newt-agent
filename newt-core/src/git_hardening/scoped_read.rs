@@ -45,7 +45,7 @@ pub fn checked_git_read(
     scope: &crate::Scope<String>,
 ) -> Result<PathBuf, ScopedGitReadError> {
     let canonical = path.canonicalize()?;
-    if !crate::caveats::permits_path(scope, &canonical.to_string_lossy()) {
+    if !newt_policy::caveats::permits_path(scope, &canonical.to_string_lossy()) {
         return Err(ScopedGitReadError::Refused(format!(
             "capability denied: fs_read for Git path {}",
             path.display()

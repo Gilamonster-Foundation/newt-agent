@@ -10,35 +10,6 @@ use serde::{Deserialize, Serialize};
 use super::Config;
 use crate::error::{NewtError, Result};
 
-/// One named permission-posture binding (`[modes.<name>]`, retained for
-/// compatibility): the atomic binding `/posture <name>` applies.
-///
-/// ```toml
-/// [modes.triage]
-/// skill   = "oncall-triage"        # skill body to preload (use_skill path)
-/// preset  = "readonly-triage"      # [permission_presets.<name>] to clamp to
-/// framing = "On-call triage: investigate, do not change production."
-/// ```
-///
-/// Every field is optional so a posture can do any subset (e.g. preset-only, or
-/// framing-only). A `skill`/`preset` that names a missing entry is reported as
-/// an error by the command rather than silently ignored — a posture that claims
-/// a clamp it never applied would be a false security claim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ModeConfig {
-    /// Skill name to preload (the same `use_skill` / `load_body_from` path).
-    /// `None` ⇒ no skill is loaded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill: Option<String>,
-    /// `[permission_presets.<name>]` to apply as the session authority floor.
-    /// `None` ⇒ authority unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
-    /// One-line framing injected into the system prompt. `None` ⇒ no framing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub framing: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // Tool permissions — preset policies, lowered to attenuated capabilities
 // ---------------------------------------------------------------------------
@@ -155,24 +126,26 @@ pub struct ToolPermissions {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_prompt_default"
     )]
-    pub prompt_default: Option<crate::PermissionAction>,
+    pub prompt_default: Option<newt_policy::PermissionAction>,
 
     /// The choice selected by Enter at a terminal MCP hostname prompt.
     /// Applies only to connection grants, never generic tools or web races.
     /// This selects a displayed action; it grants nothing without an answer.
     #[serde(deserialize_with = "deserialize_mcp_net_prompt_default")]
-    pub mcp_net_prompt_default: crate::PermissionAction,
+    pub mcp_net_prompt_default: newt_policy::PermissionAction,
 }
 
 fn deserialize_prompt_default<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<crate::PermissionAction>, D::Error>
+) -> std::result::Result<Option<newt_policy::PermissionAction>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let action = crate::PermissionAction::deserialize(deserializer)?;
+    let action = newt_policy::PermissionAction::deserialize(deserializer)?;
     match action {
-        crate::PermissionAction::AllowOnce | crate::PermissionAction::Deny => Ok(Some(action)),
+        newt_policy::PermissionAction::AllowOnce | newt_policy::PermissionAction::Deny => {
+            Ok(Some(action))
+        }
         _ => Err(serde::de::Error::custom(
             "prompt_default must be allow_once or deny",
         )),
@@ -181,14 +154,14 @@ where
 
 fn deserialize_mcp_net_prompt_default<'de, D>(
     deserializer: D,
-) -> std::result::Result<crate::PermissionAction, D::Error>
+) -> std::result::Result<newt_policy::PermissionAction, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let action = crate::PermissionAction::deserialize(deserializer)?;
+    let action = newt_policy::PermissionAction::deserialize(deserializer)?;
     if matches!(
         action,
-        crate::PermissionAction::Back | crate::PermissionAction::Exit
+        newt_policy::PermissionAction::Back | newt_policy::PermissionAction::Exit
     ) {
         return Err(serde::de::Error::custom(
             "mcp_net_prompt_default must name a permission decision, not back or exit",
@@ -205,7 +178,7 @@ impl Default for ToolPermissions {
             net: Vec::new(),
             prompt: false,
             prompt_default: None,
-            mcp_net_prompt_default: crate::PermissionAction::AllowOnce,
+            mcp_net_prompt_default: newt_policy::PermissionAction::AllowOnce,
         }
     }
 }
@@ -273,8 +246,8 @@ impl ToolPermissions {
     /// Note: the `Caveats` lattice uses exact-set semantics; prefix matching
     /// is the responsibility of the enforcement site (`tui_permits_path` in
     /// newt-tui), not this algebra. This is an intentional layer separation.
-    pub fn to_caveats(&self, workspace: &str) -> crate::caveats::Caveats {
-        use crate::caveats::{Caveats, CountBound, Scope};
+    pub fn to_caveats(&self, workspace: &str) -> newt_policy::caveats::Caveats {
+        use newt_policy::caveats::{Caveats, CountBound, Scope};
 
         let ws = workspace.to_string();
         let net = self.net_scope();
@@ -334,8 +307,8 @@ impl ToolPermissions {
     ///
     /// Empty → `none` (no network). A `"*"` entry → `All` (every host, still
     /// SSRF-screened by the web tool). Otherwise an exact host allowlist.
-    pub(super) fn net_scope(&self) -> crate::caveats::Scope<String> {
-        use crate::caveats::Scope;
+    pub(super) fn net_scope(&self) -> newt_policy::caveats::Scope<String> {
+        use newt_policy::caveats::Scope;
         if self.net.is_empty() {
             Scope::none()
         } else if self.net.iter().any(|h| h == "*") {
@@ -354,7 +327,7 @@ impl Config {
     /// rule (#94). The spawn path widens exec by exactly the probed command
     /// (`newt-mcp-client`'s `spawn_caveats`); everything else stays closed.
     #[must_use]
-    pub fn mcp_probe_caveats(&self, workspace: &Path) -> crate::caveats::Caveats {
+    pub fn mcp_probe_caveats(&self, workspace: &Path) -> newt_policy::caveats::Caveats {
         let ws = workspace.to_string_lossy();
         self.tui
             .as_ref()
@@ -444,11 +417,11 @@ impl Config {
     /// authority. Only an explicit Allow once or Deny choice is accepted.
     pub fn set_permission_prompt_default(
         path: &Path,
-        action: crate::PermissionAction,
+        action: newt_policy::PermissionAction,
     ) -> Result<()> {
         if !matches!(
             action,
-            crate::PermissionAction::AllowOnce | crate::PermissionAction::Deny
+            newt_policy::PermissionAction::AllowOnce | newt_policy::PermissionAction::Deny
         ) {
             return Err(NewtError::Config(
                 "permission prompt default must be allow_once or deny".into(),

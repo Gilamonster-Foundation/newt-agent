@@ -23,12 +23,12 @@ use super::prompt_read::execute_prompt_read_silent;
 use super::prompt_read::PromptReadContext;
 use super::recall::{execute_recall, recall_tool_definition};
 use super::report::{execute_render_report, render_report_tool_definition};
-use crate::caveats::CaveatsExt as _;
-use crate::permissions::{
+use newt_policy::caveats::CaveatsExt as _;
+use newt_policy::permissions::{
     DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
     BOUND_REASON_PREFIX,
 };
-use crate::PermissionAction;
+use newt_policy::PermissionAction;
 #[cfg(test)]
 use output_budget::paginate_read;
 #[cfg(test)]
@@ -470,9 +470,9 @@ pub fn full_access_requested() -> bool {
 /// caveats enforces "planning is read-only" — the design's safety guarantee,
 /// not the model's good intentions. The call-count and generation bounds stay
 /// permissive here; the TUI `meet` still preserves any tighter session limits.
-pub fn plan_phase_clamp() -> crate::caveats::Caveats {
-    use crate::caveats::{CountBound, Scope};
-    crate::caveats::Caveats {
+pub fn plan_phase_clamp() -> newt_policy::caveats::Caveats {
+    use newt_policy::caveats::{CountBound, Scope};
+    newt_policy::caveats::Caveats {
         fs_read: Scope::All,
         fs_write: Scope::none(),
         exec: Scope::none(),
@@ -489,11 +489,11 @@ pub fn plan_phase_clamp() -> crate::caveats::Caveats {
 /// shell enforces the same `fs_write` floor, so `run_command` cannot write
 /// what the hidden tools could not. Exec and net stay as granted: read-only
 /// still runs builds and tests. Only narrows; never widens.
-pub fn read_only_clamp() -> crate::caveats::Caveats {
-    use crate::caveats::Scope;
-    crate::caveats::Caveats {
+pub fn read_only_clamp() -> newt_policy::caveats::Caveats {
+    use newt_policy::caveats::Scope;
+    newt_policy::caveats::Caveats {
         fs_write: Scope::none(),
-        ..crate::caveats::Caveats::top()
+        ..newt_policy::caveats::Caveats::top()
     }
 }
 
@@ -517,19 +517,22 @@ pub fn routing_disabled() -> bool {
 }
 
 // The lexical-normalisation + prefix-containment helpers now live in one shared
-// place — `crate::caveats` — so the interactive tool gate here and the headless
+// place — `newt_policy::caveats` — so the interactive tool gate here and the headless
 // `newt-coder` apply path decide containment identically (no drift surface).
 // Only the Linux object-bound helpers below normalise paths directly; the
-// prefix gate itself goes through `crate::caveats::permits_path`.
+// prefix gate itself goes through `newt_policy::caveats::permits_path`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::caveats::lexically_normalize;
+use newt_policy::caveats::lexically_normalize;
 
 /// Returns true if `full_path` is permitted by `scope`, under prefix
-/// (containment) semantics. Thin alias for [`crate::caveats::permits_path`],
+/// (containment) semantics. Thin alias for [`newt_policy::caveats::permits_path`],
 /// kept so the many call sites in this module read as the tool-gate they are;
 /// the containment logic lives in one shared owner.
-pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path: &str) -> bool {
-    crate::caveats::permits_path(scope, full_path)
+pub(crate) fn tui_permits_path(
+    scope: &newt_policy::caveats::Scope<String>,
+    full_path: &str,
+) -> bool {
+    newt_policy::caveats::permits_path(scope, full_path)
 }
 
 /// #2516/#2533: a routed call's result note is always APPENDED, never
@@ -566,13 +569,13 @@ fn justfile_findable_from(dir: &std::path::Path) -> bool {
 /// resolves beneath the very root the gate approved.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn authorizing_root<'a>(
-    scope: &'a crate::caveats::Scope<String>,
+    scope: &'a newt_policy::caveats::Scope<String>,
     full_path: &str,
 ) -> Option<Option<&'a str>> {
     match scope {
-        crate::caveats::Scope::All => Some(None),
-        crate::caveats::Scope::Only(set) if set.is_empty() => None,
-        crate::caveats::Scope::Only(set) => {
+        newt_policy::caveats::Scope::All => Some(None),
+        newt_policy::caveats::Scope::Only(set) if set.is_empty() => None,
+        newt_policy::caveats::Scope::Only(set) => {
             let candidate = lexically_normalize(full_path);
             set.iter()
                 .find(|root| candidate.starts_with(lexically_normalize(root)))
@@ -616,7 +619,7 @@ fn is_fs_containment_denied(e: &std::io::Error) -> bool {
 /// resolver behind the object-bound read/list arms.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_target<'a>(
-    scope: &'a crate::caveats::Scope<String>,
+    scope: &'a newt_policy::caveats::Scope<String>,
     full_str: &str,
 ) -> Option<Option<(&'a str, std::path::PathBuf)>> {
     authorizing_root(scope, full_str)
@@ -647,7 +650,7 @@ fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, FileIoError> {
 /// whose read is authorised by — and contained beneath — the `fs_write` root).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_read(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     axis: &str,
     path: &str,
     full: &std::path::Path,
@@ -692,7 +695,7 @@ fn object_bound_read(
 /// fd. `Scope::All` lists via `std::fs`. Available on Linux and macOS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_list(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     full: &std::path::Path,
     full_str: &str,
 ) -> Result<Vec<String>, FileIoError> {
@@ -721,7 +724,7 @@ fn object_bound_list(
 /// persists on non-Linux — see `fs-canonical-containment`; CI/prod is Linux).
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_read(
-    _scope: &crate::caveats::Scope<String>,
+    _scope: &newt_policy::caveats::Scope<String>,
     _axis: &str,
     path: &str,
     full: &std::path::Path,
@@ -733,7 +736,7 @@ fn object_bound_read(
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_list(
-    _scope: &crate::caveats::Scope<String>,
+    _scope: &newt_policy::caveats::Scope<String>,
     full: &std::path::Path,
     _full_str: &str,
 ) -> Result<Vec<String>, FileIoError> {
@@ -760,7 +763,7 @@ fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), Fi
 /// Linux and macOS; the other-platform fallback keeps the lexical-gate + `std::fs` path.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_write(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     axis: &str,
     path: &str,
     full: &std::path::Path,
@@ -795,7 +798,7 @@ fn object_bound_write(
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_write(
-    _scope: &crate::caveats::Scope<String>,
+    _scope: &newt_policy::caveats::Scope<String>,
     _axis: &str,
     path: &str,
     full: &std::path::Path,
@@ -812,7 +815,7 @@ fn object_bound_write(
 /// `std::fs`. Available on Linux and macOS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_delete(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     path: &str,
     full: &std::path::Path,
     full_str: &str,
@@ -841,7 +844,7 @@ fn object_bound_delete(
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_delete(
-    _scope: &crate::caveats::Scope<String>,
+    _scope: &newt_policy::caveats::Scope<String>,
     path: &str,
     full: &std::path::Path,
     _full_str: &str,
@@ -859,7 +862,7 @@ fn object_bound_delete(
 /// discarded, so smart mode refuses this adapter and uses the confined shell.
 #[cfg(target_os = "linux")]
 fn find_root_contained(
-    _scope: &crate::caveats::Scope<String>,
+    _scope: &newt_policy::caveats::Scope<String>,
     workspace: &str,
     full: &std::path::Path,
     _full_str: &str,
@@ -884,7 +887,7 @@ fn find_root_contained(
 
 #[cfg(not(target_os = "linux"))]
 fn find_root_contained(
-    _scope: &crate::caveats::Scope<String>,
+    _scope: &newt_policy::caveats::Scope<String>,
     workspace: &str,
     full: &std::path::Path,
     _full_str: &str,
@@ -907,10 +910,13 @@ fn find_root_contained(
 /// unless the read scope covers the whole workspace.
 const SCOPE_NOT_WALKABLE: &str = "capability denied: find/grep walk the whole workspace and cannot enforce a narrower fs_read scope. Use list_dir/read_file inside the granted scope, or run_command within your granted authority.";
 
-fn read_scope_covers_workspace(scope: &crate::caveats::Scope<String>, workspace: &str) -> bool {
+fn read_scope_covers_workspace(
+    scope: &newt_policy::caveats::Scope<String>,
+    workspace: &str,
+) -> bool {
     match scope {
-        crate::caveats::Scope::All => true,
-        crate::caveats::Scope::Only(set) => {
+        newt_policy::caveats::Scope::All => true,
+        newt_policy::caveats::Scope::Only(set) => {
             let Ok(ws) = std::path::Path::new(workspace).canonicalize() else {
                 return false;
             };
@@ -927,11 +933,11 @@ fn read_scope_covers_workspace(scope: &crate::caveats::Scope<String>, workspace:
 /// interactive mode. Under --yolo the operator already chose an explicit
 /// auto-run mode, so do not let EOF on stdin become a fake human denial.
 fn confirm_unrestricted_fs_mutation(
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
     question: &str,
 ) -> bool {
-    if !matches!(caveats.fs_write, crate::caveats::Scope::All) {
+    if !matches!(caveats.fs_write, newt_policy::caveats::Scope::All) {
         return true;
     }
     if ocap_disabled() {
@@ -1231,8 +1237,8 @@ async fn lifecycle_run_with_escalation(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
+    caveats: &newt_policy::caveats::Caveats,
+    exec_floor: Option<&newt_policy::caveats::Scope<String>>,
     mut permission_gate: Option<&mut dyn PermissionGate>,
     tool_offload: bool,
     spill_store: Option<&dyn super::content_spill::SpillStore>,
@@ -1433,7 +1439,7 @@ async fn run_confined_build_lane(
     argv: Vec<String>,
     display: &str,
     smart_harness: Option<&super::smart_harness::SmartHarness>,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     // F19: double indirection — see the matching comment on
     // `exec_confined_command`'s parameter in `shell.rs`.
     permission_gate: &mut Option<&mut dyn PermissionGate>,
@@ -1639,12 +1645,12 @@ fn denial_recovery_hint(capability: &str, target: &str) -> String {
 fn denial_context(
     workspace: &str,
     requested_cwd: Option<&str>,
-    caveats: Option<&crate::caveats::Caveats>,
+    caveats: Option<&newt_policy::caveats::Caveats>,
 ) -> String {
-    fn scope(scope: &crate::caveats::Scope<String>) -> String {
+    fn scope(scope: &newt_policy::caveats::Scope<String>) -> String {
         match scope {
-            crate::caveats::Scope::All => "all".into(),
-            crate::caveats::Scope::Only(roots) => {
+            newt_policy::caveats::Scope::All => "all".into(),
+            newt_policy::caveats::Scope::Only(roots) => {
                 const DISPLAY_ROOTS: usize = 4;
                 let shown: Vec<_> = roots.iter().take(DISPLAY_ROOTS).collect();
                 let mut text = serde_json::json!(shown).to_string();
@@ -1732,7 +1738,7 @@ pub(super) fn authorized_read(
     tool: &str,
     path: &str,
     workspace: &str,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     permission_gate: Option<&mut (dyn PermissionGate + '_)>,
 ) -> Result<String, String> {
     let full = resolve_tool_path(std::path::Path::new(workspace), path)?;
@@ -1779,7 +1785,7 @@ fn fs_gate_allows(
     tool: &str,
     kind: DenialKind,
     full_path: &str,
-    axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
+    axis: impl Fn(&newt_policy::caveats::Caveats) -> &newt_policy::caveats::Scope<String>,
 ) -> bool {
     fs_gate_widened(gate, tool, kind, full_path, axis).is_some()
 }
@@ -1790,8 +1796,8 @@ fn fs_gate_widened(
     tool: &str,
     kind: DenialKind,
     full_path: &str,
-    axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
-) -> Option<crate::caveats::Caveats> {
+    axis: impl Fn(&newt_policy::caveats::Caveats) -> &newt_policy::caveats::Scope<String>,
+) -> Option<newt_policy::caveats::Caveats> {
     let request = PermissionRequest {
         tool: tool.to_string(),
         kind,
@@ -1813,7 +1819,7 @@ fn fs_gate_widened(
 /// the walker reopens paths by name and cannot keep to a subtree (#2980).
 fn walker_read_gate(
     tool: &str,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     workspace: &str,
     full_str: &str,
     gate: &mut Option<&mut dyn PermissionGate>,
@@ -1861,7 +1867,7 @@ fn is_git_write_denial(out: &str) -> bool {
 /// away). Read-side and constructive ops (commit/branch/checkout/stash-pop…)
 /// are unaffected.
 fn is_git_data_loss_op(op: &str) -> bool {
-    crate::permissions::git_data_loss_action(op).is_some()
+    newt_policy::permissions::git_data_loss_action(op).is_some()
 }
 
 /// Ask the operator to confirm data-loss git ops (#1191), in one prompt.
@@ -2044,8 +2050,8 @@ fn single_grant_covers_missing(
         }
         match kind {
             DenialKind::FsRead | DenialKind::FsWrite => {
-                let scope = crate::caveats::Scope::only([target.to_string()]);
-                crate::caveats::permits_path(&scope, &request.target)
+                let scope = newt_policy::caveats::Scope::only([target.to_string()]);
+                newt_policy::caveats::permits_path(&scope, &request.target)
             }
             DenialKind::Exec => request.target == target,
             _ => false,
@@ -2184,7 +2190,7 @@ fn execute_request_permissions(
     workspace: &str,
     bound: Option<&PendingRerun>,
 ) -> (
-    Option<crate::caveats::Caveats>,
+    Option<newt_policy::caveats::Caveats>,
     Option<EligibleReplay>,
     String,
 ) {
@@ -3121,7 +3127,7 @@ pub(crate) fn tool_presentation(
     raw_name: &str,
     raw_args: &serde_json::Value,
     workspace: &std::path::Path,
-    read_scope: &crate::caveats::Scope<String>,
+    read_scope: &newt_policy::caveats::Scope<String>,
 ) -> (String, String) {
     let (name, correction) = match resolve_tool_alias(raw_name) {
         Some(AliasOutcome::Rewrite(canonical)) => (canonical, false),
@@ -3359,7 +3365,7 @@ fn open_workspace_file_via(
         )),
         WalkOpenRoute::ObjectBound | WalkOpenRoute::PhysicalCheckReparseLeaf => {
             let scope =
-                crate::caveats::Scope::only([workspace_root.to_string_lossy().into_owned()]);
+                newt_policy::caveats::Scope::only([workspace_root.to_string_lossy().into_owned()]);
             file_capture::open_for_scope(&scope, path, true)
         }
     }
@@ -3496,11 +3502,11 @@ fn open_regular_file(_path: &std::path::Path, _nofollow: bool) -> std::io::Resul
 /// Artifact reads use the same object boundary as model-facing file reads.
 /// A physical-path check alone cannot protect a later reopen from a link swap.
 fn artifact_open_scoped_regular_file(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     path: &std::path::Path,
 ) -> std::io::Result<std::fs::File> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let crate::caveats::Scope::Only(_) = scope {
+    if let newt_policy::caveats::Scope::Only(_) = scope {
         let Some(Some((root, relative))) = object_bound_target(scope, &path.to_string_lossy())
         else {
             return Err(std::io::Error::from_raw_os_error(libc::EACCES));
@@ -3517,7 +3523,7 @@ fn artifact_open_scoped_regular_file(
 }
 
 fn artifact_preimage_state(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     path: &std::path::Path,
     read_authorized: bool,
 ) -> super::artifact_hooks::ArtifactFileState {
@@ -3574,7 +3580,7 @@ fn artifact_preimage_state(
 /// Verify a governed write against the bytes it submitted without allocating a
 /// second copy of the file. Only a regular file can satisfy the postcondition.
 fn artifact_file_matches(
-    scope: &crate::caveats::Scope<String>,
+    scope: &newt_policy::caveats::Scope<String>,
     path: &std::path::Path,
     expected: &[u8],
 ) -> std::io::Result<bool> {
@@ -3727,7 +3733,7 @@ async fn execute_tool_unadopted(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     mut collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
@@ -3807,7 +3813,7 @@ async fn execute_authorized_tool(
     workspace: &str,
     color: bool,
     tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     mcp: &mut dyn McpTools,
     collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
@@ -5641,7 +5647,7 @@ async fn execute_authorized_tool(
                     &full,
                 );
 
-            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &newt_policy::caveats::Scope::All };
             if !file_capture::regular_target(&full) {
                 return file_capture::present(
                     format!("error: write_file refuses a nonregular target: {path}"),
@@ -5836,7 +5842,7 @@ async fn execute_authorized_tool(
             let artifact_before = artifact_path_within.then(|| {
                 artifact_preimage_state(&caveats.fs_read, &full, tui_permits_path(&caveats.fs_read, &full_str))
             });
-            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &newt_policy::caveats::Scope::All };
 
             // step-52.6: object-bound removal when the scope authorised it (the
             // parent is resolved beneath the root and the entry unlinked via its
@@ -5966,7 +5972,7 @@ async fn execute_authorized_tool(
                     presentation,
                 );
             }
-            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &newt_policy::caveats::Scope::All };
             // step-52.5: read the existing file object-bound beneath the same
             // fs_write root (a symlink-escape edit is refused here, so the
             // no-match head display below can't leak an outside file either).

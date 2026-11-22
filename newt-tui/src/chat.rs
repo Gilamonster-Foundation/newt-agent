@@ -500,7 +500,7 @@ struct PlanApprovalEffects {
 /// queues nothing. No gate outcome other than a submitted answer can widen
 /// what the model may do.
 fn run_plan_approval(
-    gate: Option<&mut dyn newt_core::permissions::PermissionGate>,
+    gate: Option<&mut dyn newt_policy::permissions::PermissionGate>,
     entry: newt_core::agentic::PlanEntry,
     plan_state: &PlanModeState,
     plan_draft: &PlanDraftState,
@@ -515,7 +515,7 @@ fn run_plan_approval(
         ledger_plan,
     } = seed;
     use newt_core::agentic::{plan_verdict, PlanEntry, PlanModeControl as _, PlanVerdict};
-    use newt_core::permissions::HumanQuestionOutcome;
+    use newt_policy::permissions::HumanQuestionOutcome;
     // `/mode plan` is the operator's own standing choice, so leaving it is
     // their explicit act too: the question says so, and approval switches
     // the mode (design row 3).
@@ -1182,7 +1182,7 @@ fn git_head_snapshot(
 ) -> Option<newt_git::HeadSnapshot> {
     let tool = tool?;
     let root = tool.root.to_string_lossy().into_owned();
-    if !newt_core::ScopeExt::permits(&caveats.fs_read, &root) {
+    if !newt_policy::ScopeExt::permits(&caveats.fs_read, &root) {
         return None;
     }
     let git_caveats = newt_core::git_caveats::GitCaveats::from_session(caveats);
@@ -1584,7 +1584,7 @@ pub(crate) trait InputSurface {
     fn present_interaction(
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
-    ) -> newt_core::HumanQuestionOutcome;
+    ) -> newt_policy::HumanQuestionOutcome;
 
     /// Lend the real terminal for inline rows or an alternate-screen panel.
     ///
@@ -2359,7 +2359,7 @@ fn session_body(
     let conversation_mode_states = ConversationModeStates::default();
     // #307/#2009: one session binding shared by the verb, settings and turns.
     // Clear only at session startup, not at conversation/persona boundaries.
-    newt_core::posture::set_active_posture(None);
+    newt_policy::posture::set_active_posture(None);
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     // #1235: per-session live spill height. `None` follows `[tui].spill_lines`;
@@ -2510,7 +2510,7 @@ fn session_body(
     }
 
     // --net (#3089): name the session's launch net grants.
-    let net_hosts = newt_core::caveats::cli_net_hosts();
+    let net_hosts = newt_policy::caveats::cli_net_hosts();
     if !net_hosts.is_empty() {
         print_newt(
             &format!(
@@ -2597,7 +2597,7 @@ fn session_body(
             || Ok(startup_caveats.clone()),
             |gate| gate.current_caveats(),
         )?;
-        let mut grant_net = |request: &newt_core::PermissionRequest| {
+        let mut grant_net = |request: &newt_policy::PermissionRequest| {
             if startup_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
@@ -3880,7 +3880,7 @@ fn session_body(
                                 anyhow::ensure!(workspace_settings.protection.is_some(),
                                     "{}", workspace_settings.unavailable.as_deref().unwrap_or("workspace settings were not protected at startup"));
                                 let recalled = permission_state.recalled_caveats(cap.caveats(), cap.delegation().map(|d| d.caveats()))?;
-                                let posture = newt_core::posture::active_posture();
+                                let posture = newt_policy::posture::active_posture();
                                 let active = operating_mode_caveats(cfg.tool_exposure().read_only, active_operating_mode,
                                     conversation_mode_states.plan.is_active(), effective_caveats(&recalled, posture.as_ref()));
                                 let permissions = resolve_tui(&cfg).map(|tui| tui.permissions).unwrap_or_default();
@@ -3964,7 +3964,7 @@ fn session_body(
                             let cancel =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let exit = std::sync::atomic::AtomicBool::new(false);
-                            let posture = newt_core::posture::active_posture();
+                            let posture = newt_policy::posture::active_posture();
                             let mut gate = PromptPermissionGate {
                                 pending_command_retries: Default::default(),
                                 ask_surface: Some(&ask_surface),
@@ -4272,7 +4272,7 @@ fn session_body(
                             lines.push(format!("active mode: {}", active_operating_mode.as_str()));
                             lines.push(format!(
                                 "active posture: {}",
-                                newt_core::posture::active_posture()
+                                newt_policy::posture::active_posture()
                                     .as_ref()
                                     .map_or("off", |p| p.name.as_str())
                             ));
@@ -4532,7 +4532,7 @@ fn session_body(
                             continue;
                         }
                         if perm_tail == "save" {
-                            let posture = newt_core::posture::active_posture();
+                            let posture = newt_policy::posture::active_posture();
                             let result = if interactive {
                                 crate::permissions::PermissionWorkflow {
                                     state: &mut permission_state,
@@ -4568,7 +4568,7 @@ fn session_body(
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
                             // #307: surface the active posture's preset clamp.
-                            newt_core::posture::active_posture().as_ref(),
+                            newt_policy::posture::active_posture().as_ref(),
                         );
                         // #2009 PR10a / #1979: bare `/permissions` on a rich
                         // TTY opens the chooser, the way `/backends` does. It
@@ -4584,7 +4584,7 @@ fn session_body(
                         if perm_tail.is_empty()
                             && std::io::IsTerminal::is_terminal(&std::io::stdout())
                         {
-                            let posture = newt_core::posture::active_posture();
+                            let posture = newt_policy::posture::active_posture();
                             let mut workflow = crate::permissions::PermissionWorkflow {
                                 state: &mut permission_state,
                                 config_path: permission_config_path.as_deref(),
@@ -5594,7 +5594,7 @@ fn session_body(
                             // Shared borrows only: no sink write, store, queued-style
                             // consumption, permission quarantine or inference call is
                             // reachable from here.
-                            let posture = newt_core::posture::active_posture();
+                            let posture = newt_policy::posture::active_posture();
                             let preview = permission_state
                                 .peek_recalled_caveats(
                                     cap.caveats(),
@@ -7503,7 +7503,7 @@ fn session_body(
                                 continue;
                             }
                             if walked_to_permissions {
-                                let posture = newt_core::posture::active_posture();
+                                let posture = newt_policy::posture::active_posture();
                                 let mut workflow = crate::permissions::PermissionWorkflow {
                                     state: &mut permission_state,
                                     config_path: permission_config_path.as_deref(),
@@ -8286,7 +8286,7 @@ fn session_body(
 
                     // Freeze one resolved binding for this accepted turn: its
                     // guidance, dispatch caveats and grant clamp must agree.
-                    let turn_posture = newt_core::posture::active_posture();
+                    let turn_posture = newt_policy::posture::active_posture();
 
                     // Prompt comprehension is deliberately after receipt
                     // creation (so every manifest has a durable origin) and
@@ -9692,7 +9692,7 @@ fn session_body(
                                         // tool call; None keeps denials verbatim.
                                         permission_gate: permission_gate
                                             .as_mut()
-                                            .map(|g| g as &mut dyn newt_core::PermissionGate),
+                                            .map(|g| g as &mut dyn newt_policy::PermissionGate),
                                         // Phase 20: per-round capability evidence +
                                         // the learned estimate calibration.
                                         on_round_usage: Some(&mut on_obs),
@@ -10068,7 +10068,7 @@ fn session_body(
                                         );
                                         let effects = run_plan_approval(
                                             permission_gate.as_mut().map(|g| {
-                                                g as &mut dyn newt_core::permissions::PermissionGate
+                                                g as &mut dyn newt_policy::permissions::PermissionGate
                                             }),
                                             entry,
                                             plan_state,

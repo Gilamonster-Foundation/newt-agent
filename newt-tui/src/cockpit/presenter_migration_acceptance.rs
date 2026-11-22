@@ -74,7 +74,7 @@ pub(crate) fn cockpit_migration_case() {
         });
         assert_eq!(
             answer.recv().unwrap(),
-            newt_core::HumanQuestionOutcome::Answer("yes".into())
+            newt_policy::HumanQuestionOutcome::Answer("yes".into())
         );
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
