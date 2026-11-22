@@ -423,18 +423,19 @@ jobs:
         if: always()
         run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings
       # HOOK PARITY: CI-only; named in .githooks/pre-push. The justfile does not
-      # repeat it. It asks cargo which features it resolved for newt-core in the
-      # confine-off configuration (dev-dependency edges included, `cargo tree`'s
-      # default), so nothing can leave the step above green on a build that has
-      # `confine` on. The first check is the control: the probe has to see
-      # `confine` when it is on. It reads the feature list only, never the
-      # package path, because a checkout directory may contain the word, and
-      # with `--color never`, because this workflow sets CARGO_TERM_COLOR to
-      # always and the list is read as text.
+      # repeat it. It asks cargo which features it resolves for newt-core in the
+      # step above's configuration, on every target (`--target all`) and with
+      # dev-dependency edges (`cargo tree`'s default), so a crate that turns
+      # `confine` back on, even on one platform only, shows here. The ratchet
+      # holds its feature list equal to that step's. The first check is the
+      # control: the probe has to see `confine` when it is on. It reads the
+      # feature list only, never the package path, because a checkout directory
+      # may contain the word, and with `--color never`, because this workflow
+      # sets CARGO_TERM_COLOR to always and the list is read as text.
       - name: the confine-off build really has confine off (#3160)
         if: always()
         run: |
-          features() { cargo tree --color never -p newt-core --no-default-features --features "$1" --depth 0 --prefix none --format '{f}'; }
+          features() { cargo tree --color never -p newt-core --no-default-features --features "$1" --target all --depth 0 --prefix none --format '{f}'; }
           has_confine() { case ",$1," in *,confine,*) return 0 ;; *) return 1 ;; esac; }
           on=$(features markdown,confine)
           off=$(features markdown)
@@ -692,13 +693,6 @@ jobs:
         run: cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
-      # HOOK PARITY: CI-only, like the rest of this job; named in
-      # .githooks/pre-push. The lean job's confine-off gate (#3160) again, on
-      # the one host that compiles newt-core's `#[cfg(windows)]` arms: the same
-      # command, held equal by newt-core/tests/confine_gate_parity_ratchet.rs.
-      - name: clippy (newt-core, confine off)
-        if: always()
-        run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings
       # HOOK PARITY: CI-only artifact caches and bounded downloads (#2817);
       # scripts/test_carried_cache.py checks this contract in lint. Both are
       # named in .githooks/pre-push. No fallback keys: version AND hash must match.
@@ -845,3 +839,12 @@ jobs:
           cargo test -p newt-core --features windows-appcontainer --lib run_command_windows_ -- --test-threads=1
           cargo test -p newt-core --features windows-appcontainer --lib -- native_git_status_requires_exec_and_reads_the_actual_repository state_modifying_git_add_is_not_routed native_git_exec_grant_retry_stages_under_appcontainer native_staging_uses_current_workspace_grants windows_disable_ocap_keeps_native_git_available --test-threads=1 --nocapture
           cargo test -p newt-core --features windows-appcontainer --test windows_appcontainer_adversarial -- --ignored --test-threads=1
+      # HOOK PARITY: CI-only, like the rest of this job; named in
+      # .githooks/pre-push. The lean job's confine-off gate (#3160) again, on
+      # the one host that compiles newt-core's `#[cfg(windows)]` arms: the same
+      # command, held equal by newt-core/tests/confine_gate_parity_ratchet.rs.
+      # Last in the job, with `if: always()`: a red workspace clippy cannot hide
+      # it, and a red result here cannot skip the #2776 proofs above.
+      - name: clippy (newt-core, confine off)
+        if: always()
+        run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings

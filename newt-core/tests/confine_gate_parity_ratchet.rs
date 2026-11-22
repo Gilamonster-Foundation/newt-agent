@@ -20,6 +20,9 @@
 //! hook to lean job, and the default feature list is read from the manifest.
 //! Change every site the same way and this stays green; change one and it fails.
 //!
+//! The lean job's probe step, which asks cargo which features it resolved, is held
+//! to the confine-off gate's own feature list, on every target.
+//!
 //! The sources are embedded with `include_str!`, so nothing here does I/O, and
 //! that is also why this file is in `exclude` in `newt-core/Cargo.toml`: it cannot
 //! compile from the published package. An extractor that finds nothing panics or
@@ -202,6 +205,68 @@ fn windows_leg_problems(lean_job: &str, windows_job: &str) -> Vec<String> {
     )]
 }
 
+/// The lean job's probe step must resolve the confine-off gate's own feature list,
+/// on every target, and its control must be that list with `confine` added.
+///
+/// The probe runs its own `cargo tree`, so nothing else ties it to the gate: a gate
+/// that grew a feature, or a probe that resolved for the host only, would leave it
+/// reporting on a configuration the gate does not lint.
+fn probe_problems(lean_job: &str) -> Vec<String> {
+    let Some(gate) = gates_with_confine(lean_job, false).into_iter().next() else {
+        return vec!["the lean-build job has no confine-off gate for the probe to follow".into()];
+    };
+    let mut gate_features = enabled_features(&gate);
+    gate_features.sort_unstable();
+    let list = |var: &str| {
+        lean_job.lines().find_map(|line| {
+            let listed = line
+                .trim()
+                .strip_prefix(&format!("{var}=$(features "))?
+                .strip_suffix(')')?;
+            let mut listed: Vec<&str> = listed.split(',').collect();
+            listed.sort_unstable();
+            Some(listed)
+        })
+    };
+    let mut problems = Vec::new();
+    let resolves_the_gate_on_every_target = lean_job.lines().any(|line| {
+        line.trim_start().starts_with("features() {")
+            && line.contains("-p newt-core --no-default-features --features \"$1\"")
+            && line.contains(" --target all ")
+    });
+    if !resolves_the_gate_on_every_target {
+        problems.push(
+            "the probe's `features()` must ask `cargo tree` for `-p newt-core \
+             --no-default-features --features \"$1\"` on every target (`--target all`)"
+                .to_string(),
+        );
+    }
+    match (list("off"), list("on")) {
+        (Some(off), Some(on)) => {
+            if off != gate_features {
+                problems.push(format!(
+                    "the probe resolves {off:?}, the confine-off gate lints {gate_features:?}"
+                ));
+            }
+            let mut control = gate_features.clone();
+            control.push("confine");
+            control.sort_unstable();
+            if on != control {
+                problems.push(format!(
+                    "the probe's control resolves {on:?}; it must be the gate's list with \
+                     `confine` added: {control:?}"
+                ));
+            }
+        }
+        _ => problems.push(
+            "the lean-build job has no probe step (`on=$(features ...)` and \
+             `off=$(features ...)`)"
+                .to_string(),
+        ),
+    }
+    problems
+}
+
 /// Only `default` and the two platform features may list `confine`, and all three must.
 fn feature_graph_problems(manifest: &str) -> Vec<String> {
     let table = feature_table(manifest);
@@ -324,6 +389,18 @@ fn default_builds_keep_confine_and_only_the_named_features_imply_it() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// **The probe asks cargo about the gate's own configuration, on every target.**
+///
+/// A `[target.'cfg(windows)'.dev-dependencies]` edge to a crate that takes
+/// newt-core's default features turns `confine` on in the Windows job's
+/// confine-off build. `cargo tree` for the host alone does not see that edge;
+/// `--target all` does.
+#[test]
+fn the_probe_resolves_the_gates_configuration_on_every_target() {
+    let problems = probe_problems(ci_job("lean-build"));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// **The hook names the confine-off gate as CI-only.**
 ///
 /// Craft Register `CRAFT-14` (v3.0): every check the pipeline runs is either
@@ -365,6 +442,12 @@ fn the_checks_reject_what_they_exist_to_catch() {
     // Both sites change the same way, so they still agree and only a rule can object.
     for (what, gate, from, to) in [
         ("`confine` is on", off, "--features ", "--features confine,"),
+        (
+            "a feature outside default",
+            off,
+            "--features ",
+            "--features newt-core/confine,",
+        ),
         ("the lean gate is unpinned", on, on_features.as_str(), ""),
         ("a second package", off, "clippy ", "clippy -p newt-tui "),
         ("`--workspace`", off, "clippy ", "clippy --workspace "),
@@ -409,4 +492,24 @@ fn the_checks_reject_what_they_exist_to_catch() {
         !hook_problems(&mutated(HOOK, off, ""), job).is_empty(),
         "red control passed: the hook no longer quotes the gate"
     );
+
+    for (what, from, to) in [
+        (
+            "the probe resolves another list",
+            "off=$(features ",
+            "off=$(features ast,",
+        ),
+        ("the probe's control lacks `confine`", ",confine)", ")"),
+        (
+            "the probe resolves for the host only",
+            " --target all ",
+            " ",
+        ),
+        ("the probe step is gone", "features() {", "removed() {"),
+    ] {
+        assert!(
+            !probe_problems(&mutated(job, from, to)).is_empty(),
+            "red control passed: {what}"
+        );
+    }
 }
