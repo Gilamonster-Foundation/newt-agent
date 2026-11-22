@@ -156,7 +156,7 @@ async fn confined_shell_parent_timezone_reaches_child_and_grandchild() {
             ..Caveats::top()
         };
         let result = super::shell::dispatch_bridled_shell(
-            confined_dispatch_args(&command, cwd),
+            confined_dispatch_args(&command, cwd, &caveats),
             &caveats,
             None,
         )
@@ -1004,7 +1004,7 @@ async fn confined_dispatch_uses_env_seam_not_export_prefix_783() {
 
     // The literal failing case from #783.
     let cmd = "hostname; sw_vers 2>/dev/null | head -1; uname -s";
-    let args = confined_dispatch_args(cmd, "/work/dir");
+    let args = confined_dispatch_args(cmd, "/work/dir", &Caveats::top());
 
     // The command is passed RAW — no `export …;` prefix smuggled in.
     assert_eq!(args["cmd"], cmd);
@@ -1037,7 +1037,7 @@ async fn confined_dispatch_env_seam_without_venv_783() {
     let _pass = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH"); // ⇒ default HOME+USER
     let _home = EnvVar::set("HOME", "/home/testuser");
 
-    let args = confined_dispatch_args("ls -la", "/work/dir");
+    let args = confined_dispatch_args("ls -la", "/work/dir", &Caveats::top());
     assert_eq!(args["cmd"], "ls -la");
     let env = &args["env"];
     // #783: without a venv, no VIRTUAL_ENV / PATH override is injected...
@@ -1069,6 +1069,182 @@ async fn confined_dispatch_env_seam_without_venv_783() {
     assert!(
         env.get("SHELL").is_some(),
         "SHELL must identify the confined engine: {args}"
+    );
+}
+
+/// #3151: the confined shell's PATH carries the pack after the venv and the explicit
+/// roots and ahead of the host's tools, and only when the caller decided it is usable.
+#[tokio::test]
+async fn the_confined_path_carries_the_pack_only_when_given_it() {
+    let _l = env_lock().await;
+    let _venv = EnvVar::set("NEWT_VENV", "/opt/fake-venv");
+    let _virtual = EnvVar::unset("VIRTUAL_ENV");
+    let _paths = EnvVar::set("NEWT_EXEC_PATHS", "/opt/roots");
+    let _host = EnvVar::set("PATH", "/usr/bin:/bin");
+    let pack = std::path::Path::new("/opt/newt/tools");
+
+    let with = confined_dispatch_args_with("ls", "/w", Some(pack));
+    let path = with["env"]["PATH"].as_str().expect("PATH in the env seam");
+    assert!(
+        path.starts_with("/opt/fake-venv/bin:/opt/roots:/opt/newt/tools:"),
+        "the pack follows the venv and the roots: {path}"
+    );
+    assert!(
+        path.ends_with(":/usr/bin:/bin"),
+        "the host's PATH follows: {path}"
+    );
+
+    let without = confined_dispatch_args_with("ls", "/w", None);
+    let path = without["env"]["PATH"]
+        .as_str()
+        .expect("PATH in the env seam");
+    assert!(path.starts_with("/opt/fake-venv/bin:/opt/roots:"), "{path}");
+    assert!(
+        !path.contains("/opt/newt/tools"),
+        "no pack, no entry: {path}"
+    );
+}
+
+/// #3151: an unpinned pack must stay off the confined PATH. On macOS a bare name grants
+/// only the system directories, so the kernel refuses a pack tool whose exact path was
+/// not pinned at startup, and a pack ahead of the host's `PATH` would shadow the host's
+/// working tool with it (the pins refuse a group-writable keg or a pack under the
+/// workspace).
+#[test]
+fn the_confined_pack_follows_the_session_grants() {
+    let pack = Some(std::path::PathBuf::from("/opt/newt/tools"));
+    let bare = Caveats {
+        exec: Scope::only(["tail".into(), "grep".into()]),
+        ..Caveats::top()
+    };
+    let pinned = Caveats {
+        exec: Scope::only(["tail".into(), "/opt/newt/tools/tail".into()]),
+        ..Caveats::top()
+    };
+    assert_eq!(
+        confined_tools(pack.clone(), &bare),
+        None,
+        "bare names do not reach the pack"
+    );
+    assert_eq!(
+        confined_tools(pack.clone(), &pinned),
+        pack,
+        "a pinned pack tool admits the pack"
+    );
+    assert_eq!(
+        confined_tools(pack.clone(), &Caveats::top()),
+        pack,
+        "unrestricted exec needs no pin"
+    );
+    assert_eq!(
+        confined_tools(None, &pinned),
+        None,
+        "no pack, nothing to admit"
+    );
+}
+
+/// Grounds `the_confined_pack_follows_the_session_grants` with the real macOS kernel
+/// sandbox (#3151). A bare `tail` grant reaches only the system directories, so a pack
+/// ahead of the host's PATH whose `tail` was not pinned breaks every `tail`; the gate keeps
+/// that pack off and the host's runs. A pinned pack is on the PATH and its `tail` runs. The
+/// pack's `tail` is a script that prints `carried`, so the output says which one ran.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "real macOS kernel sandbox; run serially in integration tier"]
+async fn a_confined_tail_survives_an_unpinned_pack_and_runs_a_pinned_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = env_lock().await;
+    let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
+    let _config = EnvVar::set("NEWT_CONFIG_DIR", "/nonexistent-newt-pack-test");
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _venv = EnvVar::unset("NEWT_VENV");
+    let _virtual = EnvVar::unset("VIRTUAL_ENV");
+    let _paths = EnvVar::unset("NEWT_EXEC_PATHS");
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = std::fs::canonicalize(workspace.path()).unwrap();
+    let cwd = cwd.to_str().unwrap().to_string();
+    std::fs::write(std::path::Path::new(&cwd).join("data.txt"), "a\nb\n").unwrap();
+    let make_pack = |root: &std::path::Path| {
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        // A script, not a copy of a system binary: those are arm64e and the kernel kills
+        // a copy that runs from another path.
+        std::fs::write(tools.join("tail"), "#!/bin/sh\necho carried\n").unwrap();
+        std::fs::set_permissions(tools.join("tail"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        for dir in [root, tools.as_path()] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::canonicalize(tools).unwrap()
+    };
+    let session = |read: Vec<String>, write: Scope<String>| Caveats {
+        exec: Scope::only(["tail".into(), "sh".into()]),
+        fs_read: Scope::only(read),
+        fs_write: write,
+        ..Caveats::top()
+    };
+    let run = |args: serde_json::Value, caveats: Caveats| async move {
+        super::shell::dispatch_bridled_shell(args, &caveats, None)
+            .await
+            .expect("confined dispatch")
+    };
+    let command = "tail data.txt";
+
+    // A pack inside the session's write root: trust refuses the pin.
+    let untrusted = make_pack(&std::path::Path::new(&cwd).join("newt"));
+    let mut inside = session(vec![cwd.clone()], Scope::only([cwd.clone()]));
+    crate::exec_grants::resolve_basenames(&mut inside, Some(untrusted.as_os_str()));
+    assert!(
+        !crate::exec_grants::pack_is_granted(&untrusted, &inside.exec),
+        "refused, so not granted"
+    );
+    let broken = run(
+        confined_dispatch_args_with(command, &cwd, Some(&untrusted)),
+        inside.clone(),
+    )
+    .await;
+    eprintln!("unpinned pack on the PATH: {broken}");
+    assert_ne!(
+        broken["stdout"].as_str(),
+        Some("a\nb\n"),
+        "the unpinned pack shadows the host's tail: {broken}"
+    );
+    let gated = confined_tools(Some(untrusted), &inside);
+    let host = run(
+        confined_dispatch_args_with(command, &cwd, gated.as_deref()),
+        inside,
+    )
+    .await;
+    eprintln!("unpinned pack kept off the PATH: {host}");
+    assert_eq!(host["exit_code"], 0, "{host}");
+    assert_eq!(
+        host["stdout"].as_str(),
+        Some("a\nb\n"),
+        "the host's tail ran: {host}"
+    );
+
+    // A pack outside every write root: the pin is granted and the pack's tail runs.
+    let outside = tempfile::tempdir().expect("pack root");
+    let trusted = make_pack(&std::fs::canonicalize(outside.path()).unwrap());
+    let mut pinned = session(
+        vec![cwd.clone(), trusted.to_str().unwrap().to_string()],
+        Scope::none(),
+    );
+    crate::exec_grants::resolve_basenames(&mut pinned, Some(trusted.as_os_str()));
+    let on_path = confined_tools(Some(trusted), &pinned);
+    assert!(on_path.is_some(), "pinned, so on the PATH");
+    let carried = run(
+        confined_dispatch_args_with(command, &cwd, on_path.as_deref()),
+        pinned,
+    )
+    .await;
+    eprintln!("pinned pack on the PATH: {carried}");
+    assert_eq!(carried["exit_code"], 0, "{carried}");
+    assert_eq!(
+        carried["stdout"].as_str(),
+        Some("carried\n"),
+        "the pack's tail ran: {carried}"
     );
 }
 

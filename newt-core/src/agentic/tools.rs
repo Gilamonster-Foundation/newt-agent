@@ -83,16 +83,17 @@ mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
 #[cfg(test)]
 pub(crate) use shell::absent_binary_refusal;
+pub(crate) use shell::carried_tools_dir;
 pub use shell::venv_cmd_prefix;
 /// newt's control plane, which no host child receives (also what `--ambient` strips from
 /// the full environment it hands run_command and stdio MCP servers).
 pub use shell::CHILD_STRIPPED_AUTHORITY_ENV;
 #[cfg(test)]
 use shell::{
-    confined_dispatch_args, decode_shell_stream, denial_recovery_hints, denied_run_command_result,
-    envelope_denial_reason, envelope_denied, exec_denial_requests, exec_floor_permits,
-    net_denial_requests, pr_creation_url, same_file_redirect_refusal, shadow_records, shell_engine,
-    shell_envelope_output, venv_env_map,
+    confined_dispatch_args, confined_dispatch_args_with, confined_tools, decode_shell_stream,
+    denial_recovery_hints, denied_run_command_result, envelope_denial_reason, envelope_denied,
+    exec_denial_requests, exec_floor_permits, net_denial_requests, pr_creation_url,
+    same_file_redirect_refusal, shadow_records, shell_engine, shell_envelope_output, venv_env_map,
 };
 use shell::{
     declared_filesystem_requests, dispatch_caveats_for_git_shell, exec_confined_command,

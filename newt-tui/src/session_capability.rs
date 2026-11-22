@@ -120,7 +120,7 @@ impl SessionCapability {
             let path = newt_core::exec_grants::dispatch_path();
             let writes = effective_writes.unwrap_or(&policy.fs_write).clone();
             let (pins, unresolved) = pin_exec_policy(&mut policy, &writes, path.as_deref());
-            let notice = newt_core::exec_grants::startup_notice(&unresolved);
+            let notice = newt_core::exec_grants::session_exec_notice(&unresolved, &policy.exec);
             (policy, pins, notice)
         };
         let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());

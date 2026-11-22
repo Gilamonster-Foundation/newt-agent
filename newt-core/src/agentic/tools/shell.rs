@@ -19,29 +19,30 @@ pub fn venv_cmd_prefix() -> Option<String> {
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
         .ok();
     let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
+    venv_prefix(
+        venv.as_deref(),
+        exec_paths.as_deref(),
+        carried_tools_dir().as_deref(),
+    )
+}
 
-    if venv.is_none() && exec_paths.is_none() {
-        return None;
-    }
-
+/// [`venv_cmd_prefix`] with its inputs given: the `export …;` text for the host shell, or
+/// None when there is nothing to export. The carried pack is a PATH entry like the others,
+/// so a host with only a pack still gets its `export PATH`.
+fn venv_prefix(
+    venv: Option<&str>,
+    exec_paths: Option<&str>,
+    tools: Option<&std::path::Path>,
+) -> Option<String> {
     // sh single-quoting: wrap in '', escape any ' as '\''
     let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
 
-    // Build a list of dirs to prepend to PATH (venv/bin first, then exec-paths).
-    let mut path_dirs: Vec<String> = Vec::new();
+    // The dirs to prepend to PATH: venv/bin, then exec-paths, then the carried tools.
+    let path_dirs = exec_path_dirs(venv, exec_paths, tools);
     let mut prefix = String::new();
 
-    if let Some(ref venv) = venv {
-        let venv_bin = format!("{venv}/bin");
+    if let Some(venv) = venv {
         prefix.push_str(&format!("export VIRTUAL_ENV={}; ", q(venv)));
-        path_dirs.push(venv_bin);
-    }
-    if let Some(ref paths) = exec_paths {
-        for dir in paths.split(':') {
-            if !dir.is_empty() {
-                path_dirs.push(dir.to_string());
-            }
-        }
     }
 
     if !path_dirs.is_empty() {
@@ -56,6 +57,70 @@ pub fn venv_cmd_prefix() -> Option<String> {
     }
 }
 
+/// The directories a shell puts ahead of the host's `PATH`, in order (#3151): the venv's
+/// `bin`, then the operator's explicit `NEWT_EXEC_PATHS` roots, then the carried tools
+/// installed beside newt, so an explicit root keeps precedence over the pack. One list
+/// for the host shell, the confined shell and the grant resolution, which all read it.
+fn exec_path_dirs(
+    venv: Option<&str>,
+    exec_paths: Option<&str>,
+    tools: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut dirs: Vec<String> = Vec::new();
+    if let Some(venv) = venv {
+        dirs.push(format!("{venv}/bin"));
+    }
+    if let Some(paths) = exec_paths {
+        dirs.extend(
+            paths
+                .split(':')
+                .filter(|dir| !dir.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(tools) = tools {
+        dirs.push(tools.to_string_lossy().into_owned());
+    }
+    dirs
+}
+
+/// The pack of carried commands installed beside the newt executable (`<dir>/tools`), if
+/// there is one (#3151): GNU-compatible `date` and `grep -P`, for a host whose own are BSD.
+/// Only macOS packages it (other Unix hosts ship GNU tools, and nothing there pins a
+/// program to a path); Windows' ambient Brush route puts the same directory first on its
+/// own `PATH`. No directory, no change.
+pub(crate) fn carried_tools_dir() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    carried_tools_dir_beside(
+        &std::env::current_exe().ok()?,
+        real_path,
+        std::path::Path::is_dir,
+    )
+}
+
+/// `std::fs::canonicalize`, as a plain function: the generic one is not usable where a
+/// callee wants `Fn(&Path)` for every lifetime.
+fn real_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+/// `tools` beside `executable`, looked up through any symlink: a package manager that
+/// links `newt` into a shared `bin` keeps the pack beside the real file, and macOS
+/// reports the link's own path for `current_exe`. `canonicalize` and `is_dir` are the
+/// filesystem, given so the rule is testable without one. The result is absolute, or
+/// nothing: a relative `tools` would resolve against the model-writable working directory.
+fn carried_tools_dir_beside(
+    executable: &std::path::Path,
+    canonicalize: impl Fn(&std::path::Path) -> std::io::Result<std::path::PathBuf>,
+    is_dir: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    let real = canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let dir = crate::ambient_brush::tools_dir(&real);
+    (dir.is_absolute() && is_dir(&dir)).then_some(dir)
+}
+
 /// Build the venv/exec-path environment as a `{KEY:VALUE}` map for the confined
 /// shell's structured `env` seam (agent-bridle, newt #783).
 ///
@@ -67,12 +132,21 @@ pub fn venv_cmd_prefix() -> Option<String> {
 /// on a compound command (`a; b | c`). Passing the vars through the env seam
 /// sidesteps that entirely and never touches the command text.
 ///
-/// `PATH` is the venv `bin` (then any `NEWT_EXEC_PATHS` dirs) *prepended* to the
-/// inherited host `PATH`: the env seam sets the value additively over the
-/// child's ambient environment, so we read the host `PATH` here and build the
-/// full string rather than relying on a `$PATH` expansion inside the value.
+/// `PATH` is the venv `bin`, then any `NEWT_EXEC_PATHS` dirs, then the carried pack
+/// beside newt (#3151), *prepended* to the inherited host `PATH`: the env seam sets the
+/// value additively over the child's ambient environment, so we read the host `PATH` here
+/// and build the full string rather than relying on a `$PATH` expansion inside the value.
 /// Returns an empty map when neither input is set (no env key is sent).
+///
+/// This is the CANDIDATE environment: the pack is in it whenever it exists, which is what
+/// exec pinning resolves names against at startup. A confined command is dispatched with
+/// [`confined_dispatch_args`], which keeps the pack out unless it was pinned.
 pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
+    env_map(carried_tools_dir().as_deref())
+}
+
+/// [`venv_env_map`] with the carried pack given.
+fn env_map(tools: Option<&std::path::Path>) -> std::collections::BTreeMap<String, String> {
     let mut map = std::collections::BTreeMap::new();
 
     // Env passthrough: the confined shell has NO ambient shell variables, so
@@ -129,28 +203,17 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
         .ok();
     let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
 
-    // Dirs to prepend to PATH (venv/bin first, then any exec-paths), mirroring
-    // venv_cmd_prefix's ordering.
-    let mut path_dirs: Vec<String> = Vec::new();
+    // Dirs to prepend to PATH (venv/bin first, then any exec-paths, then the carried
+    // tools), the same list venv_cmd_prefix builds.
     if let Some(ref venv) = venv {
         map.insert("VIRTUAL_ENV".to_string(), venv.clone());
-        path_dirs.push(format!("{venv}/bin"));
     }
-    if let Some(ref paths) = exec_paths {
-        for dir in paths.split(':') {
-            if !dir.is_empty() {
-                path_dirs.push(dir.to_string());
-            }
-        }
-    }
+    let mut path_dirs = exec_path_dirs(venv.as_deref(), exec_paths.as_deref(), tools);
 
     // Resolve Apple's real developer tools before the /usr/bin xcrun shims.
     // The shims need ambient per-user caches; direct tools keep workspace-only
     // writes. Explicit venv and operator executable roots retain precedence.
-    #[cfg(target_os = "macos")]
-    if let Some(tools) = crate::confined_exec::developer_tool_directory() {
-        path_dirs.push(tools.to_string_lossy().into_owned());
-    }
+    path_dirs.extend(developer_tools_dir());
 
     if !path_dirs.is_empty() {
         let prepend = path_dirs.join(":");
@@ -162,6 +225,18 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     }
 
     map
+}
+
+/// Apple's real developer tools, when there are any to resolve ahead of the xcrun shims.
+#[cfg(target_os = "macos")]
+fn developer_tools_dir() -> Option<String> {
+    crate::confined_exec::developer_tool_directory()
+        .map(|directory| directory.to_string_lossy().into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn developer_tools_dir() -> Option<String> {
+    None
 }
 
 /// The confined-shell env passthrough list: `NEWT_SHELL_ENV_PASSTHROUGH`
@@ -649,12 +724,37 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
         })
 }
 
-pub(super) fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
-    let env = venv_env_map();
+pub(super) fn confined_dispatch_args(
+    cmd: &str,
+    cwd: &str,
+    caveats: &crate::caveats::Caveats,
+) -> serde_json::Value {
+    confined_dispatch_args_with(
+        cmd,
+        cwd,
+        confined_tools(carried_tools_dir(), caveats).as_deref(),
+    )
+}
+
+/// The carried pack, but only while this session's exec grants name it: an unpinned pack
+/// ahead of the host's `PATH` would shadow a tool the kernel lets run with one it refuses.
+pub(super) fn confined_tools(
+    pack: Option<std::path::PathBuf>,
+    caveats: &crate::caveats::Caveats,
+) -> Option<std::path::PathBuf> {
+    pack.filter(|dir| crate::exec_grants::pack_is_granted(dir, &caveats.exec))
+}
+
+/// [`confined_dispatch_args`] with the carried pack decided by the caller.
+pub(super) fn confined_dispatch_args_with(
+    cmd: &str,
+    cwd: &str,
+    tools: Option<&std::path::Path>,
+) -> serde_json::Value {
     serde_json::json!({
         "cmd": cmd,
         "cwd": cwd,
-        "env": env,
+        "env": env_map(tools),
     })
 }
 
@@ -1500,7 +1600,7 @@ pub(super) async fn exec_confined_command_with_broker(
 
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
-    let mut dispatch_args = confined_dispatch_args(cmd, cwd);
+    let mut dispatch_args = confined_dispatch_args(cmd, cwd, caveats);
     dispatch_args["timeout_secs"] = serde_json::json!(timeout_secs);
     let result = match dispatch_bridled_shell_with_floor(
         dispatch_args.clone(),
@@ -2346,11 +2446,7 @@ fn host_shell_command_at(
         c.arg(flag);
     }
     if route == ShellRoute::AmbientBrush {
-        let tools = dunce::simplified(executable)
-            .parent()
-            .ok_or_else(|| std::io::Error::other("executable has no parent"))?
-            .join("tools");
-        let mut paths = vec![tools];
+        let mut paths = vec![crate::ambient_brush::tools_dir(executable)];
         // Windows PATH uses semicolons, not a POSIX export prefix. Preserve
         // the operator's virtualenv using the native executable directory.
         if let Some(venv) =
@@ -3814,5 +3910,145 @@ mod missing_ambient_runner_tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carried_tools_path_tests {
+    use super::*;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// A filesystem of `dirs`, in which each `(link, real)` pair is a symlink.
+    fn lookup<'a>(
+        dirs: &'a [&'a str],
+        links: &'a [(&'a str, &'a str)],
+    ) -> (
+        impl Fn(&Path) -> io::Result<PathBuf> + 'a,
+        impl Fn(&Path) -> bool + 'a,
+    ) {
+        let canonicalize =
+            move |path: &Path| match links.iter().find(|(link, _)| Path::new(link) == path) {
+                Some((_, real)) => Ok(PathBuf::from(real)),
+                None => Err(io::Error::from(io::ErrorKind::NotFound)),
+            };
+        let is_dir = move |path: &Path| dirs.iter().any(|dir| Path::new(dir) == path);
+        (canonicalize, is_dir)
+    }
+
+    /// #3151: the carried tools come after the venv and the operator's explicit roots, so
+    /// an explicit root keeps precedence over the pack, and every input is optional.
+    #[test]
+    fn the_carried_tools_follow_the_venv_and_the_explicit_roots() {
+        let tools = Path::new("/opt/newt/tools");
+        assert_eq!(
+            exec_path_dirs(Some("/v"), Some("/a::/b"), Some(tools)),
+            ["/v/bin", "/a", "/b", "/opt/newt/tools"]
+        );
+        assert_eq!(exec_path_dirs(None, None, Some(tools)), ["/opt/newt/tools"]);
+        assert_eq!(exec_path_dirs(Some("/v"), None, None), ["/v/bin"]);
+        assert!(exec_path_dirs(None, None, None).is_empty());
+    }
+
+    /// #3151: the host shell exports the pack like any other PATH entry, so a host with
+    /// only a pack still gets its `export PATH`, in the same order and quoting.
+    #[test]
+    fn the_host_shell_exports_the_pack_after_the_venv_and_the_explicit_roots() {
+        let tools = Path::new("/opt/newt/tools");
+        assert_eq!(
+            venv_prefix(None, None, Some(tools)).as_deref(),
+            Some("export PATH='/opt/newt/tools':\"$PATH\"; ")
+        );
+        assert_eq!(
+            venv_prefix(Some("/v"), Some("/a"), Some(tools)).as_deref(),
+            Some(
+                "export VIRTUAL_ENV='/v'; export PATH='/v/bin':'/a':'/opt/newt/tools':\"$PATH\"; "
+            )
+        );
+        assert_eq!(
+            venv_prefix(Some("/v"), None, None).as_deref(),
+            Some("export VIRTUAL_ENV='/v'; export PATH='/v/bin':\"$PATH\"; ")
+        );
+        assert_eq!(venv_prefix(None, None, None), None, "no input, no prefix");
+        assert_eq!(
+            venv_prefix(None, Some(""), None),
+            None,
+            "an empty root list exports nothing"
+        );
+    }
+
+    /// #3151: a directory named `tools` beside the executable is the pack; one elsewhere,
+    /// or none, is not.
+    #[cfg(unix)]
+    #[test]
+    fn the_pack_is_a_tools_directory_beside_the_executable() {
+        let executable = Path::new("/opt/newt/bin/newt");
+        let (canonicalize, is_dir) = lookup(&[], &[]);
+        assert_eq!(
+            carried_tools_dir_beside(executable, canonicalize, is_dir),
+            None
+        );
+        let (canonicalize, is_dir) = lookup(&["/opt/newt/tools"], &[]);
+        assert_eq!(
+            carried_tools_dir_beside(executable, canonicalize, is_dir),
+            None,
+            "a tools directory one level up is not beside the executable"
+        );
+        let (canonicalize, is_dir) = lookup(&["/opt/newt/bin/tools"], &[]);
+        assert_eq!(
+            carried_tools_dir_beside(executable, canonicalize, is_dir),
+            Some(PathBuf::from("/opt/newt/bin/tools"))
+        );
+    }
+
+    /// #3151: Homebrew links `newt` into a shared `bin` and keeps `tools` in the keg, and
+    /// macOS reports the link's own path for `current_exe`, so the pack is found only by
+    /// looking through the link to the real file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_executable_finds_the_pack_beside_the_real_file() {
+        let link = Path::new("/shared/bin/newt");
+        let (canonicalize, is_dir) = lookup(
+            &["/keg/bin/tools"],
+            &[("/shared/bin/newt", "/keg/bin/newt")],
+        );
+        assert_eq!(
+            carried_tools_dir_beside(link, canonicalize, is_dir),
+            Some(PathBuf::from("/keg/bin/tools"))
+        );
+        // Without the link resolved, the lookup beside the link finds nothing.
+        let (canonicalize, is_dir) = lookup(&["/keg/bin/tools"], &[]);
+        assert_eq!(carried_tools_dir_beside(link, canonicalize, is_dir), None);
+    }
+
+    /// #3151: a relative `tools` would resolve against the model-writable working
+    /// directory, so an executable path that stays relative never has a pack.
+    #[test]
+    fn a_relative_tools_directory_is_never_the_pack() {
+        let (canonicalize, is_dir) = lookup(&["tools"], &[]);
+        assert_eq!(
+            carried_tools_dir_beside(Path::new("newt"), canonicalize, is_dir),
+            None
+        );
+    }
+
+    /// Grounds `a_symlinked_executable_finds_the_pack_beside_the_real_file`: macOS reports
+    /// the link's own path for `current_exe`, so the real `canonicalize` is what must find
+    /// the keg.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real filesystem and symlink; weekly/release real-resource tier"]
+    fn a_real_symlinked_executable_finds_the_pack_in_its_keg() {
+        let root = tempfile::tempdir().unwrap();
+        let keg = root.path().join("keg/bin");
+        let shared = root.path().join("shared/bin");
+        std::fs::create_dir_all(keg.join("tools")).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(keg.join("newt"), b"").unwrap();
+        std::os::unix::fs::symlink(keg.join("newt"), shared.join("newt")).unwrap();
+        assert_eq!(
+            carried_tools_dir_beside(&shared.join("newt"), real_path, Path::is_dir),
+            Some(std::fs::canonicalize(keg.join("tools")).unwrap())
+        );
     }
 }
