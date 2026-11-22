@@ -809,9 +809,7 @@ fn shell_dialect_2775_execution_and_description_share_route() {
                                 let script = if windows {
                                     "echo hello".to_owned()
                                 } else {
-                                    agent_bridle_tool_shell::with_posix_command_discovery(
-                                        "echo hello",
-                                    )
+                                    crate::ambient_shell::with_posix_command_discovery("echo hello")
                                 };
                                 assert_eq!(
                                     child.get_args().collect::<Vec<_>>(),

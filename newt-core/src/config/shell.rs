@@ -36,6 +36,15 @@ pub enum ShellEngine {
     Brush,
 }
 
+/// Does this target provide the Brush engine's private worker transport? Linux and macOS
+/// do; elsewhere the safe-subset shell is selected instead. Copied from agent-bridle's
+/// tool-shell so the engine choice needs no bridle crate (#3160, the `confine` feature);
+/// `the_worker_transport_probe_is_the_one_bridle_reports` keeps the two equal.
+#[must_use]
+pub(crate) const fn brush_private_control_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
 impl ShellEngine {
     /// The canonical config/flag token (`kebab-case`).
     #[must_use]
@@ -49,7 +58,7 @@ impl ShellEngine {
 
     /// Validate that this platform provides the engine's required worker transport.
     pub fn validate_available(self) -> Result<(), String> {
-        self.validate_worker_transport(agent_bridle_tool_shell::brush_private_control_supported())
+        self.validate_worker_transport(brush_private_control_supported())
     }
 
     fn validate_worker_transport(self, supported: bool) -> Result<(), String> {
@@ -256,9 +265,7 @@ pub fn mcp_stdio_env_passthrough() -> Vec<&'static str> {
 /// worker support remains unavailable.
 #[must_use]
 pub fn full_access_default_engine() -> ShellEngine {
-    full_access_default_with_worker_transport(
-        agent_bridle_tool_shell::brush_private_control_supported(),
-    )
+    full_access_default_with_worker_transport(brush_private_control_supported())
 }
 
 fn full_access_default_with_worker_transport(supported: bool) -> ShellEngine {
@@ -325,10 +332,7 @@ pub fn resolve_shell_engine_choice(
 /// restricted grant; parser selection does not weaken that admission check.
 #[must_use]
 pub fn confined_default_engine(l3_active: bool) -> ShellEngine {
-    confined_default_with_worker_transport(
-        l3_active,
-        agent_bridle_tool_shell::brush_private_control_supported(),
-    )
+    confined_default_with_worker_transport(l3_active, brush_private_control_supported())
 }
 
 fn confined_default_with_worker_transport(l3_active: bool, supported: bool) -> ShellEngine {
@@ -386,12 +390,23 @@ pub fn ocap_l3_backend() -> (&'static str, bool) {
 #[cfg(test)]
 mod shell_engine_tests {
     use super::{
-        confined_default_engine, confined_default_with_worker_transport,
-        full_access_default_engine, full_access_default_with_worker_transport,
-        resolve_shell_engine, resolve_shell_engine_choice, shell_env_passthrough_default,
-        IntakeConfig, ShellConfig, ShellEngine,
+        brush_private_control_supported, confined_default_engine,
+        confined_default_with_worker_transport, full_access_default_engine,
+        full_access_default_with_worker_transport, resolve_shell_engine,
+        resolve_shell_engine_choice, shell_env_passthrough_default, IntakeConfig, ShellConfig,
+        ShellEngine,
     };
     use crate::config::Config;
+
+    /// #3160: the probe is bridle's own, copied so the engine choice needs no bridle crate;
+    /// while bridle is a dependency the two must agree.
+    #[test]
+    fn the_worker_transport_probe_is_the_one_bridle_reports() {
+        assert_eq!(
+            brush_private_control_supported(),
+            agent_bridle_tool_shell::brush_private_control_supported()
+        );
+    }
 
     #[test]
     fn env_passthrough_default_is_minimal() {
@@ -534,7 +549,7 @@ mod shell_engine_tests {
     fn confined_default_is_l3_gated() {
         assert_eq!(
             confined_default_engine(true),
-            if agent_bridle_tool_shell::brush_private_control_supported() {
+            if brush_private_control_supported() {
                 ShellEngine::Brush
             } else {
                 ShellEngine::SafeSubset
