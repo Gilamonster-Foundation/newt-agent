@@ -1,7 +1,8 @@
 //! crew_attest.rs — the human-presence (`attest`) authority surface for the
 //! crew/team tools (#479, ROADMAP 23.2).
 //!
-//! Wraps agent-bridle's `step_up` (the merged `attest` primitive, agent-bridle#24)
+//! Wraps the `step_up` policy (the merged `attest` primitive, agent-bridle#24;
+//! the subset read here is copied from agent-bridle into `step_up.rs`, #3160)
 //! for the crew. A crew **dispatch** is an *amplify* — it grants a sub-agent the
 //! authority to act — which §7.5 (knowledge#40) says must ride a **live human
 //! gesture**: the `{allow, attest, deny}` surface, not a bare env toggle.
@@ -15,11 +16,13 @@
 //!
 //! Pure (no I/O); the caller surfaces `NeedsAttest` to the overseer.
 
-use agent_bridle::{AttestRequirement, CallRequest, Rule, StepUpPolicy};
+mod step_up;
+
+use step_up::{AttestRequirement, CallRequest, Rule, StepUpPolicy};
 
 // Re-export the presence ladder so callers (e.g. the CLI's LocalCrewRunner) can
-// name the established presence without a direct agent-bridle dependency.
-pub use agent_bridle::Presence;
+// name the established presence.
+pub use step_up::Presence;
 
 /// The default crew/team step-up policy. `crew`/`team` dispatch requires a human
 /// gesture (`Prompt` today; raise to `Passkey` for amplifying crews once BOOT
