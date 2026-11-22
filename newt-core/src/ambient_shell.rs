@@ -7,8 +7,10 @@
 //! `XDG_RUNTIME_DIR` reach a browser launch.
 //!
 //! Both are pure here: the caller supplies `$SHELL` and the environment, so the unit tier
-//! needs no process env. Every other posture is untouched; nothing here runs unless the
-//! caller already saw `ambient()`.
+//! needs no process env. Every other posture is untouched, with one exception:
+//! [`with_posix_command_discovery`] is the host `bash -c` route's `which` shim, so every
+//! host command gets it, ambient or not (#3160). The rest runs only once the caller has
+//! seen `ambient()`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
