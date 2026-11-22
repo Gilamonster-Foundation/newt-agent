@@ -4,7 +4,7 @@
 use newt_core::{
     agentic::{chat_complete, GitTool, PromptDisposition},
     worktree_adoption::WorktreeSession,
-    BackendKind, Caveats, ChatCtx, MemMessage, NoMcp,
+    BackendKind, Caveats, ChatCtx, MemMessage, NoMcp, PermissionGate,
 };
 use std::{
     path::Path,
@@ -24,6 +24,19 @@ pub async fn dispatch(
     caveats: &Caveats,
     command: &str,
     git_tool: Option<&dyn GitTool>,
+) -> String {
+    dispatch_gated(session, workspace, caveats, command, git_tool, None).await
+}
+
+/// [`dispatch`] with an operator to ask: a git op that destroys work is confirmed with
+/// them first (#3145), and refused when there is none.
+pub async fn dispatch_gated(
+    session: &WorktreeSession,
+    workspace: &Path,
+    caveats: &Caveats,
+    command: &str,
+    git_tool: Option<&dyn GitTool>,
+    gate: Option<&mut dyn PermissionGate>,
 ) -> String {
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
@@ -55,6 +68,8 @@ pub async fn dispatch(
     context.workspace = workspace.to_str().unwrap();
     context.worktree_session = Some(session);
     context.git_tool = git_tool;
+    // `&mut dyn` is invariant in its object lifetime; the coercion shortens it to the context's.
+    context.permission_gate = gate.map(|gate| gate as &mut dyn PermissionGate);
     chat_complete(context, &mut NoMcp)
         .await
         .expect("scripted ChatCtx turn");

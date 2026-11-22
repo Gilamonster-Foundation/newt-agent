@@ -1,20 +1,30 @@
 //! Explicit Git worktree administration is caught by the narrow accident guard.
 //! Runs with production Brush on both Linux and macOS (not SafeSubset).
-use super::{adopt, dispatch, fixture, real_git, real_git_output, WorktreeSession};
+use super::{
+    adopt, dispatch, dispatch_with_operator, fixture, real_git, real_git_output, Operator,
+    WorktreeSession,
+};
 
 pub async fn run() {
     aliases().await;
     let (_temp, main, task, caveats) = fixture();
     let session = WorktreeSession::default();
-    // A session without adoption retains ordinary worktree administration.
+    // A session without adoption retains ordinary worktree administration, behind the
+    // operator's confirmation since #3145: declined, the worktree stays; confirmed, it goes.
     real_git(&main, &["worktree", "add", "-b", "task", "../task"]);
     let command = format!(
         "git -C '{}' worktree remove '{}' --force",
         main.display(),
         task.display()
     );
-    let out = dispatch(&session, &main, &caveats, &command).await;
+    let mut declining = Operator::new(false);
+    let out = dispatch_with_operator(&session, &main, &caveats, &command, &mut declining).await;
+    assert!(task.exists(), "a declined removal ran: {out}");
+    assert_eq!(declining.asked, ["worktree-remove"], "{out}");
+    let mut confirming = Operator::new(true);
+    let out = dispatch_with_operator(&session, &main, &caveats, &command, &mut confirming).await;
     assert!(!task.exists(), "unadopted removal: {out}");
+    assert_eq!(confirming.asked, ["worktree-remove"], "{out}");
     real_git(&main, &["branch", "-D", "task"]);
     println!("PASS unadopted_worktree_removal_unchanged");
 
