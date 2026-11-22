@@ -23,7 +23,7 @@ fn resolve_exec_cwd_confines_to_workspace() {
     };
     assert_eq!(resolve_exec_cwd("/ws", Some(abs)), abs);
     // The dispatch args carry it verbatim.
-    let a = confined_dispatch_args("ls", &joined);
+    let a = confined_dispatch_args("ls", &joined, &crate::caveats::Caveats::top());
     assert_eq!(a["cwd"], joined);
 }
 
