@@ -105,6 +105,9 @@ pub mod notes;
 pub mod notes_scan;
 pub mod nudger;
 pub mod ocap;
+pub mod ocap_policy;
+#[cfg(test)]
+mod ocap_policy_parity_tests;
 pub mod ocap_propose;
 pub mod ocap_store;
 pub mod operating_mode;

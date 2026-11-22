@@ -53,6 +53,8 @@ newtui.workspace = true
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true
 sha2.workspace = true
+# The durable-policy signature check (`ocap_policy`, #3160): the major agent-bridle-core pins.
+ed25519-dalek = "2"
 # Pure index/object readers and Git blob hashing for optional publication evidence.
 grit-lib.workspace = true
 # Encrypted token store (`newt_core::secrets`) — see the workspace-level

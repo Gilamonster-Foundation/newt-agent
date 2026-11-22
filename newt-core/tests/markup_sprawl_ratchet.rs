@@ -1134,6 +1134,11 @@ fn action_model_registry_is_exact() {
         // An unrelated eval Verdict shares the name; pinned so a rename or a
         // third Verdict cannot hide behind the permissions one.
         ("newt-core/src/symbols.rs", "Verdict", 1),
+        // The durable-policy file verdict (deny, passkey, ask, approve), copied from
+        // agent-bridle-core's `policy` (#3160, the `confine` feature). It was
+        // `agent_bridle::policy::Verdict`, re-exported by `ocap_store`. Pinned at one
+        // definition so it cannot multiply; renaming it `PolicyVerdict` removes this row.
+        ("newt-core/src/ocap_policy.rs", "Verdict", 1),
         ("newt-core/src/tty/modal.rs", "PromptLine", 1),
         ("newt-core/src/sas_confirm.rs", "SasVerdict", 1),
         ("newt-tui/src/vi.rs", "Confirm", 1),

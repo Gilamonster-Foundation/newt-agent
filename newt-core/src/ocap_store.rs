@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-pub use agent_bridle::policy::{
+pub use crate::ocap_policy::{
     ApproveVerifier, CapabilityClass, Ed25519ApproveVerifier, ExecEntry, FsEntry, NetEntry,
     PolicyFile, PolicySet, Verdict,
 };
@@ -293,7 +293,7 @@ impl ApproveEntry {
 /// (bulk re-bless) and [`persist_approve`] (one freshly-answered grant) route
 /// through, so there is exactly one place that turns bytes into a hex `sig`.
 pub fn sign_entry(payload: &[u8], sign: &impl Fn(&[u8]) -> [u8; 64]) -> String {
-    agent_bridle::policy::hex_encode(&sign(payload))
+    crate::ocap_policy::hex_encode(&sign(payload))
 }
 
 /// Append ONE operator-answered grant to `approve.toml` under the config file

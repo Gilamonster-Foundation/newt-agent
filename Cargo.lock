@@ -4742,6 +4742,7 @@ dependencies = [
  "crossterm",
  "diffy",
  "dunce",
+ "ed25519-dalek",
  "futures-util",
  "globset",
  "grep-regex",
