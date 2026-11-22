@@ -2790,6 +2790,57 @@ mod tests {
         assert_eq!(closed[21..], ["B0", "B1", "B2"], "{closed:#?}");
     }
 
+    /// #3144, decided 2026-11-22: a palette closing is the same repaint-versus-blank-band
+    /// trade-off as #3143, and the repaint stays. The palette makes the block 7 rows taller
+    /// on a full screen, which scrolls the top 7 visible transcript rows into the terminal's
+    /// history; when it closes the transcript slides down and the repaint writes those rows
+    /// above the block again, so each is held twice. This pins that cost so it cannot grow
+    /// unnoticed: after one open and close, exactly the 7 rows the opening scrolled away are
+    /// in the history twice, and no other row is. A change that removes the duplicates fails
+    /// here on purpose, and should replace the numbers with zero.
+    #[test]
+    #[ignore = "real tmux terminal; weekly/release real-resource tier"]
+    fn a_palette_closing_holds_exactly_the_scrolled_away_rows_twice() {
+        let Some(term) = RealTerminal::open() else {
+            return;
+        };
+        term.write("\x1b[H\x1b[J");
+        term.paint_block(0, 3);
+        let mut screen = screen_on((term.tty(), term.tty()), 80, 24, 0, 3, &[2, 2, 2], (2, 1));
+        let transcript = (0..30).map(|n| format!("T{n:02}").into_bytes()).collect();
+        screen.insert_rows(transcript).unwrap();
+        term.paint_block(screen.top, 3);
+        term.screen(|rows| rows.get(23).is_some_and(|row| row == "B2"));
+
+        screen.relayout(9, 1).unwrap();
+        term.paint_block(screen.top, 10);
+        term.screen(|rows| rows.get(23).is_some_and(|row| row == "B9"));
+        screen.relayout(2, 1).unwrap();
+        term.paint_block(screen.top, 3);
+        let history = term.history(|rows| rows.len() == 24 && rows[23] == "B2");
+
+        let mut seen = std::collections::BTreeMap::new();
+        for row in transcript_rows(&history) {
+            *seen.entry(row.to_string()).or_insert(0u32) += 1;
+        }
+        let twice: Vec<String> = seen
+            .iter()
+            .filter(|(_, count)| **count == 2)
+            .map(|(row, _)| row.clone())
+            .collect();
+        let expected: Vec<String> = (9..16).map(|n| format!("T{n:02}")).collect();
+        assert_eq!(twice, expected, "history {history:#?}");
+        assert!(
+            seen.values().all(|count| *count <= 2),
+            "no row is held more than twice: {seen:?}"
+        );
+        assert_eq!(
+            seen.len(),
+            30,
+            "every inserted row is in the history: {seen:?}"
+        );
+    }
+
     /// #3144: a block on the bottom row that gets shorter slides the transcript down and
     /// repaints the rows above it from the tail, but a terminal never takes scrollback
     /// back, so those rows were already in scrollback and the next scroll added a
