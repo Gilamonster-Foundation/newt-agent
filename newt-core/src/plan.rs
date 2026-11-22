@@ -30,7 +30,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{Caveats, CountBound, Scope};
-use newt_policy::{preset::ScopeKeyword, preset::ScopeSpec};
+use newt_policy::preset::{ScopeKeyword, ScopeSpec};
 
 /// A complete plan, or a fragment of one.
 ///

@@ -11,7 +11,8 @@
 
 pub mod caveats;
 pub mod danger;
-#[cfg(unix)]
+// The same gate it had in newt-core: every caller is macOS-only or a unix test.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub mod fs_aliases;
 pub mod netguard;
 pub mod paths;

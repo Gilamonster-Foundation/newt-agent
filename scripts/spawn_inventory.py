@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -45,6 +46,9 @@ SCAN_ROOTS = [
     "newt-git/src",
     "newt-inference/src",
     "newt-mesh/src",
+    # #3160: the policy layer left newt-core for its own crate; a spawn added there is
+    # inventoried like one in newt-core.
+    "newt-policy/src",
     "plugins-protocol/src",
     "newt-eval/src",
     "newt-mcp-server/src",
@@ -108,6 +112,12 @@ def self_test() -> None:
     assert any("UNREVIEWED" in x for x in v) and any("NEW spawn" in x for x in v), v
     assert check({"a/b.rs": 2}, {"a/b.rs": 2}) == []
     assert check({"a/b.rs": 2}, {"a/b.rs": 1}) == []  # removing a spawn is fine
+    # A spawn in the policy crate is inventoried like one in newt-core (#3160).
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        (repo / "newt-policy" / "src").mkdir(parents=True)
+        (repo / "newt-policy" / "src" / "x.rs").write_text('fn f() { std::process::Command::new("x"); }')
+        assert scan(repo) == {"newt-policy/src/x.rs": 1}, scan(repo)
     print("spawn_inventory self-test OK")
 
 

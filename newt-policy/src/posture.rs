@@ -237,4 +237,113 @@ mod tests {
         };
         assert!(clamped.permission_clamp().is_some());
     }
+
+    fn one_mode(name: &str, mode: ModeConfig) -> BTreeMap<String, ModeConfig> {
+        BTreeMap::from([(name.to_string(), mode)])
+    }
+
+    fn never_loaded(_: &str) -> Result<String, String> {
+        panic!("no skill is named, so the loader must not be called")
+    }
+
+    /// `build_posture` takes the two tables and a loader, not a `Config`, so every
+    /// refusal is testable here with no filesystem. An unnamed posture says where its
+    /// entry belongs.
+    #[test]
+    fn an_unknown_posture_is_an_error_naming_the_missing_entry() {
+        let error = build_posture("ghost", &BTreeMap::new(), &BTreeMap::new(), never_loaded)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("unknown posture: 'ghost'") && error.contains("[modes.ghost]"),
+            "{error}"
+        );
+    }
+
+    /// A posture that names a preset nobody defined is a hard error, never a silent
+    /// no-clamp.
+    #[test]
+    fn a_named_but_undefined_preset_is_a_hard_error() {
+        let modes = one_mode(
+            "triage",
+            ModeConfig {
+                preset: Some("strict".into()),
+                ..ModeConfig::default()
+            },
+        );
+        let error = build_posture("triage", &modes, &BTreeMap::new(), never_loaded)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("names preset 'strict'")
+                && error.contains("[permission_presets.strict]"),
+            "{error}"
+        );
+    }
+
+    /// A skill the loader cannot produce fails the whole posture, naming both.
+    #[test]
+    fn a_named_skill_that_fails_to_load_is_a_hard_error() {
+        let modes = one_mode(
+            "coach",
+            ModeConfig {
+                skill: Some("review".into()),
+                ..ModeConfig::default()
+            },
+        );
+        let error = build_posture("coach", &modes, &BTreeMap::new(), |name| {
+            Err(format!("{name} not found"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("posture 'coach' skill 'review': review not found"),
+            "{error}"
+        );
+    }
+
+    /// A complete binding resolves its preset clamp, skill body and framing together.
+    #[test]
+    fn a_complete_binding_resolves_preset_skill_and_framing_together() {
+        let modes = one_mode(
+            "audit",
+            ModeConfig {
+                skill: Some("review".into()),
+                preset: Some("strict".into()),
+                framing: Some("read only".into()),
+            },
+        );
+        let strict = NamedPermissionPreset {
+            readonly: true,
+            ..NamedPermissionPreset::default()
+        };
+        let presets = BTreeMap::from([("strict".to_string(), strict.clone())]);
+        let posture = build_posture::<String>("audit", &modes, &presets, |name| {
+            Ok(format!("body of {name}"))
+        })
+        .unwrap();
+        assert_eq!(
+            (posture.name.as_str(), posture.preset_name.as_str()),
+            ("audit", "strict")
+        );
+        assert_eq!(posture.skill.as_deref(), Some("review"));
+        assert_eq!(posture.skill_body.as_deref(), Some("body of review"));
+        assert_eq!(posture.framing.as_deref(), Some("read only"));
+        assert_eq!(posture.clamp, strict.clamp());
+        assert_eq!(posture.clamp_summary, strict.summary());
+        assert!(posture.permission_clamp().is_some());
+    }
+
+    /// A binding may omit its preset, skill and framing: it is valid, imposes no clamp
+    /// and loads nothing.
+    #[test]
+    fn a_binding_with_nothing_named_imposes_nothing() {
+        let modes = one_mode("plain", ModeConfig::default());
+        let posture = build_posture("plain", &modes, &BTreeMap::new(), never_loaded).unwrap();
+        assert_eq!(posture.preset_name, "");
+        assert_eq!(posture.clamp, Caveats::top());
+        assert_eq!(posture.clamp_summary, "unconstrained");
+        assert!(posture.skill.is_none() && posture.skill_body.is_none());
+        assert!(posture.permission_clamp().is_none());
+    }
 }
