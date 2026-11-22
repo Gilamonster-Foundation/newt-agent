@@ -68,7 +68,7 @@ fn a_timed_out_build_command_names_the_build_wall_in_its_result() {
     let (text, class) = super::shell::confined_result(
         r#"cargo test; echo "EXIT=$?""#,
         &envelope,
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |envelope| {
             format!(
@@ -180,7 +180,7 @@ fn issue_2732_timeout_reports_selected_budget() {
     let (text, outcome) = super::shell::confined_result(
         "cargo --version; find /",
         &envelope,
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         false,
         |_| "partial".into(),
         Default::default(),

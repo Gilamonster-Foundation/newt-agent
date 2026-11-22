@@ -15,8 +15,8 @@
 //! Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:53 EDT | Date: 2026-08-12
 
 use anyhow::{anyhow, Context, Result};
-use newt_core::caveats::Caveats;
 use newt_core::mcp::{McpServerEntry, TransportKind};
+use newt_policy::caveats::Caveats;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -829,7 +829,7 @@ fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
 /// allow-list either way (see `caveats::spawn_net_scope`). `Scope::All` and
 /// `Scope::none()` still pass through unchanged.
 fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     let mut caveats = session.clone();
     if let Scope::Only(ref mut set) = caveats.exec {
         set.extend([command.to_string()]);
@@ -839,7 +839,7 @@ fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
     // host-scoped session `net` grant is `Unknown` to agent-bridle 0.8's
     // admission on Linux and refuses the whole spawn (L3 BOUND). Narrow to
     // `net: none`, which the `DenyDirect` sandbox policy below can bind.
-    caveats.net = newt_core::caveats::spawn_net_scope(&caveats.net);
+    caveats.net = newt_policy::caveats::spawn_net_scope(&caveats.net);
     caveats
 }
 
@@ -1516,13 +1516,16 @@ pub fn http_host_grant_matches(granted: &str, host: &str) -> bool {
 /// the existing local-development exception; `Scope::All` admits public hosts,
 /// while `Scope::Only` requires one exact canonical hostname grant.
 #[must_use]
-pub fn net_scope_permits_http_host(scope: &newt_core::caveats::Scope<String>, host: &str) -> bool {
+pub fn net_scope_permits_http_host(
+    scope: &newt_policy::caveats::Scope<String>,
+    host: &str,
+) -> bool {
     if host_is_loopback(host) {
         return true;
     }
     match scope {
-        newt_core::caveats::Scope::All => true,
-        newt_core::caveats::Scope::Only(hosts) => hosts
+        newt_policy::caveats::Scope::All => true,
+        newt_policy::caveats::Scope::Only(hosts) => hosts
             .iter()
             .any(|granted| http_host_grant_matches(granted, host)),
     }

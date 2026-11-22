@@ -702,7 +702,7 @@ pub(super) async fn every_verification_case_ends_within_its_allowance() {
         status: Option<CheckStatus>,
     }
     let no_exec = Caveats {
-        exec: crate::caveats::Scope::none(),
+        exec: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
     };
     let cases = [

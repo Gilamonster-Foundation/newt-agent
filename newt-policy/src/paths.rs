@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub(crate) fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
+pub fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
     let path = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("frame authority paths must have lossless UTF-8 names"))?;
@@ -15,7 +15,7 @@ pub(crate) fn normalize_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 /// Resolve existing ancestors without creating paths named by untrusted grants.
 /// Unlike ResolvedPath's write setup, admission must have no filesystem effects.
-pub(crate) fn resolve_uncreated_path(path: &Path) -> anyhow::Result<PathBuf> {
+pub fn resolve_uncreated_path(path: &Path) -> anyhow::Result<PathBuf> {
     for ancestor in path.ancestors() {
         match std::fs::symlink_metadata(ancestor) {
             Ok(_) => {

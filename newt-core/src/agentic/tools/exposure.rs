@@ -221,7 +221,10 @@ impl ExposureSettings {
     /// [`read_only_clamp`](super::read_only_clamp), so visibility and authority
     /// cannot drift apart. Only narrows; `read_only = false` is the identity.
     #[must_use]
-    pub fn attenuate(&self, caveats: crate::caveats::Caveats) -> crate::caveats::Caveats {
+    pub fn attenuate(
+        &self,
+        caveats: newt_policy::caveats::Caveats,
+    ) -> newt_policy::caveats::Caveats {
         if self.read_only {
             caveats.meet(&super::read_only_clamp())
         } else {
@@ -978,7 +981,7 @@ mod tests {
             true,
             true,
             true,
-            Some(&crate::caveats::Scope::All),
+            Some(&newt_policy::caveats::Scope::All),
             true,
             true,
             true,
@@ -1133,7 +1136,7 @@ mod tests {
     /// #2950 review 1: `read_only` narrows authority, not only visibility.
     #[test]
     fn read_only_attenuates_fs_write_and_only_narrows() {
-        use crate::caveats::{Caveats, CaveatsExt, Scope};
+        use newt_policy::caveats::{Caveats, CaveatsExt, Scope};
         let writable = Caveats::top();
         let narrowed = ExposureSettings {
             read_only: true,

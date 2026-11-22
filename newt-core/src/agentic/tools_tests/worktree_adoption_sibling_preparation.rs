@@ -131,7 +131,7 @@ fn sibling_round2_preparation_failure_spends_once_queue() {
     let original = policy.worktree.parent().unwrap().join("main");
     let target = policy.worktree.join("missing/task");
     let mut base = Caveats::top();
-    crate::caveats::lock_fs_to_workspace(&mut base, original.to_str().unwrap(), &[], &[]);
+    newt_policy::caveats::lock_fs_to_workspace(&mut base, original.to_str().unwrap(), &[], &[]);
     let args = serde_json::json!({"command":"git worktree add -b task ../task/missing/task"});
     let mut gate = AllowOnce::default();
     let mut candidate = Creation::before(&original, &target, &base).unwrap();
@@ -170,9 +170,9 @@ fn sibling_guard_forwards_the_dependency_fetch_prompt() {
     impl PermissionGate for Operator {
         fn ask_dependency_fetch(
             &mut self,
-            prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
+            prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
             self.0 += 1;
             PermissionDecision::Allow(prepared.clone())
         }
@@ -214,10 +214,10 @@ fn sibling_round2_late_refresh_swap_refuses() {
     impl PermissionGate for Swap {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             PermissionDecision::Deny

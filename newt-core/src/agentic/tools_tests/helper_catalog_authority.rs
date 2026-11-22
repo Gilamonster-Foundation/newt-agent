@@ -116,7 +116,7 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_initiative_requires_it
 /// Persona preferences retain the full catalog for task-driven discovery.
 #[test]
 fn persona_preferences_rank_the_full_advertised_catalog() {
-    let git = Some(&crate::caveats::Scope::All);
+    let git = Some(&newt_policy::caveats::Scope::All);
     let full = merged_tool_definitions(
         &NoMcp,
         true,
@@ -414,7 +414,7 @@ async fn persona_preferences_preserve_explicit_file_authority() {
 #[tokio::test]
 async fn executor_enforces_the_absolute_deny_list() {
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = crate::caveats::Caveats::top(); // maximal grant — deny still bites
+    let caveats = newt_policy::caveats::Caveats::top(); // maximal grant — deny still bites
     let denied = call_offload(
         "run_command",
         &serde_json::json!({ "command": "ssh host 'uptime'" }),
@@ -448,7 +448,7 @@ async fn call_offload(
     name: &str,
     args: &serde_json::Value,
     ws: &tempfile::TempDir,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
     persona_tools: Option<&[String]>,
 ) -> String {
     execute_tool_with_offload(

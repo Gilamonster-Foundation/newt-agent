@@ -140,7 +140,7 @@ impl GitTool for ConfirmedGit {
         _op: &str,
         _args: &serde_json::Value,
         _caveats: &crate::git_caveats::GitCaveats,
-        _session: &crate::caveats::Caveats,
+        _session: &newt_policy::caveats::Caveats,
     ) -> Result<String, String> {
         unreachable!("the fixture publishes the same host-only success signal directly")
     }

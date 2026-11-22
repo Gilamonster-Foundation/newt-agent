@@ -10,10 +10,10 @@
 //! existed (there was nothing to call) and is the fix's regression test.
 
 use super::*;
-use newt_core::caveats::{Caveats, Scope};
 use newt_core::ocap_store::{
     build_store, verify_approves, Ed25519ApproveVerifier, PolicyFile, Verdict,
 };
+use newt_policy::caveats::{Caveats, Scope};
 
 /// A verified `PolicySet` carrying one signed read-only `[[fs]]` approve for
 /// `path`, signed by a disposable in-memory root key — never the real
@@ -61,13 +61,13 @@ fn ocap_approval_does_not_reach_caveats_before_folding() {
     let base = fenced_base("/ws");
     let caveats = state.recalled_caveats(&base, None).unwrap();
     assert!(
-        !newt_core::caveats::permits_path(&caveats.fs_read, "/outside/token"),
+        !newt_policy::caveats::permits_path(&caveats.fs_read, "/outside/token"),
         "an ocap_policy that is never folded must not widen recall"
     );
     // Folding is what closes the gap (proved by the sibling test below); this
     // guard only pins that `ocap_policy` alone (pre-fold) does nothing.
     state.fold_ocap_approvals();
-    assert!(newt_core::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &state.recalled_caveats(&base, None).unwrap().fs_read,
         "/outside/token"
     ));
@@ -86,19 +86,19 @@ fn fold_ocap_approvals_widens_recalled_caveats_like_a_durable_grant() {
     state.fold_ocap_approvals();
     let base = fenced_base("/ws");
     let widened = state.recalled_caveats(&base, None).unwrap();
-    assert!(newt_core::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &widened.fs_read,
         "/outside/token"
     ));
     // Read-only: a write approve was never granted, so fs_write is untouched.
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &widened.fs_write,
         "/outside/token"
     ));
     // Attenuate-only: the ceiling still wins over a folded grant.
     let ceiling = fenced_base("/ws");
     let capped = state.recalled_caveats(&base, Some(&ceiling)).unwrap();
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &capped.fs_read,
         "/outside/token"
     ));
@@ -122,7 +122,7 @@ fn folding_never_resurrects_an_unverified_approve() {
     };
     state.fold_ocap_approvals();
     let widened = state.recalled_caveats(&fenced_base("/ws"), None).unwrap();
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &widened.fs_read,
         "/outside/token"
     ));

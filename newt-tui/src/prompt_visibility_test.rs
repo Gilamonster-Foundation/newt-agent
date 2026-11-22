@@ -10,9 +10,9 @@ use crate::permissions::{
     permission_definition, permission_interaction, prompt_permission_choice, PermissionPromptState,
     PromptPermissionGate,
 };
-use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::tty::{LineCaps, Sink, Spinner, MODAL_INPUT_GLYPH};
-use newt_core::{DenialKind, PermissionGate as _, PermissionRequest};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
+use newt_policy::{DenialKind, PermissionGate as _, PermissionRequest};
 
 const CHILD_TEST: &str = "prompt_visibility_test::prompt_scenario_child";
 
@@ -200,7 +200,7 @@ fn prompt_scenario_child() {
         };
         matches!(
             gate.ask(std::slice::from_ref(&request)),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         )
     };
     drop(spinner);
@@ -368,7 +368,7 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     let expected_interaction = permission_interaction(
         &web_fetch_request("example.com"),
         &danger::DangerTable::builtin(),
-        newt_core::PermissionAction::AllowOnce,
+        newt_policy::PermissionAction::AllowOnce,
     );
     let expected_prompt = newt_core::markup::plain::render(&expected_interaction.definition);
 

@@ -147,8 +147,8 @@ fn branch_list_rejects_special_ref_files_without_opening_them() {
     );
 }
 
-fn read_scope(paths: &[&Path]) -> newt_core::caveats::Caveats {
-    use newt_core::caveats::{Caveats, Scope};
+fn read_scope(paths: &[&Path]) -> newt_policy::caveats::Caveats {
+    use newt_policy::caveats::{Caveats, Scope};
     Caveats {
         fs_read: Scope::only(paths.iter().map(|p| p.to_string_lossy().into_owned())),
         fs_write: Scope::none(),

@@ -44,8 +44,8 @@ mod terminal {
     use newt_core::interaction_surface::SurfaceInteraction;
     use newt_core::tty::raw_mode::RawModeGuard;
     use newt_core::tty::{ControlReader, Echo, PromptLine};
-    use newt_core::HumanQuestionOutcome;
     use newt_interaction::{ControlKind, SemanticRole};
+    use newt_policy::HumanQuestionOutcome;
     use ratatui::layout::{Constraint, Layout, Rect};
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span as TuiSpan};

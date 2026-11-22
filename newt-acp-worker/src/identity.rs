@@ -34,8 +34,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use newt_core::caveats::{lock_fs_to_workspace, Caveats, CountBound, Scope};
 use newt_identity::{attenuate, enforced_caveats, load_or_generate, session_root, AgentKey};
+use newt_policy::caveats::{lock_fs_to_workspace, Caveats, CountBound, Scope};
 // The unrestricted debug authority is only compiled in under the dev feature.
 #[cfg(feature = "allow-no-key")]
 use newt_identity::unbounded_debug_fallback;
@@ -299,7 +299,7 @@ pub fn worker_session_caveats(backend_host: Option<&str>) -> Caveats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::{CaveatsExt, CountBoundExt};
+    use newt_policy::{CaveatsExt, CountBoundExt};
     use tempfile::TempDir;
 
     #[test]

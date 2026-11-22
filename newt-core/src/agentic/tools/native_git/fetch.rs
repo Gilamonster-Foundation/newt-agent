@@ -28,9 +28,9 @@
 
 use super::push_command::GovernedCommand;
 use super::{ensure_net_granted, invocation, is_git, PermissionGate};
-use crate::caveats::{permits_path, Caveats, CaveatsExt};
 use crate::git_staging as staging;
 use agent_mesh_protocol::caveats::Scope;
+use newt_policy::caveats::{permits_path, Caveats, CaveatsExt};
 use std::path::Path;
 
 /// What the model's `git fetch` asked for. Only these shapes are brokered.

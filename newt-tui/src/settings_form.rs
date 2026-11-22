@@ -43,8 +43,8 @@
 
 use newt_core::interaction_surface::SurfaceInteraction;
 use newt_core::settings_receipt::SettingChange;
-use newt_core::HumanQuestionOutcome;
 use newt_interaction::InteractionDefinition;
+use newt_policy::HumanQuestionOutcome;
 
 /// How the form reaches the operator: C1's seam, and nothing wider — the same
 /// type `crew_form` uses, for the same reason.
@@ -507,7 +507,7 @@ impl Field {
             Self::Detail => newt_core::config::session_spill_lines()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
             Self::Posture => {
-                newt_core::posture::active_posture().map_or_else(|| "off".to_string(), |p| p.name)
+                newt_policy::posture::active_posture().map_or_else(|| "off".to_string(), |p| p.name)
             }
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
@@ -1069,16 +1069,19 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // the config declares.
         Field::Posture => {
             if value == "off" {
-                newt_core::posture::set_active_posture(None);
+                newt_policy::posture::set_active_posture(None);
             } else {
                 let cfg =
                     crate::migration_notices::read(|report| newt_core::Config::resolve(report))
                         .map_err(|e| e.to_string())?;
-                let posture = newt_core::posture::build_posture(value, &cfg, |skill| {
-                    cfg.load_skill_body(skill)
-                })
+                let posture = newt_policy::posture::build_posture(
+                    value,
+                    &cfg.modes,
+                    &cfg.permission_presets,
+                    |skill| cfg.load_skill_body(skill),
+                )
                 .map_err(|e| e.to_string())?;
-                newt_core::posture::set_active_posture(Some(posture));
+                newt_policy::posture::set_active_posture(Some(posture));
             }
         }
         // Through the same writer `/spill` and `/detail` use, so the three
@@ -1930,10 +1933,10 @@ mod tests {
     #[test]
     fn the_posture_field_reports_and_releases_what_is_installed() {
         let _guard = settings_guard();
-        newt_core::posture::set_active_posture(None);
+        newt_policy::posture::set_active_posture(None);
         assert_eq!(Field::Posture.current(), "off");
 
-        newt_core::posture::set_active_posture(Some(newt_core::posture::ActivePosture {
+        newt_policy::posture::set_active_posture(Some(newt_policy::posture::ActivePosture {
             name: "locked".to_string(),
             preset_name: "strict".to_string(),
             clamp: newt_core::Caveats::default(),
@@ -1949,7 +1952,7 @@ mod tests {
             Ok("permission posture: off".to_string())
         );
         assert!(
-            newt_core::posture::active_posture().is_none(),
+            newt_policy::posture::active_posture().is_none(),
             "`off` releases the clamp rather than storing the word"
         );
     }
@@ -2029,9 +2032,9 @@ mod tests {
         }
         let _guard = settings_guard();
         let receipts = std::env::current_dir().unwrap().join("receipts.jsonl");
-        let saved_posture = newt_core::posture::active_posture();
+        let saved_posture = newt_policy::posture::active_posture();
         std::env::set_var(newt_core::settings_receipt::RECEIPT_PATH_ENV, &receipts);
-        let previous = newt_core::posture::ActivePosture {
+        let previous = newt_policy::posture::ActivePosture {
             name: "existing".into(),
             preset_name: "strict".into(),
             clamp: newt_core::Caveats::default(),
@@ -2040,10 +2043,10 @@ mod tests {
             skill_body: None,
             framing: Some("Keep the existing guidance.".into()),
         };
-        newt_core::posture::set_active_posture(Some(previous.clone()));
+        newt_policy::posture::set_active_posture(Some(previous.clone()));
         let result = apply_and_record(Field::Posture, "broken", "/settings posture");
-        let installed = newt_core::posture::active_posture();
-        newt_core::posture::set_active_posture(saved_posture);
+        let installed = newt_policy::posture::active_posture();
+        newt_policy::posture::set_active_posture(saved_posture);
         let error = result.expect_err("an unresolved preset must fail");
         assert!(
             error.contains("names preset 'missing'")

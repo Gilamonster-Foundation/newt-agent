@@ -23,7 +23,7 @@ fn resolve_exec_cwd_confines_to_workspace() {
     };
     assert_eq!(resolve_exec_cwd("/ws", Some(abs)), abs);
     // The dispatch args carry it verbatim.
-    let a = confined_dispatch_args("ls", &joined, &crate::caveats::Caveats::top());
+    let a = confined_dispatch_args("ls", &joined, &newt_policy::caveats::Caveats::top());
     assert_eq!(a["cwd"], joined);
 }
 
@@ -446,7 +446,7 @@ async fn grep_and_find_with_a_directory_are_not_redirected() {
             ws,
             false,
             20,
-            &crate::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             &mut crate::NoMcp,
             None,
             None,

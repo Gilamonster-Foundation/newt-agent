@@ -4,7 +4,8 @@ use super::*;
 // parity these tests claim would be against a different fixture.
 use super::permission_prompt_tests::{publish_low_danger, scripted_gate, store_and_conv};
 use newt_core::interaction_gate::{authorize_action, mint_offer, now_tick, permission_registry};
-use newt_core::{AnswerOutcome, Caveats, DenialKind, PermissionGate, PermissionRequest};
+use newt_core::{AnswerOutcome, Caveats};
+use newt_policy::{DenialKind, PermissionGate, PermissionRequest};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Barrier};

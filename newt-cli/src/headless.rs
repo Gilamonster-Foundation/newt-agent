@@ -55,13 +55,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::model_card::ChatCompletionsCapability;
 use newt_core::role_profile::Cognition;
 use newt_core::{
     BackendKind, Config, OpenAiApi, RuntimeSettingsSnapshot, TurnDriver, TurnDriverConfig,
     TurnStatus,
 };
+use newt_policy::caveats::{Caveats, CountBound, Scope};
 
 use crate::headless_contract;
 
@@ -1342,7 +1342,7 @@ fn calibrate_headless_filesystem(baseline: &mut Caveats, build: &Caveats, smart:
 }
 
 fn headless_fs_intersection(left: &Scope<String>, right: &Scope<String>) -> Scope<String> {
-    use newt_core::caveats::permits_path;
+    use newt_policy::caveats::permits_path;
     let (Scope::Only(left), Scope::Only(right)) = (left, right) else {
         return if matches!(left, Scope::All) {
             right.clone()
@@ -1443,7 +1443,7 @@ fn fence_scratch_roots(
 }
 
 /// Fold this run's VERIFIED OCAP `approve.toml` entries (#2524 item 1) into
-/// `caveats`: attenuate-only, never a bypass. `newt_core::widen_caveats`
+/// `caveats`: attenuate-only, never a bypass. `newt_policy::widen_caveats`
 /// only ever *inserts into an already-`Scope::Only` axis* — an axis left at
 /// `Scope::All` (reads/exec/net in the default confined lane,
 /// [`confined_bench_caveats`]) is untouched, so folding can never turn an
@@ -1492,7 +1492,7 @@ fn fold_ocap_grants(
         .iter()
         .map(|(kind, target)| grant_already_permitted(caveats, *kind, target))
         .collect();
-    *caveats = newt_core::widen_caveats(caveats, &grants);
+    *caveats = newt_policy::widen_caveats(caveats, &grants);
     grants
         .into_iter()
         .zip(already_permitted)
@@ -1510,13 +1510,13 @@ fn fold_ocap_grants(
 /// Would folding this grant change anything? Mirrors [`CaveatsExt`]'s
 /// per-axis check so the contract only records a grant that actually widened
 /// a fenced axis (see [`fold_ocap_grants`]).
-fn grant_already_permitted(caveats: &Caveats, kind: newt_core::DenialKind, target: &str) -> bool {
-    use newt_core::caveats::CaveatsExt;
+fn grant_already_permitted(caveats: &Caveats, kind: newt_policy::DenialKind, target: &str) -> bool {
+    use newt_policy::caveats::CaveatsExt;
     match kind {
-        newt_core::DenialKind::FsRead => caveats.permits_fs_read(target),
-        newt_core::DenialKind::FsWrite => caveats.permits_fs_write(target),
-        newt_core::DenialKind::Exec => caveats.permits_exec(target),
-        newt_core::DenialKind::Net => caveats.permits_net(target),
+        newt_policy::DenialKind::FsRead => caveats.permits_fs_read(target),
+        newt_policy::DenialKind::FsWrite => caveats.permits_fs_write(target),
+        newt_policy::DenialKind::Exec => caveats.permits_exec(target),
+        newt_policy::DenialKind::Net => caveats.permits_net(target),
         _ => false,
     }
 }
@@ -1528,27 +1528,27 @@ fn grant_already_permitted(caveats: &Caveats, kind: newt_core::DenialKind, targe
 /// reading of a durable fs grant); the axes this function never sees
 /// (`RemoteTool`/`GitWrite`/`Build`) are not produced by `approved_grants`.
 fn denial_kind_to_capability_class(
-    kind: newt_core::DenialKind,
+    kind: newt_policy::DenialKind,
 ) -> newt_core::ocap_store::CapabilityClass {
     match kind {
-        newt_core::DenialKind::Exec => newt_core::ocap_store::CapabilityClass::Exec,
-        newt_core::DenialKind::Net => newt_core::ocap_store::CapabilityClass::Net,
+        newt_policy::DenialKind::Exec => newt_core::ocap_store::CapabilityClass::Exec,
+        newt_policy::DenialKind::Net => newt_core::ocap_store::CapabilityClass::Net,
         _ => newt_core::ocap_store::CapabilityClass::Fs,
     }
 }
 
-/// The contract-record axis label for a folded grant — `newt_core::DenialKind`
+/// The contract-record axis label for a folded grant — `newt_policy::DenialKind`
 /// has no `Display`/label of its own outside the danger table, and this is
 /// the one place that needs a short, stable string.
-fn ocap_grant_axis_label(kind: newt_core::DenialKind) -> &'static str {
+fn ocap_grant_axis_label(kind: newt_policy::DenialKind) -> &'static str {
     match kind {
-        newt_core::DenialKind::Exec => "exec",
-        newt_core::DenialKind::FsRead => "fs_read",
-        newt_core::DenialKind::FsWrite => "fs_write",
-        newt_core::DenialKind::Net => "net",
-        newt_core::DenialKind::RemoteTool => "remote_tool",
-        newt_core::DenialKind::GitWrite => "git_write",
-        newt_core::DenialKind::Build => "build",
+        newt_policy::DenialKind::Exec => "exec",
+        newt_policy::DenialKind::FsRead => "fs_read",
+        newt_policy::DenialKind::FsWrite => "fs_write",
+        newt_policy::DenialKind::Net => "net",
+        newt_policy::DenialKind::RemoteTool => "remote_tool",
+        newt_policy::DenialKind::GitWrite => "git_write",
+        newt_policy::DenialKind::Build => "build",
     }
 }
 
@@ -1829,7 +1829,7 @@ mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
     #[cfg(unix)]
-    use newt_core::ScopeExt as _;
+    use newt_policy::ScopeExt as _;
 
     /// #2552 round 3: `commits_since` — the exact function `handback`'s
     /// `commits` field is built from — is reached whenever `workspace` is
@@ -2433,7 +2433,7 @@ mod tests {
         assert_eq!(resolve_lane(false, None, true), HeadlessLane::Yolo);
     }
 
-    use newt_core::caveats::CaveatsExt;
+    use newt_policy::caveats::CaveatsExt;
 
     /// The load-bearing invariant of the OCAP-on lane: writes are FENCED, never
     /// unrestricted. A `Scope::All` fs_write would (a) drop us back to the
@@ -2491,7 +2491,7 @@ mod tests {
     /// operator's `~/.rustup` because `/home` was a built-in write root.
     #[test]
     fn confined_fence_excludes_home_and_system_roots_by_default() {
-        use newt_core::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         let cv =
             confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
         for p in [
@@ -2510,7 +2510,7 @@ mod tests {
 
     #[test]
     fn confined_fence_broad_roots_are_opt_in_by_grant() {
-        use newt_core::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         let grants = ["/data/scratch".to_string(), "/home".to_string()];
         let cv =
             confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &grants);
@@ -2523,7 +2523,7 @@ mod tests {
     /// EQUAL, but every root it grants must already be inside the default's.
     #[test]
     fn smart_fence_is_within_the_default_fence() {
-        use newt_core::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         let default =
             confined_bench_caveats_with_grants("/app/task", &["/srv/scratch".to_string()], &[]);
         let build = newt_core::confined_exec::build_tool_caveats("/app/task".as_ref());
@@ -2542,7 +2542,7 @@ mod tests {
 
     #[test]
     fn headless_build_projection_admits_only_covered_paths_in_both_modes() {
-        use newt_core::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap();
         let workspace = root.join("workspace").to_string_lossy().into_owned();
@@ -2612,7 +2612,7 @@ mod tests {
 
     #[test]
     fn default_scratch_policy_admits_only_its_managed_build_partition() {
-        use newt_core::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap();
         let workspace = root.join("workspace");
@@ -2671,7 +2671,7 @@ mod tests {
 
     #[test]
     fn headless_build_projection_preserves_narrow_reads_and_other_authority() {
-        use newt_core::caveats::CountBound;
+        use newt_policy::caveats::CountBound;
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().canonicalize().unwrap();
         let workspace = root.join("workspace").to_string_lossy().into_owned();
@@ -2802,7 +2802,7 @@ mod tests {
     /// the platform temp dir. The managed Build addition is tested separately.
     #[test]
     fn fence_scratch_root_comes_from_configuration_then_temp_dir() {
-        use newt_core::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         // `fence_scratch_roots` asks the HOST whether a dir is absolute, so the
         // "configured absolute dir" and the fallback must be absolute ON THE
         // RUNNING HOST: `/srv/scratch` has no drive on Windows and would be

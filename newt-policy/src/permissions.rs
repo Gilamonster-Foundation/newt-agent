@@ -108,7 +108,7 @@ pub enum DenialKind {
     /// with this call" (it widens nothing). `target` is the tool name.
     RemoteTool,
     /// #1056: a LOCAL git write (`add`/`commit`/`reset`/`branch`/…) the embedded
-    /// git tool's projected [`GitCaveats`](crate::git_caveats::GitCaveats) does
+    /// git tool's projected `GitCaveats` does
     /// not grant. Like [`RemoteTool`](Self::RemoteTool) it maps to NO
     /// fs/exec/net caveat — the git tool's leash is its own op-class lattice, not
     /// the shell allowlist — so an `Allow` means "proceed with local git writes
@@ -589,7 +589,7 @@ fn filesystem_grant_is_covered(scope: &Scope<String>, target: &str) -> bool {
 
 /// One prompted permission decision, recorded with the session for later
 /// review (issue #263). Chained onto `~/.newt/permission-log.jsonl` via
-/// [`crate::permission_journal`] (issue #2524 item 3) — see that module for
+/// `newt-core`'s `permission_journal` (issue #2524 item 3) — see that module for
 /// the append/read machinery; this type is only the payload.
 ///
 /// This file is a record, NOT config: nothing reads it back into authority.
@@ -927,7 +927,7 @@ mod tests {
     }
 
     // Chained append/round-trip for `PermissionRecord` is covered in
-    // `crate::permission_journal`'s tests (issue #2524 item 3) — this type
+    // `newt-core`'s `permission_journal` tests (issue #2524 item 3) — this type
     // is now only the chain's payload, not its own flat writer.
 
     // ---- #904: persistent "permanently deny" store ----

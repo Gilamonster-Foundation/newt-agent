@@ -144,7 +144,7 @@ impl Confinement {
 #[derive(Clone)]
 struct HttpReconnectState {
     entry: McpServerEntry,
-    caveats: newt_core::caveats::Caveats,
+    caveats: newt_policy::caveats::Caveats,
     explicit_net_hosts: Vec<String>,
     bearer: Option<String>,
     insecure_authorization_allowed: bool,
@@ -203,7 +203,7 @@ fn parse_scheme_host(url: Option<&str>) -> (String, String) {
 /// Whether an HTTP MCP server at `host` may be dialed under the session net
 /// scope (#1156). Empty host (no URL) and loopback are always allowed (dev /
 /// no-egress); any other host must be permitted by the net allow-list.
-fn http_egress_permitted(net: &newt_core::caveats::Scope<String>, host: &str) -> bool {
+fn http_egress_permitted(net: &newt_policy::caveats::Scope<String>, host: &str) -> bool {
     host.is_empty() || newt_mcp_client::net_scope_permits_http_host(net, host)
 }
 
@@ -455,7 +455,7 @@ fn refreshed_or_recorded(
 
 /// The permission gate returns fresh caveats, the named net approvals that
 /// survive a full-access scope, and whether the current grant may be reused.
-pub(crate) type McpNetGrantPrompt<'a> = dyn FnMut(&newt_core::PermissionRequest) -> Option<(newt_core::Caveats, Vec<String>, bool)>
+pub(crate) type McpNetGrantPrompt<'a> = dyn FnMut(&newt_policy::PermissionRequest) -> Option<(newt_core::Caveats, Vec<String>, bool)>
     + 'a;
 
 fn request_http_net_grant(
@@ -480,9 +480,9 @@ fn request_net_grant(
     } else {
         "the host is outside the session network capability"
     };
-    let request = newt_core::PermissionRequest {
+    let request = newt_policy::PermissionRequest {
         tool: tool.into(),
-        kind: newt_core::DenialKind::Net,
+        kind: newt_policy::DenialKind::Net,
         target: required.host.clone(),
         reason: format!("MCP server `{server_name}`: {reason}. {scope_note}"),
         harness_bound: false,
@@ -1359,9 +1359,9 @@ mod tests {
     #[test]
     fn mcp_net_retry_prompts_only_for_typed_network_denials() {
         let mut calls = 0;
-        let mut approve = |request: &newt_core::PermissionRequest| {
+        let mut approve = |request: &newt_policy::PermissionRequest| {
             calls += 1;
-            assert_eq!(request.kind, newt_core::DenialKind::Net);
+            assert_eq!(request.kind, newt_policy::DenialKind::Net);
             assert_eq!(request.target, "mcp.example.test");
             Some((newt_core::Caveats::top(), Vec::new(), true))
         };
@@ -1392,9 +1392,9 @@ mod tests {
             private: true,
         });
         assert!(request_http_net_grant(&error, "review", &mut None).is_none());
-        let mut deny = |_request: &newt_core::PermissionRequest| None;
+        let mut deny = |_request: &newt_policy::PermissionRequest| None;
         assert!(request_http_net_grant(&error, "review", &mut Some(&mut deny)).is_none());
-        let mut clamped = |_request: &newt_core::PermissionRequest| {
+        let mut clamped = |_request: &newt_policy::PermissionRequest| {
             Some((
                 newt_core::Caveats {
                     net: newt_core::Scope::none(),
@@ -1415,7 +1415,7 @@ mod tests {
                 private: true,
             }
             .into());
-            let mut approve = |_request: &newt_core::PermissionRequest| {
+            let mut approve = |_request: &newt_policy::PermissionRequest| {
                 Some((newt_core::Caveats::top(), Vec::new(), remembered))
             };
             let mut startup = (
@@ -1467,11 +1467,11 @@ mod tests {
                     },
                     vec!["mcp.example.test".into()],
                 );
-                let granted = newt_core::widen_caveats(
+                let granted = newt_policy::widen_caveats(
                     &startup.0,
-                    &[(newt_core::DenialKind::Net, "auth.example.test".into())],
+                    &[(newt_policy::DenialKind::Net, "auth.example.test".into())],
                 );
-                let mut approve = |_request: &newt_core::PermissionRequest| {
+                let mut approve = |_request: &newt_policy::PermissionRequest| {
                     Some((
                         granted.clone(),
                         vec!["auth.example.test".into()],
@@ -2079,7 +2079,7 @@ mod tests {
 
     #[test]
     fn http_egress_net_gate() {
-        use newt_core::caveats::Scope;
+        use newt_policy::caveats::Scope;
         // #1156: loopback + empty always allowed; a remote host needs a grant.
         let none: Scope<String> = Scope::only::<Vec<String>>(vec![]);
         assert!(http_egress_permitted(&none, ""));

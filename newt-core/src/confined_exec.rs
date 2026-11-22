@@ -76,7 +76,7 @@ use agent_bridle::{
     AxisEnforcement, ConfinedCommand, EnforcementFloor, Gate, Tool, ToolContext, ToolError,
 };
 
-use crate::caveats::{Caveats, Scope};
+use newt_policy::caveats::{Caveats, Scope};
 
 /// The trust class of the code being executed — the axis that decides how hard
 /// the executor must confine before it will run anything.
@@ -1182,7 +1182,7 @@ pub fn workspace_confined_caveats(workspace: &Path) -> Caveats {
         // Empty net allow-list → a kernel deny-all under Landlock ABI-v4 /
         // Seatbelt. Untrusted code has no network without an explicit grant (#9).
         net: Scope::none(),
-        max_calls: crate::caveats::CountBound::Unlimited,
+        max_calls: newt_policy::caveats::CountBound::Unlimited,
         valid_for_generation: Scope::All,
     }
 }
@@ -1203,7 +1203,7 @@ pub fn build_tool_request(
     network: &Scope<String>,
 ) -> ExecRequest {
     let mut caveats = build_tool_caveats(workspace);
-    caveats.net = crate::caveats::spawn_net_scope(network);
+    caveats.net = newt_policy::caveats::spawn_net_scope(network);
     let net_grant = if caveats.net == Scope::none() {
         NetGrant::DenyAll
     } else {
@@ -1524,7 +1524,7 @@ fn build_caveats_with_scratch(
         fs_write: Scope::only(write_roots),
         exec: Scope::All,
         net: Scope::none(),
-        max_calls: crate::caveats::CountBound::Unlimited,
+        max_calls: newt_policy::caveats::CountBound::Unlimited,
         valid_for_generation: Scope::All,
     }
 }
@@ -1543,7 +1543,7 @@ fn build_tool_read_roots(workspace: &Path) -> Vec<String> {
 
 /// The per-user toolchain / package-cache roots alone (no workspace), derived
 /// from the operator's environment. Shared by [`build_tool_read_roots`] and by
-/// [`crate::permissions::widen_caveats`]'s build-tool exec arm — an
+/// [`newt_policy::permissions::widen_caveats`]'s build-tool exec arm — an
 /// `exec` grant for `cargo`/`just`/`make` carries the same calibrated reads a
 /// lifecycle build gets, one derivation, not two (dec1-build-grant, F35).
 ///
@@ -1677,7 +1677,7 @@ mod tests {
     /// ambient environment — a runner with `XDG_BIN_HOME` set or no `HOME`
     /// must not flip or skip this assertion.
     ///
-    /// The forbidden check reuses [`crate::caveats::permits_path`] — the same
+    /// The forbidden check reuses [`newt_policy::caveats::permits_path`] — the same
     /// containment logic the fence itself enforces — so it is an
     /// ancestor-or-equal check, not string equality: a root of `$HOME` itself
     /// would pass an equality check against `$HOME/.newt` but must fail this
@@ -1720,7 +1720,7 @@ mod tests {
         ] {
             let forbidden = forbidden.to_string_lossy().into_owned();
             assert!(
-                !crate::caveats::permits_path(&read_scope, &forbidden),
+                !newt_policy::caveats::permits_path(&read_scope, &forbidden),
                 "a build-lane root must not grant read over {forbidden}"
             );
         }
@@ -1784,7 +1784,7 @@ mod tests {
         for secret in ["credentials.toml", "credentials"] {
             let forbidden = cargo_home.join(secret).to_string_lossy().into_owned();
             assert!(
-                !crate::caveats::permits_path(&read_scope, &forbidden),
+                !newt_policy::caveats::permits_path(&read_scope, &forbidden),
                 "toolchain_read_roots must never grant read over {forbidden}"
             );
         }
@@ -1797,7 +1797,7 @@ mod tests {
             .join(".cache/huggingface/token")
             .to_string_lossy()
             .into_owned();
-        assert!(!crate::caveats::permits_path(&read_scope, &hf_token));
+        assert!(!newt_policy::caveats::permits_path(&read_scope, &hf_token));
     }
 
     #[test]
@@ -1835,15 +1835,15 @@ mod tests {
             let home = Path::new(&home);
             let registry = home.join("registry").to_string_lossy().into_owned();
             let credentials = home.join("credentials.toml").to_string_lossy().into_owned();
-            assert!(crate::caveats::permits_path(
+            assert!(newt_policy::caveats::permits_path(
                 &request.caveats.fs_write,
                 &registry
             ));
-            assert!(!crate::caveats::permits_path(
+            assert!(!newt_policy::caveats::permits_path(
                 &request.caveats.fs_write,
                 &credentials
             ));
-            assert!(!crate::caveats::permits_path(
+            assert!(!newt_policy::caveats::permits_path(
                 &request.caveats.fs_read,
                 &credentials
             ));
@@ -1888,11 +1888,11 @@ mod tests {
         // readable (never a secret; toolchains only).
         if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
             assert_eq!(env.get("RUSTUP_HOME"), Some(&path));
-            assert!(crate::caveats::permits_path(
+            assert!(newt_policy::caveats::permits_path(
                 &request.caveats.fs_read,
                 &path
             ));
-            assert!(!crate::caveats::permits_path(
+            assert!(!newt_policy::caveats::permits_path(
                 &request.caveats.fs_write,
                 &path
             ));
@@ -1904,16 +1904,16 @@ mod tests {
         if let Some(path) = operator_tool_home("CARGO_HOME", ".cargo") {
             assert_eq!(env.get("CARGO_HOME"), Some(&path));
             for subdir in ["bin", "registry", "git"] {
-                assert!(crate::caveats::permits_path(
+                assert!(newt_policy::caveats::permits_path(
                     &request.caveats.fs_read,
                     &Path::new(&path).join(subdir).to_string_lossy()
                 ));
             }
-            assert!(!crate::caveats::permits_path(
+            assert!(!newt_policy::caveats::permits_path(
                 &request.caveats.fs_read,
                 &Path::new(&path).join("credentials.toml").to_string_lossy()
             ));
-            assert!(!crate::caveats::permits_path(
+            assert!(!newt_policy::caveats::permits_path(
                 &request.caveats.fs_write,
                 &path
             ));
@@ -1945,11 +1945,11 @@ mod tests {
         assert_eq!(request.scratch_dirs.len(), 1);
         assert_eq!(env.get("TMPDIR").map(Path::new), Some(scratch.as_path()));
         assert!(!scratch.starts_with("/ws"), "{scratch:?}");
-        assert!(crate::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &request.caveats.fs_write,
             &scratch.to_string_lossy()
         ));
-        assert!(crate::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &request.caveats.fs_read,
             &scratch.to_string_lossy()
         ));
@@ -1976,11 +1976,11 @@ mod tests {
             for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
                 assert_eq!(env.get(name).cloned(), operator_tool_home(name, default));
             }
-            assert!(crate::caveats::permits_path(
+            assert!(newt_policy::caveats::permits_path(
                 &request.caveats.fs_write,
                 &home.to_string_lossy()
             ));
-            assert!(!crate::caveats::permits_path(
+            assert!(!newt_policy::caveats::permits_path(
                 &request.caveats.fs_write,
                 &home.parent().unwrap().parent().unwrap().to_string_lossy()
             ));
@@ -2299,7 +2299,7 @@ mod tests {
         // A build/test tool reads the workspace + toolchain caches, but NOT
         // arbitrary secrets; it must not write outside the workspace fence, and
         // must not reach the network.
-        use crate::caveats::ScopeExt;
+        use newt_policy::caveats::ScopeExt;
         let cav = build_tool_caveats(Path::new("/ws"));
         // Reads: the workspace is granted; an arbitrary credential path is not.
         assert!(cav.fs_read.permits(&"/ws".to_string()));
@@ -2377,11 +2377,11 @@ mod tests {
 
         let root = root.to_string_lossy().into_owned();
         let cav = build_caveats_with_scratch(ws, &[], Some(base));
-        assert!(crate::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &cav.fs_write,
             &run.to_string_lossy()
         ));
-        assert!(crate::caveats::permits_path(&cav.fs_read, &root));
+        assert!(newt_policy::caveats::permits_path(&cav.fs_read, &root));
 
         let default = build_caveats_with_scratch(ws, &[], None);
         assert_eq!(default.fs_write, Scope::only(["/ws".to_owned()]));
@@ -2390,7 +2390,7 @@ mod tests {
 
     #[test]
     fn build_tool_caveats_with_writes_grants_only_the_named_extra_root() {
-        use crate::caveats::ScopeExt;
+        use newt_policy::caveats::ScopeExt;
         let cav = build_tool_caveats_with_writes(Path::new("/ws"), &["/crew/target".to_string()]);
         assert!(cav.fs_write.permits(&"/ws".to_string()));
         assert!(
@@ -2404,7 +2404,7 @@ mod tests {
     fn workspace_caveats_fence_reads_writes_to_workspace_and_denies_net() {
         // #9: net is an empty allow-list (deny-all). fs_read/fs_write name only
         // the workspace root; exec stays open (interpreter identity, not behavior).
-        use crate::caveats::ScopeExt;
+        use newt_policy::caveats::ScopeExt;
         let cav = workspace_confined_caveats(Path::new("/ws"));
         assert!(cav.fs_write.permits(&"/ws".to_string()));
         assert!(!cav.fs_write.permits(&"/etc".to_string()));

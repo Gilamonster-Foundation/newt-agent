@@ -499,6 +499,7 @@ jobs:
           - newt-data
           - newt-interaction
           - newt-launch
+          - newt-policy
           - newt-refactor-evidence
           - newt-router
           - newt-skills

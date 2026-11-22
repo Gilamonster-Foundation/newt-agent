@@ -347,10 +347,10 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
     impl PermissionGate for Deny {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
             HumanQuestionOutcome::Unavailable
@@ -405,10 +405,10 @@ async fn adoption_refs_approved_external_destination_is_adopted() {
     impl PermissionGate for Allow {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("expected filesystem baseline");

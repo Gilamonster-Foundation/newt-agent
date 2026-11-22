@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     {
         let mut argv = std::env::args_os();
         if argv.nth(1).as_deref() == Some(std::ffi::OsStr::new("__net-guard")) {
-            newt_core::netguard::run_guard_and_exec(argv);
+            newt_policy::netguard::run_guard_and_exec(argv);
         }
     }
     // Windows' default main-thread stack (~1 MB) overflows on the large clap

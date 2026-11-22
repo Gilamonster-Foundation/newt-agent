@@ -11,10 +11,8 @@ mod removal;
 mod siblings;
 
 use super::native::{real_git, real_git_output, TrailerGitTool};
-use newt_core::{
-    worktree_adoption::WorktreeSession, Caveats, PermissionDecision, PermissionGate,
-    PermissionRequest, Scope,
-};
+use newt_core::{worktree_adoption::WorktreeSession, Caveats, Scope};
+use newt_policy::{PermissionDecision, PermissionGate, PermissionRequest};
 use std::path::{Path, PathBuf};
 
 pub fn run() {
@@ -151,8 +149,8 @@ impl PermissionGate for Operator {
         PermissionDecision::Deny
     }
 
-    fn ask_question(&mut self, _: &str) -> newt_core::HumanQuestionOutcome {
-        newt_core::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
     }
 }
 

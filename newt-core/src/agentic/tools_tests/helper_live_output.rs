@@ -287,9 +287,9 @@ async fn bridled_shell_forwards_live_bytes_without_changing_the_envelope() {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let sink = std::sync::Arc::new(RecordingLiveOutput::default());
-    let caveats = crate::caveats::Caveats {
-        exec: crate::caveats::Scope::only(["echo".to_string()]),
-        ..crate::caveats::Caveats::top()
+    let caveats = newt_policy::caveats::Caveats {
+        exec: newt_policy::caveats::Scope::only(["echo".to_string()]),
+        ..newt_policy::caveats::Caveats::top()
     };
 
     let envelope = super::shell::dispatch_bridled_shell(

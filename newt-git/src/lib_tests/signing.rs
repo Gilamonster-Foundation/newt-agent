@@ -11,20 +11,20 @@ fn commit_one(t: &LocalGitTool, dir: &Path) -> Result<String, String> {
         "init",
         &serde_json::json!({}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )?;
     std::fs::write(dir.join("a.txt"), "x\n").unwrap();
     t.dispatch(
         "add",
         &serde_json::json!({"paths": ["a.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )?;
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "C1"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
 }
 

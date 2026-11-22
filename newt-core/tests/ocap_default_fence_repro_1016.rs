@@ -43,8 +43,8 @@
 use std::path::Path;
 use std::process::Command;
 
-use newt_core::caveats::{lock_fs_to_workspace, Caveats};
 use newt_core::{PermissionPreset, ToolPermissions};
+use newt_policy::caveats::{lock_fs_to_workspace, Caveats};
 use serial_test::serial;
 use tempfile::TempDir;
 

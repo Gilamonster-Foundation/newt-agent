@@ -9,9 +9,9 @@
 //! discovery on Windows needs the AppContainer feature. Libtest substitutes
 //! SafeSubset; tests/native_git_broker_pipeline/contract.rs proves production Brush.
 use super::*;
-use crate::caveats::Caveats;
 use crate::{worktree_adoption::WorktreeSession, ExecOutcome, Scope};
 use disable_ocap_tests::{env_lock, EnvVar};
+use newt_policy::caveats::Caveats;
 use std::{
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -47,10 +47,10 @@ struct Gate(Vec<PermissionRequest>);
 impl PermissionGate for Gate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
         self.0.extend_from_slice(requests);

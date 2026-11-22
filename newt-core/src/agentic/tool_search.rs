@@ -344,7 +344,7 @@ mod tests {
     /// The full advertised catalog with every presence gate ON, so crew /
     /// plan / scratchpad / etc. all appear — the richest catalog to search.
     fn full_catalog() -> serde_json::Value {
-        let git = Some(&crate::caveats::Scope::All);
+        let git = Some(&newt_policy::caveats::Scope::All);
         merged_tool_definitions(
             &NoMcp,
             true,

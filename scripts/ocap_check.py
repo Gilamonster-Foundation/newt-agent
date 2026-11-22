@@ -36,6 +36,7 @@ Usage:  python3 scripts/ocap_check.py        (or `just ocap-check`)
 from __future__ import annotations
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -75,10 +76,13 @@ GATE_RE = re.compile(r"OCAP-GATE:\s*([a-z0-9-]+)")
 AUTHORITY_ENV_READ_RE = re.compile(
     r'env::var(?:_os)?\s*\(\s*"(NEWT_DISABLE_OCAP|NEWT_FULL_ACCESS|NEWT_UNSAFE_HOST_EXEC|NEWT_AMBIENT)"'
 )
-# The deep-library crate the ban applies to (entrypoint crates may still read the
-# twins at startup as the compatibility input, then freeze the resolved value).
-AUTHORITY_LIB_ROOT = REPO / "newt-core" / "src"
-AUTHORITY_RESOLVER = AUTHORITY_LIB_ROOT / "launch_authority.rs"
+# The deep-library crates the ban applies to (entrypoint crates may still read the
+# twins at startup as the compatibility input, then freeze the resolved value). The policy
+# layer (`newt-policy`, #3160) holds the caveat and permission code that decides
+# authority, so it is scanned with `newt-core`: moving a module between them must not
+# drop it from the gate.
+AUTHORITY_LIB_ROOTS = ("newt-core/src", "newt-policy/src")
+AUTHORITY_RESOLVER = "newt-core/src/launch_authority.rs"
 
 
 class Result:
@@ -180,34 +184,36 @@ def check_code_guards(res: Result, known_ids: set, entries: dict):
     return danger_sites
 
 
-def check_launch_authority_reads(res: Result):
+def check_launch_authority_reads(res: Result, repo: Path = REPO):
     """`noninteractive-launch-policy`: no deep-library ambient authority read.
 
-    In `newt-core/src`, `env::var("NEWT_DISABLE_OCAP" | "NEWT_FULL_ACCESS" |
-    "NEWT_UNSAFE_HOST_EXEC" | "NEWT_AMBIENT")` may appear ONLY in `launch_authority.rs` (the sole
-    resolver). Any other deep read lets a later-appearing env var widen authority
-    mid-process — the hole the frozen `LaunchAuthority` closes.
+    In `newt-core/src` and `newt-policy/src`, `env::var("NEWT_DISABLE_OCAP" |
+    "NEWT_FULL_ACCESS" | "NEWT_UNSAFE_HOST_EXEC" | "NEWT_AMBIENT")` may appear ONLY in
+    `launch_authority.rs` (the sole resolver). Any other deep read lets a later-appearing
+    env var widen authority mid-process — the hole the frozen `LaunchAuthority` closes.
     """
-    if not AUTHORITY_LIB_ROOT.is_dir():
-        return
-    resolver = AUTHORITY_RESOLVER.resolve()
-    for path in AUTHORITY_LIB_ROOT.rglob("*.rs"):
-        if path.resolve() == resolver:
+    resolver = (repo / AUTHORITY_RESOLVER).resolve()
+    for root in AUTHORITY_LIB_ROOTS:
+        base = repo / root
+        if not base.is_dir():
             continue
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            continue
-        for i, line in enumerate(lines):
-            m = AUTHORITY_ENV_READ_RE.search(line)
-            if m:
-                rel = path.relative_to(REPO)
-                res.err(
-                    f"{rel}:{i+1} reads authority env var {m.group(1)!r} directly — deep "
-                    "libraries must decide authority via launch_authority::current() (the "
-                    "frozen value); only launch_authority.rs may read the env twin "
-                    "(noninteractive-launch-policy)"
-                )
+        for path in base.rglob("*.rs"):
+            if path.resolve() == resolver:
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines):
+                m = AUTHORITY_ENV_READ_RE.search(line)
+                if m:
+                    rel = path.relative_to(repo)
+                    res.err(
+                        f"{rel}:{i+1} reads authority env var {m.group(1)!r} directly — deep "
+                        "libraries must decide authority via launch_authority::current() (the "
+                        "frozen value); only launch_authority.rs may read the env twin "
+                        "(noninteractive-launch-policy)"
+                    )
 
 
 # Machine-checkable evidence fields that turn a Status label into a proven state.
@@ -471,6 +477,31 @@ def run_self_tests() -> int:
     r = Result()
     check_state_proofs(r, _fixture_entries(md), texts={})
     expect("bounded-by-closed-accepted", not r.errors)
+
+    # 6. The authority-env ban covers every deep-library root, the policy crate included: a
+    #    read planted in either is rejected, the resolver and clean crates are accepted.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        for rel, text in {
+            "newt-core/src/launch_authority.rs": 'fn from_env() { std::env::var("NEWT_FULL_ACCESS"); }',
+            "newt-core/src/ok.rs": "fn f() {}",
+            "newt-policy/src/ok.rs": "fn f() {}",
+        }.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
+        r = Result()
+        check_launch_authority_reads(r, repo)
+        expect("authority-env-resolver-and-clean-crates-accepted", not r.errors)
+        for crate in ("newt-core", "newt-policy"):
+            planted = repo / crate / "src" / "planted.rs"
+            planted.write_text('fn g() { let _ = std::env::var("NEWT_FULL_ACCESS"); }')
+            r = Result()
+            check_launch_authority_reads(r, repo)
+            expect(
+                f"authority-env-read-in-{crate}-rejected",
+                any(f"{crate}/src/planted.rs" in e for e in r.errors),
+            )
+            planted.unlink()
 
     if failures:
         for f in failures:

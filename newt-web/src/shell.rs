@@ -995,11 +995,11 @@ mod tests {
                 note: Some("High danger.".into()),
                 actions: vec![
                     newt_core::Action::new(
-                        newt_core::PermissionAction::AllowOnce,
+                        newt_policy::PermissionAction::AllowOnce,
                         "a",
                         "allow once",
                     ),
-                    newt_core::Action::new(newt_core::PermissionAction::Deny, "d", "deny"),
+                    newt_core::Action::new(newt_policy::PermissionAction::Deny, "d", "deny"),
                 ],
             };
             let definition =

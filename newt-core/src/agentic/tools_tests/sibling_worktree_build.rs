@@ -2,7 +2,7 @@
 //! Real temporary directories ground canonical/symlink containment; a recording
 //! gate stops before external execution, inspecting the actual build request.
 use super::*;
-use crate::caveats::{Caveats, Scope};
+use newt_policy::caveats::{Caveats, Scope};
 use std::path::Path;
 
 #[derive(Default)]
@@ -10,10 +10,10 @@ struct BuildGate(Vec<(Caveats, String)>);
 impl PermissionGate for BuildGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("build admission must retain its requested caveats")
@@ -27,7 +27,7 @@ impl PermissionGate for BuildGate {
         self.0.push((baseline.clone(), requests[0].target.clone()));
         PermissionDecision::Deny // deterministically stop before spawning
     }
-    fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+    fn ask_question(&mut self, _: &str) -> newt_policy::permissions::HumanQuestionOutcome {
         panic!("no question expected")
     }
 }

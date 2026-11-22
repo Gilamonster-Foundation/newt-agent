@@ -3,7 +3,7 @@
 use crate::config_panel::{clamp_step, hint_line, render_panel, RowView};
 use crate::list_cursor::ListCursor;
 use crate::panel::{Flow, Key, Screen};
-use newt_core::PermissionAction;
+use newt_policy::PermissionAction;
 
 const VISIBLE: usize = 12;
 const DEFAULTS: [PermissionAction; 2] = [PermissionAction::AllowOnce, PermissionAction::Deny];
@@ -160,7 +160,7 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use crate::panel::{Flow, Key, Screen};
-    use newt_core::PermissionAction;
+    use newt_policy::PermissionAction;
 
     fn panel(count: usize) -> PermissionsPanel {
         PermissionsPanel::new(

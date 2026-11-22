@@ -20,9 +20,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use newt_core::{permits_path, Caveats, CaveatsExt, CountBoundExt};
+use newt_core::Caveats;
 use newt_identity::AgentKey;
 use newt_inference::{ChatRequest, InferenceBackend};
+use newt_policy::{permits_path, CaveatsExt, CountBoundExt};
 
 use crate::emission::{normalize_emission, Emission};
 use crate::error::{CoderError, Result};
@@ -347,7 +348,7 @@ impl Coder {
     /// Every filesystem write goes through the `fs_write` axis first,
     /// under **prefix (containment)** semantics: the model-supplied path
     /// is joined to `workspace` and checked with
-    /// [`newt_core::permits_path`], the same shared gate the interactive
+    /// [`newt_policy::permits_path`], the same shared gate the interactive
     /// tool sites use. A production dispatch fences `fs_write` to the
     /// session workspace (`Scope::only([workspace])`, step-4.3), so an
     /// in-workspace target is permitted and a `..`/absolute escape is
@@ -778,7 +779,7 @@ mod tests {
     // ── Caveat enforcement at the apply boundary ─────────────────────────
     //
     // step-4.3: the fs_write scope now stores absolute roots and is matched by
-    // containment (`newt_core::permits_path`), mirroring production dispatch
+    // containment (`newt_policy::permits_path`), mirroring production dispatch
     // (`Scope::only([workspace])`). The pre-step-4.3 per-file relative-exact
     // fixtures are retired — see `apply_under_workspace_fence_permits_inside_
     // denies_escape` above for the core permit/deny property.

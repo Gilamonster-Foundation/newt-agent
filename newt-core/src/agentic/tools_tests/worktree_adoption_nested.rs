@@ -39,17 +39,17 @@ struct GrantExec(usize);
 impl PermissionGate for GrantExec {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
         assert!(requests.iter().all(|r| r.kind == DenialKind::Exec));
         self.0 += 1;
         PermissionDecision::Allow(Caveats::top())
     }
-    fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
+    fn ask_question(&mut self, _: &str) -> newt_policy::permissions::HumanQuestionOutcome {
         panic!("unexpected question")
     }
 }

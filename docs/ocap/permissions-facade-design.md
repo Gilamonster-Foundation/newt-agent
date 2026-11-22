@@ -133,7 +133,7 @@ HEAD `1a0fb88`.
 
 ### 2.1 The permission surface
 
-**`newt-core/src/permissions.rs`** — the kernel-facing seam. *(Line
+**`newt-policy/src/permissions.rs`** — the kernel-facing seam. *(Line
 numbers re-verified against HEAD `1a0fb88` in the 2026-06-29 red-team; the
 24-line module header had shifted the prior citations ~20 lines.)*
 
@@ -372,7 +372,7 @@ window. Each verb is defined by the algebra operation it compiles to.
     generation-window fix below is **P2, unbuilt** (§8).
   - **Unbounded in breadth, with no risk-tiering.** The exec axis matches by
     **command-name set membership** (`Scope::permits → set.contains`,
-    `newt-core/src/caveats.rs:41`). Nothing distinguishes `ls` from
+    `newt-policy/src/caveats.rs:41`). Nothing distinguishes `ls` from
     `bash`/`sh`/`python`/`node`/`perl`. A single `[s]ession allow` of an
     **interpreter name** is therefore a standing arbitrary-code grant: once
     `(Exec,"bash")` is in `session_grants`, future `run_command bash …`
@@ -413,7 +413,7 @@ window. Each verb is defined by the algebra operation it compiles to.
      authority — it is sound by construction (§6.1).
   2. dispatch gains a generation-aware check
      (`permits_exec_at(cmd, generation)` etc. on `CaveatsExt`,
-     `newt-core/src/caveats.rs:78`) so a session grant stops applying once the
+     `newt-policy/src/caveats.rs:78`) so a session grant stops applying once the
      session's generation window closes.
 - **Why this is the right shape:** a session grant minted this way is already
   *wire-compatible* with mesh generation-scoped certs — no adapter is needed to
@@ -800,7 +800,7 @@ correction, the code is doing exactly what it should for delegation.
   grants live in process memory (`session_grants`, `lib.rs:1740`) with no time
   bound in the minted caveat. The fix is P2, **unbuilt**.
 - *Too broad (the sharp one):* exec matches by command-name set membership
-  (`Scope::permits → set.contains`, `newt-core/src/caveats.rs:41`). One
+  (`Scope::permits → set.contains`, `newt-policy/src/caveats.rs:41`). One
   `[s]ession allow` of an interpreter (`bash`/`python`/…) is a standing
   arbitrary-code grant that auto-allows with no re-prompt (`lib.rs:1860`); the
   interpreter's `exec`'d children fork outside the per-spawn interceptor. The

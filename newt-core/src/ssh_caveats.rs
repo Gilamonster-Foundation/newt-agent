@@ -31,8 +31,8 @@
 //! (`git-upload-pack` = read vs `git-receive-pack` = write) for defense in depth;
 //! today the verb split lives in `GitCaveats`.
 
-use crate::caveats::{Scope, ScopeExt};
 use crate::git_caveats::GitCaveats;
+use newt_policy::caveats::{Scope, ScopeExt};
 use serde::{Deserialize, Serialize};
 
 /// A capability surface for SSH: which **hosts** the agent may reach and which

@@ -16,7 +16,7 @@ async fn mcp_spawn_tool_is_a_trivial_minting_stub() {
 
 #[test]
 fn mint_spawn_context_authorizes_any_leash() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     assert!(mint_spawn_context(&Caveats::top()).is_ok());
     let restricted = Caveats {
         exec: Scope::only(["echo".to_string()]),
@@ -30,7 +30,7 @@ fn mint_spawn_context_authorizes_any_leash() {
 
 #[test]
 fn spawn_caveats_admits_command_but_keeps_runtime_leash() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     // An Only-exec leash gains the server command; the rest is preserved.
     let session = Caveats {
         exec: Scope::only(["echo".to_string()]),
@@ -66,7 +66,7 @@ fn spawn_caveats_admits_command_but_keeps_runtime_leash() {
 ///     child net was `All`, expected `Only({})`
 #[test]
 fn spawn_caveats_narrows_host_net_to_none_and_preserves_session() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     let session = Caveats {
         net: Scope::only([

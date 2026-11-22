@@ -8,8 +8,8 @@
 //! each other's guards.
 
 use super::*;
-use crate::caveats::Caveats;
 use crate::{BackendKind, MemMessage};
+use newt_policy::caveats::Caveats;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{header, method, path};
@@ -112,27 +112,30 @@ impl<'a> FixtureMcpPermission<'a> {
     }
 }
 
-impl crate::PermissionGate for FixtureMcpPermission<'_> {
+impl newt_policy::PermissionGate for FixtureMcpPermission<'_> {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
-    fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
-        crate::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _question: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
     }
 
-    fn ask(&mut self, requests: &[crate::PermissionRequest]) -> crate::PermissionDecision {
+    fn ask(
+        &mut self,
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         if requests.len() == 1
-            && requests[0].kind == crate::DenialKind::RemoteTool
+            && requests[0].kind == newt_policy::DenialKind::RemoteTool
             && requests[0].target == self.target
             && requests[0].tool == self.target
         {
-            crate::PermissionDecision::Allow(self.caveats.clone())
+            newt_policy::PermissionDecision::Allow(self.caveats.clone())
         } else {
-            crate::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         }
     }
 }

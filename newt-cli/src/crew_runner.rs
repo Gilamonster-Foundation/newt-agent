@@ -16,8 +16,8 @@
 use crate::crew::{infer_test_command, model_for_role, worktree_id, WorktreeWorkspace};
 use async_trait::async_trait;
 use newt_core::agentic::{crew_authz, crew_step_up_policy, CrewAuthz, CrewRunner, Presence};
-use newt_core::caveats::{Caveats, CaveatsExt};
 use newt_core::Config;
+use newt_policy::caveats::{Caveats, CaveatsExt};
 use newt_router::Tier;
 use newt_scheduler::{
     compose_from_pool, run_crew, run_team, BackendPool, CrewConfig, CrewStatus, LocalDispatcher,
@@ -621,7 +621,7 @@ impl CrewRunner for LocalCrewRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     fn runner() -> LocalCrewRunner {
         // Default Config has no backends → composing finds no live models. The /team

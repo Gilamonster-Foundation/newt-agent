@@ -130,7 +130,7 @@ pub struct TurnDriverConfig {
     /// Absolute workspace path the tool loop runs against.
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
-    pub caveats: crate::caveats::Caveats,
+    pub caveats: newt_policy::caveats::Caveats,
     /// `[tool_exposure]` policy for driven turns (#2932). Default is the
     /// identity (full catalog); `read_only` also attenuates `caveats` at the
     /// turn boundary through [`ExposureSettings::attenuate`].
@@ -204,7 +204,7 @@ pub struct TurnDriverConfig {
 impl TurnDriverConfig {
     /// Construct a config with sensible cowork defaults; only the endpoint, the
     /// model, the backend kind, and the workspace are required. Caveats default
-    /// to [`Caveats::top`](crate::caveats::Caveats::top) — the downstream
+    /// to [`Caveats::top`](newt_policy::caveats::Caveats::top) — the downstream
     /// consumer is expected to narrow them.
     pub fn new(
         url: impl Into<String>,
@@ -230,7 +230,7 @@ impl TurnDriverConfig {
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             workspace: workspace.into(),
-            caveats: crate::caveats::Caveats::top(),
+            caveats: newt_policy::caveats::Caveats::top(),
             exposure: Default::default(),
             max_tool_rounds: 40,
             narration_nudge_cap: 1,
@@ -1009,8 +1009,8 @@ mod tests {
     include!("driver_cognition_wire_tests.rs");
     use super::*;
     use crate::agentic::SessionSemanticIndex;
-    use crate::caveats::{Caveats, CountBound, Scope};
     use crate::Role;
+    use newt_policy::caveats::{Caveats, CountBound, Scope};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;

@@ -1,6 +1,6 @@
 # Feature Proposal: Kit System — package, discovery, provenance
 
-> **Status:** Draft — proposal, not normative · **Owner:** hartsock · **Last review:** 2026-08-16 · **Builds on:** [ocap_confinement_model.md](../decisions/ocap_confinement_model.md), [agent_bridle_publishing.md](../decisions/agent_bridle_publishing.md), [agentic_object_capability_security.md](../decisions/agentic_object_capability_security.md), [1528b3-cid-spill-identity.md](../decisions/1528b3-cid-spill-identity.md), `newt-core/src/kit.rs`, `newt-core/src/caveats.rs`, `newt-core/src/git_caveats.rs`, `newt-skills` (`SkillCaveats`), `plugins-protocol`, `newt-identity` · **Supersedes/Superseded by:** —
+> **Status:** Draft — proposal, not normative · **Owner:** hartsock · **Last review:** 2026-08-16 · **Builds on:** [ocap_confinement_model.md](../decisions/ocap_confinement_model.md), [agent_bridle_publishing.md](../decisions/agent_bridle_publishing.md), [agentic_object_capability_security.md](../decisions/agentic_object_capability_security.md), [1528b3-cid-spill-identity.md](../decisions/1528b3-cid-spill-identity.md), `newt-core/src/kit.rs`, `newt-policy/src/caveats.rs`, `newt-core/src/git_caveats.rs`, `newt-skills` (`SkillCaveats`), `plugins-protocol`, `newt-identity` · **Supersedes/Superseded by:** —
 
 Tracking: [#1737](https://github.com/Gilamonster-Foundation/newt-agent/issues/1737) (A3 — Kit = package / discovery / provenance; Module = principal + Grant) under the
 [#1734](https://github.com/Gilamonster-Foundation/newt-agent/issues/1734) companion train. Index:

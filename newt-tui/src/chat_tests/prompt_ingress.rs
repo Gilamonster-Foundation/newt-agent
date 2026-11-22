@@ -67,7 +67,7 @@ fn git_head_snapshot_requires_effective_workspace_read_authority() {
     assert!(git_head_snapshot(Some(&tool), &newt_core::Caveats::top()).is_some());
     let workspace = tmp.path().to_str().unwrap();
     let mut read_only = read_only_caveats(workspace);
-    newt_core::caveats::lock_fs_to_workspace(&mut read_only, workspace, &[], &[]);
+    newt_policy::caveats::lock_fs_to_workspace(&mut read_only, workspace, &[], &[]);
     assert_eq!(read_only.fs_write, newt_core::Scope::none());
     assert_eq!(read_only.exec, newt_core::Scope::none());
     assert_eq!(read_only.net, newt_core::Scope::none());

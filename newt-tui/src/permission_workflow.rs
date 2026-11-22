@@ -75,7 +75,8 @@ pub(super) fn review_session_grants(
         if state.recall_conflicts_with_denial(*kind, target)
             || danger.classify(*kind, target) == danger::DangerTier::High
             || preset.is_some_and(|floor| {
-                *kind != newt_core::DenialKind::RemoteTool && !ceiling_permits(floor, *kind, target)
+                *kind != newt_policy::DenialKind::RemoteTool
+                    && !ceiling_permits(floor, *kind, target)
             })
             || ceiling.is_some_and(|floor| !ceiling_permits(floor, *kind, target))
         {

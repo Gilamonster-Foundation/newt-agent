@@ -14,6 +14,7 @@ categories = ["development-tools"]
 [dependencies]
 agent-toolchain.workspace = true
 newt-core.workspace = true
+newt-policy.workspace = true
 # MIT only — never grit-legacy (GPL-2.0). See the root Cargo.toml note.
 grit-lib.workspace = true
 chrono.workspace = true

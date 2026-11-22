@@ -5,8 +5,8 @@
 //! the next model request can actually observe.
 
 use super::*;
-use crate::caveats::Caveats;
 use crate::{BackendKind, MemMessage, Role};
+use newt_policy::caveats::Caveats;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wiremock::matchers::{method, path};

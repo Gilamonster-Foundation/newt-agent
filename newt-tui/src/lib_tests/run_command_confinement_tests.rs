@@ -1,6 +1,6 @@
 use super::*;
 use newt_core::agentic::execute_tool;
-use newt_core::caveats::{Caveats, CountBound, Scope};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
 
 // Only the `#[cfg(unix)]` confinement tests below construct this guard; on
 // Windows those tests are gated out, so gate the guard too or it trips the

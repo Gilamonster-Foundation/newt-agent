@@ -24,27 +24,30 @@ const MCP_RESULT: &str = "authenticated review 42 loaded";
 
 struct ReviewPermission(usize);
 
-impl crate::PermissionGate for ReviewPermission {
+impl newt_policy::PermissionGate for ReviewPermission {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
-    fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
-        crate::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _question: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Unavailable
     }
 
-    fn ask(&mut self, requests: &[crate::PermissionRequest]) -> crate::PermissionDecision {
+    fn ask(
+        &mut self,
+        requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
         if requests.len() == 1
-            && requests[0].kind == crate::DenialKind::RemoteTool
+            && requests[0].kind == newt_policy::DenialKind::RemoteTool
             && requests[0].target == REVIEW_TOOL
         {
             self.0 += 1;
-            crate::PermissionDecision::Allow(Caveats::top())
+            newt_policy::PermissionDecision::Allow(Caveats::top())
         } else {
-            crate::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         }
     }
 }

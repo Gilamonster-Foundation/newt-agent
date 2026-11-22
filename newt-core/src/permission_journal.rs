@@ -27,7 +27,7 @@
 use std::path::Path;
 
 use crate::event_journal::{self, JournalLine};
-use crate::PermissionRecord;
+use newt_policy::PermissionRecord;
 
 /// The chain's reader-side vocabulary, re-exported so a caller does not have
 /// to know this journal is built on the event journal's machinery.
@@ -78,7 +78,7 @@ pub fn records(lines: &[PermissionLine]) -> Vec<PermissionRecord> {
 mod tests {
     use super::*;
     use crate::event_journal::Journal;
-    use crate::DenialKind;
+    use newt_policy::DenialKind;
 
     fn rec(target: &str) -> PermissionRecord {
         PermissionRecord::new(

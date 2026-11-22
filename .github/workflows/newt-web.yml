@@ -15,6 +15,7 @@ on:
     paths:
       - "newt-web/**"
       - "newt-core/**"
+      - "newt-policy/**"
       - "newt-router/**"
       - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
@@ -23,6 +24,7 @@ on:
     paths:
       - "newt-web/**"
       - "newt-core/**"
+      - "newt-policy/**"
       - "newt-router/**"
       - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"

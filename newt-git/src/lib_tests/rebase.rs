@@ -40,7 +40,7 @@ fn rebase_rewords_a_middle_commit() {
                 ]
             }),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.starts_with("rebased onto"), "got: {out}");
@@ -80,7 +80,7 @@ fn rebase_pick_commit_receives_canonical_attribution() {
             ]
         }),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     // The HEAD commit (c3 replayed) now carries canonical attribution.
@@ -111,7 +111,7 @@ fn rebase_squashes_two_commits_into_one() {
             ]
         }),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     // c1 + one squashed commit = 2.
@@ -174,7 +174,7 @@ fn rebase_drops_a_commit() {
             ]
         }),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     assert_eq!(commit_count(dir.path()), 2);
@@ -217,7 +217,7 @@ fn rebase_refuses_on_a_dirty_tree() {
                 ]
             }),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -297,7 +297,7 @@ fn rebase_refuses_when_the_new_tree_would_overwrite_an_ignored_file() {
                 ]
             }),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -358,7 +358,7 @@ fn rebase_all_drop_preserves_pending_contributors() {
                 ]
             }),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(
@@ -378,14 +378,14 @@ fn rebase_all_drop_preserves_pending_contributors() {
         "add",
         &serde_json::json!({"paths": ["d.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "after all-drop rebase"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let msg = head_message(dir.path());
@@ -441,7 +441,7 @@ fn rebase_aborts_on_conflict_leaving_the_branch_unchanged() {
                 "plan": [{"commit": oids[2], "action": "pick"}]
             }),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -464,7 +464,7 @@ fn rebase_denied_on_read_only() {
             "rebase",
             &serde_json::json!({"onto": oids[0], "plan": [{"commit": oids[1], "action": "pick"}]}),
             &GitCaveats::read_only(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -481,7 +481,7 @@ fn local_git_tool_unknown_op_and_missing_args_error() {
             "frobnicate",
             &serde_json::json!({}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("unknown git op"), "got: {err}");
@@ -491,7 +491,7 @@ fn local_git_tool_unknown_op_and_missing_args_error() {
             "commit",
             &serde_json::json!({}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("message"), "got: {err}");

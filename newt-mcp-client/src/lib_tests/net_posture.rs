@@ -1,5 +1,5 @@
 use super::*;
-use newt_core::caveats::Scope;
+use newt_policy::caveats::Scope;
 
 #[test]
 fn gated_reports_the_granted_remote_host_count() {

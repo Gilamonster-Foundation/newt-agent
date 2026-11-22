@@ -180,7 +180,7 @@ fn advertised_set_matches_all_tool_names_both_directions() {
             Some(serde_json::json!([]))
         }
     }
-    let git = Some(&crate::caveats::Scope::All);
+    let git = Some(&newt_policy::caveats::Scope::All);
     let all = merged_tool_definitions(
         &DiscoveredMcp,
         true,
@@ -448,7 +448,7 @@ fn git_tool_advertised_only_with_the_presence_gate() {
             .filter_map(|d| d["function"]["name"].as_str())
             .collect()
     }
-    let git = Some(&crate::caveats::Scope::All);
+    let git = Some(&newt_policy::caveats::Scope::All);
     let with = merged_tool_definitions(
         &NoMcp,
         false,

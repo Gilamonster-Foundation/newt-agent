@@ -124,7 +124,7 @@ pub(crate) struct AdoptedWorktree {
 }
 
 fn resolved(path: &Path) -> Option<PathBuf> {
-    crate::paths::resolve_uncreated_path(path).ok()
+    newt_policy::paths::resolve_uncreated_path(path).ok()
 }
 fn overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
@@ -139,7 +139,7 @@ impl AdoptedWorktree {
         let mut out = base.clone();
         if self.relocate_workspace_access {
             for scope in [&mut out.fs_read, &mut out.fs_write] {
-                if crate::caveats::permits_path(scope, &self.original.to_string_lossy()) {
+                if newt_policy::caveats::permits_path(scope, &self.original.to_string_lossy()) {
                     if let Scope::Only(roots) = scope {
                         roots.insert(self.worktree.to_string_lossy().into_owned());
                     }
@@ -176,7 +176,10 @@ impl AdoptedWorktree {
             || !cwd
                 .canonicalize()
                 .is_ok_and(|p| p.starts_with(&self.worktree))
-            || !crate::caveats::permits_path(&authority.fs_write, &self.worktree.to_string_lossy())
+            || !newt_policy::caveats::permits_path(
+                &authority.fs_write,
+                &self.worktree.to_string_lossy(),
+            )
             || self.protects_branch(branch)
         {
             return Err(self.notice());
@@ -215,7 +218,7 @@ impl AdoptedWorktree {
         // admin/object roots. Each retained root must already be writable;
         // adoption never adds authority to deny-all or unrelated-only callers.
         for root in [&self.worktree, &self.admin, &self.common.join("objects")] {
-            if crate::caveats::permits_path(&authority.fs_write, &root.to_string_lossy()) {
+            if newt_policy::caveats::permits_path(&authority.fs_write, &root.to_string_lossy()) {
                 roots.insert(root.to_string_lossy().into_owned());
             }
         }
@@ -250,7 +253,9 @@ impl Creation {
     pub(crate) fn prepare(&mut self, authority: &Caveats) -> Result<(), String> {
         if ![&authority.fs_read, &authority.fs_write]
             .iter()
-            .all(|scope| crate::caveats::permits_path(scope, &self.destination.to_string_lossy()))
+            .all(|scope| {
+                newt_policy::caveats::permits_path(scope, &self.destination.to_string_lossy())
+            })
         {
             return Err("worktree destination needs read and write approval".into());
         }

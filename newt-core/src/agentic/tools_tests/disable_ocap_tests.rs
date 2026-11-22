@@ -1,6 +1,6 @@
 use super::super::NoMcp;
 use super::*;
-use crate::caveats::{Caveats, CountBound, Scope};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
 
 /// Serializes every test that reads or writes `NEWT_DISABLE_OCAP` (and
 /// the venv vars the bypass forwards) with settings and denial journaling.
@@ -425,7 +425,7 @@ async fn run_command_output_over_budget_is_token_capped() {
 /// Unit-cover every branch of the bypass-floor predicate.
 #[test]
 fn exec_floor_permits_covers_each_branch() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     // No floor ⇒ always permit (bit-for-bit pre-#307).
     assert!(exec_floor_permits(None, "rm -rf /"));
     // Empty command ⇒ let it through to the normal path.
@@ -451,7 +451,7 @@ fn exec_floor_permits_covers_each_branch() {
 /// form that could chain or substitute a second program.
 #[test]
 fn exec_floor_refuses_every_metacharacter_form() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
     let echo = Scope::only(["echo".to_string()]);
     // Each of these begins with the allow-listed `echo` but smuggles or
     // could smuggle a second program. None may bypass.
@@ -519,7 +519,7 @@ async fn floor_blocks_disable_ocap_for_a_denied_exec() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_no_exec(ws.path());
     // A readonly-triage preset clamp: exec denies everything.
-    let floor = crate::NamedPermissionPreset {
+    let floor = newt_policy::NamedPermissionPreset {
         readonly: true,
         ..Default::default()
     }
@@ -552,7 +552,7 @@ async fn floor_allows_disable_ocap_for_an_in_floor_exec() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_no_exec(ws.path());
     // A triage preset that allow-lists `echo`.
-    let floor = crate::NamedPermissionPreset {
+    let floor = newt_policy::NamedPermissionPreset {
         readonly: true,
         exec_allow: vec!["echo".to_string()],
         ..Default::default()
@@ -586,7 +586,7 @@ async fn floor_refuses_bypass_for_a_compound_command() {
     let ws = tempfile::TempDir::new().unwrap();
     let caveats = caveats_no_exec(ws.path());
     // `echo` is allow-listed, but the `&&` chains an unlisted `rm`.
-    let floor = crate::NamedPermissionPreset {
+    let floor = newt_policy::NamedPermissionPreset {
         readonly: true,
         exec_allow: vec!["echo".to_string()],
         ..Default::default()
@@ -828,10 +828,10 @@ async fn unrestricted_mutation_confirm_accepts_y_case_insensitively_and_fails_cl
     impl super::PermissionGate for ScriptGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _r: &[super::PermissionRequest]) -> super::PermissionDecision {
             super::PermissionDecision::Deny
@@ -900,10 +900,10 @@ async fn unrestricted_write_and_delete_confirm_through_permission_gate() {
     impl super::PermissionGate for ConfirmGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             super::PermissionDecision::Deny
@@ -1311,10 +1311,10 @@ async fn yolo_never_consults_the_permission_gate_for_exec() {
     impl super::PermissionGate for PanicGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             panic!("yolo exec must never prompt, but the gate was asked: {requests:?}");
@@ -1500,10 +1500,10 @@ async fn routed_cargo_test_reaches_the_confined_build_lane() {
     impl super::PermissionGate for RecordingDenyGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.seen = requests.first().cloned();
@@ -1841,10 +1841,10 @@ async fn native_git_exec_grant_retry_stages_under_appcontainer() {
     impl super::PermissionGate for GrantExecGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.requests.extend_from_slice(requests);
@@ -2061,7 +2061,7 @@ fn build_route_refuses_unsafe_argv_shapes() {
         r"cargo test a\ b",
     ] {
         assert_eq!(
-            table.classify(cmd, cwd, &crate::caveats::Scope::All),
+            table.classify(cmd, cwd, &newt_policy::caveats::Scope::All),
             RouteDecision::Exec,
             "{cmd:?} carries a token the shell would transform; it must gate to exec"
         );
@@ -2069,7 +2069,11 @@ fn build_route_refuses_unsafe_argv_shapes() {
 
     assert!(
         matches!(
-            table.classify("cargo test -p newt-core", cwd, &crate::caveats::Scope::All),
+            table.classify(
+                "cargo test -p newt-core",
+                cwd,
+                &newt_policy::caveats::Scope::All
+            ),
             RouteDecision::Route {
                 tool: "build_exec",
                 ..
@@ -2679,10 +2683,10 @@ async fn lifecycle_run_of_build_tool_requests_build_authority() {
     impl super::PermissionGate for RecordingDenyGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.seen = requests.first().cloned();
@@ -2760,10 +2764,10 @@ async fn lifecycle_run_of_non_build_tool_does_not_request_build_authority() {
     impl super::PermissionGate for RecordingDenyGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
             self.seen = requests.first().cloned();

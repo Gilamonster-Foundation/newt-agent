@@ -962,7 +962,7 @@ mod tests {
     /// session or re-resolve a scoped caller's repository grant.
     #[test]
     fn full_access_commit_writes_are_bounded_without_changing_session() {
-        use crate::caveats::permits_path;
+        use newt_policy::caveats::permits_path;
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().canonicalize().unwrap();
         let session = crate::Caveats::top();

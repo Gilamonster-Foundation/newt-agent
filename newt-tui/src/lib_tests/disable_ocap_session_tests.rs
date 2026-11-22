@@ -2,7 +2,7 @@ use super::*;
 #[cfg(unix)]
 use newt_core::agentic::execute_tool;
 #[cfg(unix)]
-use newt_core::caveats::{Caveats, CountBound, Scope};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
 
 /// #774 (P0) — PURE: the operator's `[tui.permissions]` exec clamp is a
 /// NON-OPTIONAL floor, sourced into `exec_floor` even with NO active
@@ -12,7 +12,7 @@ use newt_core::caveats::{Caveats, CountBound, Scope};
 /// command took the `--disable-ocap` bypass unconfined.
 #[test]
 fn tui_permissions_exec_clamp_is_an_always_on_floor_without_posture() {
-    use newt_core::caveats::{Scope, ScopeExt as _};
+    use newt_policy::caveats::{Scope, ScopeExt as _};
     // `[tui.permissions]` configures a restrictive exec clamp; no posture.
     let configured_exec: Scope<String> = Scope::only(["cargo".to_string(), "git".to_string()]);
     let floor = exec_floor_from(&configured_exec, /* posture_active = */ false).expect(
@@ -38,7 +38,7 @@ fn tui_permissions_exec_clamp_is_an_always_on_floor_without_posture() {
 /// preset yields a floor.
 #[test]
 fn exec_floor_none_only_when_unrestricted_and_no_posture_floor() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     // Unrestricted base + no posture preset ⇒ no floor.
     assert!(exec_floor_from(&Scope::<String>::All, false).is_none());
     // Unrestricted base + configured posture preset ⇒ floor present.
@@ -167,7 +167,7 @@ fn full_access_record_is_the_session_shape_and_appends() {
 /// and_no_mode` above), so `--yolo --full-access` covers every command.
 #[test]
 fn full_access_env_overrides_configured_preset_in_policy_for() {
-    use newt_core::caveats::{Caveats as Cav, Scope};
+    use newt_policy::caveats::{Caveats as Cav, Scope};
     // Exclusive guard: this test mutates NEWT_FULL_ACCESS, which
     // policy_for reads (alongside the NEWT_*_PATHS grant scans).
     let _g = crate::test_env_guard::env_write_guard();
@@ -437,7 +437,7 @@ async fn floor_wins_over_disable_ocap_at_the_tui_seam() {
     let ws = tempfile::TempDir::new().unwrap();
     let base = caveats_no_exec(ws.path());
     // The readonly-triage preset clamp the active posture supplies.
-    let clamp = newt_core::NamedPermissionPreset {
+    let clamp = newt_policy::NamedPermissionPreset {
         readonly: true,
         ..Default::default()
     }

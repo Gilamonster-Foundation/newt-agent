@@ -12,6 +12,7 @@ readme = "README.md"
 # tree never enters the agent workspace graph.
 [dependencies]
 newt-core = { path = "../newt-core", features = ["markdown"] }
+newt-policy = { path = "../newt-policy" }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 # Markdown for the transcript: the same engine Scrybe's scrybe-render uses

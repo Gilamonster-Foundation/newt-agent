@@ -1,6 +1,7 @@
 //! Explicit test-only adapter: each gate has the production turn lifetime.
 use crate::permissions::{production_danger_table, PermissionPromptState, PromptPermissionGate};
-use newt_core::{Caveats, PermissionAction, PermissionGate};
+use newt_core::Caveats;
+use newt_policy::{PermissionAction, PermissionGate};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Default)]

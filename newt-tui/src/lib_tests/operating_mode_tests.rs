@@ -1,6 +1,6 @@
 use super::*;
 use newt_core::agentic::PromptDisposition;
-use newt_core::CaveatsExt as _;
+use newt_policy::CaveatsExt as _;
 
 #[test]
 fn operating_modes_have_the_canonical_names_and_human_descriptions() {

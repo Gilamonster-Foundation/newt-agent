@@ -46,10 +46,10 @@ struct Gate(Vec<PermissionRequest>);
 impl PermissionGate for Gate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
         panic!("read broker must not ask a freeform question")
@@ -242,10 +242,10 @@ struct AllowGate {
 impl PermissionGate for AllowGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
         panic!("unexpected question")

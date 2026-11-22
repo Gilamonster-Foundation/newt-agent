@@ -1,7 +1,7 @@
 use super::*;
 use crate::agentic::mcp::LeasedMcpCall;
 use crate::agentic::NoMcp;
-use crate::caveats::{Caveats, CountBound, Scope};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
 
 /// fs read everywhere, fs write scoped to the workspace (skips the y/N
 /// confirm — the scoped preset is the consent), nothing else.
@@ -80,10 +80,10 @@ impl MockGate {
 impl super::PermissionGate for MockGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask_full_access(
         &mut self,
@@ -98,7 +98,9 @@ impl super::PermissionGate for MockGate {
             .iter()
             .map(|r| (r.kind, r.target.clone()))
             .collect();
-        super::PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
+        super::PermissionDecision::Allow(newt_policy::permissions::widen_caveats(
+            &self.base, &grants,
+        ))
     }
     fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
         for r in requests {
@@ -110,7 +112,9 @@ impl super::PermissionGate for MockGate {
                 .iter()
                 .map(|r| (r.kind, r.target.clone()))
                 .collect();
-            super::PermissionDecision::Allow(crate::permissions::widen_caveats(&self.base, &grants))
+            super::PermissionDecision::Allow(newt_policy::permissions::widen_caveats(
+                &self.base, &grants,
+            ))
         } else {
             super::PermissionDecision::Deny
         }
