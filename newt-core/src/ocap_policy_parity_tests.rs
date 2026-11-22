@@ -3,6 +3,10 @@
 //! agree on everything a store writes or reads: the parse and its refusals, the serialized form,
 //! the signing payload (a signature minted by one must verify under the other), which entries
 //! survive verification and why the rest are dropped, and the precedence law.
+//!
+//! Three KNOWN differences are pinned at the end, so none can grow unnoticed: two come from
+//! the `toml` versions the crates link (newt-core 1.1, bridle-core 0.8), and one is a fix
+//! (a `sig` that is not ASCII). Each pin says when it ends.
 
 use crate::ocap_policy as ours;
 use agent_bridle::policy as theirs;
@@ -376,4 +380,108 @@ fn hex_is_bridles_and_round_trips() {
             Ok(bytes.to_vec())
         );
     }
+}
+
+/// `verify_strict`, not `verify`: a weak (small-order) root key with the all-zero-scalar
+/// signature passes plain `verify` for EVERY payload, so a store that used it would accept a
+/// forged grant for any target. Both sides must refuse it, and a signature that is not 64
+/// bytes, with the same reason.
+#[test]
+fn a_weak_key_and_a_short_signature_are_refused_as_bridle_refuses_them() {
+    // The identity point, compressed (y = 1, x = 0), as the key and as R; S = 0.
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let mut trivial = [0u8; 64];
+    trivial[0] = 1;
+    let payload = ours::ExecEntry {
+        target: "rm".into(),
+        ..Default::default()
+    }
+    .signing_payload();
+    // Anti-vacuous: this pair really is one plain `verify` accepts.
+    let weak = ed25519_dalek::VerifyingKey::from_bytes(&identity).unwrap();
+    let signature = ed25519_dalek::Signature::from_bytes(&trivial);
+    assert!(ed25519_dalek::Verifier::verify(&weak, &payload, &signature).is_ok());
+
+    let ours_weak = ours::Ed25519ApproveVerifier {
+        verifying_key: identity,
+    };
+    let theirs_weak = theirs::Ed25519ApproveVerifier {
+        verifying_key: identity,
+    };
+    let refused = ours::ApproveVerifier::verify(&ours_weak, &payload, &trivial);
+    assert!(refused.is_err(), "a weak key verified");
+    assert_eq!(
+        refused,
+        theirs::ApproveVerifier::verify(&theirs_weak, &payload, &trivial)
+    );
+
+    let key = signer().verifying_key().to_bytes();
+    let short = [0xabu8; 63];
+    let refused = ours::ApproveVerifier::verify(
+        &ours::Ed25519ApproveVerifier { verifying_key: key },
+        &payload,
+        &short,
+    );
+    assert_eq!(refused, Err("signature is not 64 bytes".to_string()));
+    assert_eq!(
+        refused,
+        theirs::ApproveVerifier::verify(
+            &theirs::Ed25519ApproveVerifier { verifying_key: key },
+            &payload,
+            &short,
+        )
+    );
+}
+
+/// KNOWN difference 1: TOML 1.1 syntax. `\xHH` is a TOML 1.1 escape, so this document
+/// parses here (toml 1.1) and is refused by bridle's parser (toml 0.8). It cannot widen
+/// authority: an approve entry still needs a valid signature over the target as read. Ends
+/// when bridle's `toml` moves; delete this test then.
+#[test]
+fn a_toml_1_1_escape_parses_here_and_is_refused_by_bridles_parser() {
+    let document = "[[exec]]\ntarget = \"\\x72m\"\n";
+    let parsed = ours::PolicyFile::parse(document).unwrap();
+    assert_eq!(parsed.exec[0].target, "rm");
+    assert!(theirs::PolicyFile::parse(document).is_err());
+}
+
+/// KNOWN difference 2: a multi-line string with CRLF line ends. toml 1.1 keeps the CRLF,
+/// toml 0.8 folded it to LF, so the same bytes read as two different targets. The signing
+/// payload is built from the target as read, so a signature made under one reading does not
+/// verify under the other; nothing is granted that was not signed. Ends when bridle's `toml`
+/// moves; delete this test then.
+#[test]
+fn a_crlf_multi_line_string_keeps_its_line_ends_here_and_loses_them_in_bridles_parser() {
+    let quotes = "'".repeat(3);
+    let document = format!("[[exec]]\ntarget = {quotes}a\r\nb{quotes}\n");
+    let document = document.as_str();
+    let ours_target = ours::PolicyFile::parse(document).unwrap().exec[0]
+        .target
+        .clone();
+    let theirs_target = theirs::PolicyFile::parse(document).unwrap().exec[0]
+        .target
+        .clone();
+    assert_eq!(ours_target, "a\r\nb");
+    assert_eq!(theirs_target, "a\nb");
+}
+
+/// KNOWN difference 3, a fix: a `sig` that is not ASCII. The copy refuses it and drops the
+/// entry (`ocap_policy_tests`); bridle's decoder slices the string mid-character and panics.
+/// Ends when bridle refuses it too; delete this test then.
+#[test]
+fn a_signature_that_is_not_ascii_is_refused_here_and_panics_in_bridle() {
+    let document = "[[exec]]\ntarget = \"cargo\"\nsig = \"aéb\"\n";
+    let key = signer().verifying_key().to_bytes();
+    let (kept, warnings) = ours::PolicyFile::parse(document)
+        .unwrap()
+        .verified_approves(&ours::Ed25519ApproveVerifier { verifying_key: key });
+    assert!(kept.exec.is_empty(), "{kept:?}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+    let theirs_file = theirs::PolicyFile::parse(document).unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        theirs_file.verified_approves(&theirs::Ed25519ApproveVerifier { verifying_key: key })
+    }));
+    assert!(outcome.is_err(), "bridle refuses it now: delete this test");
 }

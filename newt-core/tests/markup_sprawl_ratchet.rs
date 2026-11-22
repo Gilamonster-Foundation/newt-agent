@@ -1137,7 +1137,8 @@ fn action_model_registry_is_exact() {
         // The durable-policy file verdict (deny, passkey, ask, approve), copied from
         // agent-bridle-core's `policy` (#3160, the `confine` feature). It was
         // `agent_bridle::policy::Verdict`, re-exported by `ocap_store`. Pinned at one
-        // definition so it cannot multiply; renaming it `PolicyVerdict` removes this row.
+        // definition so it cannot multiply; renaming it `PolicyVerdict` moves this row to
+        // that name.
         ("newt-core/src/ocap_policy.rs", "Verdict", 1),
         ("newt-core/src/tty/modal.rs", "PromptLine", 1),
         ("newt-core/src/sas_confirm.rs", "SasVerdict", 1),

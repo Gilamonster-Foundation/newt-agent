@@ -73,11 +73,12 @@
 //! monotonic counter / revocation list is future contract work.
 //!
 //! Copied from agent-bridle-core's `policy.rs` (#3160, the `confine` feature) so
-//! newt-core loads and evaluates durable policy without a bridle crate. The only
-//! changes are the `verifier-ed25519` gates (newt-core always builds the Ed25519
-//! verifier) and the doc passages that named bridle-internal modules;
+//! newt-core loads and evaluates durable policy without a bridle crate. The changes
+//! are the `verifier-ed25519` gates (newt-core always builds the Ed25519 verifier),
+//! the doc passages that named bridle-internal modules, and one fix: `hex_decode`
+//! refuses a string that is not ASCII, which bridle's slices mid-character (a panic).
 //! `ocap_policy_parity_tests` holds the two equal, byte for byte on the signing
-//! payload, while bridle is a dependency.
+//! payload, while bridle is a dependency, and pins the places where they differ.
 
 use std::collections::BTreeMap;
 
@@ -260,6 +261,9 @@ impl ApproveVerifier for Ed25519ApproveVerifier {
 /// decoder beats a dependency for one field; `pub(crate)` because bridle's
 /// web-authz contract (`operator`) shares it there rather than forking a copy.
 pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    if !s.is_ascii() {
+        return Err("hex string is not ASCII".into());
+    }
     if !s.len().is_multiple_of(2) {
         return Err("hex string has odd length".into());
     }

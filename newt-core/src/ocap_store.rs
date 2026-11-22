@@ -4,7 +4,7 @@
 //!
 //! The accumulation loop's memory: prompt → decision → **stored policy** →
 //! fewer prompts. Four per-verdict TOML files under `~/.newt/ocap/` —
-//! `approve.toml` / `deny.toml` / `ask.toml` / `passkey.toml` — each a bridle
+//! `approve.toml` / `deny.toml` / `ask.toml` / `passkey.toml` — each a
 //! [`PolicyFile`] of per-class entries (exec / fs / net). This module LOADS
 //! them into a [`PolicySet`] and answers the one question the permission gate
 //! asks: *"is there a durable verdict for this capability + target?"*
@@ -80,7 +80,7 @@ pub fn build_store(files: &[(Verdict, Option<String>)]) -> (PolicySet, Vec<Strin
 }
 
 /// Sanitize the LOOSENING verdict (pure; #1207): run `approve.toml` through
-/// bridle's fail-closed [`PolicyFile::verified_approves`] with the trusted
+/// the policy contract's fail-closed [`PolicyFile::verified_approves`] with the trusted
 /// verifier. `None` (no root key this session) drops ALL approve entries with
 /// one loud warning — an unverifiable grant is no grant. The narrowing
 /// verdicts pass through untouched (see the module docs for why).
