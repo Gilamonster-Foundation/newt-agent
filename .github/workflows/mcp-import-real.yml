@@ -265,6 +265,18 @@ jobs:
           -p newt-core --lib a_hostile_path_git_never_runs_during_network_read_approval
           -- --ignored --test-threads=1
 
+      # #3148: a remote whose URL is a path on this machine is fetched inside the
+      # fence with no network prompt, and an https remote is not waved through.
+      - name: Run local-path remote grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test a_local_path_remote_is_fetched_in_the_fence_without_a_network_prompt_real_repo
+          -p newt-core --lib
+          a_local_path_remote_is_fetched_in_the_fence_without_a_network_prompt_real_repo
+          -- --ignored --test-threads=1
+
       # PR #3099: both copies require DenyAll. Linux and audited, unprivileged
       # macOS launches exercise successful transfer and hostile rewrites;
       # Linux additionally exercises the independently locked destination ref.
