@@ -4,12 +4,17 @@
 //   node scripts/build-platform-package.mjs \
 //     --name @gilamonster/newt \
 //     --binary target/x86_64-unknown-linux-gnu/release/newt \
-//     --key linux-x64 --version 0.6.0 --out dist-npm/newt-linux-x64
+//     --key linux-x64 --version 0.6.0 --out dist-npm/newt-linux-x64 [--tools <dir>]
+//
+// `--tools` names a directory shipped beside the binary as `tools/` (the carried command
+// pack, #3151). Its files are copied, never linked: `npm install` silently drops hardlinks
+// and symlinks, so a pack that is hardlinked in the release archive would arrive with one
+// name instead of all of them.
 //
 // Generic over the binary — `--name` is the shim package, the binary file name is
 // its last path segment. Reads npm/platforms.json (single source of truth).
 
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, cpSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkReleaseVersion } from './release-version.mjs';
@@ -26,11 +31,17 @@ function arg(name) {
   return process.argv[i + 1];
 }
 
+function optionalArg(name) {
+  const i = process.argv.indexOf(`--${name}`);
+  return i === -1 || i === process.argv.length - 1 ? undefined : process.argv[i + 1];
+}
+
 const shim = arg('name'); // @gilamonster/newt
 const binary = arg('binary');
 const key = arg('key');
 const version = arg('version');
 const out = resolve(arg('out'));
+const tools = optionalArg('tools');
 checkReleaseVersion(version);
 
 const entry = PLATFORMS.find((p) => p.key === key);
@@ -47,6 +58,10 @@ if (!source.isFile() || source.size === 0) {
   console.error('build-platform-package: --binary must name a nonempty regular file');
   process.exit(2);
 }
+if (tools !== undefined && !statSync(tools).isDirectory()) {
+  console.error('build-platform-package: --tools must name a directory');
+  process.exit(2);
+}
 const license = readFileSync(join(here, '..', '..', 'LICENSE'));
 
 mkdirSync(out, { recursive: true });
@@ -61,7 +76,7 @@ const pkg = {
   os: [entry.os],
   cpu: [entry.cpu],
   ...(entry.libc ? { libc: [entry.libc] } : {}),
-  files: [fileName, 'README.md', 'LICENSE'],
+  files: [fileName, ...(tools !== undefined ? ['tools'] : []), 'README.md', 'LICENSE'],
   publishConfig: { access: 'public' },
 };
 
@@ -69,6 +84,7 @@ writeFileSync(join(out, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
 copyFileSync(binary, join(out, fileName));
 writeFileSync(join(out, 'LICENSE'), license);
 if (entry.os !== 'win32') chmodSync(join(out, fileName), 0o755);
+if (tools !== undefined) cpSync(tools, join(out, 'tools'), { recursive: true, dereference: true });
 writeFileSync(
   join(out, 'README.md'),
   `# ${pkg.name}\n\nPrebuilt \`${binName}\` binary for ${entry.os}-${entry.cpu}. Installed automatically ` +
