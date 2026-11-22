@@ -60,7 +60,7 @@ pub(in crate::agentic::tools) fn destructive(source: &str) -> bool {
             Some("list" | "add" | "lock")
         )
     }
-    fn contains(inspection: &agent_bridle::ShellInspection) -> bool {
+    fn contains(inspection: &crate::shell_inspect::ShellInspection) -> bool {
         inspection.commands.iter().any(|command| {
             words(command.program.as_deref(), &command.argv)
                 || command
@@ -72,7 +72,7 @@ pub(in crate::agentic::tools) fn destructive(source: &str) -> bool {
             .iter()
             .any(|construct| construct.inspection.as_deref().is_some_and(contains))
     }
-    agent_bridle::inspect_shell(source).map_or_else(
+    crate::shell_inspect::inspect_shell(source).map_or_else(
         |_| {
             // Opaque runners (including xargs) are not evidence of Git use.
             // This is an accident guard, not a shell admission policy: retain

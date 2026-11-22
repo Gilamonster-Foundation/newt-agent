@@ -6,7 +6,7 @@ impl Check {
         let exit = self
             .exit
             .map_or_else(|| "unavailable".into(), |code| code.to_string());
-        let simple = agent_bridle::inspect_shell(&self.command)
+        let simple = crate::shell_inspect::inspect_shell(&self.command)
             .ok()
             .is_some_and(|shell| shell.commands.len() == 1 && shell.constructs.is_empty());
         let failure = self.lines.iter().any(|line| {

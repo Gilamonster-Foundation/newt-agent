@@ -1455,7 +1455,7 @@ pub(super) async fn exec_confined_command_with_broker(
     // retain their existing statically inspected matching behavior below.
     let bound = permission_gate.as_deref_mut().map(|gate| {
         let mut current = gate.apply_command_retry(cmd, cwd, caveats);
-        let Ok(inspection) = agent_bridle::inspect_shell(cmd) else {
+        let Ok(inspection) = crate::shell_inspect::inspect_shell(cmd) else {
             return current;
         };
         let commands = inspection.commands;

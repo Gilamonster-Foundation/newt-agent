@@ -4737,6 +4737,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "brush-ocap-parser",
  "chrono",
  "content-addressable",
  "crossterm",

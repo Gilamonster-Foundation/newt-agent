@@ -17,7 +17,7 @@ pub(super) fn branch_in_place(
     {
         return None;
     }
-    let inspection = agent_bridle::inspect_shell(command).ok()?;
+    let inspection = crate::shell_inspect::inspect_shell(command).ok()?;
     // #2778: this is advisory syntax recognition, not evidence that a
     // conditional segment ran. Inspect every literal segment, never quoted
     // operands, shell substitutions or delegated child commands.

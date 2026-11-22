@@ -14,7 +14,7 @@ use push_failure::classify_failure;
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::{Caveats, CaveatsExt};
 use crate::git_caveats::GitCaveats;
-use agent_bridle::{inspect_shell, ShellInspection};
+use crate::shell_inspect::{inspect_shell, ShellInspection};
 use std::path::{Path, PathBuf};
 
 pub(super) fn preflight(
@@ -1014,7 +1014,7 @@ pub(super) fn is_git(program: &str) -> bool {
 /// Resolve a single argument with Bridle's word parser. Argument data is not
 /// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
 pub(super) fn literal(word: &str) -> Option<String> {
-    agent_bridle_tool_shell::literal_shell_word(word).ok()
+    crate::shell_inspect::literal_shell_word(word).ok()
 }
 
 /// Find the native verb without translating argv. Repository/config selectors

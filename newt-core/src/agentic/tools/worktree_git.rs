@@ -55,7 +55,7 @@ pub(super) fn read_only(args: &[&str]) -> bool {
 /// Only the explicit start operand of the ordinary -b form treats `.` as HEAD.
 /// Never rewrite a cwd, branch name, destination, sibling, or quoted prose.
 fn creation_source(
-    command: &agent_bridle::InspectedCommand,
+    command: &crate::shell_inspect::InspectedCommand,
     words: &[String],
 ) -> Result<String, ()> {
     let Some(args) = super::worktree_add_args(words) else {
@@ -87,7 +87,7 @@ pub(super) fn pin(source: &str, git: &Path, caveats: &Caveats) -> Result<String,
         regex::Regex::new(r"\A(?:\s|;|&&|\|\||\||[0-9]*[<>]&[0-9]+)*\z")
             .expect("fixed shell gap pattern")
     });
-    let inspection = agent_bridle::inspect_shell(source).map_err(|_| ())?;
+    let inspection = crate::shell_inspect::inspect_shell(source).map_err(|_| ())?;
     if !inspection.constructs.is_empty() {
         return Err(());
     }
