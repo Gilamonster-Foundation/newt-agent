@@ -26,7 +26,7 @@ pub(super) fn preflight(
 ) -> Result<(), String> {
     let inspection = match inspect_shell(source) {
         Ok(inspection) => inspection,
-        // Bridle cannot see into xargs, sh -c, env and the like, so a delete
+        // The shell inspector cannot see into xargs, sh -c, env and the like, so a delete
         // behind one would run without the confirmation below. Refuse it.
         Err(_) if hides_git_delete(source) => {
             return Err(format!(
@@ -75,7 +75,7 @@ pub(super) fn preflight(
     }
 }
 
-/// Whether `source`, which Bridle could not inspect, runs a branch or stash
+/// Whether `source`, which the shell inspector could not inspect, runs a branch or stash
 /// delete as a bare word, as `xargs git branch -d` does. Without this,
 /// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
 /// tripwire, not a boundary: like the commit check in `catalog.rs`, words keep
@@ -110,7 +110,7 @@ const NAME_IT_LITERALLY: &str = "Retry with run_command naming each branch or st
 
 /// The first `git` verb in `verbs` that `source` invokes anywhere, nested
 /// constructs included. A loose trigger: text that merely mentions Git is not
-/// an invocation, and a source Bridle cannot inspect names none.
+/// an invocation, and a source the shell inspector cannot inspect names none.
 fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
     fn find(inspection: &ShellInspection, verbs: &[&str]) -> Option<String> {
         inspection
@@ -1011,7 +1011,7 @@ pub(super) fn is_git(program: &str) -> bool {
     name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
 }
 
-/// Resolve a single argument with Bridle's word parser. Argument data is not
+/// Resolve a single argument with the shell inspector's word parser. Argument data is not
 /// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
 pub(super) fn literal(word: &str) -> Option<String> {
     crate::shell_inspect::literal_shell_word(word).ok()
@@ -1104,7 +1104,7 @@ fn inspect_commands(
         match verb.as_str() {
             "commit" if native_commit_broker => continue,
             // Complement the preexisting lexical attribution guard for
-            // quoted executable/verb spellings resolved by Bridle.
+            // quoted executable/verb spellings resolved by the shell inspector.
             "commit" | "merge" | "rebase" | "cherry-pick" | "revert" => {
                 let aborting = verb != "commit"
                     && args

@@ -225,6 +225,13 @@ fn extras() -> Vec<String> {
             "printf before; {prefix} 'cargo' check --offline 2>&1 | tail -30"
         ));
     }
+    // The inherited tests build two more inputs at run time, so the literals in `CORPUS`
+    // are their parts and not what the inspector is given: a quoted heredoc whose body
+    // holds a substitution, a backquote and an unmatched quote, and a substitution around
+    // a quoted path.
+    let body = "literal $(touch never) `touch neither` 'unmatched\n";
+    inputs.push(format!("cat <<'EOF'\n{body}EOF\n"));
+    inputs.push("echo $(touch '/tmp/newt-inspect-marker')".to_string());
     inputs
 }
 
