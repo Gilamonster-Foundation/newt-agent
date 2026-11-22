@@ -2667,6 +2667,62 @@ async fn broker_bearing_commit_denial_now_consults_the_gate() {
     );
 }
 
+/// #3146 regression, found only by the `native_git_commit` proof in the Seatbelt lane: a
+/// command the inspector cannot read that names `git commit` is refused whole, before any of
+/// it runs, even with a commit policy at hand. Binding the broker on the bare words let the
+/// direct commit land before the commit a dispatcher ran beside it was refused. Nothing is
+/// spawned here: the refusal comes before the shell.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_in_a_command_the_inspector_cannot_read_is_refused_before_anything_runs() {
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = super::disable_ocap_tests::EnvVar::unset("NEWT_DISABLE_OCAP");
+    let ws = tempfile::tempdir().unwrap();
+    let workspace = ws.path().canonicalize().unwrap();
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    let base = caveats_rw(&workspace);
+    let git_tool = crate::agentic::tools::tests::git_shell_grant::FixtureGitTool;
+    for command in [
+        "touch ran; if true; then git commit --allow-empty -m x; fi",
+        "touch ran; git commit --allow-empty -m direct; \
+         find . -maxdepth 0 -exec timeout 30 git commit --allow-empty -m delegated \\;",
+    ] {
+        let mut gate = MockGate::new(true, &base);
+        let result = execute_tool_with_collaborators(
+            "run_command",
+            &serde_json::json!({ "command": command }),
+            &workspace_str,
+            false,
+            20,
+            &base,
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+                git_tool: Some(&git_tool),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            result.contains("refusing Git commit publication")
+                && result.contains("shell inspection failed")
+                && result.contains("No command ran"),
+            "{command}: {result}"
+        );
+        assert!(gate.asks.is_empty(), "{command}: {:?}", gate.asks);
+        assert!(
+            !workspace.join("ran").exists(),
+            "{command}: its first command ran"
+        );
+    }
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.

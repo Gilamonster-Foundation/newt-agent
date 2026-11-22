@@ -147,9 +147,11 @@ fn hides_git_delete(source: &str) -> bool {
 /// Every `git` invocation `source` makes, as `(verb, arguments)`, read from its bare
 /// words without Bridle: segments split at shell punctuation, and `git` taken
 /// anywhere in a segment, so `then git commit -m x` and `xargs git branch -d` count.
-/// A tripwire, not a boundary: words keep their quotes, so git text inside an
-/// interpreter string (`sh -c '…'`) stays the confined executor's, as does an
-/// obfuscated command.
+/// A tripwire, not a boundary. Words are split at white space and keep their quotes,
+/// so `'git fetch'` or `"git` is not git, but git text inside a longer quoted
+/// string, a comment or a here-document is read as an invocation wherever no quote
+/// touches the `git` or the verb. An obfuscated command stays the confined
+/// executor's.
 fn bare_git_invocations(source: &str) -> Vec<(String, Vec<String>)> {
     let mut found = Vec::new();
     for segment in source.split(['|', ';', '&', '\n', '(', ')', '`', '<', '>']) {
@@ -171,8 +173,12 @@ const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out 
     newt then asks the operator.";
 
 /// The first `git` verb in `verbs` that `source` invokes anywhere, nested
-/// constructs included. A loose trigger: text that merely mentions Git is not
-/// an invocation, and a source Bridle cannot inspect names none.
+/// constructs included. A loose trigger. In a source the inspector can read, text
+/// that merely mentions Git is not an invocation. In one it cannot read (#3146) the
+/// verb is read from the bare words, see [`bare_git_invocations`], and git text
+/// that no quote touches counts even when nothing would run it. A false hit costs:
+/// one network prompt the command did not need (a decline refuses the command), or
+/// for a push or a commit a refusal of the whole command. Never a missed gate.
 fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
     fn find(inspection: &ShellInspection, verbs: &[&str]) -> Option<String> {
         inspection
@@ -208,8 +214,19 @@ fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
     }
 }
 
+/// Whether `run_command` binds the commit broker to `source`. Only for a source the
+/// inspector can read: the broker covers a commit the shell itself runs, not one a
+/// dispatcher runs (`find -exec`, `timeout`), and telling the two apart takes the inspection.
 pub(super) fn needs_commit_broker(source: &str) -> bool {
-    git_verb_in(source, &["commit"]).is_some()
+    inspect_shell(source).is_ok() && git_verb_in(source, &["commit"]).is_some()
+}
+
+/// #3146: whether `source`, which the inspector cannot read, runs `git commit` by its bare
+/// words. No broker can be bound to it (see [`needs_commit_broker`]), so `run_command`
+/// refuses the whole command before any of it runs. With the broker bound instead, a direct
+/// commit landed before the confined shell refused the commit a dispatcher ran beside it.
+pub(super) fn commit_in_an_uninspectable_source(source: &str) -> bool {
+    inspect_shell(source).is_err() && git_verb_in(source, &["commit"]).is_some()
 }
 
 /// Git verbs that read from a remote. Pure data: a three-Cs candidate for the
@@ -2442,21 +2459,47 @@ mod tests {
         ] {
             assert_eq!(git_verb_in(source, NETWORK_READ_VERBS), None, "{source}");
         }
+        // The fallback's real reach, pinned so it cannot widen unnoticed. It runs on every
+        // source the inspector refuses, an interpreter or a dispatcher included, and git
+        // text counts wherever no quote touches the `git` or the verb: in a quoted
+        // sentence, in an interpreter string, in a comment, in a here-document.
+        for source in [
+            "python3 -c \"print('then run git fetch origin')\"",
+            "sh -c 'cd sub && git fetch origin'",
+            "if true; then :; fi # later: git fetch origin",
+            "if true; then cat <<EOF\nrun git fetch origin\nEOF\nfi",
+        ] {
+            assert!(inspect_shell(source).is_err(), "{source}");
+            assert_eq!(
+                git_verb_in(source, NETWORK_READ_VERBS).as_deref(),
+                Some("fetch"),
+                "{source}"
+            );
+        }
     }
 
     /// #3146: the triggers that key on `git_verb_in` now fire inside a construct Bridle
-    /// cannot inspect: a commit gets the attribution broker instead of reaching the
-    /// confined shell without one, and a push goes to the push broker, which refuses
-    /// what is not a standalone push with a retry that works.
+    /// cannot inspect. A push goes to the push broker, which refuses what is not a
+    /// standalone push with a retry that works. A commit is named for refusal and gets NO
+    /// broker: the broker covers only a commit the inspection shows to be the shell's own,
+    /// and the third source is the `native_git_commit` proof's, where a broker bound on
+    /// the bare words let `direct` land before the dispatcher's commit was refused.
     #[test]
-    fn the_brokers_are_chosen_inside_a_construct_bridle_cannot_inspect() {
+    fn a_push_in_a_construct_bridle_cannot_inspect_reaches_its_broker_and_a_commit_is_refused() {
         for source in [
             "if [ -z \"$x\" ]; then git commit -m x; fi",
             "while true; do git commit -am wip; break; done",
+            "git commit --allow-empty -m direct; find . -maxdepth 0 -exec timeout 30 git commit --allow-empty -m delegated \\;",
         ] {
             assert!(inspect_shell(source).is_err(), "{source}");
-            assert!(needs_commit_broker(source), "{source}");
+            assert!(commit_in_an_uninspectable_source(source), "{source}");
+            assert!(!needs_commit_broker(source), "{source}");
             assert!(!needs_push_broker(source), "{source}");
+        }
+        // A commit the inspector can read keeps its broker and is not refused here.
+        for source in ["git commit -m x", "git add -A && git commit -m x"] {
+            assert!(needs_commit_broker(source), "{source}");
+            assert!(!commit_in_an_uninspectable_source(source), "{source}");
         }
         for source in [
             "if [ -z \"$x\" ]; then git push origin HEAD; fi",
@@ -2467,6 +2510,9 @@ mod tests {
             assert!(!needs_commit_broker(source), "{source}");
         }
         assert!(!needs_commit_broker("if true; then git status; fi"));
+        assert!(!commit_in_an_uninspectable_source(
+            "if true; then git status; fi"
+        ));
         assert!(!needs_push_broker("if true; then git status; fi"));
     }
 
@@ -2474,7 +2520,7 @@ mod tests {
     /// command and nothing runs.
     #[test]
     fn a_network_read_inside_an_if_asks_the_operator() {
-        let source = "git fetch origin; if [ -z \"$x\" ]; then echo a; fi";
+        let source = "if [ -z \"$x\" ]; then git fetch origin; fi";
         let mut gate = EgressGate {
             allow: false,
             ..Default::default()

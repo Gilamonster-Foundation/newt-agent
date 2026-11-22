@@ -4700,7 +4700,11 @@ async fn execute_authorized_tool(
             } else {
                 None
             };
-            if governed_git && run_command_creates_shell_git_commit(cmd) && commit_broker.is_none() {
+            // #3146: the lexical check misses a commit behind a shell keyword (`then git
+            // commit`), and a source the inspector cannot read gets no broker, so the
+            // bare-word trigger sends that source to the same refusal.
+            let commit_named = run_command_creates_shell_git_commit(cmd) || native_git::commit_in_an_uninspectable_source(cmd);
+            if governed_git && commit_named && commit_broker.is_none() {
                 let reason = match agent_bridle::inspect_shell(cmd) {
                     Err(error) => format!("shell inspection failed: {error}"),
                     Ok(_) if commit_requested => "native commit attribution/signing policy is unavailable in this session".to_owned(),
