@@ -128,9 +128,8 @@ fn other_data_loss_op(verb: &str, args: &[String]) -> Option<&'static str> {
 /// delete, or another work-destroying op, as a bare word, as `xargs git branch -d`
 /// does. Without this,
 /// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
-/// tripwire, not a boundary: like the commit check in `catalog.rs`, words keep
-/// their quotes, so git text inside an interpreter string (`sh -c '…'`) stays
-/// the confined executor's, as does an obfuscated command.
+/// tripwire, not a boundary: it reads the bare words of [`bare_git_invocations`],
+/// which says what that sees and what it does not.
 fn hides_git_delete(source: &str) -> bool {
     bare_git_invocations(source).iter().any(|(verb, args)| {
         other_data_loss_op(verb, args).is_some()
@@ -178,7 +177,9 @@ const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out 
 /// verb is read from the bare words, see [`bare_git_invocations`], and git text
 /// that no quote touches counts even when nothing would run it. A false hit costs:
 /// one network prompt the command did not need (a decline refuses the command), or
-/// for a push or a commit a refusal of the whole command. Never a missed gate.
+/// for a push or a commit a refusal of the whole command. Never a missed gate. The
+/// push refusal ends with the push retry text, so a command that only mentioned a
+/// push is told how to push.
 fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
     fn find(inspection: &ShellInspection, verbs: &[&str]) -> Option<String> {
         inspection
@@ -364,8 +365,9 @@ fn is_gh(program: &str) -> bool {
     name.eq_ignore_ascii_case("gh") || name.eq_ignore_ascii_case("gh.exe")
 }
 
-/// issue-1188: is `source` a `git push` invocation anywhere in it (loose
-/// trigger, same shape as [`needs_commit_broker`])? A `true` here routes the
+/// issue-1188: is `source` a `git push` invocation anywhere in it (a loose
+/// trigger; unlike [`needs_commit_broker`] it also fires on the bare words of a
+/// source the inspector cannot read)? A `true` here routes the
 /// WHOLE `run_command` call to [`execute_governed_push`] instead of the
 /// confined shell — that function applies the source-bound/fixed-argv
 /// check and refuses anything this loose scan admits but the broker cannot
