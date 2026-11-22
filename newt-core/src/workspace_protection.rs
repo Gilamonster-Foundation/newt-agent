@@ -314,9 +314,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn every_implicit_root_list_reaches_the_guard() {
-        let temp = tempfile::tempdir().unwrap();
-        let operator = temp.path().join("operator");
-        std::fs::create_dir(&operator).unwrap();
+        // A fixed path that does not exist: the guard protects an absent resource
+        // without creating it, so the test needs no real directory.
+        let operator = PathBuf::from("/newt-virtual-operator");
         // A private key is read-protected; a policy file is only write-protected.
         let key_guard = WorkspaceProtection::new(&[], &[operator.join("identity.pem")]).unwrap();
         let policy_guard = WorkspaceProtection::new(&[operator.join("policy.age")], &[]).unwrap();
