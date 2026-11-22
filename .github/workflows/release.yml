@@ -783,10 +783,21 @@ jobs:
           for shim in "@gilamonster/newt" "@gilamonster/newt-mcp-server"; do
             bin="${shim##*/}"
             out="dist-npm/${bin}-${{ matrix.key }}"
+            # #3151: ship `date`, `grep` and `rg` from the carried command pack the archive
+            # holds (macOS only) beside newt: the two GNU behaviours the host lacks and the
+            # ripgrep `grep` needs. The rest of the pack stays out of the package for size.
+            pack="incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/tools"
+            tools=()
+            if [ "$bin" = newt ] && [ -d "$pack" ]; then
+              subset="$RUNNER_TEMP/newt-npm-tools"
+              mkdir -p "$subset"
+              cp "$pack/date" "$pack/grep" "$pack/rg" "$pack/LICENSE-uutils" "$pack"/ripgrep-* "$subset/"
+              tools=(--tools "$subset")
+            fi
             node npm/scripts/build-platform-package.mjs \
               --name "$shim" \
               --binary "incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/${bin}${{ matrix.binary_ext }}" \
-              --key "${{ matrix.key }}" --version "$VERSION" --out "$out"
+              --key "${{ matrix.key }}" --version "$VERSION" --out "$out" "${tools[@]}"
             ( cd "$out"
               PKG=$(node -p "require('./package.json').name")
               if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
