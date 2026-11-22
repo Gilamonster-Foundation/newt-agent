@@ -2057,7 +2057,7 @@ fn single_grant_covers_missing(
 /// its entirety, is a single simple command with no dynamic content and no
 /// redirect that can itself mutate state. Round 2's "denied spawn is the
 /// FIRST command in source order" check conflated SOURCE order with
-/// EXECUTION order: `agent_bridle::inspect_shell` is a non-executing,
+/// EXECUTION order: `crate::shell_inspect::inspect_shell` is a non-executing,
 /// source-order inventory, and source order is not a safety witness for
 /// several shapes it still has to represent faithfully —
 /// a command substitution's inner command expands (and can run arbitrary
@@ -2081,7 +2081,7 @@ fn single_grant_covers_missing(
 /// command itself — the existing, always-safe fallback. Fails closed on an
 /// inspection error.
 fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
-    let Ok(inspection) = agent_bridle::inspect_shell(cmd) else {
+    let Ok(inspection) = crate::shell_inspect::inspect_shell(cmd) else {
         return false;
     };
     if !inspection.warnings.is_empty() || !inspection.constructs.is_empty() {
@@ -2132,15 +2132,15 @@ fn requests_are_replay_safe(requests: &[PermissionRequest], cmd: &str) -> bool {
 /// shell engine opens a redirect relative to its exec-authority check, so
 /// [`exec_denial_is_replay_safe`] treats a write-shaped redirect as
 /// disqualifying on principle rather than assuming today's engine order.
-fn redirect_has_effect(redirect: &agent_bridle::InspectedRedirect) -> bool {
+fn redirect_has_effect(redirect: &crate::shell_inspect::InspectedRedirect) -> bool {
     matches!(
         redirect.operation,
-        agent_bridle::RedirectOperation::Write
-            | agent_bridle::RedirectOperation::Append
-            | agent_bridle::RedirectOperation::ReadWrite
-            | agent_bridle::RedirectOperation::Clobber
-            | agent_bridle::RedirectOperation::OutputAndError
-            | agent_bridle::RedirectOperation::AppendOutputAndError
+        crate::shell_inspect::RedirectOperation::Write
+            | crate::shell_inspect::RedirectOperation::Append
+            | crate::shell_inspect::RedirectOperation::ReadWrite
+            | crate::shell_inspect::RedirectOperation::Clobber
+            | crate::shell_inspect::RedirectOperation::OutputAndError
+            | crate::shell_inspect::RedirectOperation::AppendOutputAndError
     )
 }
 
@@ -4710,7 +4710,7 @@ async fn execute_authorized_tool(
             // bare-word trigger sends that source to the same refusal.
             let commit_named = run_command_creates_shell_git_commit(cmd) || native_git::commit_in_an_uninspectable_source(cmd);
             if governed_git && commit_named && commit_broker.is_none() {
-                let reason = match agent_bridle::inspect_shell(cmd) {
+                let reason = match crate::shell_inspect::inspect_shell(cmd) {
                     Err(error) => format!("shell inspection failed: {error}"),
                     Ok(_) if commit_requested => "native commit attribution/signing policy is unavailable in this session".to_owned(),
                     Ok(_) => "this commit-producing Git operation is not supported by the native broker".to_owned(),

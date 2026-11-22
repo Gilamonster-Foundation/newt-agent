@@ -176,7 +176,7 @@ fn words(
 
 pub(super) fn classify(source: &str, known: &dyn Fn(&str, bool) -> bool) -> Option<Intent> {
     fn inspect(
-        inspection: &agent_bridle::ShellInspection,
+        inspection: &crate::shell_inspect::ShellInspection,
         known: &dyn Fn(&str, bool) -> bool,
     ) -> Option<Intent> {
         let stable_cwd = inspection.constructs.is_empty()
@@ -214,7 +214,7 @@ pub(super) fn classify(source: &str, known: &dyn Fn(&str, bool) -> bool) -> Opti
                 })
             })
     }
-    match agent_bridle::inspect_shell(source) {
+    match crate::shell_inspect::inspect_shell(source) {
         Ok(inspection) => inspect(&inspection, known),
         Err(_) => {
             // Opaque dispatch cannot establish creation intent. It may force

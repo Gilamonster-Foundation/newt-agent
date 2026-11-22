@@ -14,7 +14,7 @@ use push_failure::classify_failure;
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::caveats::{Caveats, CaveatsExt};
 use crate::git_caveats::GitCaveats;
-use agent_bridle::{inspect_shell, ShellInspection};
+use crate::shell_inspect::{inspect_shell, ShellInspection};
 use std::path::{Path, PathBuf};
 
 pub(super) fn preflight(
@@ -26,7 +26,7 @@ pub(super) fn preflight(
 ) -> Result<(), String> {
     let inspection = match inspect_shell(source) {
         Ok(inspection) => inspection,
-        // Bridle cannot see into xargs, sh -c, env and the like, so a delete
+        // The shell inspector cannot see into xargs, sh -c, env and the like, so a delete
         // behind one would run without the confirmation below. Refuse it.
         Err(_) if hides_git_delete(source) => {
             return Err(format!(
@@ -124,7 +124,7 @@ fn other_data_loss_op(verb: &str, args: &[String]) -> Option<&'static str> {
     }
 }
 
-/// Whether `source`, which Bridle could not inspect, runs a branch or stash
+/// Whether `source`, which the shell inspector could not inspect, runs a branch or stash
 /// delete, or another work-destroying op, as a bare word, as `xargs git branch -d`
 /// does. Without this,
 /// `git branch --merged | xargs git branch -d` deleted `main` unasked. A
@@ -144,7 +144,7 @@ fn hides_git_delete(source: &str) -> bool {
 }
 
 /// Every `git` invocation `source` makes, as `(verb, arguments)`, read from its bare
-/// words without Bridle: segments split at shell punctuation, and `git` taken
+/// words without the shell inspector: segments split at shell punctuation, and `git` taken
 /// anywhere in a segment, so `then git commit -m x` and `xargs git branch -d` count.
 /// A tripwire, not a boundary. Words are split at white space and keep their quotes,
 /// so `'git fetch'` or `"git` is not git, but git text inside a longer quoted
@@ -204,10 +204,10 @@ fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
     }
     match inspect_shell(source) {
         Ok(inspection) => find(&inspection, verbs),
-        // #3146: Bridle errors on an `if`, `while`, `until`, `case`, subshell or brace
-        // group, and one anywhere in a command hid every git verb from the triggers
-        // that use this (the network prompt and the commit and push brokers). Read the
-        // bare words instead, as the delete tripwire does.
+        // #3146: the shell inspector errors on an `if`, `while`, `until`, `case`, subshell
+        // or brace group, and one anywhere in a command hid every git verb from the
+        // triggers that use this (the network prompt and the commit and push brokers).
+        // Read the bare words instead, as the delete tripwire does.
         Err(_) => bare_git_invocations(source)
             .into_iter()
             .filter_map(|(verb, _)| literal(&verb))
@@ -1102,10 +1102,10 @@ pub(super) fn is_git(program: &str) -> bool {
     name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
 }
 
-/// Resolve a single argument with Bridle's word parser. Argument data is not
+/// Resolve a single argument with the shell inspector's word parser. Argument data is not
 /// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
 pub(super) fn literal(word: &str) -> Option<String> {
-    agent_bridle_tool_shell::literal_shell_word(word).ok()
+    crate::shell_inspect::literal_shell_word(word).ok()
 }
 
 /// Find the native verb without translating argv. Repository/config selectors
@@ -1207,7 +1207,7 @@ fn inspect_commands(
         match verb.as_str() {
             "commit" if native_commit_broker => continue,
             // Complement the preexisting lexical attribution guard for
-            // quoted executable/verb spellings resolved by Bridle.
+            // quoted executable/verb spellings resolved by the shell inspector.
             "commit" | "merge" | "rebase" | "cherry-pick" | "revert" => {
                 let aborting = verb != "commit"
                     && args
@@ -2422,16 +2422,16 @@ mod tests {
     }
 
     /// #3146, found live: a fetch followed by a loop holding an `if` died at the fence
-    /// with no network prompt, because Bridle cannot inspect an `if` and the command
-    /// was read as having no git verb. The verb is now read from the bare words.
+    /// with no network prompt, because the shell inspector cannot read an `if` and the
+    /// command was read as having no git verb. The verb is now read from the bare words.
     #[test]
-    fn a_git_verb_in_a_command_bridle_cannot_inspect_is_still_seen() {
+    fn a_git_verb_in_an_uninspectable_command_is_still_seen() {
         let live = "git fetch --prune origin 2>&1 | head -5; echo \"=== local branches ===\"; \
                     for b in $(git for-each-ref refs/heads); do merged=$(git log -1 $b); \
                     if [ -z \"$merged\" ]; then echo $b; fi; done";
         assert!(
             inspect_shell(live).is_err(),
-            "the premise: Bridle cannot read it"
+            "the premise: the inspector cannot read it"
         );
         assert_eq!(
             git_verb_in(live, NETWORK_READ_VERBS).as_deref(),
@@ -2480,14 +2480,14 @@ mod tests {
         }
     }
 
-    /// #3146: the triggers that key on `git_verb_in` now fire inside a construct Bridle
-    /// cannot inspect. A push goes to the push broker, which refuses what is not a
+    /// #3146: the triggers that key on `git_verb_in` now fire inside a construct the shell
+    /// inspector cannot read. A push goes to the push broker, which refuses what is not a
     /// standalone push with a retry that works. A commit is named for refusal and gets NO
     /// broker: the broker covers only a commit the inspection shows to be the shell's own,
     /// and the third source is the `native_git_commit` proof's, where a broker bound on
     /// the bare words let `direct` land before the dispatcher's commit was refused.
     #[test]
-    fn a_push_in_a_construct_bridle_cannot_inspect_reaches_its_broker_and_a_commit_is_refused() {
+    fn a_push_in_an_uninspectable_construct_reaches_its_broker_and_a_commit_is_refused() {
         for source in [
             "if [ -z \"$x\" ]; then git commit -m x; fi",
             "while true; do git commit -am wip; break; done",
