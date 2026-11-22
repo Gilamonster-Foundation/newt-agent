@@ -4671,9 +4671,13 @@ async fn execute_authorized_tool(
 
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
-            if let Some(tool) = run_command_redirect(cmd)
-                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "find" | "grep"))
-            {
+            // `find`/`grep` are real binaries: once the command names a directory
+            // (a folded `cd`, or `cwd`) the tool cannot honour it, and outside the
+            // workspace it refuses and points back here — so run the shell.
+            let has_dir = cd_path.is_some() || args.get("cwd").is_some_and(|c| !c.is_null());
+            if let Some(tool) = run_command_redirect(cmd).filter(|tool| {
+                (smart_harness.is_none() && !has_dir) || !matches!(*tool, "find" | "grep")
+            }) {
                 return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
