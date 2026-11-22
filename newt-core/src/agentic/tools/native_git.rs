@@ -4062,8 +4062,9 @@ mod governed_push_tests {
                 .any(|line| line.contains("/o/r.git/info/refs?service=git-upload-pack"));
             assert_eq!(dialed, allow, "allow={allow}: {output} / {seen:?}");
             if !allow {
+                // The refusal names the verb the command ran, `ls-remote` here.
                 assert!(
-                    output.contains("network access for this `git fetch` was not granted"),
+                    output.contains("network access for this `git ls-remote` was not granted"),
                     "{output}"
                 );
             }
