@@ -6,12 +6,22 @@ version.workspace = true
 # newt-eval, newt-web) through the workspace manifest, so they fail
 # deterministically anywhere newt-core is not sitting in this monorepo —
 # an extracted package, a vendored copy, a `cargo test` on the published
-# tarball. Excluding them keeps the package self-contained (#1823 A0-9).
+# tarball. Excluding them keeps the package self-contained (#1823 A0-9). Every test that
+# declares `mod common;` is excluded too, because `tests/common` is: the guard
+# tests/package_excludes.rs fails on one that is not listed here (#3164), and is excluded
+# itself, since its twin looks for tests the package does not ship.
 exclude = [
     "tests/markup_sprawl_ratchet.rs",
     "tests/first_principle.rs",
     "tests/inert_code_ratchet.rs",
     "tests/closure_ledger.rs",
+    "tests/adapter.rs",
+    "tests/epic_size.rs",
+    "tests/extension_purity.rs",
+    "tests/resolve_publishes_ratchet.rs",
+    "tests/skill_dirs_one_owner.rs",
+    "tests/terminal_taker_registry.rs",
+    "tests/package_excludes.rs",
     "tests/common",
 ]
 edition.workspace = true
