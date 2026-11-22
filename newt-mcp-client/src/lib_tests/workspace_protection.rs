@@ -57,7 +57,7 @@ fn prepared_stdio_rejects_the_configured_commands_protected_read() {
             &f.base,
             secret_command.to_str().unwrap(),
             Some(&f.guard),
-            &agent_bridle::SandboxPolicy::default(),
+            &SandboxRoots::from(&agent_bridle::SandboxPolicy::default()),
             true
         )
         .is_err(),
@@ -79,7 +79,7 @@ fn prepared_stdio_validates_its_actual_implicit_read_policy() {
             &f.base,
             f.program.to_str().unwrap(),
             Some(&f.guard),
-            &policy,
+            &SandboxRoots::from(&policy),
             true
         )
         .is_err(),
@@ -90,20 +90,20 @@ fn prepared_stdio_validates_its_actual_implicit_read_policy() {
 #[test]
 fn protected_stdio_refuses_advisory_transport_but_preserves_legacy_selection() {
     let f = Fixture::new();
-    let policy = agent_bridle::SandboxPolicy::default();
+    let roots = SandboxRoots::from(&agent_bridle::SandboxPolicy::default());
     assert!(
         prepare_stdio_caveats(
             &f.base,
             f.program.to_str().unwrap(),
             Some(&f.guard),
-            &policy,
+            &roots,
             false
         )
         .is_err(),
         "protected sessions require actual local process confinement"
     );
     assert!(
-        prepare_stdio_caveats(&f.base, f.program.to_str().unwrap(), None, &policy, false).is_ok(),
+        prepare_stdio_caveats(&f.base, f.program.to_str().unwrap(), None, &roots, false).is_ok(),
         "legacy advisory behavior remains explicit and unchanged"
     );
 }
@@ -115,7 +115,7 @@ fn lawful_prepared_stdio_preserves_each_other_authority_axis() {
         &f.base,
         f.program.to_str().unwrap(),
         Some(&f.guard),
-        &agent_bridle::SandboxPolicy::default(),
+        &SandboxRoots::from(&agent_bridle::SandboxPolicy::default()),
         true,
     )
     .unwrap();

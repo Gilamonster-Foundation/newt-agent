@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::validate_stable_anchor;
 use crate::paths::{normalize_path, resolve_uncreated_path};
+use crate::sandbox_seam::SandboxRoots;
 use crate::{Caveats, DenialKind, Scope};
 
 #[derive(Clone, Debug)]
@@ -57,24 +58,20 @@ impl WorkspaceProtection {
     /// Validate actual filesystem authority, including the existing sandbox's
     /// implicit read/loader/executable roots and writable device sinks.
     pub fn validate_caveats(&self, caveats: &Caveats) -> anyhow::Result<()> {
-        self.validate_with_sandbox_policy(caveats, &crate::confined_exec::runtime_sandbox_policy())
+        self.validate_with_sandbox_roots(caveats, &SandboxRoots::runtime())
     }
 
     /// Validate against the exact runtime substrate selected by a child launcher.
-    pub fn validate_with_sandbox_policy(
+    pub fn validate_with_sandbox_roots(
         &self,
         caveats: &Caveats,
-        policy: &agent_bridle::SandboxPolicy,
+        roots: &SandboxRoots,
     ) -> anyhow::Result<()> {
-        self.validate_policy(caveats, policy)
+        self.validate_policy(caveats, roots)
             .map_err(|error| anyhow::anyhow!("{error:#}; {}", crate::ocap_store::REPAIR_HINT))
     }
 
-    fn validate_policy(
-        &self,
-        caveats: &Caveats,
-        policy: &agent_bridle::SandboxPolicy,
-    ) -> anyhow::Result<()> {
+    fn validate_policy(&self, caveats: &Caveats, implicit: &SandboxRoots) -> anyhow::Result<()> {
         for resource in &self.write_protected {
             anyhow::ensure!(
                 resolve_uncreated_path(&resource.named)? == resource.resolved,
@@ -87,19 +84,19 @@ impl WorkspaceProtection {
         // does not consume these Unix runtime path lists. In particular, `/dev`
         // is not an implicit grant to the current Windows drive's `dev` folder.
         #[cfg(windows)]
-        let _ = policy;
+        let _ = implicit;
         #[cfg(not(windows))]
         let writes = {
             let mut writes = writes;
-            let devices = policy.device_sink_paths.resolve();
+            let devices = &implicit.device_sink_paths;
             writes.extend(devices.iter().map(PathBuf::from));
             for roots in [
-                policy.base_read_paths.resolve(),
-                policy.bin_read_paths.resolve(),
-                policy.loader_paths.resolve(),
+                &implicit.base_read_paths,
+                &implicit.bin_read_paths,
+                &implicit.loader_paths,
                 devices,
             ] {
-                reads.extend(roots.into_iter().map(PathBuf::from));
+                reads.extend(roots.iter().map(PathBuf::from));
             }
             writes
         };
@@ -300,13 +297,54 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn implicit_sandbox_read_roots_cannot_expose_private_keys() {
-        let policy = crate::confined_exec::runtime_sandbox_policy();
-        let Some(root) = policy.base_read_paths.resolve().into_iter().next() else {
+        let Some(root) = SandboxRoots::runtime().base_read_paths.into_iter().next() else {
             return;
         };
         let key = Path::new(&root).join("newt-protected-key-fixture");
         let protection = WorkspaceProtection::new(&[], &[key]).unwrap();
         assert!(protection.validate_caveats(&authority(&[], &[])).is_err());
+    }
+
+    /// Each implicit list reaches the guard by itself, on the axes the launcher
+    /// grants it: all four are read, and the device sinks are also written.
+    #[cfg(not(windows))]
+    #[test]
+    fn every_implicit_root_list_reaches_the_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let operator = temp.path().join("operator");
+        std::fs::create_dir(&operator).unwrap();
+        // A private key is read-protected; a policy file is only write-protected.
+        let key_guard = WorkspaceProtection::new(&[], &[operator.join("identity.pem")]).unwrap();
+        let policy_guard = WorkspaceProtection::new(&[operator.join("policy.age")], &[]).unwrap();
+        let caveats = authority(&[], &[]);
+        let names = [
+            "base_read_paths",
+            "bin_read_paths",
+            "loader_paths",
+            "device_sink_paths",
+        ];
+        // One list at a time holds the operator directory; `None` is the control.
+        for only in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let list = |index: usize| {
+                if only == Some(index) {
+                    vec![operator.to_string_lossy().into_owned()]
+                } else {
+                    Vec::new()
+                }
+            };
+            let roots = SandboxRoots {
+                base_read_paths: list(0),
+                bin_read_paths: list(1),
+                loader_paths: list(2),
+                device_sink_paths: list(3),
+            };
+            let name = only.map_or("no list", |index| names[index]);
+            let refused = |guard: &WorkspaceProtection| {
+                guard.validate_with_sandbox_roots(&caveats, &roots).is_err()
+            };
+            assert_eq!(refused(&key_guard), only.is_some(), "{name}: key");
+            assert_eq!(refused(&policy_guard), only == Some(3), "{name}: policy");
+        }
     }
 
     #[test]
@@ -346,21 +384,19 @@ mod tests {
             std::slice::from_ref(&operator),
         )
         .unwrap();
-        let mut policy = agent_bridle::SandboxPolicy::default();
-        for roots in [
-            &mut policy.base_read_paths,
-            &mut policy.bin_read_paths,
-            &mut policy.loader_paths,
-            &mut policy.device_sink_paths,
-        ] {
-            roots.extra.push(operator.to_str().unwrap().to_owned());
-        }
+        let operator_root = || vec![operator.to_str().unwrap().to_owned()];
+        let roots = SandboxRoots {
+            base_read_paths: operator_root(),
+            bin_read_paths: operator_root(),
+            loader_paths: operator_root(),
+            device_sink_paths: operator_root(),
+        };
         protection
-            .validate_with_sandbox_policy(&authority(&[], &[]), &policy)
+            .validate_with_sandbox_roots(&authority(&[], &[]), &roots)
             .unwrap();
         for caveats in [authority(&[&operator], &[]), authority(&[], &[&operator])] {
             assert!(protection
-                .validate_with_sandbox_policy(&caveats, &policy)
+                .validate_with_sandbox_roots(&caveats, &roots)
                 .is_err());
         }
     }

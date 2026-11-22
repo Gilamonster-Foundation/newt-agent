@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::BackendRef;
 use crate::agentic::smart_harness::AdjudicationSettings;
 use crate::caveats::{Caveats, Scope};
+use crate::sandbox_seam::SandboxRoots;
 
 /// Opt-in accounted navigation and independent narration adjudication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,14 +379,13 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
     // The executor grants these paths in addition to explicit Caveats. Reuse
     // its policy data, including executable search roots, rather than treating
     // a narrow tool-level grant as the full filesystem authority.
-    let policy = crate::confined_exec::runtime_sandbox_policy();
-    let device_sinks = policy.device_sink_paths.resolve();
-    writable.extend(device_sinks.iter().map(PathBuf::from));
+    let implicit = SandboxRoots::runtime();
+    writable.extend(implicit.device_sink_paths.iter().map(PathBuf::from));
     for paths in [
-        policy.base_read_paths.resolve(),
-        policy.bin_read_paths.resolve(),
-        device_sinks,
-        policy.loader_paths.resolve(),
+        implicit.base_read_paths,
+        implicit.bin_read_paths,
+        implicit.device_sink_paths,
+        implicit.loader_paths,
     ] {
         roots.extend(paths.into_iter().map(PathBuf::from));
     }
@@ -637,10 +637,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let private = tempfile::tempdir().unwrap();
         let mut caveats = crate::confined_exec::build_tool_caveats(workspace.path());
-        for root in agent_bridle::SandboxPolicy::default()
-            .base_read_paths
-            .resolve()
-        {
+        let implicit = SandboxRoots::runtime().base_read_paths;
+        assert!(!implicit.is_empty(), "no implicit root to check");
+        for root in implicit {
             let cwd = std::env::current_dir();
             let result = SmartHarnessConfig::validate_frame_directory(
                 Path::new(&root),
@@ -978,10 +977,7 @@ mod tests {
 fn selected_developer_runtime_cannot_contain_a_private_frame() {
     let workspace = tempfile::tempdir().unwrap();
     let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-    for root in crate::confined_exec::runtime_sandbox_policy()
-        .base_read_paths
-        .extra
-    {
+    for root in SandboxRoots::runtime().base_read_paths {
         assert!(SmartHarnessConfig::validate_frame_directory(
             &std::path::Path::new(&root).join("private-frame"),
             &caveats,
