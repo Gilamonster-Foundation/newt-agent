@@ -67,7 +67,7 @@ fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
             "init",
             &serde_json::json!({}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("initialized"), "got: {out}");
@@ -81,7 +81,7 @@ fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
         "add",
         &serde_json::json!({"paths": ["f.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let c = t
@@ -89,7 +89,7 @@ fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
             "commit",
             &serde_json::json!({"message": "first"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(c.contains("committed"), "got: {c}");
@@ -112,7 +112,7 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
         "init",
         &serde_json::json!({}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     // No commit yet → drain is zero (a bare `HEAD` move from init does NOT
@@ -127,7 +127,7 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
         "add",
         &serde_json::json!({"paths": ["f.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     // A FAILED commit (empty message is rejected) does NOT signal.
@@ -135,7 +135,7 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
         "commit",
         &serde_json::json!({"message": "   "}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     );
     assert!(bad.is_err(), "empty message must be rejected");
     assert_eq!(
@@ -148,7 +148,7 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
         "commit",
         &serde_json::json!({"message": "first"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     assert_eq!(t.drain_commit_success(), 1, "one confirmed commit");
@@ -159,7 +159,7 @@ fn drain_commit_success_signals_only_a_confirmed_landing() {
         "amend",
         &serde_json::json!({"message": "first (reworded)"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     assert_eq!(t.drain_commit_success(), 1, "amend signals a commit");
@@ -202,7 +202,7 @@ fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
         "init",
         &serde_json::json!({}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     // Off `main` before C2/C3: only the very first commit on an unborn
@@ -215,14 +215,14 @@ fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
         "add",
         &serde_json::json!({"paths": ["a.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "C1"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let c1 = head_message(dir.path());
@@ -250,14 +250,14 @@ fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
         "add",
         &serde_json::json!({"paths": ["b.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "C2"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let c2 = head_message(dir.path());
@@ -280,14 +280,14 @@ fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
         "add",
         &serde_json::json!({"paths": ["c.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "C3"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let c3 = head_message(dir.path());
@@ -325,7 +325,7 @@ fn failed_commit_does_not_consume_contributors() {
         "init",
         &serde_json::json!({}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
@@ -333,7 +333,7 @@ fn failed_commit_does_not_consume_contributors() {
         "add",
         &serde_json::json!({"paths": ["a.txt"]}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
 
@@ -343,7 +343,7 @@ fn failed_commit_does_not_consume_contributors() {
         "commit",
         &serde_json::json!({"message": "denied"}),
         &GitCaveats::read_only(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     );
     assert!(denied.is_err(), "read-only caps deny the commit");
     let cursor = t
@@ -362,7 +362,7 @@ fn failed_commit_does_not_consume_contributors() {
         "commit",
         &serde_json::json!({"message": "C1"}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let c1 = head_message(dir.path());
@@ -387,7 +387,7 @@ fn dispatch_init_is_idempotent_on_an_existing_repo() {
             "init",
             &serde_json::json!({}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("already a repository"), "got: {out}");
@@ -399,7 +399,7 @@ fn dispatch_init_is_denied_without_write_permission() {
         "init",
         &serde_json::json!({}),
         &GitCaveats::read_only(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     );
     assert!(res.is_err(), "read-only session must not create a repo");
     assert!(
@@ -417,7 +417,7 @@ fn dispatch_checkout_creates_branch_and_branch_delete_removes_it() {
             "checkout",
             &serde_json::json!({"name": "feat/dispatch"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.contains("created and switched"), "{out}");
@@ -426,7 +426,7 @@ fn dispatch_checkout_creates_branch_and_branch_delete_removes_it() {
         "checkout",
         &serde_json::json!({"name": "main", "create": false}),
         &GitCaveats::top(),
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .unwrap();
     let del = t
@@ -434,7 +434,7 @@ fn dispatch_checkout_creates_branch_and_branch_delete_removes_it() {
             "branch-delete",
             &serde_json::json!({"name": "feat/dispatch"}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap();
     assert_eq!(del, "deleted branch 'feat/dispatch'");
@@ -449,7 +449,7 @@ fn dispatch_unknown_op_lists_the_supported_ops() {
             "pull",
             &serde_json::json!({}),
             &GitCaveats::top(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(err.contains("unknown git op 'pull'"), "{err}");

@@ -316,10 +316,10 @@ fn approval_intake_resumes_as_act_even_when_the_text_opens_collaboratively() {
 // ---------------------------------------------------------------------------
 
 use newt_core::agentic::{PlanDraftSink as _, PlanModeControl as _};
-use newt_core::permissions::{
+use newt_core::Caveats;
+use newt_policy::permissions::{
     HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
 };
-use newt_core::Caveats;
 
 /// Answers each question with the next scripted outcome; records the
 /// questions asked. `ask`/`refresh_caveats` must never be reached by the
@@ -343,10 +343,10 @@ impl ScriptedGate {
 impl PermissionGate for ScriptedGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &newt_core::caveats::Caveats,
-        _request: &newt_core::permissions::PermissionRequest,
-    ) -> newt_core::permissions::PermissionDecision {
-        newt_core::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         panic!("plan approval must never request a permission grant");
@@ -363,7 +363,7 @@ impl PermissionGate for ScriptedGate {
     fn ask_choice(
         &mut self,
         question: &str,
-        options: &[newt_core::permissions::ChoiceSpec],
+        options: &[newt_policy::permissions::ChoiceSpec],
     ) -> HumanQuestionOutcome {
         assert_eq!(
             options.iter().map(|o| o.id).collect::<Vec<_>>(),

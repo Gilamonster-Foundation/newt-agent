@@ -7,7 +7,7 @@
 [`../design/loadout-composition.md`](../design/loadout-composition.md)) and the
 proposed **`team_clamp`** policy for `run_team`.
 **Authority substrate:** the `meet`-only `Caveats` algebra
-(`agent-mesh-protocol/src/caveats.rs`, re-exported via `newt-core/src/caveats.rs`),
+(`agent-mesh-protocol/src/caveats.rs`, re-exported via `newt-policy/src/caveats.rs`),
 `NamedPermissionPreset::clamp` (`newt-core/src/role_profile.rs`), the `Plan` /
 `CaveatPolicy` / `run_plan` path (`newt-core/src/plan.rs`,
 `newt-core/src/agentic/plan_exec.rs`), and the OCAP deviation ratchet

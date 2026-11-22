@@ -12,9 +12,9 @@
 //! guards did not exist, and the high-danger refusal ran ONLY for net.
 
 use super::*;
-use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::ocap_store::Verdict;
-use newt_core::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
+use newt_policy::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
 
 fn open_caveats() -> Caveats {
     Caveats {
@@ -132,8 +132,8 @@ fn exec_allow_permanent_writes_a_signed_approve_entry_and_folds_the_session() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
-        newt_core::PermissionDecision::Deny => panic!("must be granted"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
+        newt_policy::PermissionDecision::Deny => panic!("must be granted"),
     }
     assert_eq!(state.decisions.last().unwrap().scope, "permanent");
     let text = std::fs::read_to_string(approve_path(&config)).unwrap();
@@ -171,8 +171,8 @@ fn fs_write_of_a_broad_root_is_refused_and_store_is_untouched() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Deny => {}
-        newt_core::PermissionDecision::Allow(_) => panic!("a broad root must be refused"),
+        newt_policy::PermissionDecision::Deny => {}
+        newt_policy::PermissionDecision::Allow(_) => panic!("a broad root must be refused"),
     }
     assert!(!approve_path(&config).exists(), "nothing should be written");
 }
@@ -192,8 +192,8 @@ fn exec_relative_path_is_refused_and_store_is_untouched() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Deny => {}
-        newt_core::PermissionDecision::Allow(_) => panic!("a relative path must be refused"),
+        newt_policy::PermissionDecision::Deny => {}
+        newt_policy::PermissionDecision::Allow(_) => panic!("a relative path must be refused"),
     }
     assert!(!approve_path(&config).exists(), "nothing should be written");
 }
@@ -208,7 +208,10 @@ fn full_access_preapproval_is_recorded_as_a_session_grant_and_never_persisted() 
     let request = req(DenialKind::RemoteTool, "mail__search");
     let decision = gate(&mut state, &config, None, None, PromptChoice::Deny)
         .ask_full_access(std::slice::from_ref(&request));
-    assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
+    assert!(matches!(
+        decision,
+        newt_policy::PermissionDecision::Allow(_)
+    ));
     let logged = state.decisions.last().unwrap();
     assert_eq!(
         (logged.decision.as_str(), logged.scope.as_str()),
@@ -239,7 +242,7 @@ fn full_access_preapproval_still_honours_delegation_and_stored_denials() {
         PromptChoice::AllowSession,
     )
     .ask_full_access(std::slice::from_ref(&request));
-    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(matches!(decision, newt_policy::PermissionDecision::Deny));
     assert!(
         state.session_grants.is_empty(),
         "delegated: no session allow"
@@ -252,7 +255,7 @@ fn full_access_preapproval_still_honours_delegation_and_stored_denials() {
         .insert((DenialKind::RemoteTool, "mail__search".to_string()));
     let decision = gate(&mut state, &config, None, None, PromptChoice::AllowSession)
         .ask_full_access(std::slice::from_ref(&request));
-    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(matches!(decision, newt_policy::PermissionDecision::Deny));
     assert!(state.session_grants.is_empty(), "denied: no session allow");
     assert!(state.decisions.is_empty());
 }
@@ -275,8 +278,8 @@ fn delegated_session_never_persists_stays_session_only() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_net("docs.rs")),
-        newt_core::PermissionDecision::Deny => panic!("must still be granted this session"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_net("docs.rs")),
+        newt_policy::PermissionDecision::Deny => panic!("must still be granted this session"),
     }
     assert_eq!(state.decisions.last().unwrap().scope, "session");
     assert!(
@@ -307,8 +310,8 @@ fn net_allow_permanent_writes_approve_toml_not_config_net() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_net("docs.rs")),
-        newt_core::PermissionDecision::Deny => panic!("must be granted"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_net("docs.rs")),
+        newt_policy::PermissionDecision::Deny => panic!("must be granted"),
     }
     let config_text = std::fs::read_to_string(&config).unwrap();
     assert!(
@@ -340,8 +343,8 @@ fn high_danger_exec_target_is_refused_before_any_write_attempt() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Deny => {}
-        newt_core::PermissionDecision::Allow(_) => panic!("an interpreter must be refused"),
+        newt_policy::PermissionDecision::Deny => {}
+        newt_policy::PermissionDecision::Allow(_) => panic!("an interpreter must be refused"),
     }
     assert_eq!(
         state.decisions.last().unwrap().scope,
@@ -380,8 +383,8 @@ fn unrelated_permanent_allow_does_not_launder_a_preexisting_unsigned_approve_ent
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
-        newt_core::PermissionDecision::Deny => panic!("cargo must be granted"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
+        newt_policy::PermissionDecision::Deny => panic!("cargo must be granted"),
     }
     // The freshly-signed entry this turn actually answered must be live —
     // folded straight into THIS session's durable grants.
@@ -433,8 +436,8 @@ fn unrelated_permanent_allow_does_not_launder_a_bogus_signature_approve_entry() 
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
-        newt_core::PermissionDecision::Deny => panic!("cargo must be granted"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
+        newt_policy::PermissionDecision::Deny => panic!("cargo must be granted"),
     }
     assert!(
         state
@@ -486,8 +489,8 @@ fn permanent_allow_with_no_config_path_gets_its_own_distinct_fallback() {
     })
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
-        newt_core::PermissionDecision::Deny => panic!("must still be granted this session"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
+        newt_policy::PermissionDecision::Deny => panic!("must still be granted this session"),
     }
     assert_eq!(state.decisions.last().unwrap().scope, "session-no-config");
     let _ = config; // fixture's config file is unused by this branch on purpose
@@ -508,8 +511,8 @@ fn permanent_allow_with_no_root_key_gets_its_own_distinct_fallback() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
-        newt_core::PermissionDecision::Deny => panic!("must still be granted this session"),
+        newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_exec("cargo")),
+        newt_policy::PermissionDecision::Deny => panic!("must still be granted this session"),
     }
     assert_eq!(state.decisions.last().unwrap().scope, "session-no-key");
     assert!(!approve_path(&config).exists(), "nothing should be written");
@@ -615,8 +618,8 @@ fn allow_permanent_refuses_a_climbing_path_that_normalizes_to_a_broad_root() {
     )
     .ask(std::slice::from_ref(&request))
     {
-        newt_core::PermissionDecision::Deny => {}
-        newt_core::PermissionDecision::Allow(_) => {
+        newt_policy::PermissionDecision::Deny => {}
+        newt_policy::PermissionDecision::Allow(_) => {
             panic!("a climbing path to a broad root must be refused")
         }
     }

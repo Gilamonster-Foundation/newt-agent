@@ -13,6 +13,7 @@ categories = ["command-line-interface"]
 
 [dependencies]
 newt-core.workspace = true
+newt-policy.workspace = true
 newt-router.workspace = true
 # B0a (#1841): the permission surfaces build ONE `InteractionDefinition`
 # and render it through newt-core's A2.2 adapter. newt-tui therefore names

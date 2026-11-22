@@ -1807,7 +1807,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
     h.open_tab_on(&mut tabs, &b);
 
     // The permission binding is shared session state, not a conversation pin.
-    newt_core::posture::set_active_posture(Some(newt_core::posture::ActivePosture {
+    newt_policy::posture::set_active_posture(Some(newt_policy::posture::ActivePosture {
         name: "locked".into(),
         preset_name: "strict".into(),
         clamp: newt_core::Caveats::default(),
@@ -1825,7 +1825,7 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
             std::env::var(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV).ok(),
             std::env::var("NEWT_POSTURE").ok(),
             std::env::var("NEWT_EPHEMERAL").ok(),
-            newt_core::posture::active_posture().map(|p| {
+            newt_policy::posture::active_posture().map(|p| {
                 (
                     p.name,
                     p.preset_name,

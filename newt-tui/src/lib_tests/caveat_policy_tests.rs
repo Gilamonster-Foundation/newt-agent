@@ -1,6 +1,6 @@
 use super::{policy_for, SessionCapability};
 // The `permits_*` adaptors live on `CaveatsExt` (post-#95).
-use newt_core::CaveatsExt;
+use newt_policy::CaveatsExt;
 
 /// RAII guard neutralizing the ambient `--full-access` / `NEWT_FULL_ACCESS`
 /// override for the duration of a test, restoring it on drop. These tests
@@ -87,15 +87,15 @@ fn workspace_access_launch_keeps_directory_fence_and_configured_network() {
     );
     assert!(policy.permits_exec("rm"));
     assert!(policy.permits_exec("arbitrary-workspace-program"));
-    assert!(newt_core::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &policy.fs_write,
         "/workspace/dir/file"
     ));
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &policy.fs_write,
         "/workspace/../sibling/file"
     ));
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &policy.fs_read,
         "/outside/file"
     ));
@@ -119,7 +119,7 @@ fn absent_config_is_read_only() {
     // #86 regression: with no [tui] config the policy must be READ-ONLY,
     // never `Caveats::top()` (the old fallback granted full access).
     let policy = policy_for(None, "/ws");
-    assert_ne!(policy, newt_core::caveats::Caveats::top());
+    assert_ne!(policy, newt_policy::caveats::Caveats::top());
     assert!(!policy.permits_exec("cargo"), "no exec when unconfigured");
     assert!(
         !policy.permits_fs_write("/ws/x"),
@@ -149,7 +149,7 @@ fn establish_unconfigured_is_signed_read_only() {
     let dir = tempfile::TempDir::new().unwrap();
     let key = dir.path().join("identity.pem");
     let cap = SessionCapability::establish(None, Some(&key), "/ws", None);
-    assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
+    assert_ne!(*cap.caveats(), newt_policy::caveats::Caveats::top());
     assert!(!cap.caveats().permits_exec("cargo"));
     // Reads locked to the workspace (see absent_config_is_read_only).
     assert!(cap.caveats().permits_fs_read("/ws"));
@@ -164,7 +164,7 @@ fn establish_without_key_is_read_only_policy() {
     let _env = crate::test_env_guard::env_write_guard();
     let _preset = ForceDefaultPreset::new();
     let cap = SessionCapability::establish(None, None, "/ws", None);
-    assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
+    assert_ne!(*cap.caveats(), newt_policy::caveats::Caveats::top());
     assert!(!cap.caveats().permits_exec("cargo"));
 }
 

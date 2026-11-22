@@ -1,5 +1,5 @@
 //! Blocker-2 real-resource proof for the seccomp egress-deny floor
-//! (`newt_core::netguard`) — the network half of b1 that Landlock (TCP-only)
+//! (`newt_policy::netguard`) — the network half of b1 that Landlock (TCP-only)
 //! cannot provide.
 //!
 //! The invariant IS the kernel refusing `socket()` for off-box families after a
@@ -21,7 +21,7 @@
 
 #![cfg(target_os = "linux")]
 
-use newt_core::netguard::egress_deny_program;
+use newt_policy::netguard::egress_deny_program;
 use serial_test::serial;
 
 // Child exit codes (0 = the whole floor behaved correctly).

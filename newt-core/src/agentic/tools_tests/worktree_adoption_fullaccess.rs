@@ -6,17 +6,17 @@ struct Approve {
 impl PermissionGate for Approve {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         self.asked = true;
         PermissionDecision::Allow(Caveats::top())
     }
-    fn ask_question(&mut self, _: &str) -> crate::permissions::HumanQuestionOutcome {
-        crate::permissions::HumanQuestionOutcome::Unavailable
+    fn ask_question(&mut self, _: &str) -> newt_policy::permissions::HumanQuestionOutcome {
+        newt_policy::permissions::HumanQuestionOutcome::Unavailable
     }
 }
 

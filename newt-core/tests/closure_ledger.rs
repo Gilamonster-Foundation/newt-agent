@@ -70,6 +70,7 @@ const LEDGER: &[(&str, usize)] = &[
     ("newt-harness", 60),
     ("agent-harness-py", 70),
     ("agent-toolchain", 90),
+    ("newt-policy", 100),
     ("newt-flock", 100),
     ("newt-provider-openai", 130),
     ("newt-mcp-data", 160),

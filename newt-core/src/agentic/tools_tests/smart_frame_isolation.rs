@@ -1,6 +1,6 @@
 use super::*;
 use crate::agentic::{mcp::NoMcp, smart_harness::SmartHarness};
-use crate::caveats::Caveats;
+use newt_policy::caveats::Caveats;
 use std::{path::Path, sync::Arc};
 
 fn harness(directory: &Path) -> (SmartHarness, content_addressable::ContentId) {
@@ -115,10 +115,10 @@ struct WidenAll;
 impl PermissionGate for WidenAll {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         PermissionDecision::Allow(Caveats::top())
@@ -142,10 +142,10 @@ async fn native_once_filesystem_frame_preflight_precedes_consumption_and_spawn()
     impl PermissionGate for CountingGate {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             self.0 += 1;
@@ -168,7 +168,7 @@ async fn native_once_filesystem_frame_preflight_precedes_consumption_and_spawn()
     let (harness, _) = harness(directory.path());
     let marker = workspace.path().join("must-not-run");
     let baseline = Caveats {
-        exec: crate::caveats::Scope::only(["/usr/bin/touch".into()]),
+        exec: newt_policy::caveats::Scope::only(["/usr/bin/touch".into()]),
         ..crate::confined_exec::workspace_confined_caveats(workspace.path())
     };
     let mut gate = CountingGate(0);
@@ -212,10 +212,10 @@ async fn live_permission_refresh_cannot_bypass_frame_isolation() {
     impl PermissionGate for RecalledAll {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             panic!("passive refresh must not ask for new authority");
@@ -375,7 +375,7 @@ async fn private_frame_denies_raw_tools_and_preserves_mediated_reads() {
 #[tokio::test]
 #[serial_test::serial]
 async fn real_shell_cannot_read_or_mutate_private_frame() {
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     let _env = super::disable_ocap_tests::env_lock().await;
     let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
@@ -808,10 +808,10 @@ fn frame_permission_gate_forwards_consume_pending_once() {
     impl PermissionGate for ConsumeSpy {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &crate::caveats::Caveats,
-            _request: &crate::permissions::PermissionRequest,
-        ) -> crate::permissions::PermissionDecision {
-            crate::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
             PermissionDecision::Deny
@@ -952,7 +952,7 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
         "fixture baseline",
     ]);
     let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
-    caveats.net = crate::caveats::Scope::All;
+    caveats.net = newt_policy::caveats::Scope::All;
     let session = crate::worktree_adoption::WorktreeSession::default();
     for (index, destination) in [workspace.path().join(".worktrees/task"), external.clone()]
         .into_iter()
@@ -960,7 +960,7 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
     {
         if index == 1 {
             // The external directory alone is delegated, never its parent.
-            caveats.fs_read = crate::caveats::Scope::only([
+            caveats.fs_read = newt_policy::caveats::Scope::only([
                 workspace.path().to_string_lossy().into_owned(),
                 external.to_string_lossy().into_owned(),
             ]);

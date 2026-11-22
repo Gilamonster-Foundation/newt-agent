@@ -9,10 +9,10 @@ struct BroadGate;
 impl PermissionGate for BroadGate {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Allow(Caveats::top())
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Allow(Caveats::top())
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
         PermissionDecision::Allow(Caveats::top())
@@ -101,18 +101,18 @@ fn worktree_adoption_clamps_refresh_retry_and_build_requests() {
         let PermissionDecision::Allow(c) = decision else {
             panic!("allowed attenuated grant")
         };
-        assert!(!crate::caveats::permits_path(
+        assert!(!newt_policy::caveats::permits_path(
             &c.fs_write,
             original.to_str().unwrap()
         ));
     }
     let c = gate.apply_pending_once(DenialKind::Exec, "python3", &Caveats::top());
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &c.fs_write,
         original.to_str().unwrap()
     ));
     let c = gate.apply_command_retry("bash script.sh", "/ws", &Caveats::top());
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &c.fs_write,
         original.to_str().unwrap()
     ));
@@ -147,7 +147,7 @@ fn worktree_guard_forwards_the_dependency_fetch_prompt_and_attenuates_it() {
     else {
         panic!("the prompt must reach the operator's gate")
     };
-    assert!(!crate::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &c.fs_write,
         original.to_str().unwrap()
     ));

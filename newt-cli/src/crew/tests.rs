@@ -56,7 +56,7 @@ fn github_refs_parses_issue_and_pr_urls_in_prose() {
 
 #[test]
 fn one_shot_authority_grants_fs_keeps_exec_and_net_denied() {
-    use newt_core::role_profile::{ScopeKeyword, ScopeSpec};
+    use newt_policy::preset::{ScopeKeyword, ScopeSpec};
     let denied = ScopeSpec::Keyword(ScopeKeyword::None);
     let all = ScopeSpec::Keyword(ScopeKeyword::All);
     let mut plan = newt_core::plan::Plan::from_toml_str(

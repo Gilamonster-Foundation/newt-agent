@@ -27,9 +27,9 @@
 
 use std::collections::BTreeMap;
 
-use newt_core::caveats::Caveats;
 use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
 use newt_mcp_client::McpToolset;
+use newt_policy::caveats::Caveats;
 
 #[tokio::test]
 #[ignore = "spawns a real subprocess + touches fs (integration tier); grounds the mocked admit() gate"]

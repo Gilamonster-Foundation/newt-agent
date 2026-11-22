@@ -4,7 +4,7 @@ use super::*;
 /// root cannot authorize the legacy engine's transitive object-store reads.
 #[test]
 fn scoped_legacy_git_refuses_external_alternates_before_opening_the_engine() {
-    use newt_core::caveats::{Caveats, Scope};
+    use newt_policy::caveats::{Caveats, Scope};
     let external = repo_with_commit();
     let marker = "external alternate commit must not be disclosed";
     git(external.path(), &["commit", "--amend", "-q", "-m", marker]);

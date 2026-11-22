@@ -103,30 +103,30 @@ mod composed_private_mcp_uat {
         approvals: usize,
     }
 
-    impl newt_core::PermissionGate for ReviewPermission {
+    impl newt_policy::PermissionGate for ReviewPermission {
         fn ask_dependency_fetch(
             &mut self,
-            _prepared: &newt_core::caveats::Caveats,
-            _request: &newt_core::permissions::PermissionRequest,
-        ) -> newt_core::permissions::PermissionDecision {
-            newt_core::permissions::PermissionDecision::Deny
+            _prepared: &newt_policy::caveats::Caveats,
+            _request: &newt_policy::permissions::PermissionRequest,
+        ) -> newt_policy::permissions::PermissionDecision {
+            newt_policy::permissions::PermissionDecision::Deny
         }
-        fn ask_question(&mut self, _question: &str) -> newt_core::HumanQuestionOutcome {
-            newt_core::HumanQuestionOutcome::Unavailable
+        fn ask_question(&mut self, _question: &str) -> newt_policy::HumanQuestionOutcome {
+            newt_policy::HumanQuestionOutcome::Unavailable
         }
 
         fn ask(
             &mut self,
-            requests: &[newt_core::PermissionRequest],
-        ) -> newt_core::PermissionDecision {
+            requests: &[newt_policy::PermissionRequest],
+        ) -> newt_policy::PermissionDecision {
             if requests.len() == 1
-                && requests[0].kind == newt_core::DenialKind::RemoteTool
+                && requests[0].kind == newt_policy::DenialKind::RemoteTool
                 && requests[0].target == REVIEW_TOOL
             {
                 self.approvals += 1;
-                newt_core::PermissionDecision::Allow(self.caveats.clone())
+                newt_policy::PermissionDecision::Allow(self.caveats.clone())
             } else {
-                newt_core::PermissionDecision::Deny
+                newt_policy::PermissionDecision::Deny
             }
         }
     }

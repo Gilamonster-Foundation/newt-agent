@@ -1,7 +1,7 @@
 use super::*;
 use crate::agentic::http_loop_tests::DisplayReplay;
-use crate::caveats::{Caveats, CountBound, Scope};
 use crate::{BackendKind, MemMessage};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use wiremock::matchers::{method, path};

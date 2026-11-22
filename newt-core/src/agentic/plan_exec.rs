@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 
 use super::crew_tool::CrewRunner;
 use crate::plan::{Plan, SubtaskStatus};
-use crate::{Caveats, CaveatsExt};
+use crate::Caveats;
+use newt_policy::CaveatsExt;
 
 /// The outcome of driving a [`Plan`] through a [`CrewRunner`] with [`run_plan`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

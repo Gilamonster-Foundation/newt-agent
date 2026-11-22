@@ -9,7 +9,7 @@
 use super::super::NoMcp;
 use super::disable_ocap_tests::{env_lock, EnvVar};
 use super::*;
-use crate::caveats::Caveats;
+use newt_policy::caveats::Caveats;
 
 async fn run_command(command: &str, ws: &std::path::Path, caveats: &Caveats) -> String {
     execute_tool(

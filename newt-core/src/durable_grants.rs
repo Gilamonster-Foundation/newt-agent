@@ -22,7 +22,7 @@ use content_addressable::{canonical, ContentAddressable, ContentError, ContentId
 use serde::{Deserialize, Serialize};
 
 use crate::secrets::TokenIdentity;
-use crate::DenialKind;
+use newt_policy::DenialKind;
 
 const SCHEMA: &str = "newt.durable-grants/v1";
 // Limits apply before decryption/decoding and before a replacement is staged.

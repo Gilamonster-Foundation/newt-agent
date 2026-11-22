@@ -46,6 +46,7 @@ on:
     paths:
       - "newt-mesh/**"
       - "newt-core/**"
+      - "newt-policy/**"
       - "newt-router/**"
       - "newt-inference/**"
       - "plugins-protocol/**"
@@ -56,6 +57,7 @@ on:
     paths:
       - "newt-mesh/**"
       - "newt-core/**"
+      - "newt-policy/**"
       - "newt-router/**"
       - "newt-inference/**"
       - "plugins-protocol/**"

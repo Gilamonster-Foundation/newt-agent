@@ -4,7 +4,7 @@
 use agent_mesh_protocol::UserKey;
 use newt_core::durable_grants::{load, merge, store_path, GrantSet};
 use newt_core::secrets::{TokenIdentity, AGE_ARMOR_MAGIC};
-use newt_core::DenialKind;
+use newt_policy::DenialKind;
 
 fn grants() -> GrantSet {
     [

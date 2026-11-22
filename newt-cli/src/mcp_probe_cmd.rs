@@ -28,11 +28,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use clap::Args;
-use newt_core::caveats::Caveats;
 use newt_core::mcp::{McpServerEntry, McpTrust, SecretValue, TransportKind};
 use newt_core::mcp_probe::{builtin_probe_rules, parse_probe_rules, ProbeRules};
 use newt_core::Config;
 use newt_mcp_client::{ConnectedServer, NetPosture, SandboxKind, ServerInfo};
+use newt_policy::caveats::Caveats;
 
 #[derive(Args, Debug)]
 pub struct ProbeArgs {
@@ -238,7 +238,7 @@ fn derive_description(server_info: Option<&ServerInfo>, instructions: Option<&st
 /// is operator consent for that one host. `Scope::All` is already
 /// unrestricted and stays untouched.
 fn widen_net_for_host(caveats: &Caveats, host: &str) -> Caveats {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     let mut widened = caveats.clone();
     if let Scope::Only(ref mut hosts) = widened.net {
         hosts.extend([host.to_string()]);
@@ -778,7 +778,7 @@ fn outcome_from_connection(
 mod tests {
     use super::*;
     use clap::Parser;
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     fn info(name: &str, title: Option<&str>, version: &str) -> ServerInfo {
         ServerInfo {

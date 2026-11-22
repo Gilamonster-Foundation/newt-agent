@@ -1131,20 +1131,23 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
 /// exist to pin.
 struct AllowEverything(Caveats);
 
-impl crate::PermissionGate for AllowEverything {
+impl newt_policy::PermissionGate for AllowEverything {
     fn ask_dependency_fetch(
         &mut self,
-        _prepared: &crate::caveats::Caveats,
-        _request: &crate::permissions::PermissionRequest,
-    ) -> crate::permissions::PermissionDecision {
-        crate::permissions::PermissionDecision::Deny
+        _prepared: &newt_policy::caveats::Caveats,
+        _request: &newt_policy::permissions::PermissionRequest,
+    ) -> newt_policy::permissions::PermissionDecision {
+        newt_policy::permissions::PermissionDecision::Deny
     }
-    fn ask_question(&mut self, _question: &str) -> crate::HumanQuestionOutcome {
-        crate::HumanQuestionOutcome::Answer("y".to_string())
+    fn ask_question(&mut self, _question: &str) -> newt_policy::HumanQuestionOutcome {
+        newt_policy::HumanQuestionOutcome::Answer("y".to_string())
     }
 
-    fn ask(&mut self, _requests: &[crate::PermissionRequest]) -> crate::PermissionDecision {
-        crate::PermissionDecision::Allow(self.0.clone())
+    fn ask(
+        &mut self,
+        _requests: &[newt_policy::PermissionRequest],
+    ) -> newt_policy::PermissionDecision {
+        newt_policy::PermissionDecision::Allow(self.0.clone())
     }
 }
 

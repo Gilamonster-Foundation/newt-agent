@@ -35,7 +35,7 @@ fn inspect(config: Option<&newt_core::Config>, fix: bool) -> Result<()> {
         match newt_tui::workspace_protection_for_diagnostics(config, &cwd) {
             Ok((mut policy, guard)) => {
                 for (kind, target) in ocap_store::approved_grants(&verified) {
-                    let candidate = newt_core::widen_caveats(&policy, &[(kind, target.clone())]);
+                    let candidate = newt_policy::widen_caveats(&policy, &[(kind, target.clone())]);
                     match guard
                         .validate_request(kind, &target)
                         .and_then(|()| guard.validate_caveats(&candidate))

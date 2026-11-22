@@ -15,7 +15,7 @@
 //! orchestration over the existing seams — unit-testable with mocks, no network.
 
 use crate::{run_crew, BackendPool, ChatRequest, CrewConfig, CrewStatus, Dispatcher, Workspace};
-use newt_core::caveats::{Caveats, CaveatsExt};
+use newt_policy::caveats::{Caveats, CaveatsExt};
 use newt_router::Tier;
 use serde::{Deserialize, Serialize};
 
@@ -578,7 +578,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "build the thing",
             &no_grounding(),
         )
@@ -606,7 +606,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "build the thing",
             &no_grounding(),
         )
@@ -633,7 +633,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &no_grounding(),
         )
@@ -663,7 +663,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &no_grounding(),
         )
@@ -692,7 +692,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &no_grounding(),
         )
@@ -731,8 +731,8 @@ mod tests {
         };
         let mut ws = MemFactory::new();
         // Exec authority covers ONLY "check-a"; "check-b" is outside the caveat.
-        let mut caveats = newt_core::caveats::Caveats::top();
-        caveats.exec = newt_core::caveats::Scope::only(["check-a".to_string()]);
+        let mut caveats = newt_policy::caveats::Caveats::top();
+        caveats.exec = newt_policy::caveats::Scope::only(["check-a".to_string()]);
         let out = run_team(&p, &d, &mut ws, &cfg(), &caveats, "goal", &no_grounding()).await;
         // The plan still ran (refuse-not-run: the denied subtask proceeds under the
         // default check, which the converging crew passes).
@@ -800,7 +800,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &no_grounding(),
         )
@@ -828,7 +828,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &no_grounding(),
         )
@@ -900,7 +900,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &def_sites,
         )
@@ -928,7 +928,7 @@ mod tests {
             &d,
             &mut ws,
             &cfg(),
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
             "goal",
             &no_grounding(),
         )

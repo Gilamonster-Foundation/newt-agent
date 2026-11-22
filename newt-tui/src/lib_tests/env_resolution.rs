@@ -34,7 +34,7 @@ pub(crate) fn with_env_vars<R>(set: &[(&str, &str)], clear: &[&str], f: impl FnO
 
 #[test]
 fn cli_fs_grants_widen_read_and_write_scopes() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     // Join with the platform path-list separator (`;` on Windows, `:` on
     // Unix), matching how the CLI now writes these vars via join_paths.
     let read_paths = std::env::join_paths(["/home/u/.newt", "/home/u/.hotseat/config.yml"])
@@ -87,7 +87,7 @@ fn cli_fs_grants_widen_read_and_write_scopes() {
 
 #[test]
 fn reads_are_locked_to_the_workspace_by_default() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     // No grants at all: a fenced preset's reads still flip from All → just the
     // workspace (the operator wants the agent locked to the CWD by default).
     with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
@@ -110,7 +110,7 @@ fn reads_are_locked_to_the_workspace_by_default() {
 
 #[test]
 fn full_access_opts_out_of_the_read_lock() {
-    use newt_core::caveats::Scope;
+    use newt_policy::caveats::Scope;
     with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
         let tui = newt_core::TuiConfig {
             permissions: newt_core::ToolPermissions {
@@ -126,7 +126,7 @@ fn full_access_opts_out_of_the_read_lock() {
 
 #[test]
 fn read_only_reads_are_confined_to_the_workspace() {
-    use newt_core::caveats::{CaveatsExt, Scope};
+    use newt_policy::caveats::{CaveatsExt, Scope};
     // Conscious decision (review of #502): `read_only` ships `fs_read = All`
     // but is the DEFAULT preset, so the CWD-lock confines its reads — an
     // unconfigured session must not read outside the workspace. Unlike
@@ -820,7 +820,7 @@ fn exact_executable_grants_scan_cli_paths_without_basename_authority() {
             let mut tui = newt_core::TuiConfig::default();
             tui.permissions.preset = newt_core::PermissionPreset::ReadOnly;
             let policy = policy_for(Some(tui), "/ws");
-            use newt_core::CaveatsExt;
+            use newt_policy::CaveatsExt;
             assert!(
                 policy.permits_exec(&exe.to_string_lossy()),
                 "CLI exec grant must widen the session exec scope"

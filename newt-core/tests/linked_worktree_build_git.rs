@@ -4,9 +4,9 @@
 
 use std::path::Path;
 
-use newt_core::caveats::{permits_path, Scope};
 use newt_core::confined_exec::{build_tool_request, ConstrainedExecutor};
 use newt_core::git_hardening::own_gitdir_grants;
+use newt_policy::caveats::{permits_path, Scope};
 
 #[path = "support/linked_git_fixture.rs"]
 mod fixture_support;

@@ -5,9 +5,9 @@ mod library;
 mod transaction;
 
 use super::{PermissionDecision, PermissionGate};
-use crate::caveats::Caveats;
 use crate::confined_exec::{build_tool_request, ConfinedOutput, ConstrainedExecutor, ExecRequest};
 use files::DiskFiles;
+use newt_policy::caveats::Caveats;
 use std::path::{Component, Path, PathBuf};
 
 pub(super) struct Moved {

@@ -215,7 +215,7 @@ lands and passes.
 
 **Honest limit (stated, not hidden).** The fence is **file-granular**
 — the same `Scope<String>` exact/prefix-match primitive as `fs_write`
-(`newt-core/src/caveats.rs:40-47`), not symbol-granular. It does
+(`newt-policy/src/caveats.rs:40-47`), not symbol-granular. It does
 **not** fix same-file overreach: two of the facet's own flagship
 examples (`tmp.6POCfpztYT`/`tmp.XGdfTylROs` — a "define a private
 helper `maximum`" leaf that also silently rewires `summarize`'s call

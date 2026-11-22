@@ -72,12 +72,12 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
     let own_git = crate::git_hardening::own_gitdir_grants(&wt);
     let mut read_roots = vec![wt.to_string_lossy().into_owned()];
     read_roots.extend(own_git.read);
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only(read_roots),
-        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
-        exec: crate::caveats::Scope::only(["git".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only(read_roots),
+        fs_write: newt_policy::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: newt_policy::caveats::Scope::only(["git".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let widened = super::shell::dispatch_caveats_for_git_shell(
         "git add f.txt",
@@ -175,12 +175,12 @@ async fn worktree_add_under_git_only_exec_grant(root: &std::path::Path) {
     let wt = root.join("wt");
 
     let root_s = root.to_string_lossy().into_owned();
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([root_s.clone()]),
-        fs_write: crate::caveats::Scope::only([root_s]),
-        exec: crate::caveats::Scope::only(["git".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([root_s.clone()]),
+        fs_write: newt_policy::caveats::Scope::only([root_s]),
+        exec: newt_policy::caveats::Scope::only(["git".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let cmd = format!("git worktree add -q {} -b task", wt.display());
     let envelope = super::shell::dispatch_bridled_shell(
@@ -388,12 +388,12 @@ async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_defaul
     let own_git = crate::git_hardening::own_gitdir_grants(&wt);
     let mut read_roots = vec![wt.to_string_lossy().into_owned()];
     read_roots.extend(own_git.read);
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only(read_roots),
-        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
-        exec: crate::caveats::Scope::only(["git".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only(read_roots),
+        fs_write: newt_policy::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: newt_policy::caveats::Scope::only(["git".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let cmd = "git add f.txt && git commit -q -m update";
     let widened =
@@ -515,12 +515,12 @@ async fn confined_shell_cannot_redirect_into_a_sibling_or_default_branch_ref_or_
     // (the common case), where the FS grant is the only thing that can
     // stop a redirect — not an artificially git-only exec scope that would
     // deny `echo` before the FS fence is ever reached.
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only(read_roots),
-        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
-        exec: crate::caveats::Scope::only(["git".to_string(), "echo".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only(read_roots),
+        fs_write: newt_policy::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: newt_policy::caveats::Scope::only(["git".to_string(), "echo".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
 
     for (label, target) in [
@@ -614,12 +614,12 @@ async fn confined_shell_commit_cannot_reach_config_packed_refs_common_head_or_a_
     let mut read_roots = vec![wt.to_string_lossy().into_owned()];
     read_roots.extend(own_git.read);
     // `exec` includes `echo` for the same reason as the sibling test above.
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only(read_roots),
-        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
-        exec: crate::caveats::Scope::only(["git".to_string(), "echo".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only(read_roots),
+        fs_write: newt_policy::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: newt_policy::caveats::Scope::only(["git".to_string(), "echo".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
 
     for (label, target) in [
@@ -686,15 +686,15 @@ fn session_fs_write_still_excludes_the_common_objects_directory() {
     // identity and correctly grants nothing.
     crate::git_hardening::own_gitdir_grants(&wt);
 
-    let session = crate::caveats::Caveats {
-        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_write: newt_policy::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        ..newt_policy::caveats::Caveats::top()
     };
     // Unwidened session caveats (what a file tool dispatch actually sees —
     // `dispatch_caveats_for_git_shell` is consulted only on the shell path).
     let objects = main.join(".git/objects/pack/x.pack");
     assert!(
-        !crate::caveats::permits_path(&session.fs_write, &objects.to_string_lossy()),
+        !newt_policy::caveats::permits_path(&session.fs_write, &objects.to_string_lossy()),
         "the common objects/ dir must stay outside the SESSION fs_write scope"
     );
     // But the per-dispatch widening for a `git` shell command DOES cover it —
@@ -705,7 +705,7 @@ fn session_fs_write_still_excludes_the_common_objects_directory() {
         &session,
     );
     assert!(
-        crate::caveats::permits_path(&widened.fs_write, &objects.to_string_lossy()),
+        newt_policy::caveats::permits_path(&widened.fs_write, &objects.to_string_lossy()),
         "the per-dispatch widening must cover objects/ for a git shell command"
     );
     // A non-`git` command gets no widening at all.
@@ -719,7 +719,7 @@ fn session_fs_write_still_excludes_the_common_objects_directory() {
 /// merely by running a native Git command.
 #[test]
 fn git_shell_widening_requires_write_authority_over_the_workspace() {
-    use crate::caveats::{Caveats, Scope};
+    use newt_policy::caveats::{Caveats, Scope};
 
     let root = tempfile::tempdir().unwrap();
     let main = root.path().join("main");
@@ -775,12 +775,12 @@ fn git_shell_widening_requires_write_authority_over_the_workspace() {
     assert!(own_git
         .write
         .iter()
-        .all(|path| !crate::caveats::permits_path(&session.fs_write, path)));
+        .all(|path| !newt_policy::caveats::permits_path(&session.fs_write, path)));
     let dispatched =
         super::shell::dispatch_caveats_for_git_shell("git add seed", &workspace, &session);
     for path in own_git.write {
         assert!(
-            crate::caveats::permits_path(&dispatched.fs_write, &path),
+            newt_policy::caveats::permits_path(&dispatched.fs_write, &path),
             "a genuine workspace write grant retains access to its Git metadata: {path}"
         );
     }
@@ -797,9 +797,9 @@ fn default_branch_gets_no_shell_write_widening() {
     real_git(root.path(), &["commit", "-q", "-m", "init"]);
     crate::git_hardening::own_gitdir_grants(root.path());
 
-    let session = crate::caveats::Caveats {
-        fs_write: crate::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_write: newt_policy::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
+        ..newt_policy::caveats::Caveats::top()
     };
     let widened = super::shell::dispatch_caveats_for_git_shell(
         "git add f.txt",
@@ -923,10 +923,10 @@ fn git_shell_widening_grants_read_on_etc_gitconfig() {
     real_git(root.path(), &["commit", "-q", "-m", "init"]);
     crate::git_hardening::own_gitdir_grants(root.path());
 
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
-        fs_write: crate::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
+        fs_write: newt_policy::caveats::Scope::only([root.path().to_string_lossy().into_owned()]),
+        ..newt_policy::caveats::Caveats::top()
     };
     let widened = super::shell::dispatch_caveats_for_git_shell(
         "git add f.txt",
@@ -934,7 +934,7 @@ fn git_shell_widening_grants_read_on_etc_gitconfig() {
         &session,
     );
     assert!(
-        crate::caveats::permits_path(&widened.fs_read, "/etc/gitconfig"),
+        newt_policy::caveats::permits_path(&widened.fs_read, "/etc/gitconfig"),
         "the widened dispatch must grant read on /etc/gitconfig"
     );
 }
@@ -979,7 +979,7 @@ impl crate::agentic::git_tool::GitTool for FixtureGitTool {
         _op: &str,
         _args: &serde_json::Value,
         _caveats: &agent_toolchain::git_caveats::GitCaveats,
-        _session: &crate::caveats::Caveats,
+        _session: &newt_policy::caveats::Caveats,
     ) -> Result<String, String> {
         Err("the embedded git tool is not exercised by this fixture".into())
     }
@@ -1026,12 +1026,12 @@ async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_fai
     let own_git = crate::git_hardening::own_gitdir_grants(&wt);
     let mut read_roots = vec![wt.to_string_lossy().into_owned()];
     read_roots.extend(own_git.read);
-    let session = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only(read_roots),
-        fs_write: crate::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
-        exec: crate::caveats::Scope::only(["git".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let session = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only(read_roots),
+        fs_write: newt_policy::caveats::Scope::only([wt.to_string_lossy().into_owned()]),
+        exec: newt_policy::caveats::Scope::only(["git".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
 
     let before = real_git_output(&main, &["rev-parse", "refs/heads/task"]);

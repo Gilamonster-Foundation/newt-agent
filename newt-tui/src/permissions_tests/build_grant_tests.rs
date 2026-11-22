@@ -9,8 +9,9 @@ use super::permission_prompt_tests::scripted_gate;
 use super::{
     permission_policy, session_grant_covers, Audience, PermissionPromptState, PromptChoice,
 };
-use newt_core::caveats::{CountBound, Scope};
-use newt_core::{Caveats, CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
+use newt_core::Caveats;
+use newt_policy::caveats::{CountBound, Scope};
+use newt_policy::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -127,7 +128,7 @@ fn plan_release_preserves_build_grant_and_network_bounds() {
         for plan_active in [false, true, false] {
             gate.preset_clamp = plan_active.then(newt_core::agentic::plan_phase_clamp);
             let decision = gate.ask_with_caveats(&baseline, std::slice::from_ref(&cargo_test));
-            let newt_core::PermissionDecision::Allow(caveats) = decision else {
+            let newt_policy::PermissionDecision::Allow(caveats) = decision else {
                 panic!("existing Build grant must not require another prompt");
             };
             assert_eq!(

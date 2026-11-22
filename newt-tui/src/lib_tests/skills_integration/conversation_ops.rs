@@ -155,7 +155,7 @@ fn deleting_a_conversation_asks_first_and_names_what_is_lost() {
 #[test]
 fn a_declined_or_unaskable_delete_removes_nothing() {
     use newt_core::interaction_surface::SurfaceInteraction;
-    use newt_core::HumanQuestionOutcome;
+    use newt_policy::HumanQuestionOutcome;
 
     let answering =
         |a: &'static str| move |_: &SurfaceInteraction| HumanQuestionOutcome::Answer(a.to_string());

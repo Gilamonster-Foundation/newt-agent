@@ -1247,7 +1247,7 @@ fn acceptance_case() {
         );
         assert_eq!(
             answer.recv().expect("interaction answer"),
-            newt_core::HumanQuestionOutcome::Answer("yes".into())
+            newt_policy::HumanQuestionOutcome::Answer("yes".into())
         );
         assert_eq!(cockpit.editor.draft(), draft, "the chat draft survives");
         assert!(!cockpit.chat_inactive, "keyboard focus returns to chat");
@@ -1388,7 +1388,7 @@ fn acceptance_case() {
         );
         assert_eq!(
             slash_answer.recv().expect("slash-command outcome"),
-            newt_core::HumanQuestionOutcome::Cancelled,
+            newt_policy::HumanQuestionOutcome::Cancelled,
             "a slash command is chat intent, not a modal answer"
         );
 

@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn state_tools_dispatch_only_with_a_store() {
     use crate::agentic::scratchpad::{ScratchpadStore, SessionScratchpadStore};
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "key": "k", "value": "v" });
     // Step 26.4: without a store the tool was never advertised → unknown.
     let none = execute_tool(
@@ -69,7 +69,7 @@ async fn code_search_dispatch_only_with_a_searcher() {
             Ok(vec![1.0])
         }
     }
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "query": "find it" });
     // Step 26.5.5: no searcher → unknown tool (presence-gate parity).
     let none = execute_tool(
@@ -134,7 +134,7 @@ async fn code_search_dispatch_only_with_a_searcher() {
 #[tokio::test]
 async fn experiential_dispatch_only_with_a_store() {
     use crate::agentic::experiential::{ExperienceStore, SessionExperienceStore};
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({
         "task": "ci flake", "outcome": "fixed", "lesson": "pin the seed for the fuzz test"
     });
@@ -179,7 +179,7 @@ async fn experiential_dispatch_only_with_a_store() {
 #[tokio::test]
 async fn scheduled_dispatch_only_with_a_ledger() {
     use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "plan": [
             { "step": "a", "status": "in_progress" },
             { "step": "b", "status": "pending" },
@@ -253,7 +253,7 @@ async fn scheduled_dispatch_only_with_a_ledger() {
 async fn resume_context_dispatch_degrades_without_a_recall_source() {
     // #714: advertised ALWAYS, so dispatch never reports "unknown tool" —
     // with no recall_source (headless) it returns the clear no-history line.
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let out = execute_tool(
         "resume_context",
         &serde_json::json!({}),

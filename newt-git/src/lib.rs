@@ -13,11 +13,11 @@
 //! fail-closed under the OCAP deviation ratchet, riding the SSH transport. We depend
 //! ONLY on the MIT `grit-lib`, never the GPL-2.0 `grit-legacy`.
 
-use newt_core::caveats::{Caveats, Scope};
 use newt_core::git_caveats::GitCaveats;
 use newt_core::git_hardening::{
     checked_git_read, checked_optional_git_read, scoped_repository_paths, ScopedGitReadError,
 };
+use newt_policy::caveats::{Caveats, Scope};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -1758,7 +1758,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         };
         if explicit_cwd
             && mutates
-            && !newt_core::caveats::permits_path(&write_scope, &root.to_string_lossy())
+            && !newt_policy::caveats::permits_path(&write_scope, &root.to_string_lossy())
         {
             return Err("capability denied: fs_write for Git cwd".into());
         }
@@ -1812,9 +1812,9 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         // back to needing the ordinary explicit `fs_write` grant.
         if explicit_cwd
             && mutates
-            && ![&git_dir, &common_dir]
-                .iter()
-                .all(|path| newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy()))
+            && ![&git_dir, &common_dir].iter().all(|path| {
+                newt_policy::caveats::permits_path(&write_scope, &path.to_string_lossy())
+            })
         {
             let is_own_repo = scoped_repository_paths(&self.root, &read_scope)
                 .ok()

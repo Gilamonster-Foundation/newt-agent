@@ -99,7 +99,7 @@ async fn http_json_response_lists_and_calls_tools() {
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
     let mut connected = connect_http_with_runtime_bearer(
         &admitted,
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         Some("secret"),
         false,
         &[],
@@ -142,7 +142,7 @@ async fn http_sse_response_is_parsed() {
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
-    let connected = connect_http(&admitted, &newt_core::caveats::Caveats::top())
+    let connected = connect_http(&admitted, &newt_policy::caveats::Caveats::top())
         .await
         .expect("connect_http (SSE) should succeed");
     assert_eq!(connected.tools.len(), 1);
@@ -188,7 +188,7 @@ async fn server_selected_legacy_version_is_the_subsequent_http_header() {
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
-    let connected = connect_http(&admitted, &newt_core::caveats::Caveats::top())
+    let connected = connect_http(&admitted, &newt_policy::caveats::Caveats::top())
         .await
         .expect("legacy handshake revision remains compatible");
     assert!(connected.tools.is_empty());
@@ -214,7 +214,7 @@ async fn http_rejects_the_pre_streamable_2024_revision() {
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
-    let error = match connect_http(&admitted, &newt_core::caveats::Caveats::top()).await {
+    let error = match connect_http(&admitted, &newt_policy::caveats::Caveats::top()).await {
         Ok(_) => panic!("2024-11-05 predates streamable HTTP"),
         Err(error) => error,
     };
@@ -234,7 +234,7 @@ fn configured_transport_owned_headers_are_rejected() {
         let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
         let error = match newt_mcp_client::HttpTransport::connect(
             &admitted,
-            &newt_core::caveats::Caveats::top(),
+            &newt_policy::caveats::Caveats::top(),
         ) {
             Ok(_) => panic!("transport-owned header must be rejected"),
             Err(error) => error,
@@ -255,7 +255,7 @@ async fn http_error_status_surfaces() {
 
     let entry = http_entry(format!("{}/mcp", server.uri()), BTreeMap::new());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
-    let err = connect_http(&admitted, &newt_core::caveats::Caveats::top())
+    let err = connect_http(&admitted, &newt_policy::caveats::Caveats::top())
         .await
         .err()
         .expect("500 must surface as an error");
@@ -293,7 +293,7 @@ async fn oversized_chunked_response_is_bounded() {
 
     let entry = http_entry(format!("http://{address}/mcp"), BTreeMap::new());
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
-    let error = connect_http(&admitted, &newt_core::caveats::Caveats::top())
+    let error = connect_http(&admitted, &newt_policy::caveats::Caveats::top())
         .await
         .err()
         .expect("oversized response must fail");
@@ -328,7 +328,7 @@ async fn bearer_is_not_forwarded_to_a_redirect_target() {
 
     let err = match connect_http_with_runtime_bearer(
         &admitted,
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
         Some("secret"),
         false,
         &[],
@@ -354,7 +354,7 @@ fn persisted_plaintext_authorization_is_rejected_by_the_shared_transport() {
     let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry is admitted");
     let error = match newt_mcp_client::HttpTransport::connect(
         &admitted,
-        &newt_core::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     ) {
         Ok(_) => panic!("plaintext config credential must fail before dialing"),
         Err(error) => error,
@@ -374,8 +374,8 @@ fn persisted_plaintext_authorization_is_rejected_by_the_shared_transport() {
 /// agent-bridle.
 #[test]
 fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
-    use newt_core::caveats::{Caveats, Scope};
     use newt_mcp_client::HttpTransport;
+    use newt_policy::caveats::{Caveats, Scope};
 
     let entry = http_entry("http://8.8.8.8/mcp".to_string(), BTreeMap::new());
     // step-1.2: the transport constructor now requires the admission witness.

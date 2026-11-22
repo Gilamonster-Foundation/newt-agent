@@ -25,11 +25,11 @@
 
 use std::path::Path;
 
-use newt_core::caveats::Scope;
 use newt_core::confined_exec::{
     build_tool_caveats, build_tool_request, workspace_confined_caveats, ConfinedOutput,
     ConstrainedExecutor, ExecOrigin, ExecRefused, ExecRequest,
 };
+use newt_policy::caveats::Scope;
 use serial_test::serial;
 use tempfile::tempdir;
 

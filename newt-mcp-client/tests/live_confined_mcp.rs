@@ -15,8 +15,8 @@
 //! ```
 //! Optional: `NEWT_UAT_MCP_ARGS="stdio"` (space-split), `NEWT_UAT_MCP_NAME=scrybe`.
 
-use newt_core::caveats::Caveats;
 use newt_core::mcp::{McpServerEntry, TransportKind};
+use newt_policy::caveats::Caveats;
 use std::collections::BTreeMap;
 
 fn entry_from_env() -> Option<McpServerEntry> {

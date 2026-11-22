@@ -188,7 +188,7 @@ impl RouteTable {
         &self,
         call: &Value,
         workspace: &Path,
-        read_scope: &crate::caveats::Scope<String>,
+        read_scope: &newt_policy::caveats::Scope<String>,
     ) -> RouteDecision {
         let decision = self.classify(
             call.get("command").and_then(Value::as_str).unwrap_or(""),
@@ -259,7 +259,7 @@ impl RouteTable {
         &self,
         command: &str,
         workspace: &Path,
-        read_scope: &crate::caveats::Scope<String>,
+        read_scope: &newt_policy::caveats::Scope<String>,
     ) -> RouteDecision {
         let trimmed = command.trim();
         if trimmed.is_empty() {
@@ -401,7 +401,7 @@ impl RouteTable {
 /// to the workspace root" with the actual question: does `<dir>`
 /// canonicalize (through any symlink) to a real DIRECTORY inside both the
 /// canonical workspace AND this call's fs-read fence
-/// ([`crate::caveats::permits_path`], the SAME containment check the
+/// ([`newt_policy::caveats::permits_path`], the SAME containment check the
 /// interactive tool gate and the headless coder apply path both use)? A
 /// missing directory, a file, an out-of-workspace absolute path, and a
 /// symlink that resolves outside all fail identically to how a real `cd`
@@ -418,7 +418,7 @@ impl RouteTable {
 fn resolve_workspace_relative_dir(
     dir: &str,
     workspace: &Path,
-    read_scope: &crate::caveats::Scope<String>,
+    read_scope: &newt_policy::caveats::Scope<String>,
 ) -> Option<String> {
     if dir.is_empty()
         || dir == "-"
@@ -434,7 +434,7 @@ fn resolve_workspace_relative_dir(
         return None;
     }
     let lexical = workspace.join(dir);
-    if !crate::caveats::permits_path(read_scope, &lexical.to_string_lossy()) {
+    if !newt_policy::caveats::permits_path(read_scope, &lexical.to_string_lossy()) {
         return None;
     }
     let canonical_workspace = workspace.canonicalize().ok()?;
@@ -448,7 +448,7 @@ fn resolve_workspace_relative_dir(
     // `read_scope` then fails for every `<dir>`, including `.` — canonicalize
     // the scope's own roots the same way before checking the canonical side,
     // so a symlinked workspace root still folds `cd`s.
-    if !crate::caveats::permits_path(
+    if !newt_policy::caveats::permits_path(
         &canonicalize_scope(read_scope),
         &canonical_dir.to_string_lossy(),
     ) {
@@ -466,15 +466,19 @@ fn resolve_workspace_relative_dir(
 /// already-canonicalized candidate path. A root that fails to canonicalize
 /// (does not exist, dangling symlink) is kept as-is — it simply will not
 /// match a canonical candidate, which is fail-closed, not a widening.
-fn canonicalize_scope(scope: &crate::caveats::Scope<String>) -> crate::caveats::Scope<String> {
+fn canonicalize_scope(
+    scope: &newt_policy::caveats::Scope<String>,
+) -> newt_policy::caveats::Scope<String> {
     match scope {
-        crate::caveats::Scope::All => crate::caveats::Scope::All,
-        crate::caveats::Scope::Only(set) => crate::caveats::Scope::only(set.iter().map(|root| {
-            std::fs::canonicalize(root)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| root.clone())
-        })),
+        newt_policy::caveats::Scope::All => newt_policy::caveats::Scope::All,
+        newt_policy::caveats::Scope::Only(set) => {
+            newt_policy::caveats::Scope::only(set.iter().map(|root| {
+                std::fs::canonicalize(root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.clone())
+            }))
+        }
     }
 }
 
@@ -539,7 +543,7 @@ fn split_leading_cd(command: &str) -> Option<(&str, &str)> {
 fn fold_leading_cd<'a>(
     command: &'a str,
     workspace: &Path,
-    read_scope: &crate::caveats::Scope<String>,
+    read_scope: &newt_policy::caveats::Scope<String>,
 ) -> (&'a str, Option<String>) {
     let Some((dir, rest)) = split_leading_cd(command) else {
         return (command, None);
@@ -1220,13 +1224,13 @@ mod tests {
     }
 
     fn classify(cmd: &str) -> RouteDecision {
-        RouteTable::builtin().classify(cmd, no_cd_match(), &crate::caveats::Scope::All)
+        RouteTable::builtin().classify(cmd, no_cd_match(), &newt_policy::caveats::Scope::All)
     }
 
     fn classify_at(
         cmd: &str,
         workspace: &Path,
-        read_scope: &crate::caveats::Scope<String>,
+        read_scope: &newt_policy::caveats::Scope<String>,
     ) -> RouteDecision {
         RouteTable::builtin().classify(cmd, workspace, read_scope)
     }
@@ -1268,8 +1272,8 @@ mod tests {
             }
         }
 
-        fn read_scope(&self) -> crate::caveats::Scope<String> {
-            crate::caveats::Scope::only([self.root.to_string_lossy().into_owned()])
+        fn read_scope(&self) -> newt_policy::caveats::Scope<String> {
+            newt_policy::caveats::Scope::only([self.root.to_string_lossy().into_owned()])
         }
     }
 
@@ -1406,7 +1410,7 @@ mod tests {
                 table.classify_call(
                     &json!({"command": command}),
                     no_cd_match(),
-                    &crate::caveats::Scope::All
+                    &newt_policy::caveats::Scope::All
                 ),
                 classify(command)
             );
@@ -1415,7 +1419,7 @@ mod tests {
                 let mut call = extra;
                 call["command"] = json!(command);
                 assert_eq!(
-                    table.classify_call(&call, no_cd_match(), &crate::caveats::Scope::All),
+                    table.classify_call(&call, no_cd_match(), &newt_policy::caveats::Scope::All),
                     RouteDecision::Exec,
                     "{call}"
                 );
@@ -1428,7 +1432,7 @@ mod tests {
                 table.classify_call(
                     &json!({"command": command, "cwd": "elsewhere"}),
                     no_cd_match(),
-                    &crate::caveats::Scope::All
+                    &newt_policy::caveats::Scope::All
                 ),
                 RouteDecision::Exec,
                 "{command}"
@@ -1744,13 +1748,13 @@ mod tests {
             table.classify_call(
                 &json!({"command": "cargo test"}),
                 no_cd_match(),
-                &crate::caveats::Scope::All
+                &newt_policy::caveats::Scope::All
             ),
             classify("cargo test")
         );
         let call = json!({"command": "cargo test", "timeout": 5});
         assert_eq!(
-            table.classify_call(&call, no_cd_match(), &crate::caveats::Scope::All),
+            table.classify_call(&call, no_cd_match(), &newt_policy::caveats::Scope::All),
             RouteDecision::Exec,
             "{call}"
         );
@@ -2019,7 +2023,7 @@ mod tests {
         // A fence that grants only a DIFFERENT root — `sub` is a real
         // directory inside the workspace, but outside THIS call's fence.
         let elsewhere = tempfile::TempDir::new().expect("tempdir");
-        let scope = crate::caveats::Scope::only([elsewhere
+        let scope = newt_policy::caveats::Scope::only([elsewhere
             .path()
             .canonicalize()
             .expect("canonicalize")
@@ -2098,7 +2102,7 @@ mod tests {
         std::os::unix::fs::symlink(&other, fx.sub.join("link")).expect("symlink");
         // Grant ONLY `sub` — `other` is genuinely inside the WORKSPACE, but
         // never inside THIS call's fence.
-        let scope = crate::caveats::Scope::only([fx.sub.to_string_lossy().into_owned()]);
+        let scope = newt_policy::caveats::Scope::only([fx.sub.to_string_lossy().into_owned()]);
         assert_eq!(
             classify_at("cd sub/link && cargo test", &fx.root, &scope),
             RouteDecision::Exec
@@ -2178,7 +2182,7 @@ mod tests {
             real_root.file_name().unwrap().to_string_lossy()
         ));
         std::os::unix::fs::symlink(&real_root, &link).expect("symlink workspace root");
-        let scope = crate::caveats::Scope::only([link.to_string_lossy().into_owned()]);
+        let scope = newt_policy::caveats::Scope::only([link.to_string_lossy().into_owned()]);
         let call = json!({ "command": "cd sub && cargo test" });
         assert_eq!(
             RouteTable::builtin().classify_call(&call, &link, &scope),

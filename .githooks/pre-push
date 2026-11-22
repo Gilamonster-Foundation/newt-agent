@@ -250,6 +250,9 @@
 #   - the `windows` and `musl` jobs (ci.yml) -- no Windows dev box / musl
 #     cross-target+musl-tools on a typical dev box; ci.yml's own top comment
 #     names these as the same kind of exception
+#   - the `macos` job (ci.yml) -- whole-tree clippy and `cargo test --workspace`
+#     on a hosted macOS runner (#3154). A Mac dev box runs this hook's changed
+#     scope natively; only the whole-tree run is CI's, as with `windows`
 #   - rust-stable-canary.yml (weekly floating-stable clippy; warns of an
 #     upcoming pin bump before it blocks PRs — never a push gate; see that
 #     workflow's own HOOK PARITY comment)

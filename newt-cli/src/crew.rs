@@ -678,7 +678,7 @@ pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
 /// not the model-authored `verify` shell, and the crew needs no network. Without
 /// this, every authored leaf is default-deny and can edit nothing.
 fn grant_one_shot_authority(plan: &mut newt_core::plan::Plan) {
-    use newt_core::role_profile::ScopeSpec;
+    use newt_policy::preset::ScopeSpec;
     for s in &mut plan.subtasks {
         s.caveat_policy.fs_read = ScopeSpec::default(); // "all"
         s.caveat_policy.fs_write = ScopeSpec::default(); // "all"

@@ -172,7 +172,7 @@ pub(super) mod checked_tree;
 
 fn read_fact(path: &std::path::Path, read: &crate::Scope<String>) -> Option<String> {
     use std::io::Read;
-    if !crate::permits_path(read, path.to_str()?) {
+    if !newt_policy::permits_path(read, path.to_str()?) {
         return None;
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]

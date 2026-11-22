@@ -20,10 +20,10 @@ async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
     {
         return;
     }
-    let caveats = crate::caveats::Caveats {
-        exec: crate::caveats::Scope::only(["python3".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let caveats = newt_policy::caveats::Caveats {
+        exec: newt_policy::caveats::Scope::only(["python3".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let envelope = super::shell::dispatch_bridled_shell(
             serde_json::json!({
@@ -72,10 +72,10 @@ async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
     let name = format!("newt-rc-afunix-{}", std::process::id());
     let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
     let _listener = UnixListener::bind_addr(&addr).unwrap();
-    let caveats = crate::caveats::Caveats {
-        exec: crate::caveats::Scope::only(["python3".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let caveats = newt_policy::caveats::Caveats {
+        exec: newt_policy::caveats::Scope::only(["python3".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let cmd = format!(
         r#"python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('\0{name}'); print('DEPUTY-REACHED'); s.close()""#
@@ -129,10 +129,10 @@ async fn run_command_route_fd_hygiene_is_cloexec_based_via_fdguard() {
     if !std::path::Path::new("/usr/bin/python3").exists() {
         return;
     }
-    let caveats = crate::caveats::Caveats {
-        exec: crate::caveats::Scope::only(["python3".to_string()]),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let caveats = newt_policy::caveats::Caveats {
+        exec: newt_policy::caveats::Scope::only(["python3".to_string()]),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let cmd = format!(
         r#"python3 -c "import os; print('FD-INHERITED' if os.path.exists('/proc/self/fd/{fd}') else 'fd-closed')""#

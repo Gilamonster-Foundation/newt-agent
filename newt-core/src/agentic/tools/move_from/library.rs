@@ -1,6 +1,6 @@
 //! Prove the edited file lies on an unconditional, ordinary library module path.
 //! A green --lib check says nothing about a disconnected or cfg-disabled file.
-use crate::caveats::Caveats;
+use newt_policy::caveats::Caveats;
 use std::path::Path;
 
 pub(super) fn source_in_library(

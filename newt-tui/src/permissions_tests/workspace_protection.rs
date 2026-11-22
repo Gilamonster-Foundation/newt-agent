@@ -2,9 +2,8 @@
 
 use super::permission_prompt_tests::scripted_gate;
 use super::*;
-use newt_core::{
-    Caveats, DenialKind, PermissionGate as _, PermissionRequest, Scope, ScopeExt as _,
-};
+use newt_core::{Caveats, Scope};
+use newt_policy::{DenialKind, PermissionGate as _, PermissionRequest, ScopeExt as _};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -94,7 +93,7 @@ fn protected_batch_denies_before_prompt_consumption_or_persistence() {
             request(DenialKind::FsWrite, &lawful),
             request(DenialKind::FsRead, &fixture.key),
         ]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     drop(gate);
     assert_eq!(prompts.get(), 0);
@@ -147,7 +146,7 @@ fn unsafe_baseline_is_refused_by_refresh_current_and_recall() {
     assert!(gate.current_caveats().is_err());
     assert!(matches!(
         gate.refresh_caveats(&unsafe_base),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
 }
@@ -173,7 +172,7 @@ fn prepared_build_fence_cannot_borrow_a_protected_read_root() {
     build.fs_read = Scope::only([fixture.key.to_string_lossy().into_owned()]);
     assert!(matches!(
         gate.ask_with_caveats(&build, &[request(DenialKind::Build, &fixture.workspace)]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
 }
@@ -195,7 +194,7 @@ fn lawful_build_preserves_network_and_does_not_require_profile_exec_ceiling() {
     );
     let mut build = newt_core::confined_exec::build_tool_caveats(&fixture.workspace);
     build.net = Scope::All;
-    let newt_core::PermissionDecision::Allow(allowed) =
+    let newt_policy::PermissionDecision::Allow(allowed) =
         gate.ask_with_caveats(&build, &[request(DenialKind::Build, &fixture.workspace)])
     else {
         panic!("ordinary authorized build must remain available")
@@ -228,7 +227,7 @@ fn combined_grants_are_checked_before_a_writable_alias_anchor_is_approved() {
     );
     assert!(matches!(
         gate.ask(&[request(DenialKind::FsWrite, &fixture.workspace)]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     drop(gate);
     assert_eq!(prompts.get(), 0);

@@ -1,5 +1,5 @@
 use super::*;
-use newt_core::CaveatsExt as _;
+use newt_policy::CaveatsExt as _;
 use std::fs;
 
 fn write_skill(root: &std::path::Path, name: &str, body: &str) {
@@ -25,7 +25,7 @@ fn triage_config(skills_dir: &std::path::Path) -> newt_core::Config {
     };
     cfg.permission_presets.insert(
         "readonly-triage".to_string(),
-        newt_core::NamedPermissionPreset {
+        newt_policy::NamedPermissionPreset {
             // fs_read: None preserves pre-#755 behavior (reads unrestricted).
             fs_read: None,
             readonly: true,
@@ -36,7 +36,7 @@ fn triage_config(skills_dir: &std::path::Path) -> newt_core::Config {
     );
     cfg.modes.insert(
         "triage".to_string(),
-        newt_core::config::ModeConfig {
+        newt_policy::posture::ModeConfig {
             skill: Some("oncall-triage".to_string()),
             preset: Some("readonly-triage".to_string()),
             framing: Some("On-call triage: investigate, do not change prod.".to_string()),
@@ -50,7 +50,7 @@ fn posture_status_lists_active_and_available_names() {
     let mut cfg = newt_core::Config::default();
     cfg.modes.insert(
         "triage".to_string(),
-        newt_core::config::ModeConfig {
+        newt_policy::posture::ModeConfig {
             skill: None,
             preset: Some("readonly-triage".to_string()),
             framing: None,
@@ -58,7 +58,7 @@ fn posture_status_lists_active_and_available_names() {
     );
     cfg.modes.insert(
         "coach".to_string(),
-        newt_core::config::ModeConfig {
+        newt_policy::posture::ModeConfig {
             skill: None,
             preset: None,
             framing: Some("Ask before acting.".to_string()),
@@ -104,13 +104,19 @@ fn posture_without_preset_carries_guidance_without_changing_authority() {
     let mut cfg = newt_core::Config::default();
     cfg.modes.insert(
         "coach".to_string(),
-        newt_core::config::ModeConfig {
+        newt_policy::posture::ModeConfig {
             skill: None,
             preset: None,
             framing: Some("Ask before acting.".to_string()),
         },
     );
-    let posture = build_posture("coach", &cfg, |_| panic!("no skill should be loaded")).unwrap();
+    let posture = build_posture::<std::convert::Infallible>(
+        "coach",
+        &cfg.modes,
+        &cfg.permission_presets,
+        |_| panic!("no skill should be loaded"),
+    )
+    .unwrap();
     let base = newt_core::Caveats::top();
 
     assert!(posture.permission_clamp().is_none());
@@ -138,7 +144,7 @@ fn build_posture_loads_skill_body_and_applies_preset_atomically() {
     let cfg = triage_config(skills.path());
     let dirs = cfg.skill_search_dirs();
 
-    let posture = build_posture("triage", &cfg, |name| {
+    let posture = build_posture("triage", &cfg.modes, &cfg.permission_presets, |name| {
         newt_skills::load_body_from(&dirs, name)
     })
     .expect("the posture resolves");
@@ -170,7 +176,7 @@ fn build_posture_errors_when_the_preset_is_missing() {
     let mut cfg = triage_config(skills.path());
     cfg.permission_presets.clear(); // preset gone, mode still references it
     let dirs = cfg.skill_search_dirs();
-    let err = build_posture("triage", &cfg, |name| {
+    let err = build_posture("triage", &cfg.modes, &cfg.permission_presets, |name| {
         newt_skills::load_body_from(&dirs, name)
     })
     .unwrap_err()
@@ -190,7 +196,7 @@ fn build_posture_errors_when_the_skill_is_missing() {
     let skills = tempfile::TempDir::new().unwrap(); // empty — no skill
     let cfg = triage_config(skills.path());
     let dirs = cfg.skill_search_dirs();
-    let err = build_posture("triage", &cfg, |name| {
+    let err = build_posture("triage", &cfg.modes, &cfg.permission_presets, |name| {
         newt_skills::load_body_from(&dirs, name)
     })
     .unwrap_err()
@@ -205,9 +211,14 @@ fn build_posture_errors_when_the_skill_is_missing() {
 #[test]
 fn build_posture_errors_on_unknown_posture() {
     let cfg = newt_core::Config::default();
-    let err = build_posture("nope", &cfg, |_| Ok(String::new()))
-        .unwrap_err()
-        .to_string();
+    let err = build_posture::<std::convert::Infallible>(
+        "nope",
+        &cfg.modes,
+        &cfg.permission_presets,
+        |_| Ok(String::new()),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("unknown posture"), "got: {err}");
 }
 
@@ -215,7 +226,7 @@ fn build_posture_errors_on_unknown_posture() {
 /// attenuated, the floor property at the wiring level.
 #[test]
 fn effective_caveats_intersect_base_with_the_posture_clamp() {
-    let clamp = newt_core::NamedPermissionPreset {
+    let clamp = newt_policy::NamedPermissionPreset {
         readonly: true,
         ..Default::default()
     }
@@ -281,30 +292,30 @@ fn read_only_tool_policy_is_a_permission_gate_ceiling() {
 #[test]
 fn posture_command_and_settings_share_the_enforced_binding() {
     let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-    let saved = newt_core::posture::active_posture();
+    let saved = newt_policy::posture::active_posture();
     let mut cfg = newt_core::Config::default();
     cfg.permission_presets.insert(
         "locked".into(),
-        newt_core::NamedPermissionPreset {
+        newt_policy::NamedPermissionPreset {
             readonly: true,
             ..Default::default()
         },
     );
     cfg.modes.insert(
         "review".into(),
-        newt_core::config::ModeConfig {
+        newt_policy::posture::ModeConfig {
             skill: None,
             preset: Some("locked".into()),
             framing: Some("Investigate without modifying files.".into()),
         },
     );
-    newt_core::posture::set_active_posture(None);
+    newt_policy::posture::set_active_posture(None);
     handle_posture_command("review", &cfg, false, false);
     let displayed = crate::settings_form::Field::Posture.current();
-    let installed = newt_core::posture::active_posture();
+    let installed = newt_policy::posture::active_posture();
     // Restore before asserting, including on the unfixed baseline whose
     // settings guard does not yet restore the permission posture.
-    newt_core::posture::set_active_posture(saved);
+    newt_policy::posture::set_active_posture(saved);
 
     assert_eq!(displayed, "review");
     let installed = installed.expect("the command must install the shared binding");
@@ -318,8 +329,8 @@ fn posture_command_and_settings_share_the_enforced_binding() {
 #[test]
 fn posture_command_off_releases_a_settings_installed_binding() {
     let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
-    let saved = newt_core::posture::active_posture();
-    newt_core::posture::set_active_posture(Some(ActivePosture {
+    let saved = newt_policy::posture::active_posture();
+    newt_policy::posture::set_active_posture(Some(ActivePosture {
         name: "locked".into(),
         preset_name: "strict".into(),
         clamp: newt_core::Caveats::default(),
@@ -329,8 +340,8 @@ fn posture_command_off_releases_a_settings_installed_binding() {
         framing: None,
     }));
     handle_posture_command("off", &newt_core::Config::default(), false, false);
-    let installed = newt_core::posture::active_posture();
-    newt_core::posture::set_active_posture(saved);
+    let installed = newt_policy::posture::active_posture();
+    newt_policy::posture::set_active_posture(saved);
     assert!(
         installed.is_none(),
         "off must release the same state settings installs"
@@ -340,11 +351,11 @@ fn posture_command_off_releases_a_settings_installed_binding() {
 #[test]
 fn posture_settings_guard_restores_the_permission_binding() {
     let _outer = newt_core::test_guard::GlobalSettingsGuard::acquire();
-    let saved = newt_core::posture::active_posture();
+    let saved = newt_policy::posture::active_posture();
     let existing = ActivePosture {
         name: "existing".into(),
         preset_name: "strict".into(),
-        clamp: newt_core::NamedPermissionPreset {
+        clamp: newt_policy::NamedPermissionPreset {
             readonly: true,
             ..Default::default()
         }
@@ -355,10 +366,10 @@ fn posture_settings_guard_restores_the_permission_binding() {
         framing: Some("Keep the existing framing.".into()),
     };
     let restored = [None, Some(existing)].map(|prior| {
-        newt_core::posture::set_active_posture(prior.clone());
+        newt_policy::posture::set_active_posture(prior.clone());
         {
             let _inner = newt_core::test_guard::GlobalSettingsGuard::acquire();
-            newt_core::posture::set_active_posture(Some(ActivePosture {
+            newt_policy::posture::set_active_posture(Some(ActivePosture {
                 name: "temporary".into(),
                 preset_name: String::new(),
                 clamp: newt_core::Caveats::top(),
@@ -368,9 +379,9 @@ fn posture_settings_guard_restores_the_permission_binding() {
                 framing: None,
             }));
         }
-        (prior, newt_core::posture::active_posture())
+        (prior, newt_policy::posture::active_posture())
     });
-    newt_core::posture::set_active_posture(saved);
+    newt_policy::posture::set_active_posture(saved);
     for (prior, actual) in &restored {
         let binding = |posture: &'_ Option<ActivePosture>| {
             posture.as_ref().map(|p| {

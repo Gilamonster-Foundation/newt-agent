@@ -1,8 +1,9 @@
 use newt_core::{
     agentic::{openai_chat_complete, ChatCtx},
     commit_review::NoOpReaders,
-    BackendKind, Caveats, MemMessage, NoMcp, PermissionGate,
+    BackendKind, Caveats, MemMessage, NoMcp,
 };
+use newt_policy::PermissionGate;
 use std::sync::atomic::AtomicBool;
 
 pub async fn run(

@@ -9,7 +9,7 @@
 //! filter set `no_new_privs` — cannot remove either. Descendants inherit the
 //! seccomp filter across fork/exec.
 //!
-//! The whole sequence lives in [`newt_core::netguard::run_guard_and_exec`] so it
+//! The whole sequence lives in [`newt_policy::netguard::run_guard_and_exec`] so it
 //! is shared verbatim with the `newt __net-guard` self-exec path (which is the
 //! production route — a released `newt` carries the guard without shipping this
 //! separate binary). This bin remains for the crate's own real-resource tests,
@@ -20,5 +20,5 @@
 //!   newt-net-guard [--cgroup-procs PATH] -- PROGRAM [ARGS...] # install floor + exec
 
 fn main() -> ! {
-    newt_core::netguard::run_guard_and_exec(std::env::args_os().skip(1))
+    newt_policy::netguard::run_guard_and_exec(std::env::args_os().skip(1))
 }

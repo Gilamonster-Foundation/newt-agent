@@ -78,7 +78,7 @@ pub struct CrewPolicyConfig {
     /// session ceiling; later steps (#749 step 8) compose a per-subtask clamp on
     /// top of this at the same `dispatch` seam.
     #[serde(default)]
-    pub clamp: crate::caveats::Caveats,
+    pub clamp: newt_policy::caveats::Caveats,
 }
 
 /// Budgets + review gates for a crew's control loop (`crew-loadout.md` §budgets).

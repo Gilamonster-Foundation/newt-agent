@@ -16,8 +16,8 @@
 //! meeting that delta against a ceiling (`recalled_caveats`) is where
 //! attenuation is enforced.
 
-use crate::caveats::Caveats;
-use crate::permissions::{widen_caveats, DenialKind};
+use newt_policy::caveats::Caveats;
+use newt_policy::permissions::{widen_caveats, DenialKind};
 
 /// Where the grant was decided — the web surface can never itself promote to
 /// durable (the web-surface law: only a terminal audit promotes). Carried
@@ -413,7 +413,7 @@ pub fn to_caveat_delta(base: &Caveats, grants: &[Grant]) -> CaveatDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::caveats::Scope;
+    use newt_policy::caveats::Scope;
 
     fn session_terminal(target: Target) -> Grant {
         Grant::new(target, Provenance::Terminal)

@@ -600,8 +600,8 @@ async fn attach_tab_renders_and_answers_a_danger_gated_permission_decision() {
     let question = newt_core::Question {
         markdown: "⊘ run_command wants to run `bash` — needs a shell.".into(),
         actions: vec![
-            newt_core::Action::new(newt_core::PermissionAction::AllowOnce, "a", "allow once"),
-            newt_core::Action::new(newt_core::PermissionAction::Deny, "d", "deny"),
+            newt_core::Action::new(newt_policy::PermissionAction::AllowOnce, "a", "allow once"),
+            newt_core::Action::new(newt_policy::PermissionAction::Deny, "d", "deny"),
         ],
         note: Some("High danger: session authorization is unavailable.".into()),
     };
@@ -648,7 +648,7 @@ async fn attach_tab_renders_and_answers_a_danger_gated_permission_decision() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(
         store.take_interaction_decision(&conv, &rid).unwrap(),
-        Some(newt_core::PermissionAction::AllowOnce),
+        Some(newt_policy::PermissionAction::AllowOnce),
         "the gate consumes the web verdict"
     );
     std::env::remove_var("NEWT_WEB_STATE_DIR");
@@ -677,8 +677,8 @@ async fn seed_followed_pending_decision(
     let question = newt_core::Question {
         markdown: "⊘ run_command wants to run `bash`.".into(),
         actions: vec![
-            newt_core::Action::new(newt_core::PermissionAction::AllowOnce, "a", "allow once"),
-            newt_core::Action::new(newt_core::PermissionAction::Deny, "d", "deny"),
+            newt_core::Action::new(newt_policy::PermissionAction::AllowOnce, "a", "allow once"),
+            newt_core::Action::new(newt_policy::PermissionAction::Deny, "d", "deny"),
         ],
         note: None,
     };
@@ -817,7 +817,7 @@ async fn a_second_web_answer_conflicts_rather_than_succeeding() {
     );
     assert_eq!(
         store.take_interaction_decision(&conv, &rid).unwrap(),
-        Some(newt_core::PermissionAction::AllowOnce),
+        Some(newt_policy::PermissionAction::AllowOnce),
         "exactly the winning verdict is recorded; the loser did not overwrite"
     );
     clear_web_env();
@@ -851,7 +851,7 @@ async fn web_allow_racing_local_deny_records_exactly_one_verdict() {
         );
         assert_eq!(
             store.take_interaction_decision(&conv, &rid).unwrap(),
-            Some(newt_core::PermissionAction::AllowOnce),
+            Some(newt_policy::PermissionAction::AllowOnce),
             "exactly the web verdict is recorded"
         );
         clear_web_env();
@@ -919,7 +919,7 @@ async fn the_losing_web_action_never_reports_204() {
     assert_eq!(loser, StatusCode::CONFLICT);
     assert_eq!(
         store.take_interaction_decision(&conv, &rid).unwrap(),
-        Some(newt_core::PermissionAction::Deny),
+        Some(newt_policy::PermissionAction::Deny),
         "only the winning verdict stands"
     );
     clear_web_env();
@@ -1116,7 +1116,7 @@ mod c3b {
         // 5. And it must have actually resolved the offer.
         assert_eq!(
             store.take_interaction_decision(&conv, &rid).unwrap(),
-            Some(newt_core::PermissionAction::AllowOnce),
+            Some(newt_policy::PermissionAction::AllowOnce),
             "the no-JS answer did not reach the store"
         );
         clear_web_env();
@@ -1208,7 +1208,7 @@ mod c3b {
         );
         assert_eq!(
             store.take_interaction_decision(&conv, &rid).unwrap(),
-            Some(newt_core::PermissionAction::AllowOnce)
+            Some(newt_policy::PermissionAction::AllowOnce)
         );
         clear_web_env();
     }
@@ -1722,7 +1722,7 @@ mod c3b {
         );
         assert_eq!(
             store.take_interaction_decision(&conv, &rid).unwrap(),
-            Some(newt_core::PermissionAction::AllowOnce),
+            Some(newt_policy::PermissionAction::AllowOnce),
             "exactly the winning verdict is recorded"
         );
         clear_web_env();
@@ -1850,7 +1850,7 @@ mod c3c {
         );
         assert_eq!(
             store.take_interaction_decision(&conv, &rid).unwrap(),
-            Some(newt_core::PermissionAction::AllowOnce)
+            Some(newt_policy::PermissionAction::AllowOnce)
         );
         clear_web_env();
     }

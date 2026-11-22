@@ -84,7 +84,7 @@ fn lifecycle_timed_out_run_puts_build_call_first() {
 /// not a second copy of the shape.
 #[tokio::test]
 async fn lifecycle_phase_build_points_at_action_build() {
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "phase": "build" });
     let out = execute_tool(
         "lifecycle",
@@ -373,7 +373,7 @@ fn run_phase_aliases_route_to_lifecycle() {
 async fn lifecycle_unknown_phase_lists_valid_phases() {
     // An unknown phase returns before any fs/subprocess touch, so this is a
     // fully-mocked unit test.
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "phase": "deploy" });
     let out = execute_tool(
         "lifecycle",
@@ -414,7 +414,7 @@ async fn lifecycle_unknown_phase_lists_valid_phases() {
 /// this is a fully-mocked unit test.
 #[tokio::test]
 async fn lifecycle_task_state_args_are_coached_to_update_plan() {
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     for args in [
         serde_json::json!({ "event": "complete", "message": "done" }),
         serde_json::json!({ "status": "blocked" }),
@@ -465,7 +465,7 @@ async fn lifecycle_task_state_args_are_coached_to_update_plan() {
 /// and the no-op no longer ledgers as a claimable success.
 #[tokio::test]
 async fn lifecycle_root_empty_names_a_nested_project_instead_of_a_silent_noop() {
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "phase": "test" });
     let out = execute_tool(
         "lifecycle",
@@ -517,7 +517,7 @@ async fn lifecycle_root_empty_names_a_nested_project_instead_of_a_silent_noop() 
 /// classifier added for the case above.
 #[tokio::test]
 async fn lifecycle_dir_param_resolves_a_nested_project_directly() {
-    let caveats = crate::caveats::Caveats::top();
+    let caveats = newt_policy::caveats::Caveats::top();
     let args = serde_json::json!({ "phase": "test", "action": "list", "dir": "newt-tuner" });
     let out = execute_tool(
         "lifecycle",
@@ -620,7 +620,7 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
         request.reason
     );
     assert_eq!(
-        crate::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
+        newt_policy::permissions::widen_caveats(&base, &[(request.kind, request.target)]),
         base
     );
     assert_eq!(
@@ -757,7 +757,7 @@ async fn lifecycle_list_at(cargo: &str, pyproject: &str) -> String {
     lifecycle_list(
         ws.path(),
         serde_json::json!({ "phase": "test", "action": "list" }),
-        &crate::caveats::Caveats::top(),
+        &newt_policy::caveats::Caveats::top(),
     )
     .await
 }
@@ -765,7 +765,7 @@ async fn lifecycle_list_at(cargo: &str, pyproject: &str) -> String {
 async fn lifecycle_list(
     ws: &std::path::Path,
     args: serde_json::Value,
-    caveats: &crate::caveats::Caveats,
+    caveats: &newt_policy::caveats::Caveats,
 ) -> String {
     execute_tool(
         "lifecycle",
@@ -861,12 +861,12 @@ async fn lifecycle_does_not_read_manifests_outside_the_read_grant() {
         "[project]\nname = \"tools\"\n",
     )
     .unwrap();
-    let workspace_only = crate::caveats::Caveats {
-        fs_read: crate::caveats::Scope::only([ws.path().to_string_lossy().into_owned()]),
-        fs_write: crate::caveats::Scope::none(),
-        exec: crate::caveats::Scope::none(),
-        net: crate::caveats::Scope::none(),
-        ..crate::caveats::Caveats::top()
+    let workspace_only = newt_policy::caveats::Caveats {
+        fs_read: newt_policy::caveats::Scope::only([ws.path().to_string_lossy().into_owned()]),
+        fs_write: newt_policy::caveats::Scope::none(),
+        exec: newt_policy::caveats::Scope::none(),
+        net: newt_policy::caveats::Scope::none(),
+        ..newt_policy::caveats::Caveats::top()
     };
     let args = serde_json::json!({
         "phase": "test",
@@ -877,6 +877,6 @@ async fn lifecycle_does_not_read_manifests_outside_the_read_grant() {
     assert!(out.contains("cargo test"), "{out}");
     assert!(!out.contains("dual-manifest root"), "{out}");
     // Control: the same directory under a read grant does get the note.
-    let out = lifecycle_list(ws.path(), args, &crate::caveats::Caveats::top()).await;
+    let out = lifecycle_list(ws.path(), args, &newt_policy::caveats::Caveats::top()).await;
     assert!(out.contains("dual-manifest root"), "{out}");
 }

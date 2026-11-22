@@ -1,5 +1,5 @@
 use super::*;
-use newt_core::{DenialKind, PermissionRequest};
+use newt_policy::{DenialKind, PermissionRequest};
 
 fn net_low() -> PermissionRequest {
     PermissionRequest {

@@ -1,8 +1,8 @@
 use super::*;
 use crate::mcp::Mcp;
 use crate::{close_out_message, help_lines, permissions_command_lines, ActivePosture};
-use newt_core::caveats::{Caveats, CountBound, Scope};
-use newt_core::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
+use newt_policy::caveats::{Caveats, CountBound, Scope};
+use newt_policy::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -93,7 +93,7 @@ fn web_decisions_publish_and_consume_a_web_verdict_without_the_tty() {
     let decision = gate.ask(&[exec_request("bash")]);
     answerer.join().unwrap();
     assert!(
-        matches!(decision, newt_core::PermissionDecision::Allow(_)),
+        matches!(decision, newt_policy::PermissionDecision::Allow(_)),
         "a web allow-once verdict must produce Allow"
     );
 }
@@ -144,7 +144,7 @@ fn web_decision_timeout_resolves_and_denies_without_hanging() {
     // hang never reaches them, and that failure now surfaces as the test
     // runner's own timeout instead of a stopwatch's `elapsed < 1s`.
     let decision = gate.ask(&[exec_request("bash")]);
-    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(matches!(decision, newt_policy::PermissionDecision::Deny));
     assert_eq!(state.decisions.len(), 1);
     assert_eq!(state.decisions[0].scope, "web-timeout");
     assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
@@ -185,7 +185,7 @@ fn web_publish_failure_records_web_unavailable_scope() {
         },
     };
     let decision = gate.ask(&[exec_request("bash")]);
-    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(matches!(decision, newt_policy::PermissionDecision::Deny));
     assert_eq!(state.decisions.len(), 1);
     assert_eq!(state.decisions[0].scope, "web-unavailable");
 }
@@ -791,7 +791,7 @@ fn authorization_prompts_disabled_denies_without_opening_a_prompt() {
     );
     gate.authorization_prompts_enabled = false;
     let decision = gate.ask(&[exec_request("bash")]);
-    assert!(matches!(decision, newt_core::PermissionDecision::Deny));
+    assert!(matches!(decision, newt_policy::PermissionDecision::Deny));
     assert_eq!(prompts.get(), 0, "disabled prompts must not open a prompt");
     assert_eq!(state.decisions.len(), 1);
     assert_eq!(state.decisions[0].scope, "authorization-prompts-disabled");
@@ -811,7 +811,10 @@ fn authorization_prompts_enabled_consults_the_operator() {
         prompts.clone(),
     );
     let decision = gate.ask(&[exec_request("bash")]);
-    assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
+    assert!(matches!(
+        decision,
+        newt_policy::PermissionDecision::Allow(_)
+    ));
     assert_eq!(
         prompts.get(),
         1,
@@ -834,7 +837,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
         .save(&key_path)
         .unwrap();
     let base = base_caveats("/ws");
-    let net_req = newt_core::PermissionRequest {
+    let net_req = newt_policy::PermissionRequest {
         tool: "web_fetch".to_string(),
         kind: DenialKind::Net,
         target: "github.com".to_string(),
@@ -871,7 +874,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
         };
         assert!(matches!(
             gate.ask(std::slice::from_ref(&net_req)),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
     }
     assert_eq!(state.decisions.len(), 1);
@@ -946,7 +949,10 @@ fn consume_pending_once_removes_what_ask_just_queued_for_request_permissions() {
         harness_bound: false,
     };
     let decision = gate.ask(&[request]);
-    assert!(matches!(decision, newt_core::PermissionDecision::Allow(_)));
+    assert!(matches!(
+        decision,
+        newt_policy::PermissionDecision::Allow(_)
+    ));
     assert!(
         gate.state
             .pending_once_grants
@@ -1193,7 +1199,7 @@ fn terminal_blank_answer_allows_once_and_never_closure() {
         };
         let result = gate.ask(&[request]);
         assert_eq!(
-            matches!(result, newt_core::PermissionDecision::Allow(_)),
+            matches!(result, newt_policy::PermissionDecision::Allow(_)),
             matches!(outcome, HumanQuestionOutcome::Answer(_)),
             "{outcome:?}"
         );
@@ -1332,7 +1338,7 @@ fn web_permission_asks_terminal_owner_before_claiming_input() {
     gate.open_panel = Some(&open_panel);
     assert!(matches!(
         gate.ask(&[exec_request("git")]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(prompts.get(), 1);
     assert_eq!(blocked.load(Ordering::Relaxed), 0);
@@ -1371,7 +1377,7 @@ fn web_permission_refused_modal_loan_does_not_take_input_or_leave_an_offer() {
     gate.open_panel = Some(&open_panel);
     assert!(matches!(
         gate.ask(&[exec_request("git")]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert!(store
         .pending_interaction_offer(&conversation_id)
@@ -1523,7 +1529,7 @@ fn nested_controls_cancel_without_recording_a_permission_decision() {
         gate.exit = Some(&exit);
         assert!(matches!(
             gate.ask(&[exec_request("npm")]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         drop(gate);
         assert!(cancel.load(Ordering::Relaxed));
@@ -1599,7 +1605,7 @@ fn a_data_loss_confirmation_is_asked_every_time() {
     for _ in 0..2 {
         assert!(matches!(
             gate.ask(&[delete()]),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
     }
     drop(gate);
@@ -1619,7 +1625,7 @@ fn a_data_loss_confirmation_is_asked_every_time() {
     );
     assert!(matches!(
         gate.ask(&[delete()]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     drop(gate);
     assert!(state.session_grants.is_empty(), "no session grant was made");
@@ -1640,7 +1646,7 @@ fn a_data_loss_confirmation_is_asked_every_time() {
     );
     assert!(matches!(
         gate.ask(&[delete()]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     drop(gate);
     assert_eq!(
@@ -1765,7 +1771,7 @@ fn high_danger_target_is_not_session_allowable_but_allow_once_works() {
         assert!(
             matches!(
                 gate.ask(&[exec_request("bash")]),
-                newt_core::PermissionDecision::Deny
+                newt_policy::PermissionDecision::Deny
             ),
             "session-allow of an interpreter must be refused (deny)"
         );
@@ -1795,13 +1801,13 @@ fn high_danger_target_is_not_session_allowable_but_allow_once_works() {
         once_prompts,
     );
     match once_gate.ask(&[exec_request("bash")]) {
-        newt_core::PermissionDecision::Allow(c) => {
+        newt_policy::PermissionDecision::Allow(c) => {
             assert!(
                 c.permits_exec("bash"),
                 "allow-once grants the target for this op"
             );
         }
-        newt_core::PermissionDecision::Deny => {
+        newt_policy::PermissionDecision::Deny => {
             panic!("allow-once of a high-danger target must still be permitted")
         }
     }
@@ -1832,11 +1838,11 @@ fn durable_ocap_approve_allows_without_prompting_and_grants_authority() {
         prompts.clone(),
     );
     match gate.ask(&[exec_request("git")]) {
-        newt_core::PermissionDecision::Allow(c) => assert!(
+        newt_policy::PermissionDecision::Allow(c) => assert!(
             c.permits_exec("git"),
             "a durable approve must fold `git` into the minted authority"
         ),
-        newt_core::PermissionDecision::Deny => panic!("durable approve must allow"),
+        newt_policy::PermissionDecision::Deny => panic!("durable approve must allow"),
     }
     assert_eq!(prompts.get(), 0, "durable approve must NOT prompt");
     drop(gate);
@@ -1898,11 +1904,11 @@ fn durable_signed_readonly_fs_approval_prompts_before_granting_write_authority()
         harness_bound: false,
     };
     match gate.ask(std::slice::from_ref(&read)) {
-        newt_core::PermissionDecision::Allow(caveats) => {
+        newt_policy::PermissionDecision::Allow(caveats) => {
             assert!(caveats.permits_fs_read(&read.target));
             assert!(!caveats.permits_fs_write(&read.target));
         }
-        newt_core::PermissionDecision::Deny => panic!("verified read approval must allow reads"),
+        newt_policy::PermissionDecision::Deny => panic!("verified read approval must allow reads"),
     }
     assert_eq!(
         prompts.get(),
@@ -1916,7 +1922,7 @@ fn durable_signed_readonly_fs_approval_prompts_before_granting_write_authority()
     };
     assert!(matches!(
         gate.ask(&[write]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(
         prompts.get(),
@@ -1973,7 +1979,7 @@ fn durable_ocap_deny_refuses_without_prompting() {
     assert!(
         matches!(
             gate.ask(&[exec_request("git")]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ),
         "a durable deny must refuse"
     );
@@ -2001,7 +2007,7 @@ fn durable_ocap_approve_of_high_danger_still_prompts() {
     assert!(
         matches!(
             gate.ask(&[exec_request("bash")]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ),
         "a durable approve must not bypass the danger prompt for an interpreter"
     );
@@ -2017,7 +2023,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
     let dir = tempfile::TempDir::new().unwrap();
     let denials = dir.path().join("permission-denials.jsonl");
     let base = base_caveats("/ws");
-    let net_req = newt_core::PermissionRequest {
+    let net_req = newt_policy::PermissionRequest {
         tool: "web_fetch".to_string(),
         kind: DenialKind::Net,
         target: "evil.example.com".to_string(),
@@ -2055,14 +2061,14 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
         };
         assert!(matches!(
             gate.ask(std::slice::from_ref(&net_req)),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
     }
     assert_eq!(state.decisions.len(), 1);
     assert_eq!(state.decisions[0].decision, "deny");
     assert_eq!(state.decisions[0].scope, "permanent");
     assert_eq!(
-        newt_core::load_denials(&denials),
+        newt_policy::load_denials(&denials),
         vec![(DenialKind::Net, "evil.example.com".to_string())],
         "the permanent deny was written to disk"
     );
@@ -2096,7 +2102,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
         };
         assert!(matches!(
             gate.ask(std::slice::from_ref(&net_req)),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
     }
     assert!(fresh.decisions.is_empty());
@@ -2176,7 +2182,7 @@ fn allow_permanently_grants_now_and_persists_host_to_approve_toml() {
                 .permissions
                 .to_caveats("/ws")
         };
-        let net_req = newt_core::PermissionRequest {
+        let net_req = newt_policy::PermissionRequest {
             tool: "mcp connect".to_string(),
             kind: DenialKind::Net,
             target: "github.com".to_string(),
@@ -2213,10 +2219,10 @@ fn allow_permanently_grants_now_and_persists_host_to_approve_toml() {
                 },
             };
             match gate.ask(std::slice::from_ref(&net_req)) {
-                newt_core::PermissionDecision::Allow(c) => {
+                newt_policy::PermissionDecision::Allow(c) => {
                     assert!(c.permits_net("github.com"), "granted this session");
                 }
-                newt_core::PermissionDecision::Deny => {
+                newt_policy::PermissionDecision::Deny => {
                     panic!("permanent-allow of a net host must be granted")
                 }
             }
@@ -2274,9 +2280,9 @@ fn refresh_caveats_includes_new_session_filesystem_grants_without_prompting() {
         };
         assert!(matches!(
             gate.ask(&[request]),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
-        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+        let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
             panic!("existing session authority must be refreshable");
         };
         assert_eq!(
@@ -2289,7 +2295,7 @@ fn refresh_caveats_includes_new_session_filesystem_grants_without_prompting() {
         );
         assert!(!refreshed.permits_fs_read("/approved/sibling.toml"));
         assert!(!refreshed.permits_fs_write("/approved/sibling.toml"));
-        assert!(newt_core::caveats::permits_path(
+        assert!(newt_policy::caveats::permits_path(
             &refreshed.fs_read,
             "/ws/source.rs"
         ));
@@ -2336,9 +2342,9 @@ fn refresh_caveats_preserves_a_narrower_caller_baseline_while_adding_session_gra
     };
     assert!(matches!(
         gate.ask(&[request]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
-    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
+    let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
         panic!("the standing grant must compose with the caller's narrower baseline");
     };
     assert_eq!(
@@ -2371,12 +2377,12 @@ fn refresh_caveats_neither_publishes_nor_consumes_pending_once_grants() {
     request.tool = "request_permissions".into();
     assert!(matches!(
         gate.ask(std::slice::from_ref(&request)),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     let pending = gate.state.pending_once_grants.clone();
     assert_eq!(pending.len(), 1);
     for _ in 0..2 {
-        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+        let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
             panic!("refresh must preserve the baseline");
         };
         assert_eq!(
@@ -2387,14 +2393,14 @@ fn refresh_caveats_neither_publishes_nor_consumes_pending_once_grants() {
         assert_eq!(gate.state.decisions.len(), 1);
     }
     request.tool = "run_command".into();
-    let newt_core::PermissionDecision::Allow(once) = gate.ask(&[request]) else {
+    let newt_policy::PermissionDecision::Allow(once) = gate.ask(&[request]) else {
         panic!("the exact operation must still consume its pending grant");
     };
     assert!(once.permits_exec("/opt/test-venv/bin/python"));
     assert!(gate.state.pending_once_grants.is_empty());
     assert!(gate.state.session_grants.is_empty());
     assert_eq!(prompts.get(), 1);
-    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+    let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
         panic!("refresh must preserve the baseline after the one-shot call");
     };
     assert_eq!(refreshed, base);
@@ -2433,7 +2439,7 @@ fn refresh_caveats_reapplies_preset_and_delegation_ceilings() {
         } else {
             gate.preset_clamp = Some(ceiling.clone());
         }
-        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+        let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
             panic!("refresh must retain authority inside the ceiling");
         };
         assert!(refreshed.permits_fs_read("/approved/config.toml"));
@@ -2472,14 +2478,14 @@ fn refresh_caveats_preserves_denials_and_filters_conflicting_cached_grants() {
     };
     assert!(matches!(
         gate.ask(std::slice::from_ref(&request)),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     request.target = "/approved/denied.toml".into();
     assert!(matches!(
         gate.ask(std::slice::from_ref(&request)),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
-    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+    let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
         panic!("a denial must not remove independent baseline authority");
     };
     assert_eq!(
@@ -2488,7 +2494,7 @@ fn refresh_caveats_preserves_denials_and_filters_conflicting_cached_grants() {
     );
     assert!(matches!(
         gate.ask(&[request]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 2, "refresh cannot clear an operator refusal");
     assert_eq!(gate.state.decisions.len(), 2);
@@ -2515,7 +2521,7 @@ fn allow_once_looped_exec_batch_asks_once_per_resolved_path() {
         "/usr/bin/tr"
     };
     let requests = vec![exec_request(path); 150];
-    let newt_core::PermissionDecision::Allow(allowed) = gate.ask(&requests) else {
+    let newt_policy::PermissionDecision::Allow(allowed) = gate.ask(&requests) else {
         panic!("one invocation's repeated target should be allowed");
     };
     assert!(allowed.permits_exec(path));
@@ -2555,7 +2561,7 @@ fn allow_once_exec_batch_keeps_programs_and_paths_distinct() {
         .collect();
     assert!(matches!(
         gate.ask(&requests),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(prompts.get(), 3, "each exact path needs its own approval");
 }
@@ -2582,7 +2588,7 @@ fn allow_once_exec_batch_expires_before_next_invocation() {
     for invocation in 1..=2 {
         assert!(matches!(
             gate.ask(&[exec_request(path), exec_request(path)]),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
         assert_eq!(
             prompts.get(),
@@ -2612,7 +2618,7 @@ fn allow_once_exec_batch_deny_still_denies() {
     };
     assert!(matches!(
         gate.ask(&[exec_request(path), exec_request(path)]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 1);
     assert!(gate.state.session_grants.is_empty());
@@ -2634,17 +2640,17 @@ fn allow_once_grants_one_call_and_reprompts_next_time() {
     );
     let req = [exec_request("npm")];
     match gate.ask(&req) {
-        newt_core::PermissionDecision::Allow(c) => {
+        newt_policy::PermissionDecision::Allow(c) => {
             assert!(c.permits_exec("npm"), "the grant covers the target");
             assert!(c.permits_exec("cargo"), "baseline grants kept");
             assert!(!c.permits_exec("rm"), "nothing else widened");
         }
-        newt_core::PermissionDecision::Deny => panic!("expected allow"),
+        newt_policy::PermissionDecision::Deny => panic!("expected allow"),
     }
     assert_eq!(prompts.get(), 1);
     assert!(matches!(
         gate.ask(&req),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(prompts.get(), 2, "allow-once re-prompts on the next call");
     drop(gate);
@@ -2676,17 +2682,17 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
     };
     assert!(matches!(
         gate.ask(&[ask]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(prompts.get(), 1);
     match gate.ask(&[exec_request("/usr/bin/python3")]) {
-        newt_core::PermissionDecision::Allow(c) => {
+        newt_policy::PermissionDecision::Allow(c) => {
             assert!(
                 c.permits_exec("/usr/bin/python3"),
                 "the carried grant widened the caveats so the retry runs"
             );
         }
-        newt_core::PermissionDecision::Deny => panic!("carried grant should cover the retry"),
+        newt_policy::PermissionDecision::Deny => panic!("carried grant should cover the retry"),
     }
     assert_eq!(
         prompts.get(),
@@ -2695,7 +2701,7 @@ fn request_permissions_allow_once_carries_to_the_run_command_retry() {
     );
     assert!(matches!(
         gate.ask(&[exec_request("/usr/bin/python3")]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(
         prompts.get(),
@@ -2728,7 +2734,7 @@ fn exact_executable_grants_preserve_immediate_and_proactive_once_authority() {
         if proactive {
             request.tool = "request_permissions".into();
         }
-        let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
+        let newt_policy::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
             panic!("exact executable should be grantable once");
         };
         assert_eq!(granted.exec, Scope::only(["cargo".into(), target.into()]));
@@ -2738,11 +2744,11 @@ fn exact_executable_grants_preserve_immediate_and_proactive_once_authority() {
         // A different executable with the same basename cannot consume the grant.
         assert!(matches!(
             gate.ask(&[exec_request(other)]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         assert_eq!(prompts.get(), 2);
         if proactive {
-            let newt_core::PermissionDecision::Allow(retry) = gate.ask(&[exec_request(target)])
+            let newt_policy::PermissionDecision::Allow(retry) = gate.ask(&[exec_request(target)])
             else {
                 panic!("the exact pending grant must survive an unrelated request");
             };
@@ -2755,7 +2761,7 @@ fn exact_executable_grants_preserve_immediate_and_proactive_once_authority() {
         }
         assert!(matches!(
             gate.ask(&[exec_request(target)]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         assert_eq!(prompts.get(), 3, "allow once never becomes sticky");
         drop(gate);
@@ -2794,7 +2800,7 @@ fn exact_executable_grants_respect_existing_basename_denials() {
         );
         assert!(matches!(
             gate.ask(&[exec_request("/opt/test-venv/bin/python")]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         assert_eq!(
             prompts.get(),
@@ -2820,7 +2826,7 @@ fn session_grant_exec_requires_exact_target() {
     for (index, target) in targets.iter().enumerate() {
         let mut request = exec_request(target);
         request.tool = "request_permissions".into();
-        let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
+        let newt_policy::PermissionDecision::Allow(granted) = gate.ask(&[request]) else {
             panic!("the operator approved {target}");
         };
         assert!(
@@ -2831,7 +2837,8 @@ fn session_grant_exec_requires_exact_target() {
         for unapproved in &targets[index + 1..] {
             assert!(!granted.permits_exec(unapproved));
         }
-        let newt_core::PermissionDecision::Allow(reused) = gate.ask(&[exec_request(target)]) else {
+        let newt_policy::PermissionDecision::Allow(reused) = gate.ask(&[exec_request(target)])
+        else {
             panic!("the identical target must reuse its session approval");
         };
         assert_eq!(reused, granted);
@@ -2853,11 +2860,11 @@ fn bare_session_exec_grant_does_not_bypass_an_absolute_request_denial() {
     );
     assert!(matches!(
         gate.ask(&[exec_request("mytool")]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert!(matches!(
         gate.ask(&[exec_request("/opt/bin/mytool")]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 2);
 }
@@ -2882,18 +2889,19 @@ fn bare_pending_once_exec_grant_survives_an_absolute_request_denial() {
     request.tool = "request_permissions".into();
     assert!(matches!(
         gate.ask(&[request]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert!(matches!(
         gate.ask(&[exec_request("/opt/bin/mytool")]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(
         prompts.get(),
         2,
         "a different target needs its own decision"
     );
-    let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("mytool")]) else {
+    let newt_policy::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("mytool")])
+    else {
         panic!("the exact pending grant must survive a different target");
     };
     assert!(granted.permits_exec("mytool"));
@@ -2901,7 +2909,7 @@ fn bare_pending_once_exec_grant_survives_an_absolute_request_denial() {
     assert_eq!(prompts.get(), 2, "exact retry consumes the pending grant");
     assert!(matches!(
         gate.ask(&[exec_request("mytool")]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 3, "the pending grant is consumed only once");
     drop(gate);
@@ -2922,12 +2930,12 @@ fn full_path_session_grant_does_not_cover_a_bare_name() {
     );
     assert!(matches!(
         gate.ask(&[exec_request("/opt/bin/mytool")]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(prompts.get(), 1);
     assert!(matches!(
         gate.ask(&[exec_request("mytool")]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(
         prompts.get(),
@@ -2940,7 +2948,7 @@ fn full_path_session_grant_does_not_cover_a_bare_name() {
 fn git_write_grant_refused_under_readonly_preset() {
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));
-    let clamp = newt_core::NamedPermissionPreset {
+    let clamp = newt_policy::NamedPermissionPreset {
         readonly: true,
         ..Default::default()
     }
@@ -2963,7 +2971,7 @@ fn git_write_grant_refused_under_readonly_preset() {
         harness_bound: false,
     };
     assert!(
-        matches!(gate.ask(&[req]), newt_core::PermissionDecision::Deny),
+        matches!(gate.ask(&[req]), newt_policy::PermissionDecision::Deny),
         "a readonly preset must refuse a git-write grant"
     );
     assert_eq!(prompts.get(), 0, "the floor refuses WITHOUT prompting");
@@ -2990,7 +2998,7 @@ fn git_write_grant_allowed_without_a_preset() {
     };
     assert!(matches!(
         gate.ask(&[req]),
-        newt_core::PermissionDecision::Allow(_)
+        newt_policy::PermissionDecision::Allow(_)
     ));
     assert_eq!(prompts.get(), 1);
 }
@@ -2999,7 +3007,7 @@ fn git_write_grant_allowed_without_a_preset() {
 fn session_grant_cannot_pierce_the_preset_floor() {
     let mut state = PermissionPromptState::default();
     let prompts = Rc::new(Cell::new(0));
-    let clamp = newt_core::NamedPermissionPreset {
+    let clamp = newt_policy::NamedPermissionPreset {
         readonly: true,
         ..Default::default()
     }
@@ -3020,23 +3028,23 @@ fn session_grant_cannot_pierce_the_preset_floor() {
     );
     gate.preset_clamp = Some(clamp.clone());
     match gate.ask(&[exec_request("rm")]) {
-        newt_core::PermissionDecision::Allow(c) => {
+        newt_policy::PermissionDecision::Allow(c) => {
             assert!(
                 !c.permits_exec("rm"),
                 "a once-grant must not pierce the preset floor: {c:?}"
             );
             assert!(!c.permits_exec("cargo"), "floor keeps exec denied");
         }
-        newt_core::PermissionDecision::Deny => panic!("the gate allowed-once"),
+        newt_policy::PermissionDecision::Deny => panic!("the gate allowed-once"),
     }
     match gate.ask(&[exec_request("rm")]) {
-        newt_core::PermissionDecision::Allow(c) => {
+        newt_policy::PermissionDecision::Allow(c) => {
             assert!(
                 !c.permits_exec("rm"),
                 "a SESSION grant must not pierce the floor either: {c:?}"
             );
         }
-        newt_core::PermissionDecision::Deny => panic!("the gate allowed-session"),
+        newt_policy::PermissionDecision::Deny => panic!("the gate allowed-session"),
     }
     drop(gate);
     assert!(state
@@ -3071,7 +3079,7 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
         );
         gate.preset_clamp =
             crate::operating_mode_permission_clamp(false, configured, model_plan_phase, None);
-        let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
+        let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&base) else {
             panic!("refresh returns the attenuated authority");
         };
         assert_eq!(
@@ -3089,7 +3097,7 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
         );
 
         for _ in 0..2 {
-            let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")])
+            let newt_policy::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")])
             else {
                 panic!("scripted operator allowed the request");
             };
@@ -3108,7 +3116,7 @@ fn explicit_operating_mode_ceiling_survives_permission_grants() {
         };
         assert!(matches!(
             gate.ask(&[request]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
     }
 
@@ -3135,12 +3143,12 @@ fn allow_session_never_reprompts_until_restart() {
         let req = [exec_request("npm")];
         assert!(matches!(
             gate.ask(&req),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
         assert_eq!(prompts.get(), 1);
         assert!(matches!(
             gate.ask(&req),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
     }
     {
@@ -3153,8 +3161,8 @@ fn allow_session_never_reprompts_until_restart() {
             prompts.clone(),
         );
         match gate.ask(&[exec_request("npm")]) {
-            newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("npm")),
-            newt_core::PermissionDecision::Deny => panic!("session grant must hold"),
+            newt_policy::PermissionDecision::Allow(c) => assert!(c.permits_exec("npm")),
+            newt_policy::PermissionDecision::Deny => panic!("session grant must hold"),
         }
     }
     assert_eq!(prompts.get(), 1, "exactly one prompt for the whole session");
@@ -3170,7 +3178,7 @@ fn allow_session_never_reprompts_until_restart() {
     );
     assert!(matches!(
         gate.ask(&[exec_request("npm")]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 2, "the grant did not survive the restart");
 }
@@ -3190,11 +3198,11 @@ fn deny_always_short_circuits_later_asks() {
     let req = [exec_request("rm")];
     assert!(matches!(
         gate.ask(&req),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert!(matches!(
         gate.ask(&req),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 1, "second ask auto-denied without a prompt");
     drop(gate);
@@ -3218,10 +3226,13 @@ fn batch_deny_and_empty_requests_deny() {
     let reqs = [exec_request("npm"), exec_request("rm")];
     assert!(matches!(
         gate.ask(&reqs),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 2, "asked per target until the deny");
-    assert!(matches!(gate.ask(&[]), newt_core::PermissionDecision::Deny));
+    assert!(matches!(
+        gate.ask(&[]),
+        newt_policy::PermissionDecision::Deny
+    ));
     assert_eq!(prompts.get(), 2, "empty batch never prompts");
 }
 
@@ -3298,8 +3309,8 @@ fn allow_remints_from_the_user_root_and_never_widens_the_baseline() {
         prompts.clone(),
     );
     let minted = match gate.ask(&[exec_request("npm")]) {
-        newt_core::PermissionDecision::Allow(c) => c,
-        newt_core::PermissionDecision::Deny => panic!("expected allow"),
+        newt_policy::PermissionDecision::Allow(c) => c,
+        newt_policy::PermissionDecision::Deny => panic!("expected allow"),
     };
     assert!(
         key_path.exists(),
@@ -3310,7 +3321,7 @@ fn allow_remints_from_the_user_root_and_never_widens_the_baseline() {
     assert!(!minted.permits_exec("rm"));
     drop(gate);
     assert_eq!(base, base_caveats("/ws"));
-    let policy = newt_core::widen_caveats(&base, &[(DenialKind::Exec, "npm".to_string())]);
+    let policy = newt_policy::widen_caveats(&base, &[(DenialKind::Exec, "npm".to_string())]);
     let key = mint_operating_key(&key_path, &policy).unwrap();
     assert_eq!(newt_identity::enforced_caveats(&key).unwrap(), minted);
 }
@@ -3396,7 +3407,7 @@ fn delegated_grants_cannot_cross_the_parent_ceiling_or_persist_approval() {
             assert!(
                 matches!(
                     gate.ask(std::slice::from_ref(req)),
-                    newt_core::PermissionDecision::Deny
+                    newt_policy::PermissionDecision::Deny
                 ),
                 "delegated {:?} cannot grant {:?}",
                 choice,
@@ -3451,7 +3462,7 @@ fn delegated_grants_reject_cached_approvals_outside_the_ceiling() {
         gate.delegation = Some(&delegation);
         assert!(matches!(
             gate.ask(&[exec_request("npm")]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         assert_eq!(prompts.get(), 0);
     }
@@ -3514,7 +3525,7 @@ fn delegated_grants_preflight_the_whole_batch_before_approval_side_effects() {
         );
         assert!(matches!(
             gate.ask(&requests),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         drop(gate);
         assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
@@ -3554,7 +3565,7 @@ fn delegated_grants_do_not_return_unrelated_cached_authority() {
         prompts.clone(),
     );
     gate.delegation = Some(&delegation);
-    let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")]) else {
+    let newt_policy::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")]) else {
         panic!("an unrelated cached grant must not prevent a lawful approval");
     };
     assert!(granted.permits_exec("npm"));
@@ -3610,7 +3621,7 @@ fn delegated_grants_reject_durable_ocap_approval_outside_the_ceiling() {
     );
     assert!(matches!(
         gate.ask(&[exec_request("git")]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     drop(gate);
     assert_eq!(prompts.get(), 0);
@@ -3649,7 +3660,7 @@ fn delegated_grants_allow_within_the_ceiling_without_creating_a_root_key() {
         prompts.clone(),
     );
     gate.delegation = Some(&delegation);
-    let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")]) else {
+    let newt_policy::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")]) else {
         panic!("a lawful grant within the inherited ceiling must still work");
     };
     assert!(granted.permits_exec("npm"));
@@ -3753,7 +3764,7 @@ async fn native_once_filesystem_pending_grants_survive_until_the_declared_retry(
         args: serde_json::Value,
         root: &std::path::Path,
         base: &Caveats,
-        gate: &mut dyn newt_core::PermissionGate,
+        gate: &mut dyn newt_policy::PermissionGate,
     ) -> String {
         newt_core::execute_tool(
             name,
@@ -3871,7 +3882,7 @@ async fn native_once_filesystem_pending_grants_survive_until_the_declared_retry(
         "only the missing executable prompts on retry"
     );
     assert_eq!(gate.state.decisions.last().unwrap().kind, "exec");
-    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
+    let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
         panic!("baseline refresh refused")
     };
     assert_eq!(
@@ -3941,19 +3952,19 @@ fn native_once_filesystem_baseline_survives_later_exec_and_net_approvals() {
             reason: "one declared invocation".into(),
             harness_bound: false,
         };
-        let newt_core::PermissionDecision::Allow(allowed) =
+        let newt_policy::PermissionDecision::Allow(allowed) =
             gate.ask_with_caveats(&current, &[request])
         else {
             panic!("approved request denied")
         };
-        expected = newt_core::widen_caveats(&expected, &[(kind, target.into())]);
+        expected = newt_policy::widen_caveats(&expected, &[(kind, target.into())]);
         assert_eq!(allowed, expected, "only the requested axis may widen");
         current = allowed;
     }
     assert_eq!(prompts.get(), 4);
     assert!(gate.state.pending_once_grants.is_empty());
     assert!(gate.state.session_grants.is_empty());
-    let newt_core::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
+    let newt_policy::PermissionDecision::Allow(refreshed) = gate.refresh_caveats(&baseline) else {
         panic!("baseline refresh refused")
     };
     assert_eq!(refreshed, baseline);
@@ -4042,7 +4053,7 @@ fn native_once_filesystem_known_refusals_precede_pending_consumption() {
         assert!(
             matches!(
                 gate.ask_with_caveats(&baseline, &requests),
-                newt_core::PermissionDecision::Deny
+                newt_policy::PermissionDecision::Deny
             ),
             "{refusal}"
         );
@@ -4206,7 +4217,7 @@ fn permissions_command_lists_decisions_and_log_location() {
         .any(|l| l.contains("no prompted permission decisions")));
     // With decisions + a log path: one row per decision, log named,
     // and promotion remains an explicit human action.
-    state.decisions.push(newt_core::PermissionRecord::new(
+    state.decisions.push(newt_policy::PermissionRecord::new(
         "conv-1",
         "run_command",
         DenialKind::Exec,
@@ -4229,7 +4240,7 @@ fn permissions_command_lists_decisions_and_log_location() {
 #[test]
 fn permissions_command_reflects_the_active_posture() {
     let state = PermissionPromptState::default();
-    let preset = newt_core::NamedPermissionPreset {
+    let preset = newt_policy::NamedPermissionPreset {
         // fs_read: None preserves pre-#755 behavior (reads unrestricted).
         fs_read: None,
         readonly: true,
@@ -4503,7 +4514,7 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
 #[test]
 fn confined_build_is_never_a_shell_expansion_and_session_allow_is_call_scoped_too() {
     let base = base_caveats("/ws");
-    let request = newt_core::PermissionRequest {
+    let request = newt_policy::PermissionRequest {
         tool: "lifecycle".into(),
         kind: DenialKind::Build,
         target: "/ws".into(),
@@ -4527,14 +4538,14 @@ fn confined_build_is_never_a_shell_expansion_and_session_allow_is_call_scoped_to
         let prompts = Rc::new(Cell::new(0));
         let mut gate = scripted_gate(&mut state, base.clone(), None, None, vec![choice], prompts);
         match gate.ask(std::slice::from_ref(&request)) {
-            newt_core::PermissionDecision::Allow(caveats) => {
+            newt_policy::PermissionDecision::Allow(caveats) => {
                 assert!(permitted);
                 assert_eq!(
                     caveats, base,
                     "build is call-scoped, never a shell expansion"
                 );
             }
-            newt_core::PermissionDecision::Deny => assert!(!permitted),
+            newt_policy::PermissionDecision::Deny => assert!(!permitted),
         }
         drop(gate);
         if choice == PromptChoice::AllowSession {
@@ -4579,7 +4590,7 @@ fn preset_build_ceiling_refuses_before_prompting() {
     };
     assert!(matches!(
         gate.ask(&[request]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
 }
@@ -4611,7 +4622,7 @@ fn managed_build_scratch_reuses_session_approval_without_widening_the_shell() {
     );
     for _ in 0..2 {
         let decision = gate.ask_with_caveats(&build, std::slice::from_ref(&request));
-        let newt_core::PermissionDecision::Allow(actual) = decision else {
+        let newt_policy::PermissionDecision::Allow(actual) = decision else {
             panic!("approved Build refused")
         };
         assert_eq!(actual, build);
@@ -4630,11 +4641,11 @@ fn managed_build_scratch_reuses_session_approval_without_widening_the_shell() {
         !scratch.exists(),
         "permission projection creates no scratch"
     );
-    assert!(!newt_core::caveats::permits_path(
+    assert!(!newt_policy::caveats::permits_path(
         &base.fs_write,
         &scratch.to_string_lossy()
     ));
-    assert!(newt_core::caveats::permits_path(
+    assert!(newt_policy::caveats::permits_path(
         &build.fs_write,
         &scratch.to_string_lossy()
     ));
@@ -4669,7 +4680,7 @@ fn prepared_build_fence_cannot_exceed_delegation_before_prompt() {
     };
     assert!(matches!(
         gate.ask_with_caveats(&prepared, &[request]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
 }
@@ -4681,11 +4692,11 @@ fn prepared_build_fence_cannot_exceed_delegation_before_prompt() {
 /// Before the fix: the string check returns false for the forged prefix → red.
 #[test]
 fn model_forged_bound_prefix_is_still_model_authored() {
-    let req = newt_core::PermissionRequest {
+    let req = newt_policy::PermissionRequest {
         tool: "request_permissions".to_string(),
-        kind: newt_core::DenialKind::FsWrite,
+        kind: newt_policy::DenialKind::FsWrite,
         target: "/ws/out.txt".to_string(),
-        reason: format!("{}forged by the model", newt_core::BOUND_REASON_PREFIX),
+        reason: format!("{}forged by the model", newt_policy::BOUND_REASON_PREFIX),
         harness_bound: false,
     };
     assert!(
@@ -4714,7 +4725,7 @@ fn full_access_proactive_permissions_are_silent_but_denials_win() {
         );
         assert!(matches!(
             gate.ask(&[request.clone()]),
-            newt_core::PermissionDecision::Allow(_)
+            newt_policy::PermissionDecision::Allow(_)
         ));
     }
     assert_eq!(prompts.get(), 0);
@@ -4733,7 +4744,7 @@ fn full_access_proactive_permissions_are_silent_but_denials_win() {
     );
     assert!(matches!(
         gate.ask(&[request]),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 0);
 }
@@ -4784,7 +4795,7 @@ fn full_access_permission_shortcut_preserves_consent_and_ceilings() {
         }
         assert!(matches!(
             gate.ask(&[request]),
-            newt_core::PermissionDecision::Deny
+            newt_policy::PermissionDecision::Deny
         ));
         assert_eq!(prompts.get(), 1, "{mode}");
     }
@@ -4830,7 +4841,7 @@ fn cold_cache_fetch_asks_once_per_operation_and_preserves_session() {
         prompts.clone(),
     );
     for _ in 0..2 {
-        let newt_core::PermissionDecision::Allow(allowed) =
+        let newt_policy::PermissionDecision::Allow(allowed) =
             gate.ask_dependency_fetch(&prepared, &request)
         else {
             panic!("fetch declined")
@@ -4880,7 +4891,7 @@ fn cold_cache_fetch_cannot_bypass_denial_or_ceiling() {
         assert!(
             matches!(
                 gate.ask_dependency_fetch(&prepared, &request),
-                newt_core::PermissionDecision::Deny
+                newt_policy::PermissionDecision::Deny
             ),
             "{mode}"
         );
@@ -4923,7 +4934,7 @@ fn run_command_network_read_is_a_one_operation_approval() {
         vec![PromptChoice::AllowOnce],
         prompts.clone(),
     );
-    let newt_core::PermissionDecision::Allow(allowed) =
+    let newt_policy::PermissionDecision::Allow(allowed) =
         gate.ask_dependency_fetch(&prepared, &request)
     else {
         panic!("network read declined")
@@ -4935,7 +4946,7 @@ fn run_command_network_read_is_a_one_operation_approval() {
     };
     assert!(matches!(
         gate.ask_dependency_fetch(&prepared, &host_request),
-        newt_core::PermissionDecision::Deny
+        newt_policy::PermissionDecision::Deny
     ));
     drop(gate);
     assert_eq!(prompts.get(), 1);
