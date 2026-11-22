@@ -262,6 +262,15 @@ impl PermissionRequest {
         self.kind == DenialKind::Net
             && (self.tool == "lifecycle" || (self.tool == "run_command" && self.harness_bound))
     }
+
+    /// Whether this is the confirmation for a git op that destroys work (#1191). It
+    /// is asked every time: a gate offers allow once or deny for it, records no
+    /// session or durable grant from the answer, and lets no recorded grant skip it
+    /// (#3187).
+    #[must_use]
+    pub fn confirms_data_loss(&self) -> bool {
+        self.kind == DenialKind::GitWrite && git_data_loss_action(&self.target).is_some()
+    }
 }
 
 /// The git ops that destroy work irrecoverably (#1191), each with what a prompt

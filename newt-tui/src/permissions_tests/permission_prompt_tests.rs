@@ -1568,6 +1568,94 @@ fn a_data_loss_confirmation_is_not_announced_as_a_commit() {
     }
 }
 
+/// #3187: a data-loss confirmation (#1191) is asked every time. The form offers allow
+/// once or deny, never a session or permanent allow, and no recorded grant skips the
+/// prompt. One "session allow" used to silence every later delete.
+#[test]
+fn a_data_loss_confirmation_is_asked_every_time() {
+    let danger = danger::DangerTable::builtin();
+    let delete = || PermissionRequest {
+        tool: "git".into(),
+        kind: DenialKind::GitWrite,
+        target: "branch-delete".into(),
+        reason: "git branch-delete DESTROYS work irrecoverably".into(),
+        harness_bound: false,
+    };
+    let form = permission_definition(&delete(), &danger, Audience::Terminal);
+    assert!(offers(&form, PromptChoice::AllowOnce));
+    for withheld in [PromptChoice::AllowSession, PromptChoice::AllowPermanent] {
+        assert!(
+            !offers(&form, withheld),
+            "{withheld:?} is offered: {}",
+            form.markdown
+        );
+    }
+
+    // Two deletes, two prompts; nothing is recorded.
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce, PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    for _ in 0..2 {
+        assert!(matches!(
+            gate.ask(&[delete()]),
+            newt_policy::PermissionDecision::Allow(_)
+        ));
+    }
+    drop(gate);
+    assert_eq!(prompts.get(), 2, "each delete asks");
+    assert!(state.session_grants.is_empty(), "nothing is recorded");
+
+    // A session answer was not offered, so it is refused and records nothing.
+    let mut state = PermissionPromptState::default();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::AllowSession],
+        prompts.clone(),
+    );
+    assert!(matches!(
+        gate.ask(&[delete()]),
+        newt_policy::PermissionDecision::Deny
+    ));
+    drop(gate);
+    assert!(state.session_grants.is_empty(), "no session grant was made");
+
+    // A grant already on record, saved by an earlier session, does not skip the prompt.
+    let mut state = PermissionPromptState::default();
+    state
+        .session_grants
+        .insert((DenialKind::GitWrite, "branch-delete".to_string()));
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        None,
+        None,
+        vec![PromptChoice::Deny],
+        prompts.clone(),
+    );
+    assert!(matches!(
+        gate.ask(&[delete()]),
+        newt_policy::PermissionDecision::Deny
+    ));
+    drop(gate);
+    assert_eq!(
+        prompts.get(),
+        1,
+        "a recorded grant must not skip the prompt"
+    );
+}
+
 #[test]
 fn question_policy_and_markdown_cover_each_axis_and_danger_tier() {
     let danger = danger::DangerTable::builtin();
