@@ -153,6 +153,16 @@
 #     test with ast. Real Cargo plus kernel confinement; no kernel skip.
 #   - `just cov-ci` (coverage floor, cargo-llvm-cov instrumented whole-workspace)
 #   - the `--no-default-features` lean build/test config (issue #416, #1409, #1828)
+#   - the confine-off newt-core gate (#3160), ci.yml lean job and again in its
+#     Windows job: newt-core alone, every default feature but `confine`:
+#     `cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings`
+#     and, in the lean job, the probe that cargo really resolved `confine` off.
+#     The lean newt-core gate of the bullet above now names `confine` and keeps
+#     it on, so each default feature has its own off-gate. `just check` runs
+#     both clippy lines on Unix; this hook builds default features only. A push
+#     that touches a file the pin reads does run the pin here, as an ordinary
+#     newt-core test: newt-core/tests/confine_gate_parity_ratchet.rs holds the
+#     two gates, the Windows copy and the command quoted in this bullet equal.
 #   - `just msrv` (MSRV toolchain check)
 #   - `cargo check -p newt-flock --lib --locked` (ci.yml lint job): the read-only
 #     library without dev-dependencies; its fixture's writer features hide a

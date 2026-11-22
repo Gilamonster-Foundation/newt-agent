@@ -7,7 +7,8 @@ name: CI
 # `cargo nextest run -E 'rdeps(<crate>)'` scoped to that classification (or
 # `--workspace` on ALL), plus scripts/spawn_inventory.py and `just docs-check`.
 # This CI workflow is the authoritative FULL gate: coverage (cov-ci), MSRV,
-# security audit, the `--no-default-features` lean config, the whole npm
+# security audit, the `--no-default-features` lean config, the `confine`-off
+# newt-core gate (#3160), the whole npm
 # installer matrix (the hook runs no npm check on any OS), the
 # eval/harness/PTY/mcp-import-real real-resource lanes, the real-`newt`-
 # session / real-PTY integration binaries the hook's nextest filter excludes
@@ -398,9 +399,49 @@ jobs:
       # six threads onto a real file lock) observed failing under load on the
       # dev box while passing 4/4 on a quiet one. A gate that fails when the
       # runner is busy is how #1872 trained everyone to re-run.
-      - name: clippy (newt-core lean tier, no default features)
+      - name: clippy (newt-core lean tier, markdown off)
         if: always()
-        run: cargo clippy -p newt-core --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p newt-core --no-default-features --features confine --all-targets -- -D warnings
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. Also runs locally
+      # through `just check`: the `check` recipe in justfile mirrors the line.
+      #
+      # #3160: `confine`, newt-core's confinement layer, is a default feature, so
+      # `--no-default-features` turns it off along with `markdown`. The step above
+      # names it, and so stays the markdown-off gate it has been since #1890. This
+      # step is its mirror image: every default feature but `confine`. One default
+      # feature off per gate, so a red step names its cause.
+      #
+      # `--all-targets`: the tests a later step has to gate along with the code
+      # compile here, not for the first time when the dependency goes optional.
+      # `-p newt-core` ALONE: features are additive, so `--workspace`, or a second
+      # crate that takes newt-core's defaults, turns `confine` back on and the step
+      # passes on a build that is not confine-off.
+      # newt-core/tests/confine_gate_parity_ratchet.rs holds both steps equal to
+      # the justfile's lines, and the Windows job's copy and the hook's account
+      # equal to this one.
+      - name: clippy (newt-core, confine off)
+        if: always()
+        run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. The justfile does not
+      # repeat it. It asks cargo which features it resolved for newt-core in the
+      # confine-off configuration (dev-dependency edges included, `cargo tree`'s
+      # default), so nothing can leave the step above green on a build that has
+      # `confine` on. The first check is the control: the probe has to see
+      # `confine` when it is on. It reads the feature list only, never the
+      # package path, because a checkout directory may contain the word, and
+      # with `--color never`, because this workflow sets CARGO_TERM_COLOR to
+      # always and the list is read as text.
+      - name: the confine-off build really has confine off (#3160)
+        if: always()
+        run: |
+          features() { cargo tree --color never -p newt-core --no-default-features --features "$1" --depth 0 --prefix none --format '{f}'; }
+          has_confine() { case ",$1," in *,confine,*) return 0 ;; *) return 1 ;; esac; }
+          on=$(features markdown,confine)
+          off=$(features markdown)
+          echo "features with confine on:  $on"
+          echo "features with confine off: $off"
+          has_confine "$on" || { echo "::error::the probe cannot see confine when it is on"; exit 1; }
+          if has_confine "$off"; then echo "::error::confine is on in the confine-off build"; exit 1; fi
       - name: test (newt-tui, rich-tui + live-spill stripped)
         if: always()
         run: cargo test -p newt-tui
@@ -651,6 +692,13 @@ jobs:
         run: cargo install agent-bridle-aclaunch --bin ab-netprobe --version 0.7.10 --locked
       - name: clippy
         run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
+      # HOOK PARITY: CI-only, like the rest of this job; named in
+      # .githooks/pre-push. The lean job's confine-off gate (#3160) again, on
+      # the one host that compiles newt-core's `#[cfg(windows)]` arms: the same
+      # command, held equal by newt-core/tests/confine_gate_parity_ratchet.rs.
+      - name: clippy (newt-core, confine off)
+        if: always()
+        run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings
       # HOOK PARITY: CI-only artifact caches and bounded downloads (#2817);
       # scripts/test_carried_cache.py checks this contract in lint. Both are
       # named in .githooks/pre-push. No fallback keys: version AND hash must match.

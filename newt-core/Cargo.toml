@@ -15,6 +15,7 @@ exclude = [
     "tests/first_principle.rs",
     "tests/inert_code_ratchet.rs",
     "tests/closure_ledger.rs",
+    "tests/confine_gate_parity_ratchet.rs",
     "tests/adapter.rs",
     "tests/epic_size.rs",
     "tests/extension_purity.rs",
@@ -231,10 +232,21 @@ seccompiler = "0.5"
 rustix.workspace = true
 
 [features]
-default = ["markdown"]
+default = ["markdown", "confine"]
+# The confinement layer (#3160): every use of agent-bridle in this crate. On
+# by default. Today it gates nothing; each later step of #3160 moves one piece
+# behind it, and the last makes the agent-bridle dependencies optional and
+# lists them here as `dep:` entries. `windows-appcontainer` and
+# `macos-seatbelt` are parts of it and list it. Features are additive, so
+# `confine` is off only when newt-core is built on its own with
+# `--no-default-features`: never under `--workspace`, and never beside a crate
+# that depends on newt-core, because each of them takes its default features.
+# ci.yml's lean job lints that build (`--features markdown`: every default
+# feature but this one); tests/confine_gate_parity_ratchet.rs pins the gate.
+confine = []
 # Markdown → ANSI rendering of assistant output (Step 25.1). On by default for
 # the human-facing binaries; compiled out (passthrough shim) for the headless
-# wyvern strip via --no-default-features.
+# wyvern strip via --no-default-features (which also turns `confine` off).
 markdown = ["dep:pulldown-cmark"]
 # Step 25.5: plain-text GFM-table-pipe alignment for the headless wyvern tier.
 # Off by default — only wyvern/headless consumers opt in (pulls comrak +
@@ -245,7 +257,7 @@ markdown-table-formatter = ["dep:markdown-table-formatter"]
 # Off by default to keep the binary lean.
 markdown-syntect = ["markdown", "dep:syntect"]
 pyo3 = ["dep:pyo3"]
-windows-appcontainer = ["agent-bridle/windows-appcontainer"]
+windows-appcontainer = ["confine", "agent-bridle/windows-appcontainer"]
 # Exposes `tty::PromptWindow::test_stub()` to DOWNSTREAM crates' tests. The
 # window is a sealed capability with no public constructor — that is the point —
 # so a crate whose prompt functions now require one needs a sanctioned inert
@@ -259,7 +271,8 @@ test-util = []
 # unit run — enable it on the macOS real-resource / weekly job:
 #   cargo test -p newt-core --features macos-seatbelt --test macos_seatbelt_adversarial -- --ignored --test-threads=1
 # Forwarding to agent-bridle's own feature keeps the two names in lock-step.
-macos-seatbelt = ["agent-bridle/macos-seatbelt"]
+# A part of `confine` (#3160): it cannot be on without it.
+macos-seatbelt = ["confine", "agent-bridle/macos-seatbelt"]
 # Tree-sitter outlines for aged `read_file` results (#2557). Off by default:
 # tree-sitter + tree-sitter-rust vendor C, compiled via `cc`, which adds
 # build cost the default build doesn't pay. Rust-only grammar for now; a
