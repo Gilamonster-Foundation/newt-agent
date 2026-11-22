@@ -175,16 +175,14 @@ jobs:
             scripts/unix/install-carried-tools.sh \
               --binary "target/${{ matrix.target }}/release/newt-carried-tools" \
               --newt-directory "$STAGE"
-            # The pack must stand on its own before it ships.
-            scripts/unix/test-carried-tools.sh "$STAGE/tools"
           fi
           tar -czf "$STAGE.tar.gz" "$STAGE"
           if [ "${{ matrix.label }}" = "macos-arm64" ]; then
-            # A release without the pack is a regression, so say so here.
-            for member in tools/date tools/grep tools/rg; do
-              tar -tzf "$STAGE.tar.gz" | grep -qx "$STAGE/$member" ||
-                { echo "::error::$STAGE.tar.gz lacks $member"; exit 1; }
-            done
+            # Test what ships: the pack as the archive extracts it, not the staging directory.
+            # A release without the pack, or with one that does not run, fails here.
+            verify="$(mktemp -d)"
+            tar -xzf "$STAGE.tar.gz" -C "$verify"
+            scripts/unix/test-carried-tools.sh "$verify/$STAGE/tools"
           fi
           echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
 
