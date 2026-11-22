@@ -10,7 +10,7 @@ ported from the [scrybe](https://github.com/hartsock/scrybe) reference shim
 | `newt-agent/` | [`newt-agent`](https://www.npmjs.com/package/newt-agent) | Unscoped umbrella — `npm i -g newt-agent` → the `newt` CLI. Depends on `@gilamonster/newt`. |
 | `newt/` | `@gilamonster/newt` | `newt` CLI bin shim. Lists per-platform binaries as `optionalDependencies`; execs whichever npm resolved. |
 | `newt-mcp-server/` | `@gilamonster/newt-mcp-server` | `newt-mcp-server` bin shim (same pattern). `npm i -g @gilamonster/newt-mcp-server`. |
-| *(generated)* | `@gilamonster/<bin>-<os>-<arch>` | Per-platform packages carrying just the prebuilt binary + `os`/`cpu` fields. Built by the release job. |
+| *(generated)* | `@gilamonster/<bin>-<os>-<arch>` | Per-platform packages carrying just the prebuilt binary + `os`/`cpu` fields (and, for `@gilamonster/newt` on macOS, `tools/` with the carried pack's `date`, `grep` and `rg`). Built by the release job. |
 
 ## Design
 
