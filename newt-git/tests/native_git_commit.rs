@@ -24,6 +24,13 @@ fn main() {
         std::env::set_var("NEWT_SHELL_ENGINE", "brush");
         std::env::remove_var("NEWT_DISABLE_OCAP");
         std::env::remove_var("NEWT_FULL_ACCESS");
+        // PR #2865, #3156: a hosted macOS image has Homebrew's git ahead of Xcode's
+        // on PATH, and the broker refuses a commit when the git the confined lookup
+        // selects is not the one admitted from the host PATH ("selected Git
+        // executable differs from the admitted host Git image"). Admit the system
+        // git, then let the production lookup select its authenticated image.
+        #[cfg(target_os = "macos")]
+        std::env::set_var("PATH", "/usr/bin:/bin");
     }
     tokio::runtime::Runtime::new()
         .unwrap()

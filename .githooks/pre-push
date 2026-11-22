@@ -495,7 +495,8 @@ cargo fmt --all -- --check
 #   brush_build_pipeline        macos-confined-contract.yml, which runs only its
 #                               linked_worktree_build_reads row
 #   macos_exec_basenames        newt-tui-pty.yml (root-owned gh copy)
-#   native_git_commit           no CI lane yet: a disclosed gap (#3156 Expected 2)
+#   native_git_commit           macos-confined-contract.yml (Seatbelt; the only lane
+#                               that runs its real body, #3156)
 # newt-harness::writer_inheritance is a different shape and stays excluded: it
 # ignores argv entirely and always runs its fork-based test
 # (tests/writer_inheritance.rs), which then hits a broken pipe when nextest
