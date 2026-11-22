@@ -193,10 +193,18 @@ test('without --tools the package carries no tools directory', (t) => {
   assert.equal(built.status, 0, built.stderr);
   assert.equal(existsSync(join(root, 'out', 'tools')), false);
   assert.deepEqual(JSON.parse(readFileSync(join(root, 'out', 'package.json'), 'utf8')).files, ['newt', 'README.md', 'LICENSE']);
-  const missing = script(root, 'build-platform-package.mjs', [
+  const refuse = (toolsArgs) => script(root, 'build-platform-package.mjs', [
     '--name', '@gilamonster/newt', '--binary', join(root, 'binary'), '--key', 'linux-x64',
-    '--version', '1.2.3', '--out', join(root, 'out2'), '--tools', join(root, 'no-such-directory'),
+    '--version', '1.2.3', '--out', join(root, 'out2'), ...toolsArgs,
   ]);
-  assert.notEqual(missing.status, 0, 'a missing --tools directory is refused');
-  assert.equal(existsSync(join(root, 'out2')), false);
+  for (const [what, path] of [['a missing path', join(root, 'no-such-directory')], ['a regular file', join(root, 'binary')]]) {
+    const refused = refuse(['--tools', path]);
+    assert.equal(refused.status, 2, `${what} is refused`);
+    assert.match(refused.stderr, /--tools must name a directory/, what);
+  }
+  // A trailing --tools with no value is an error, not "no pack".
+  const valueless = refuse(['--tools']);
+  assert.equal(valueless.status, 2, 'a valueless --tools is refused');
+  assert.match(valueless.stderr, /--tools needs a value/);
+  assert.equal(existsSync(join(root, 'out2')), false, 'a refusal builds nothing');
 });

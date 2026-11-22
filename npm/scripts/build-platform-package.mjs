@@ -22,18 +22,25 @@ import { checkReleaseVersion } from './release-version.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const PLATFORMS = JSON.parse(readFileSync(join(here, '..', 'platforms.json'), 'utf8'));
 
-function arg(name) {
+// The value after `--name`; undefined when the flag is absent. A flag with no value is an
+// error, never "absent": a mistyped `--tools` must not build a package without the pack.
+function optionalArg(name) {
   const i = process.argv.indexOf(`--${name}`);
-  if (i === -1 || i === process.argv.length - 1) {
-    console.error(`build-platform-package: missing --${name}`);
+  if (i === -1) return undefined;
+  if (i === process.argv.length - 1) {
+    console.error(`build-platform-package: --${name} needs a value`);
     process.exit(2);
   }
   return process.argv[i + 1];
 }
 
-function optionalArg(name) {
-  const i = process.argv.indexOf(`--${name}`);
-  return i === -1 || i === process.argv.length - 1 ? undefined : process.argv[i + 1];
+function arg(name) {
+  const value = optionalArg(name);
+  if (value === undefined) {
+    console.error(`build-platform-package: missing --${name}`);
+    process.exit(2);
+  }
+  return value;
 }
 
 const shim = arg('name'); // @gilamonster/newt
@@ -58,7 +65,7 @@ if (!source.isFile() || source.size === 0) {
   console.error('build-platform-package: --binary must name a nonempty regular file');
   process.exit(2);
 }
-if (tools !== undefined && !statSync(tools).isDirectory()) {
+if (tools !== undefined && !statSync(tools, { throwIfNoEntry: false })?.isDirectory()) {
   console.error('build-platform-package: --tools must name a directory');
   process.exit(2);
 }
