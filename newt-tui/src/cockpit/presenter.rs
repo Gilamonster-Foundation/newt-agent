@@ -2671,7 +2671,7 @@ mod tests {
     /// on purpose, and should replace the numbers with zero.
     #[test]
     #[ignore = "real tmux terminal; weekly/release real-resource tier"]
-    fn a_shrink_and_grow_holds_exactly_the_scrolled_away_rows_twice() {
+    fn a_real_terminal_holds_exactly_the_scrolled_away_rows_twice_after_a_shrink_and_grow() {
         let Some(term) = RealTerminal::open() else {
             return;
         };
@@ -2790,17 +2790,18 @@ mod tests {
         assert_eq!(closed[21..], ["B0", "B1", "B2"], "{closed:#?}");
     }
 
-    /// #3144, decided 2026-11-22: a palette closing is the same repaint-versus-blank-band
-    /// trade-off as #3143, and the repaint stays. The palette makes the block 7 rows taller
-    /// on a full screen, which scrolls the top 7 visible transcript rows into the terminal's
-    /// history; when it closes the transcript slides down and the repaint writes those rows
-    /// above the block again, so each is held twice. This pins that cost so it cannot grow
-    /// unnoticed: after one open and close, exactly the 7 rows the opening scrolled away are
-    /// in the history twice, and no other row is. A change that removes the duplicates fails
-    /// here on purpose, and should replace the numbers with zero.
+    /// Grounds `a_shrinking_block_on_the_bottom_row_stays_there`. #3144: a palette closing is
+    /// the same repaint-versus-blank-band trade-off as #3143, and the repaint stays. The
+    /// palette makes the block 7 rows taller on a full screen, which scrolls the top 7
+    /// visible transcript rows into the terminal's history; when it closes the transcript
+    /// slides down and the repaint writes those rows above the block again, so each is held
+    /// twice. This pins that cost so it cannot grow unnoticed: after one open and close,
+    /// exactly the 7 rows the opening scrolled away are held twice (history plus screen),
+    /// and no other row is. A change that removes the duplicates fails here on purpose, and
+    /// should replace the numbers with zero.
     #[test]
     #[ignore = "real tmux terminal; weekly/release real-resource tier"]
-    fn a_palette_closing_holds_exactly_the_scrolled_away_rows_twice() {
+    fn a_real_terminal_holds_exactly_the_scrolled_away_rows_twice_when_a_palette_closes() {
         let Some(term) = RealTerminal::open() else {
             return;
         };
