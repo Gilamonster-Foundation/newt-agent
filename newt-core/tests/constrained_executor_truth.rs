@@ -22,22 +22,37 @@ use newt_core::ocap::verify_constrained_executor;
 /// The committed inventory, embedded at compile time (no runtime fs read).
 const SPAWN_INVENTORY: &str = include_str!("../../docs/security/spawn-inventory.toml");
 
-/// Sum the `count` of every entry classed `agent-exec-todo-p4` — the unmigrated
-/// attacker-influenced spawns the P4 closure criterion must hold at 0.
+/// Sum the `count` of every `[files]` row classed `agent-exec-todo-p4` — the unmigrated
+/// attacker-influenced spawns the P4 closure criterion must hold at 0. Each row is
+/// `"path" = { count, class, note }`; a p4 row without an integer count fails here.
 fn unmigrated_attacker_spawn_count(toml_src: &str) -> i64 {
     let doc: toml::Value = toml::from_str(toml_src).expect("spawn-inventory.toml parses");
-    let mut total = 0i64;
-    // The data section is a flat table of `"path" = { count, class, note }`.
-    for (_path, entry) in doc.as_table().expect("top-level table") {
-        let Some(t) = entry.as_table() else { continue };
-        if t.get("class").and_then(toml::Value::as_str) == Some("agent-exec-todo-p4") {
-            total += t
-                .get("count")
+    doc.get("files")
+        .and_then(toml::Value::as_table)
+        .expect("the inventory keeps its rows in a [files] table")
+        .iter()
+        .filter(|(_, row)| {
+            row.get("class").and_then(toml::Value::as_str) == Some("agent-exec-todo-p4")
+        })
+        .map(|(path, row)| {
+            row.get("count")
                 .and_then(toml::Value::as_integer)
-                .unwrap_or(0);
-        }
-    }
-    total
+                .unwrap_or_else(|| {
+                    panic!("{path}: an agent-exec-todo-p4 row needs an integer count")
+                })
+        })
+        .sum()
+}
+
+/// Anti-vacuous twin: the count reads the committed inventory's rows, so a p4 row
+/// added to it is seen. It read the top-level table before, which holds only `[files]`
+/// itself, so the sum was 0 whatever the rows said.
+#[test]
+fn the_count_sees_a_p4_row_in_the_committed_inventory() {
+    let planted = format!(
+        "{SPAWN_INVENTORY}\n\"planted.rs\" = {{ count = 2, class = \"agent-exec-todo-p4\", note = \"planted\" }}\n"
+    );
+    assert_eq!(unmigrated_attacker_spawn_count(&planted), 2);
 }
 
 #[test]
