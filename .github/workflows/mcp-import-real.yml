@@ -90,6 +90,18 @@ jobs:
               -- --ignored --test-threads=1
           done
 
+      # #3195's third pack ground, under the real macOS kernel sandbox: with a
+      # bare `tail` grant, the gate keeps an unpinned pack off the PATH so the
+      # host's `tail` runs, and a pinned pack's `tail` runs.
+      - name: Run carried-tool pack Seatbelt grounding
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test a_confined_tail_survives_an_unpinned_pack_and_runs_a_pinned_one
+          -p newt-core --lib a_confined_tail_survives_an_unpinned_pack_and_runs_a_pinned_one
+          -- --ignored --test-threads=1
+
       - name: Run MCP import CLI real-resource tests
         shell: bash
         run: >-
