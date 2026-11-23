@@ -98,12 +98,10 @@ pub(super) fn is_gh(program: &str) -> bool {
 /// issue-1188: is `source` a `git push` invocation anywhere in it (a loose
 /// trigger; unlike [`needs_commit_broker`] it also fires on the bare words of a
 /// source the inspector cannot read)? A `true` here routes the
-/// WHOLE `run_command` call to [`execute_governed_push`] instead of the
+/// WHOLE `run_command` call to `native_git::execute_governed_push` instead of the
 /// confined shell — that function applies the source-bound/fixed-argv
 /// check and refuses anything this loose scan admits but the broker cannot
 /// safely execute. Harmless output wrappers are interpreted in-process (#2719).
-///
-/// [`execute_governed_push`]: super::native_git::execute_governed_push
 pub(super) fn needs_push_broker(source: &str) -> bool {
     git_verb_in(source, &["push"]).is_some()
 }

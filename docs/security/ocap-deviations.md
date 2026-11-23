@@ -1260,10 +1260,10 @@ resolved in a later release:
   brokers and none of their checks: no push, PR-create, gh read, fetch or
   commit broker, and no preflight refusal, data-loss confirmation or
   network-read prompt in `run_command`. With OCAP on, the existing no-broker
-  refusal still stops a plain `git commit`, and every other command takes
-  the shell route; with OCAP off and no preset floor that forbids them, they
-  run on the host, as in any build (the operator's decision of 2026-11-23).
-  No released build turns `confine` off: every crate that depends on
+  refusal still stops a `git commit` that the lexical check or the shell
+  inspector names, and every other command takes the shell route; with OCAP
+  off and no preset floor that forbids them, they run on the host, as in any
+  build. No released build turns `confine` off: every crate that depends on
   newt-core takes its default features.
 
 ### Native commit cancellation: lease shutdown is not tree completion (#2686)
