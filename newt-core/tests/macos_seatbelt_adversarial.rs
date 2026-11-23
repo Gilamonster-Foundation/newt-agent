@@ -692,7 +692,7 @@ fn seatbelt_build_request_runs_cargo_and_denies_sibling_secret() {
     std::fs::create_dir(ws.path().join("src")).unwrap();
     std::fs::write(
         ws.path().join("Cargo.toml"),
-        "[package]\nname = \"confined-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlibc = \"=0.2.186\"\n",
+        "[package]\nname = \"confined-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlibc = \"0.2\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -723,8 +723,9 @@ fn seatbelt_build_request_runs_cargo_and_denies_sibling_secret() {
     assert!(!outside.path().join("write").exists());
 }
 
-/// Grounds `build_network_authority_preserves_granted_scope_and_filesystem_fence`
-/// with an actual compiler/build-script/test process tree. Positive controls
+/// Grounds the unrestricted row of
+/// `build_network_authority_narrows_hosts_and_preserves_filesystem_fence` with an actual
+/// compiler/build-script/test process tree. Positive controls
 /// prove the child runs, can write inside its workspace and can use the explicit
 /// network grant; sibling reads/writes must fail with a permission error.
 #[test]
@@ -793,46 +794,58 @@ fn seatbelt_operator_network_grant_keeps_build_filesystem_confined() {
     assert_eq!(received, "operator-granted");
 }
 
-/// Grounds the build-network narrowing (#2730) against L3: a build granted a host list
-/// is neither refused nor given that host. Seatbelt cannot name an arbitrary host (ADR
-/// 0015), so the host list narrows to deny-all, the build runs under Seatbelt, and a
-/// loopback connect the parent can make fails in the child: the grant is never promoted
-/// to an unrestricted one. Before #2730 this shape was refused before spawn, which this
-/// test (then `seatbelt_build_without_unrestricted_network_grant_refuses_before_spawn`)
-/// asserted.
+/// Grounds the host-list and unrestricted rows of
+/// `build_network_authority_narrows_hosts_and_preserves_filesystem_fence` against L3: a
+/// build granted a host list is neither refused nor given that host (#2730). Seatbelt
+/// cannot name an arbitrary host (ADR 0015), so the host list narrows to deny-all and the
+/// build runs under Seatbelt without network. The positive control runs the same script
+/// under an unrestricted grant, where its loopback connect succeeds, so the host-list
+/// run's failure is the network denial and not a broken probe. Before #2730 this shape
+/// was refused before spawn, which this test (then
+/// `seatbelt_build_without_unrestricted_network_grant_refuses_before_spawn`) asserted.
 #[test]
 #[ignore = "real Seatbelt admission and a loopback socket"]
 #[serial]
 fn seatbelt_build_with_a_host_list_runs_without_network() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // The parent reaches the port, so a refused connect in the child is the sandbox's.
-    std::net::TcpStream::connect(("127.0.0.1", port)).expect("the listener accepts the parent");
-    let ws = tempdir().unwrap();
-    let marker = ws.path().join("ran");
-    let script = format!(
-        "echo ran > {}; /usr/bin/nc -G 2 -z 127.0.0.1 {port}",
-        marker.display()
-    );
-    let request = newt_core::confined_exec::build_tool_request(
-        ws.path(),
-        ws.path(),
-        "/bin/sh",
-        ["-c", &script],
-        &Scope::only(["example.test".into()]),
-    );
-    let out = ConstrainedExecutor::run(&request)
-        .expect("a host-list build grant narrows to deny-all and is admitted (#2730)");
-    assert_seatbelt(&out);
+    let script = format!("echo ran > ran; /usr/bin/nc -G 2 -z 127.0.0.1 {port}");
+    let run_with = |network: &Scope<String>| {
+        let ws = tempdir().unwrap();
+        let request = newt_core::confined_exec::build_tool_request(
+            ws.path(),
+            ws.path(),
+            "/bin/sh",
+            ["-c", script.as_str()],
+            network,
+        );
+        let out = ConstrainedExecutor::run(&request)
+            .expect("a build is admitted under either grant; a host list narrows (#2730)");
+        assert_seatbelt(&out);
+        assert!(
+            ws.path().join("ran").exists(),
+            "the admitted build must have run"
+        );
+        out
+    };
+    let shown = |out: &ConfinedOutput| {
+        format!(
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let granted = run_with(&Scope::All);
     assert!(
-        marker.exists(),
-        "the admitted build must have run: stderr={:?}",
-        String::from_utf8_lossy(&out.stderr)
+        granted.success,
+        "positive control: under an unrestricted grant the probe connects: {}",
+        shown(&granted)
     );
+    let hosts = run_with(&Scope::only(["example.test".into()]));
     assert!(
-        !out.success,
-        "the loopback connect must be kernel-denied: stdout={:?} stderr={:?}",
-        out.stdout, out.stderr
+        !hosts.success,
+        "under a host list the loopback connect must be kernel-denied: {}",
+        shown(&hosts)
     );
 }
 
@@ -841,10 +854,8 @@ fn seatbelt_build_with_a_host_list_runs_without_network() {
 /// so a build-tool request under it ADMITS instead of refusing "Net axis"
 /// before spawn — this used to be part of the refusal test that the test above
 /// replaced, asserting the OPPOSITE, before the Mach-deputy audit this promotion backs
-/// existed. The
-/// real kernel still has no network: this is a pure admission proof, not a
-/// network-reachability one (that is `seatbelt_net_deny_all_runs_kernel_denied`,
-/// above).
+/// existed. The real kernel still has no network: this is a pure admission proof, not a
+/// network-reachability one (that is `seatbelt_net_deny_all_runs_kernel_denied`, above).
 #[test]
 #[ignore = "real Seatbelt admission"]
 #[serial]
