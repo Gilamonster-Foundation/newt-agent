@@ -1529,6 +1529,52 @@ pub(super) async fn exec_confined_command_with_broker(
         };
     }
 
+    exec_bridled(
+        cmd,
+        cwd,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        filesystem_requests,
+        permission_gate,
+        tool_offload,
+        spill_store,
+        live_tool_output,
+        presentation,
+        command_broker,
+        execution_lease,
+        pre_exec_missing,
+        retry_authorized,
+        timeout_secs,
+        adopted,
+        command_budget,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exec_bridled(
+    cmd: &str,
+    cwd: &str,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &newt_policy::caveats::Caveats,
+    filesystem_requests: &[PermissionRequest],
+    permission_gate: &mut Option<&mut dyn PermissionGate>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+    live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    presentation: &mut dyn ToolPresentation,
+    command_broker: Option<std::sync::Arc<dyn crate::sandbox_seam::CommandBroker>>,
+    execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
+    retry_authorized: Option<&std::sync::OnceLock<()>>,
+    timeout_secs: Option<u64>,
+    adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
+    command_budget: crate::RunCommandBudget,
+) -> (String, ExecOutcome) {
     // A proactive session grant can change standing authority during this
     // turn. Refresh before spawning: a child filesystem refusal is not a
     // structured denial that can enter the permission-retry path below.
