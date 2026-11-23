@@ -4922,7 +4922,7 @@ async fn execute_authorized_tool(
                 workspace
             };
             let invocation_caveats = if commit_broker.is_some() {
-                match crate::native_git_broker::NativeGitBroker::invocation_caveats(
+                match crate::git_hardening::commit_invocation_caveats(
                     caveats, std::path::Path::new(commit_workspace),
                 ) {
                     Ok(invocation) => invocation,

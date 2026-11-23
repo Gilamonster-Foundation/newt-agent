@@ -271,6 +271,28 @@ pub(crate) fn ambient_gitdir_write_grant(workspace: &Path) -> Vec<String> {
     own_gitdir_shell_write_grant(workspace)
 }
 
+/// #2720: ambient session authority is not the commit child's write grant.
+/// Keep helpers and the worker image immutable during the hook handshake.
+/// Scoped sessions retain their already-bound repository identity; only an
+/// ambient caller may authorize resolving a repository at dispatch time.
+pub(crate) fn commit_invocation_caveats(
+    caveats: &crate::Caveats,
+    workspace: &Path,
+) -> Result<crate::Caveats, String> {
+    if !matches!(caveats.fs_write, crate::Scope::All) {
+        return Ok(caveats.clone());
+    }
+    let canonical_workspace = workspace
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let write = crate::git_hardening::ambient_gitdir_write_grant(workspace);
+    let mut invocation = caveats.clone();
+    invocation.fs_write = crate::Scope::only(
+        std::iter::once(canonical_workspace.to_string_lossy().into_owned()).chain(write),
+    );
+    Ok(invocation)
+}
+
 /// Per-dispatch write grant for the confined-shell `git` lane
 /// (`dispatch_caveats_for_git_shell`, PR #2577 round 3/4). Re-runs `rev-parse`
 /// on EVERY `git` dispatch, but the write grant is bound to the identity
@@ -2235,6 +2257,28 @@ mod own_gitdir_grant_tests {
         git(dir, &["commit", "-q", "-m", "init"]);
     }
 
+    /// #2720: attenuation is per invocation; it must not mutate the ambient
+    /// session or re-resolve a scoped caller's repository grant.
+    #[test]
+    fn full_access_commit_writes_are_bounded_without_changing_session() {
+        use newt_policy::caveats::permits_path;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let session = crate::Caveats::top();
+        let invocation = super::commit_invocation_caveats(&session, &workspace).unwrap();
+        assert!(matches!(session.fs_write, crate::Scope::All));
+        assert!(permits_path(
+            &invocation.fs_write,
+            workspace.to_str().unwrap()
+        ));
+        assert!(!permits_path(
+            &invocation.fs_write,
+            workspace.parent().unwrap().to_str().unwrap()
+        ));
+        let repeated = super::commit_invocation_caveats(&invocation, &workspace).unwrap();
+        assert_eq!(invocation, repeated);
+    }
+
     /// #2720: ambient commit setup must not replace a scoped session's cached
     /// refusal/identity. The global cache can be shared by sibling sessions.
     #[test]
@@ -2244,11 +2288,7 @@ mod own_gitdir_grant_tests {
         init_repo(&workspace);
         git(&workspace, &["checkout", "-q", "-b", "task"]);
         prime_identity_cache(&workspace, None);
-        let _ = crate::native_git_broker::NativeGitBroker::invocation_caveats(
-            &crate::Caveats::top(),
-            &workspace,
-        )
-        .unwrap();
+        let _ = super::commit_invocation_caveats(&crate::Caveats::top(), &workspace).unwrap();
         assert!(own_gitdir_shell_write_grant(&workspace).is_empty());
         assert!(cached_identity(&workspace).is_none());
     }
