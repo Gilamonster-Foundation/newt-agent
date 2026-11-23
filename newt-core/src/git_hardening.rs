@@ -1357,6 +1357,29 @@ fn rev_parse(identity: &BoundGitIdentity, rev: &str) -> Result<Option<String>, S
     Ok((!oid.is_empty()).then_some(oid))
 }
 
+/// The parents a commit's headers name, each a 40- or 64-digit hex oid. The
+/// commit broker reads them, and so does `advance_own_branch_ref` (#2682 round
+/// 2), host-side, to verify the fast-forward/amend shape of a commit landed
+/// with HEAD detached, before the bounded `update-ref` that publishes it.
+pub(crate) fn commit_parents(commit: &[u8]) -> Result<Vec<String>, String> {
+    let boundary = commit
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .ok_or("commit has no message boundary")?;
+    std::str::from_utf8(&commit[..boundary])
+        .map_err(|error| error.to_string())?
+        .lines()
+        .filter_map(|line| line.strip_prefix("parent "))
+        .map(|parent| {
+            if crate::git_staging::is_hex_oid(parent) {
+                Ok(parent.to_owned())
+            } else {
+                Err("invalid Git parent identifier".into())
+            }
+        })
+        .collect()
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn commit_parents_of(identity: &BoundGitIdentity, oid: &str) -> Result<Vec<String>, String> {
     let output = hardened_git_common(identity, &["cat-file", "commit", oid])
@@ -1366,7 +1389,7 @@ fn commit_parents_of(identity: &BoundGitIdentity, oid: &str) -> Result<Vec<Strin
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    crate::native_git_broker::commit_parents(&output.stdout)
+    commit_parents(&output.stdout)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3561,6 +3584,64 @@ mod governed_push_config_tests {
             github_owner_repo("https://gitlab.example.com/Org/Repo.git"),
             None,
             "non-github hosts refuse the gh broker rather than guessing --repo"
+        );
+    }
+}
+
+/// [`commit_parents`] reads parent headers from commit bytes; no git runs.
+#[cfg(test)]
+mod commit_parents_tests {
+    use super::*;
+
+    #[test]
+    fn commit_parents_reads_parent_headers_and_refuses_malformed_commits() {
+        let commit = |parents: &[&str]| {
+            let parents: String = parents.iter().map(|p| format!("parent {p}\n")).collect();
+            format!(
+                "tree {}\n{parents}author A <a@example.com> 0 +0000\n\nmessage\n",
+                "4".repeat(40)
+            )
+            .into_bytes()
+        };
+        let (a, b, upper, sha256) = (
+            "a".repeat(40),
+            "b".repeat(40),
+            "A".repeat(40),
+            "c".repeat(64),
+        );
+        assert_eq!(
+            commit_parents(&commit(&[])),
+            Ok(Vec::new()),
+            "a root commit"
+        );
+        assert_eq!(commit_parents(&commit(&[&a])), Ok(vec![a.clone()]));
+        assert_eq!(
+            commit_parents(&commit(&[&a, &b])),
+            Ok(vec![a.clone(), b]),
+            "a merge keeps its parents in order"
+        );
+        assert_eq!(commit_parents(&commit(&[&upper])), Ok(vec![upper]));
+        assert_eq!(commit_parents(&commit(&[&sha256])), Ok(vec![sha256]));
+        for bad in [
+            String::new(),
+            "a".repeat(39),
+            "a".repeat(41),
+            "g".repeat(40),
+            "\u{e9}".repeat(20),
+        ] {
+            assert_eq!(
+                commit_parents(&commit(&[&a, &bad])),
+                Err("invalid Git parent identifier".to_string()),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            commit_parents(b"tree t\nparent p\n"),
+            Err("commit has no message boundary".to_string())
+        );
+        assert!(
+            commit_parents(b"tree \xff\n\nmessage\n").is_err(),
+            "a non-UTF-8 header"
         );
     }
 }
