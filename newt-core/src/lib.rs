@@ -174,6 +174,9 @@ pub mod tooling;
 pub mod tty;
 pub mod tuning;
 pub mod verify_gate;
+pub mod web_fetch;
+#[cfg(test)]
+mod web_fetch_parity_tests;
 pub mod where_is;
 mod wire_framing;
 pub mod workflows;

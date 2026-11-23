@@ -32,7 +32,7 @@ what is true on `main` today, not what the adapters below will make true:
 | Mechanism | Crate(s) | Today's discovery | Today's authority |
 |---|---|---|---|
 | Skills — behavioural packages (prompts, hooks, sub-agents) | `newt-skills` | skill loader (frontmatter) | declarative `caveats:` frontmatter block → `SkillCaveats` (attenuation-only, mirrors the `Caveats` axes) — the direct ancestor of this doc's *required authority* |
-| Tools — function implementations | Bridle `Registry` built in `newt-core/src/agentic/tools/shell.rs` (`agent_bridle::Registry::builder()`, holds `shell` + `web_fetch`); every other builtin dispatches through the builtin `match` in `newt-core/src/agentic/tools.rs`; `git` gates on its own `GitCaveats` lattice (`newt-core/src/git_caveats.rs`); `newt-tools` is the vi-minimal file surface (read/edit/search/apply_patch), not a Bridle registry | Bridle `Registry` for the two `agent_bridle::Tool`s; the builtin `match` for the rest | `shell`/`web_fetch`: `Tool::required()` ⊓ Grant via `Gate::authorize`; other builtins: `PermissionGate` / `OperatingModeControl` in front, **no per-tool `required()` ceiling**; `git`: `Caveats` ⊓ `GitCaveats` |
+| Tools — function implementations | Bridle `Registry` built in `newt-core/src/agentic/tools/shell.rs` (`agent_bridle::Registry::builder()`, holds `shell`); every other builtin dispatches through the builtin `match` in `newt-core/src/agentic/tools.rs`, `web_fetch` among them (newt-core's `web_fetch` module, #3160); `git` gates on its own `GitCaveats` lattice (`newt-core/src/git_caveats.rs`); `newt-tools` is the vi-minimal file surface (read/edit/search/apply_patch), not a Bridle registry | Bridle `Registry` for the one `agent_bridle::Tool`; the builtin `match` for the rest | `shell`: `Tool::required()` ⊓ Grant via `Gate::authorize` (`web_fetch` makes the same budget and generation checks in its copy); other builtins: `PermissionGate` / `OperatingModeControl` in front, **no per-tool `required()` ceiling**; `git`: `Caveats` ⊓ `GitCaveats` |
 | MCP servers | `newt-mcp-server` / `newt-mcp-client` | `newt mcp add/list/probe` config | Bridle enforcement floor on the subprocess (`agent_bridle::ConfinedCommand`, `newt-mcp-client/src/lib.rs`) |
 | Plugins — external processes | `plugins-protocol` (`PluginClient` / `PluginServer` / `PluginHandler`); the only in-tree host is the inference-provider plugin (`newt-inference/src/provider_plugin.rs`) | a `[backends]` provider-plugin entry names the command (`PluginClient::spawn_command`). The command-plugin manifest ([command_plugin_runtime.md](command_plugin_runtime.md)) is **proposed**, not implemented — no manifest loader or `~/.newt/commands` reader exists | process boundary + a delegated `AgentKey` cert chain (`newt_identity::delegate_for_plugin`, handed over `AGENT_KEY_ENV`) that the *plugin* verifies — attenuation by delegation, **no host-side Bridle enforcement floor today** (the spawn is a plain `tokio::process::Command`, `plugins-protocol/src/client.rs`; MCP, by contrast, goes through `ConfinedCommand`) |
 
@@ -214,7 +214,7 @@ decision points consume. The contract this proposal relies on:
 `Action` exports and for the fs/net/exec effects of *any* export (cloud STT declares `net`; local
 whisper on a `.wav` declares nothing). It cannot say "microphone capture", "subscribe to session S's
 `ResponseEvent`s", or "publish `PaneEvent`s to pane host H" — and `Gate::authorize` takes a
-`&dyn Tool`. Today only `shell`/`web_fetch` are in the Bridle `Registry`; the Gate is also reached
+`&dyn Tool`. Today only `shell` is in the Bridle `Registry` (`web_fetch` is a builtin since #3160); the Gate is also reached
 directly by the spawn-context tools `ExecSpawnTool` (confined exec, `newt-core/src/confined_exec.rs`)
 and `McpSpawnTool` (MCP subprocess, `newt-mcp-client/src/lib.rs`) — every one of them
 `Action`-shaped. Streams and sessions have no Gate path at all. The workspace
@@ -365,7 +365,7 @@ behaviour moves, and no adapter is a new index:
 
 | Adapter | Produces | Notes |
 |---|---|---|
-| Bridle `Registry` (`shell`, `web_fetch`) → kit | one `Export` per `Tool`, `required.bridle = tool.required()`, `ImplRef::Builtin` | zero new authority code; the Gate path is untouched |
+| Bridle `Registry` (`shell`) → kit | one `Export` per `Tool`, `required.bridle = tool.required()`, `ImplRef::Builtin` | zero new authority code; the Gate path is untouched |
 | builtin tool `match` (`newt-core/src/agentic/tools.rs`) → kit | one `Export` per builtin; `required.bridle` **defined** as declarative data (these tools have no `required()` today); `git` adds `required.domain = GitCaveats` | this is where a ceiling appears for the first time; `PermissionGate` stays in front |
 | `newt-skills` → kit | `Export`s with `newt.skill.*` ids; `SkillCaveats → required.bridle` | prompts/hooks are data already; the frontmatter block is the manifest fragment |
 | `newt-mcp-*` → kit | `Export` per configured server, `ImplRef::Subprocess`/`Remote` | `newt mcp list` becomes a catalog view |
@@ -408,7 +408,7 @@ Acceptance for #1737 (each item is a test or a mechanical gate in the unit tier,
 1. **Types round-trip.** `KitManifest` / `Export` / `RequiredAuthority` / `InterfaceId` / `ImplRef`
    serialize and deserialize losslessly (serde round-trip test per type; `consumes` / `provides`
    present in the fixture and equal after round-trip).
-2. **Bridle adapter is transparent.** For `shell` and `web_fetch`, `Export.required.bridle ==
+2. **Bridle adapter is transparent.** For `shell`, `Export.required.bridle ==
    tool.required()` (assert_eq); for a fixed `(tool, granted)` fixture, `Gate::authorize`'s resulting
    `ToolContext` effective caveats are equal with and without the catalog in the path. For the
    builtin `match`, every builtin name has an `Export` with a declared `required.bridle`

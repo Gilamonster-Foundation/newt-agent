@@ -420,8 +420,8 @@ pub(crate) fn validate_tool_call_batch(
 /// workspace, and `brush-ocap-*` resolve from crates.io in `Cargo.lock`. The
 /// publishable configuration and the real-shell configuration are the same
 /// configuration. `web_fetch` is NOT bypassed, and never was affected by the
-/// caveat above either way — `agent-bridle-tool-web` ships the real
-/// leash-enforcing implementation (verified at agent-bridle rev `2129c91`), so
+/// caveat above either way — `crate::web_fetch` is the real leash-enforcing
+/// implementation (a copy of agent-bridle-tool-web's, #3160), so
 /// it does not fail closed. The fs tools keep the
 /// newt-native workspace fence untouched: yolo is unconfined exec, fenced fs
 /// — never a global authority-off switch.
@@ -2419,7 +2419,7 @@ fn execute_request_user_input(
 }
 
 /// Best-effort host extraction for the #263 net pre-check. This only gates
-/// whether to PROMPT — reachability enforcement stays with the bridle's
+/// whether to PROMPT — reachability enforcement stays with `crate::web_fetch`'s
 /// leash (host allowlist + SSRF screen). `None` (unparseable / non-http URL)
 /// skips the pre-check entirely, leaving today's dispatch path untouched.
 pub(crate) fn host_of_url(url: &str) -> Option<String> {
@@ -2441,26 +2441,25 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
     }
 }
 
-/// Extract the denied host from a [`agent_bridle::ToolError::Denied`] reason
+/// Extract the denied host from a [`crate::web_fetch::WebFetchError::Denied`] reason
 /// IFF the reason is an EXACT match for the literal wording two known leash
 /// constructors emit — never a substring check (#2645 round 2). Both
-/// `agent_bridle_core::ToolContext::check_net`
-/// (vendor/agent-bridle-core/src/context.rs) AND agent-bridle-tool-web's own
-/// `NetGuardError::HostNotAllowed` (`net_guard.rs`, converted to `Denied` at
-/// `web_fetch.rs`'s `net_guard_to_tool`) use the identical
+/// `crate::web_fetch`'s `check_net` (bridle's `ToolContext::check_net`) AND
+/// its `NetGuardError::HostNotAllowed` (`web_fetch/net_guard.rs`, converted to
+/// `Denied` by `net_guard_to_tool`) use the identical
 /// `format!("network access to {host:?} is not within the granted authority")`
 /// — correcting round 2's comment, which claimed only `check_net` emits this
 /// (#2645 round-2 review). Both are genuine net-authority denials for the
 /// SAME host/scope the fetch loop already re-checks per hop
-/// (`web_fetch.rs:250-269` calls `check_net` before `screen_host`), so
+/// (`fetch_with_leashed_redirects` calls `check_net` before `screen_host`), so
 /// treating them alike is not a widening.
 ///
 /// This function only ever sees the `Denied` variant's raw `reason` field —
-/// never `ToolError`'s `Display` (which prepends `"denied: "`) and never any
+/// never `WebFetchError`'s `Display` (which prepends `"denied: "`) and never any
 /// other variant — see [`web_fetch_denial_host`], which matches the variant
 /// FIRST (#2645 round 3). Requiring the anchored prefix/suffix (not
 /// `.contains`) means wrapper text around an untrusted, interpolated string
-/// — e.g. agent-bridle-tool-web's `redirect Location {location:?} is not a
+/// — e.g. `crate::web_fetch`'s `redirect Location {location:?} is not a
 /// valid URL: {e}` when a server sends a malformed `Location` — can never
 /// satisfy the match merely by *containing* both trigger phrases somewhere in
 /// a longer message.
@@ -2476,7 +2475,7 @@ fn parse_net_denial_host(reason: &str) -> Option<String> {
 /// The `web_fetch` dispatch-error → net-denial-journal decision (#2645 round
 /// 3), factored out of the `execute_tool` match arm as a narrow seam: it
 /// takes exactly what the call site has (the request URL, for parity with
-/// the pre-#2645 shape of this decision, and the leash's `ToolError`) so
+/// the pre-#2645 shape of this decision, and the fetch's `WebFetchError`) so
 /// tests can drive it with a CONSTRUCTED error instead of a live network
 /// dispatch. `url` is not consulted for the recorded host — #2645 round 2
 /// fixed the bug where it was (a redirect can be denied on a DIFFERENT host
@@ -2484,12 +2483,13 @@ fn parse_net_denial_host(reason: &str) -> Option<String> {
 /// matches what a caller here actually has in hand.
 ///
 /// Matches the `Denied` VARIANT before parsing anything (#2645 round-3
-/// review): a `NotFound`, `Budget`, `Generation`, `Exec` or `Other` failure
-/// never reaches [`parse_net_denial_host`] at all, regardless of what text it
-/// happens to contain.
-fn web_fetch_denial_host(_url: &str, err: &agent_bridle::ToolError) -> Option<String> {
+/// review): a `Budget` or `Generation` failure never reaches
+/// [`parse_net_denial_host`] at all. (bridle's `ToolError` also had
+/// `NotFound`, `Exec` and `Other`, the last with free text; `WebFetchError`
+/// has none of them.)
+fn web_fetch_denial_host(_url: &str, err: &crate::web_fetch::WebFetchError) -> Option<String> {
     match err {
-        agent_bridle::ToolError::Denied { reason } => parse_net_denial_host(reason),
+        crate::web_fetch::WebFetchError::Denied { reason } => parse_net_denial_host(reason),
         _ => None,
     }
 }
@@ -2725,7 +2725,7 @@ fn authenticated_url_recovery(
     )
 }
 
-/// Whether a bridle raw-fetch error is the private-address SSRF refusal that an
+/// Whether a raw-fetch error is the private-address SSRF refusal that an
 /// authenticated connector is designed to handle. Match the stable, explicit
 /// security diagnostic rather than treating ordinary timeouts/DNS failures as
 /// evidence that a private source exists.
@@ -2736,9 +2736,10 @@ fn is_private_address_fetch_error(error: &str) -> bool {
 }
 
 /// Whether a failed raw fetch explicitly reports HTTP authentication or
-/// authorization refusal. Bridle versions may surface non-2xx responses either
-/// as structured results or errors, so both representations share the same
-/// MCP-first recovery contract.
+/// authorization refusal. A fetch may report a non-2xx response as a structured
+/// result (as `crate::web_fetch` does) or as an error (as some agent-bridle
+/// versions did), so both representations share the same MCP-first recovery
+/// contract.
 fn is_authentication_fetch_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     [
@@ -2753,7 +2754,7 @@ fn is_authentication_fetch_error(error: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// Render a successful bridle dispatch. HTTP 401/403 are transport successes
+/// Render a successful `web_fetch`. HTTP 401/403 are transport successes
 /// but content failures: treating their login/error body as page evidence led
 /// the agent into unauthenticated shell fallbacks. Surface them as failures and,
 /// when possible, route discovery to connected MCP tools.
@@ -2797,7 +2798,7 @@ fn render_web_fetch_result(
     }
 }
 
-/// Render a bridle dispatch error, adding the authenticated-source recovery
+/// Render a `web_fetch` refusal, adding the authenticated-source recovery
 /// only for the private-address SSRF case. The error itself is never weakened.
 fn render_web_fetch_error(
     url: &str,
@@ -6370,7 +6371,7 @@ async fn execute_authorized_tool(
         "web_fetch" => {
             let url = args["url"].as_str().unwrap_or("");
 
-            // Route through agent-bridle's `web_fetch` tool under the SAME
+            // Fetch through `crate::web_fetch` under the SAME
             // Caveats. The `net` axis gates which hosts are reachable (host
             // allowlist + SSRF screen); an out-of-scope host is denied by the
             // leash, surfaced via the dispatch error. The tool returns extracted
@@ -6414,9 +6415,7 @@ async fn execute_authorized_tool(
                     );
                 }
             }
-            let registry = agent_bridle::registry();
-            let grant = registry.mint_grant(effective_caveats.clone());
-            match registry.dispatch("web_fetch", fetch_args, &grant).await {
+            match crate::web_fetch::fetch(effective_caveats, fetch_args).await {
                 Ok(result) =>
                     render_web_fetch_result(url, &result, &*mcp, persona_tools, disposition),
                 // A `net`-axis leash denial, or a fetch error (SSRF screen,

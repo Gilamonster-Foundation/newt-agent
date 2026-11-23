@@ -915,12 +915,6 @@ pub(super) fn shell_engine() -> crate::ShellEngine {
     crate::confined_default_engine(crate::ocap_l3_backend().1)
 }
 
-/// agent-bridle's tool registry with the `"shell"` tool bound to the selected
-/// engine (the ADR 0005 D2 seam: `safe-subset` / `host` / `brush` all honor the
-/// same `Tool` contract under the `"shell"` name). `web_fetch` is added
-/// unchanged. Mirrors `agent_bridle::registry()` but swaps the shell engine so
-/// `[shell] engine = "host"` (or `--full-access`) routes `run_command` to the
-/// full-grammar, kernel-jailed sandbox-host engine instead of the safe subset.
 /// The b1 sandbox policy every `run_command` shell engine runs under: the
 /// default backend confinement PLUS [`agent_bridle::ChildNetworkPolicy::DenyDirect`]
 /// — the seccomp `socket()`-family egress deny (agent-bridle 0.7.15) that closes
@@ -940,6 +934,13 @@ fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
     }
 }
 
+/// agent-bridle's tool registry holding the `"shell"` tool alone, bound to the
+/// selected engine (the ADR 0005 D2 seam: `safe-subset` / `host` / `brush` all
+/// honor the same `Tool` contract under the `"shell"` name). `web_fetch` is
+/// `crate::web_fetch` (#3160). Unlike `agent_bridle::registry()`, the engine is
+/// the selected one, so `[shell] engine = "host"` (or `--full-access`) routes
+/// `run_command` to the full-grammar, kernel-jailed sandbox-host engine instead
+/// of the safe subset.
 fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -1029,10 +1030,7 @@ fn bridle_registry(
             shell
         }
     };
-    agent_bridle::Registry::builder()
-        .tool(shell)
-        .tool(Arc::new(agent_bridle::WebFetchTool::new()))
-        .build()
+    agent_bridle::Registry::builder().tool(shell).build()
 }
 
 /// #1176: should an about-to-run command be shadow-recorded? Exactly when it
@@ -3686,6 +3684,27 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
         });
     }
     Some(requests)
+}
+
+#[cfg(test)]
+mod bridle_registry_tests {
+    use super::*;
+
+    /// `run_command`'s registry holds the shell tool and nothing else. It also
+    /// registered bridle's `web_fetch`, which nothing dispatched through it (the one
+    /// dispatch names `"shell"`); `web_fetch` is `crate::web_fetch` (#3160).
+    #[test]
+    fn bridle_registry_registers_only_the_shell_tool() {
+        let registry = bridle_registry(
+            crate::ShellEngine::SafeSubset,
+            None,
+            std::time::Duration::from_secs(1),
+            Vec::new(),
+            None,
+            None,
+        );
+        assert_eq!(registry.tool_names(), ["shell"]);
+    }
 }
 
 #[cfg(test)]
