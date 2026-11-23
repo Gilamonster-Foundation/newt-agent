@@ -43,26 +43,34 @@ tracing-subscriber.workspace = true
 # The capability lattice — same `agent-mesh-protocol "0.7"` the rest of the
 # workspace pins (see newt-core), so the `Caveats` type the config helper loads
 # is *identical* to the one `agent-bridle`'s `Registry::dispatch` accepts (no
-# version skew).
+# version skew). This crate names `Caveats` and `Scope` through it, and agent-bridle
+# re-exports the same types, so they are one type with or without `confine`.
 agent-mesh-protocol.workspace = true
 
-# The bridle leash: a Caveats-confined shell tool that routes commands through
-# agent-bridle's registry. The structured denial envelope
-# (`denied: bool` + `denials: [{kind,target,reason}]`) is read directly —
-# never stderr string-matching.
+# The bridle leash behind `shell_run` and `web_fetch`, with `confine` (#3160): a
+# Caveats-confined shell and fetch dispatched through agent-bridle's registry. The
+# structured denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`) is
+# read directly, never by matching stderr. Without `confine` this crate names no
+# agent-bridle crate and the server has neither tool.
 #
-# Keep this direct consumer on the same reviewed source as newt-core — now the
-# published agent-bridle 0.7.7 (supersedes the earlier #1235 git pin; 0.7.7 was
-# cut after PR #246's output-observer API merged), preserving a single bridle
-# type universe.
-agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"] }
+# Keep this direct consumer on the same reviewed source as newt-core, so there is one
+# bridle type universe. One line, `version` first: scripts/build_agent_stack.py and
+# scripts/relax_agent_stack_versions.py rewrite the version by regex.
+agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"], optional = true }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
 pyo3 = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["confine"]
+# The confinement layer (#3160): `shell_run` and `web_fetch`, the two tools this server
+# dispatches through agent-bridle's registry. On by default. Without it the server lists and
+# dispatches neither, and this crate names no agent-bridle crate. `newt-mcp-client/confine`
+# and `newt-core/confine` are theirs, and no-ops while those crates come in with their
+# default features, which every dependent takes: the edge this feature removes is this
+# crate's own.
+confine = ["dep:agent-bridle", "newt-mcp-client/confine", "newt-core/confine"]
 pyo3 = [
     "dep:pyo3",
     "newt-core/pyo3",

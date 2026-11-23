@@ -24,6 +24,10 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 - `newt_core::confined_exec::ConfinedOutput::sandbox_kind` is
   `newt_core::sandbox_seam::SandboxKind`, a newt-core enum with bridle's six variant names; it
   was `agent_bridle::SandboxKind`, with no alias. Convert with `SandboxKind::from` (#3160).
+- `newt-mcp-server` has a `confine` feature, on by default (#3160). Without it the crate names
+  no agent-bridle crate: `shell_run` and `web_fetch`, the two tools it dispatches through
+  agent-bridle's registry, are neither listed nor dispatched (a call gets `unknown tool`), and
+  the startup banner names the file and git tools. A default build behaves as before.
 - `web_fetch` runs through `newt_core::web_fetch` (`fetch`, `WebFetchError`), a copy of
   agent-bridle-tool-web 0.8.0-rc.7, instead of agent-bridle's `WebFetchTool` (#3160). Its
   requests send the user agent `newt-agent/<version>` where they sent
