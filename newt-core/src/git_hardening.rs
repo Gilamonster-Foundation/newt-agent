@@ -2302,6 +2302,20 @@ mod own_gitdir_grant_tests {
         assert_eq!(invocation, repeated);
     }
 
+    /// #2720: a scoped caller's grant is not re-resolved to the workspace. The test above
+    /// only feeds an already-narrowed session back in, which narrowing maps to itself; a
+    /// session scoped elsewhere comes back unchanged only if the early return holds, and
+    /// that return comes before the workspace is read, so the path need not exist.
+    #[test]
+    fn a_scoped_commit_session_keeps_its_own_write_grant() {
+        let mut scoped = crate::Caveats::top();
+        scoped.fs_write = crate::Scope::only(["/elsewhere".into()]);
+        assert_eq!(
+            super::commit_invocation_caveats(&scoped, Path::new("/no-such-workspace")),
+            Ok(scoped.clone())
+        );
+    }
+
     /// #2720: ambient commit setup must not replace a scoped session's cached
     /// refusal/identity. The global cache can be shared by sibling sessions.
     #[test]
