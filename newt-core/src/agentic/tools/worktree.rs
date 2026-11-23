@@ -4,7 +4,7 @@ use crate::worktree_adoption::{task_path_literal, AdoptedWorktree, Creation};
 use crate::Caveats;
 use std::path::{Path, PathBuf};
 
-use super::native_git::{invocation, is_git as resembles_git, literal};
+use super::git_words::{invocation, is_git as resembles_git, literal};
 pub(super) mod administration;
 pub(super) mod branch;
 mod detect;

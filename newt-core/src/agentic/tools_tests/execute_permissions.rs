@@ -2544,7 +2544,7 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
 
 /// #2689 regression, through the `GitTool`/`PendingRerun` collaborator path:
 /// a denied `git add -A && git commit -q -m probe` (which installs a real
-/// `CommitPolicy`-backed broker, per `native_git::needs_commit_broker`) must
+/// `CommitPolicy`-backed broker, per `git_words::needs_commit_broker`) must
 /// now consult the SAME gate as any other exec denial — this replaces a
 /// round-2 (#2681) test that pinned the OPPOSITE as expected ("the broker
 /// early return must never consult the permission gate"), which was this

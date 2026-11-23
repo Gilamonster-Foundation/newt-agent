@@ -22,10 +22,10 @@ fn route(
     presentation: &mut dyn ToolPresentation,
 ) -> bool {
     if bypass
-        && (super::needs_commit_broker(source)
-            || super::commit_in_an_uninspectable_source(source)
-            || super::needs_push_broker(source)
-            || super::needs_pr_create_broker(source))
+        && (super::git_words::needs_commit_broker(source)
+            || super::git_words::commit_in_an_uninspectable_source(source)
+            || super::git_words::needs_push_broker(source)
+            || super::git_words::needs_pr_create_broker(source))
     {
         notice.call_once(|| presentation.preview(BYPASS_NOTICE, 0));
     }

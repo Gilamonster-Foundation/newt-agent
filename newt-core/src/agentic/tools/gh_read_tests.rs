@@ -413,7 +413,7 @@ async fn gh_read_nested_commands_follow_pr_create_recognition_exactly() {
         ("echo $(gh issue view 1)", "echo $(gh pr create)"),
     ] {
         let recognized = native_git::gh_read::recognizes(read);
-        assert_eq!(recognized, native_git::needs_pr_create_broker(create));
+        assert_eq!(recognized, git_words::needs_pr_create_broker(create));
         let probe = Probe::default();
         let mut gate = Gate::default();
         let out = dispatch(read, &granted(), &probe, &mut gate).await;

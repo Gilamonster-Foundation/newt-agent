@@ -135,7 +135,7 @@ pub(crate) fn own_git_test_fixture(repo: &Path) {
 /// touches the common dir's `refs/heads/`/`logs/refs/heads/` at all (a
 /// detached HEAD's own ref IS the worktree-local `HEAD` file, already
 /// inside the worktree-gitdir grant), and
-/// [`crate::agentic::tools::native_git::needs_commit_broker`] firing routes
+/// [`crate::agentic::tools::git_words::needs_commit_broker`] firing routes
 /// the dispatch through a HOST-SIDE, bounded `update-ref` compare-and-swap —
 /// [`own_branch_for_commit_ref_move`], [`detach_own_head`],
 /// [`advance_own_branch_ref`], [`reattach_own_head`] — that verifies the
