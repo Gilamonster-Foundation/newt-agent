@@ -846,7 +846,7 @@ fn frame_permission_gate_forwards_consume_pending_once() {
 
 /// A native positive control prevents a macOS run from passing only because
 /// every dispatch was refused before any file operation.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 #[serial_test::serial]
 async fn macos_smart_runtime_admits_confined_seatbelt() {
