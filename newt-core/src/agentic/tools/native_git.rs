@@ -727,7 +727,7 @@ fn run_staged_push(
 
     // F4: the ONLY step that reads workspace objects, kernel-confined, from
     // the held roots (identity-verified immediately before admission).
-    git_staging::confined_fetch(
+    git_staging::confined::confined_fetch(
         &plan.tools,
         &staging,
         &plan.source_repo,
@@ -3795,7 +3795,7 @@ mod governed_push_tests {
         let copy = |seam: Box<dyn FnOnce() + '_>| {
             let held = HeldRoots::bind(&caveats.fs_read).unwrap();
             let st = StagingRepo::create(&state.path().join("state"), tools.ctx()).unwrap();
-            let outcome = staging::confined_fetch_with(
+            let outcome = staging::confined::confined_fetch_with(
                 &tools,
                 &st,
                 &repo.join(".git"),
@@ -4158,7 +4158,7 @@ mod governed_push_tests {
         let rewrite = format!("url.http://127.0.0.1:{port}/rewrite.insteadOf");
         git(repo.path(), &["config", &rewrite, source]);
         let before = refs(repo.path());
-        let result = crate::git_staging::confined_git(
+        let result = crate::git_staging::confined::confined_git(
             &tools,
             &staging,
             &args,
@@ -4234,7 +4234,7 @@ mod governed_push_tests {
                 source,
             ],
         );
-        let result = crate::git_staging::confined_git(
+        let result = crate::git_staging::confined::confined_git(
             &tools,
             &staging,
             &args,

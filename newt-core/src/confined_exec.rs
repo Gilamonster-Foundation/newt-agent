@@ -2224,7 +2224,7 @@ mod tests {
             "/ws",
             baseline.clone(),
         );
-        let request = crate::git_staging::fetch_copy_request(request);
+        let request = crate::git_staging::confined::fetch_copy_request(request);
         assert_eq!(
             request.net_grant,
             NetGrant::DenyAll,
