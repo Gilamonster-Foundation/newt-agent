@@ -33,8 +33,9 @@ const IGNORED: &str =
 const PUBLISHED_LIB_LINES: usize = 260;
 
 /// The copy below its header: everything after the first line that starts with the sentinel.
-/// Every line above it must be a `//` comment, so no code hides in a header, an inner attribute
-/// such as `#![cfg(any())]` included.
+/// Every line above it must be a plain `// ` comment, so no code hides in a header: not an inner
+/// attribute such as `#![cfg(any())]`, and not a `//!` line, which is an inner doc attribute and
+/// can hold a doctest.
 fn body(copy: &str) -> Result<&str, String> {
     let mut offset = 0;
     for (index, line) in copy.split_inclusive('\n').enumerate() {
@@ -42,7 +43,7 @@ fn body(copy: &str) -> Result<&str, String> {
         if line.starts_with(SENTINEL) {
             return Ok(&copy[offset..]);
         }
-        if !line.starts_with("//") {
+        if !line.starts_with("// ") {
             let number = index + 1;
             return Err(format!("header line {number} is code: {line:?}"));
         }
@@ -213,14 +214,20 @@ fn the_comparer_reports_a_difference() {
 
 /// A copy with no sentinel, or with code above it, is refused, so an empty file, a headerless
 /// one or one that hides code in its header cannot pass. An inner attribute is code: in a
-/// header, `#![cfg(any())]` would empty a test binary and `#![allow(..)]` would lift a lint.
+/// header, `#![cfg(any())]` would empty a test binary, `#![allow(..)]` would lift a lint, and a
+/// `//!` block would add a doctest.
 #[test]
 fn a_copy_without_a_header_is_refused() {
     assert!(body("").is_err());
     assert!(body(VENDORED_BENEATH).is_err());
     let hidden = format!("fn above() {{}}\n{SENTINEL} ----\n{VENDORED_BENEATH}");
     assert!(body(&hidden).is_err());
-    for attribute in ["#![cfg(any())]", "#![allow(unsafe_op_in_unsafe_fn)]"] {
+    for attribute in [
+        "#![cfg(any())]",
+        "#![allow(unsafe_op_in_unsafe_fn)]",
+        "//! ```",
+        "/// a doc line",
+    ] {
         let hidden = format!("// a header\n{attribute}\n{SENTINEL} ----\n{VENDORED_BENEATH}");
         assert!(
             body(&hidden).is_err(),
