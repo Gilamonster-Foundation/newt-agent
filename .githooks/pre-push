@@ -187,7 +187,7 @@
 #     agent-bridle among its direct dependencies with `confine` and not without it. `just
 #     check` runs the clippy and test lines on Unix; this hook builds default features
 #     only, so a build without `confine` (a spawn with no OS sandbox, a pinned HTTP
-#     client) is exercised by CI alone.
+#     client) is not exercised by this hook.
 #   - feature-gated test targets compile (ci.yml lint job, #2971): `cargo check
 #     --tests` for newt-tui under native-permission-test / rich-tui /
 #     rich-tui,live-spill and newt-core under ast, the combinations the
