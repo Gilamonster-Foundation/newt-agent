@@ -11,6 +11,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `newt_core::confined_exec::ConfinedOutput::sandbox_kind` is
+  `newt_core::sandbox_seam::SandboxKind`, a newt-core enum with bridle's six variant names; it
+  was `agent_bridle::SandboxKind`, with no alias. Convert with `SandboxKind::from` (#3160).
 - `newt_core::workspace_protection::WorkspaceProtection::validate_with_sandbox_policy` is
   renamed `validate_with_sandbox_roots` and takes `newt_core::sandbox_seam::SandboxRoots`,
   with no alias (#3160). Convert a launcher's policy with `SandboxRoots::from(&policy)`.
