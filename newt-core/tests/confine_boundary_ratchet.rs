@@ -6,7 +6,13 @@
 //! comment; code that needs bridle, a test included, lives in a file that is not listed.
 //! `confined_exec.rs` holds the request, result and refusal types its callers use; the
 //! executor that uses bridle is its child `confined_exec/executor.rs`, which is not
-//! listed.
+//! listed. `git_hardening.rs` and `git_staging.rs` came free of bridle when #3229 moved
+//! the confined git broker into `git_hardening/build_reads.rs` and
+//! `git_staging/confined.rs` (with its tests), which are not listed. Every other file
+//! under them is listed, test files included, except `git_hardening/commit_view_tests.rs`,
+//! which a later step of #3160 compiles only with `confine`. None of the listed files
+//! under them has named a bridle crate since #3223 moved `git_staging/held_root.rs` and
+//! `git_staging/tool_diagnostics/repair.rs` onto newt-fdguard.
 //!
 //! The list only grows: each later step of #3160 adds the files it frees of bridle, and
 //! the step that makes the bridle dependencies optional deletes this file, because from
@@ -15,10 +21,60 @@
 //! it from the scan.
 
 /// The files that name no agent-bridle crate outside a comment, by repository path.
-const BRIDLE_FREE: &[(&str, &str)] = &[(
-    "newt-core/src/confined_exec.rs",
-    include_str!("../src/confined_exec.rs"),
-)];
+const BRIDLE_FREE: &[(&str, &str)] = &[
+    (
+        "newt-core/src/confined_exec.rs",
+        include_str!("../src/confined_exec.rs"),
+    ),
+    (
+        "newt-core/src/git_hardening.rs",
+        include_str!("../src/git_hardening.rs"),
+    ),
+    (
+        "newt-core/src/git_hardening/branch.rs",
+        include_str!("../src/git_hardening/branch.rs"),
+    ),
+    (
+        "newt-core/src/git_hardening/branch_tests.rs",
+        include_str!("../src/git_hardening/branch_tests.rs"),
+    ),
+    (
+        "newt-core/src/git_hardening/ref_namespace.rs",
+        include_str!("../src/git_hardening/ref_namespace.rs"),
+    ),
+    (
+        "newt-core/src/git_hardening/scoped_read.rs",
+        include_str!("../src/git_hardening/scoped_read.rs"),
+    ),
+    (
+        "newt-core/src/git_staging.rs",
+        include_str!("../src/git_staging.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/failure.rs",
+        include_str!("../src/git_staging/failure.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/held_root.rs",
+        include_str!("../src/git_staging/held_root.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/tool_diagnostics.rs",
+        include_str!("../src/git_staging/tool_diagnostics.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/tool_diagnostics/repair.rs",
+        include_str!("../src/git_staging/tool_diagnostics/repair.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/tool_diagnostics/repair/tests.rs",
+        include_str!("../src/git_staging/tool_diagnostics/repair/tests.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/trust_paths.rs",
+        include_str!("../src/git_staging/trust_paths.rs"),
+    ),
+];
 
 /// The crates' Rust names (`agent_bridle`, `agent_bridle_tool_shell`, ...) and their
 /// package names, as a `#[path]` into a vendored copy would spell them.
