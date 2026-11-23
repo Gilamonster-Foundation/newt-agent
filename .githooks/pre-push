@@ -506,8 +506,8 @@ cargo fmt --all -- --check
 # them as ignored tests and skips them here: they are no longer excluded below.
 # Their real bodies still run only under `-- --ignored`:
 #   native_git_broker_pipeline  .github/workflows/native-git-broker-real.yml
-#                               (weekly, release tags, PRs touching newt-core
-#                               or agent-toolchain) and macos-confined-contract.yml
+#                               (weekly, release tags, PRs touching one of the
+#                               paths it lists) and macos-confined-contract.yml
 #   brush_build_pipeline        macos-confined-contract.yml, which runs only its
 #                               linked_worktree_build_reads row
 #   macos_exec_basenames        newt-tui-pty.yml (root-owned gh copy)
