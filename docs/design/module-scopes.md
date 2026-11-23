@@ -453,7 +453,7 @@ Acceptance criteria for a first Module PR (no schedule; ship when green):
    refusal.
 3. `ScopedKitView::visible()` is a pure function of `(selection data, grant)`: it never calls the
    Gate, never charges a call, yields no `dyn Tool` or handle, and each listed `effective` equals
-   `grant.meet(&export.required.bridle)` — which for `shell` / `web_fetch` equals
+   `grant.meet(&export.required.bridle)` — which for `shell` equals
    `grant.meet(&tool.required())` (property test; a spy Gate asserts zero `authorize` calls during
    enumeration).
 4. Resource-budget exhaustion (tokens / memory / concurrency) produces `Ready → Draining` and an

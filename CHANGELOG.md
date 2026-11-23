@@ -11,6 +11,10 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `web_fetch` runs through `newt_core::web_fetch` (`fetch`, `WebFetchError`), a copy of
+  agent-bridle-tool-web 0.8.0-rc.7, instead of agent-bridle's `WebFetchTool` (#3160). Its
+  requests send the user agent `newt-agent/<version>` where they sent
+  `agent-bridle-web/<version>`; its refusals keep their text.
 - `newt_core::workspace_protection::WorkspaceProtection::validate_with_sandbox_policy` is
   renamed `validate_with_sandbox_roots` and takes `newt_core::sandbox_seam::SandboxRoots`,
   with no alias (#3160). Convert a launcher's policy with `SandboxRoots::from(&policy)`.

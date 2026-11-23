@@ -365,7 +365,7 @@ behaviour moves, and no adapter is a new index:
 
 | Adapter | Produces | Notes |
 |---|---|---|
-| Bridle `Registry` (`shell`, `web_fetch`) → kit | one `Export` per `Tool`, `required.bridle = tool.required()`, `ImplRef::Builtin` | zero new authority code; the Gate path is untouched |
+| Bridle `Registry` (`shell`) → kit | one `Export` per `Tool`, `required.bridle = tool.required()`, `ImplRef::Builtin` | zero new authority code; the Gate path is untouched |
 | builtin tool `match` (`newt-core/src/agentic/tools.rs`) → kit | one `Export` per builtin; `required.bridle` **defined** as declarative data (these tools have no `required()` today); `git` adds `required.domain = GitCaveats` | this is where a ceiling appears for the first time; `PermissionGate` stays in front |
 | `newt-skills` → kit | `Export`s with `newt.skill.*` ids; `SkillCaveats → required.bridle` | prompts/hooks are data already; the frontmatter block is the manifest fragment |
 | `newt-mcp-*` → kit | `Export` per configured server, `ImplRef::Subprocess`/`Remote` | `newt mcp list` becomes a catalog view |
@@ -408,7 +408,7 @@ Acceptance for #1737 (each item is a test or a mechanical gate in the unit tier,
 1. **Types round-trip.** `KitManifest` / `Export` / `RequiredAuthority` / `InterfaceId` / `ImplRef`
    serialize and deserialize losslessly (serde round-trip test per type; `consumes` / `provides`
    present in the fixture and equal after round-trip).
-2. **Bridle adapter is transparent.** For `shell` and `web_fetch`, `Export.required.bridle ==
+2. **Bridle adapter is transparent.** For `shell`, `Export.required.bridle ==
    tool.required()` (assert_eq); for a fixed `(tool, granted)` fixture, `Gate::authorize`'s resulting
    `ToolContext` effective caveats are equal with and without the catalog in the path. For the
    builtin `match`, every builtin name has an `Export` with a declared `required.bridle`
