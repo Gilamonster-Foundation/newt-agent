@@ -17,7 +17,7 @@ fn mutable_anchor_refusal_names_the_offending_path() {
 
 /// Ground the admission check in a real symlink replacement: no independent
 /// PATH directory rule may make the private frame readable through workspace/bin.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "confine"))]
 #[test]
 fn swapped_path_directory_cannot_read_private_frame() {
     use crate::confined_exec::{ConstrainedExecutor, ExecOrigin, ExecRequest};
@@ -57,7 +57,7 @@ fn swapped_path_directory_cannot_read_private_frame() {
 /// Exact TUI authority shape: bare commands plus a PATH directory beneath the
 /// launch root. Keep the primary session alive with a path-bearing notice;
 /// the same authority with a trusted PATH still admits the feature silently.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "confine"))]
 #[test]
 fn parent_directory_path_disables_only_smart_harness() {
     let _lock = crate::process_env::lock();

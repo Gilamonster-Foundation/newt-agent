@@ -366,22 +366,27 @@ pub fn resolved_confined_default() -> ShellEngine {
 /// confines it in the kernel (L3). Surfaced by `newt doctor` (#926) so the
 /// operator can see what actually enforces a restricted grant here. A restricted
 /// filesystem grant requires a kernel boundary. When that floor cannot be met,
-/// admission refuses the command rather than allowing advisory access.
+/// admission refuses the command rather than allowing advisory access. A build
+/// without newt-core's `confine` feature probes no kernel fence: it reports none, on
+/// any platform (#3160).
 #[must_use]
 pub fn ocap_l3_backend() -> (&'static str, bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "confine", target_os = "linux"))]
     {
         ("Landlock", agent_bridle::landlock_is_supported())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "confine", target_os = "macos"))]
     {
         ("Seatbelt", agent_bridle::seatbelt_is_supported())
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(feature = "confine", target_os = "windows"))]
     {
         ("AppContainer", true)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(all(
+        feature = "confine",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     {
         ("none", false)
     }

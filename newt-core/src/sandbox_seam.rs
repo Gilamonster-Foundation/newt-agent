@@ -11,7 +11,8 @@
 //! [`SandboxKind`] is the OS sandbox a confined run reports it ran under
 //! (`confined_exec::ConfinedOutput`).
 //!
-//! The two `From` impls are the only conversions that know bridle.
+//! The two `From` impls are the only conversions that know bridle, and they are compiled only
+//! with `confine`. Without it `SandboxRoots::runtime` has no policy to read and is empty.
 //!
 //! [`HeldReadRoot`] and [`CommandBroker`] are bridle's own types, named from here by the
 //! executor's request and the build's Git reads (their held read roots) and by the confined
@@ -41,13 +42,27 @@ pub struct SandboxRoots {
 
 impl SandboxRoots {
     /// The roots of the policy newt-core's own executor installs, so the guard, the frame check
-    /// and the executor read one policy.
+    /// and the executor read one policy. Without `confine` there is no executor, and every list
+    /// is empty.
     pub(crate) fn runtime() -> Self {
-        Self::from(&crate::confined_exec::runtime_sandbox_policy())
+        #[cfg(feature = "confine")]
+        {
+            Self::from(&crate::confined_exec::runtime_sandbox_policy())
+        }
+        #[cfg(not(feature = "confine"))]
+        {
+            Self {
+                base_read_paths: Vec::new(),
+                bin_read_paths: Vec::new(),
+                loader_paths: Vec::new(),
+                device_sink_paths: Vec::new(),
+            }
+        }
     }
 }
 
 /// A launcher that builds its own policy converts the policy it launches with.
+#[cfg(feature = "confine")]
 impl From<&agent_bridle::SandboxPolicy> for SandboxRoots {
     fn from(policy: &agent_bridle::SandboxPolicy) -> Self {
         Self {
@@ -79,6 +94,7 @@ pub enum SandboxKind {
 
 /// The kind bridle's launcher reports, variant for variant. There is no wildcard arm, so a kind
 /// bridle adds stops this compiling instead of reading as `None`.
+#[cfg(feature = "confine")]
 impl From<agent_bridle::SandboxKind> for SandboxKind {
     fn from(kind: agent_bridle::SandboxKind) -> Self {
         match kind {
@@ -94,11 +110,14 @@ impl From<agent_bridle::SandboxKind> for SandboxKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandBroker, HeldReadRoot, SandboxKind, SandboxRoots};
+    #[cfg(feature = "confine")]
+    use super::SandboxKind;
+    use super::{CommandBroker, HeldReadRoot, SandboxRoots};
     use std::sync::Arc;
 
     /// `roots` holds each of `policy`'s four lists as bridle resolves it, which is how bridle
     /// reads them when it builds the sandbox.
+    #[cfg(feature = "confine")]
     fn assert_resolved(roots: &SandboxRoots, policy: &agent_bridle::SandboxPolicy) {
         assert_eq!(roots.base_read_paths, policy.base_read_paths.resolve());
         assert_eq!(roots.bin_read_paths, policy.bin_read_paths.resolve());
@@ -108,6 +127,7 @@ mod tests {
 
     /// The conversion reads each list into its own field, with the operator's additions: the
     /// defaults then the extras, or the extras alone under `replace`.
+    #[cfg(feature = "confine")]
     #[test]
     fn the_roots_are_the_resolved_policy_lists() {
         let mut policy = agent_bridle::SandboxPolicy::default();
@@ -129,6 +149,7 @@ mod tests {
 
     /// The guard and the frame check see the policy the executor installs, and that policy
     /// grants roots.
+    #[cfg(feature = "confine")]
     #[test]
     fn the_runtime_roots_are_what_the_executor_installs() {
         let roots = SandboxRoots::runtime();
@@ -138,6 +159,7 @@ mod tests {
 
     /// Each kind bridle's launcher reports becomes the newt-core kind of the same name, which
     /// prints the same: the move check and the confined-git refusal print it.
+    #[cfg(feature = "confine")]
     #[test]
     fn the_sandbox_kind_is_the_one_bridle_reports() {
         use agent_bridle::SandboxKind as Bridle;
@@ -157,6 +179,17 @@ mod tests {
         }
         // Anti-vacuous: six kinds with six different names.
         assert_eq!(names.len(), 6);
+    }
+
+    /// Without `confine` the roots are not read from a policy: they are empty.
+    #[cfg(not(feature = "confine"))]
+    #[test]
+    fn confine_off_runtime_sandbox_roots_are_empty() {
+        let roots = SandboxRoots::runtime();
+        assert!(roots.base_read_paths.is_empty());
+        assert!(roots.bin_read_paths.is_empty());
+        assert!(roots.loader_paths.is_empty());
+        assert!(roots.device_sink_paths.is_empty());
     }
 
     // The two names are bridle's own types, not look-alikes. Each coercion compiles only when

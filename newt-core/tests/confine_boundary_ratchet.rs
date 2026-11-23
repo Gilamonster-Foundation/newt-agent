@@ -4,9 +4,11 @@
 //! here stay compiled with `confine` off, tests included, since CI's confine-off job
 //! builds `--all-targets`. So no line of theirs may name an agent-bridle crate outside a
 //! comment; code that needs bridle, a test included, lives in a file that is not listed.
-//! `confined_exec.rs` holds the request, result and refusal types its callers use; the
-//! executor that uses bridle is its child `confined_exec/executor.rs`, which is not
-//! listed. `git_hardening.rs` and `git_staging.rs` came free of bridle when #3229 moved
+//! `confined_exec.rs` holds the request, result and refusal types its callers use. Its
+//! children `confined_exec/executor.rs`, the executor that uses bridle, and
+//! `confined_exec/sandbox_policy.rs`, the policy it installs, are not listed. Without
+//! `confine` the executor is `confined_exec/executor_off.rs`, a refusal, and it is listed.
+//! `git_hardening.rs` and `git_staging.rs` came free of bridle when #3229 moved
 //! the confined git broker into `git_hardening/build_reads.rs` and
 //! `git_staging/confined.rs` (with its tests), which are not listed. Every other file
 //! under them is listed, test files included, except `git_hardening/commit_view_tests.rs`,
@@ -68,6 +70,10 @@ const BRIDLE_FREE: &[(&str, &str)] = &[
     (
         "newt-core/src/confined_exec.rs",
         include_str!("../src/confined_exec.rs"),
+    ),
+    (
+        "newt-core/src/confined_exec/executor_off.rs",
+        include_str!("../src/confined_exec/executor_off.rs"),
     ),
     (
         "newt-core/src/git_hardening.rs",

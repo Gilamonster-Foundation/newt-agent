@@ -628,6 +628,7 @@ mod tests {
         assert!(!directory.starts_with(workspace.path()));
     }
 
+    #[cfg(feature = "confine")]
     #[test]
     #[serial_test::serial(real_fs)]
     fn frame_storage_excludes_implicit_sandbox_and_executable_roots() {
@@ -972,7 +973,7 @@ mod tests {
 
 /// The native runtime grant and the private-store exclusion must share one
 /// policy; otherwise making xcrun work could accidentally expose frame files.
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, target_os = "macos", feature = "confine"))]
 #[test]
 fn selected_developer_runtime_cannot_contain_a_private_frame() {
     let workspace = tempfile::tempdir().unwrap();

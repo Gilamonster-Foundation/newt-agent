@@ -67,16 +67,33 @@
 //! `RepositoryProbe` re-dispatch, never a model-chosen command. Recorded as a
 //! named deviation: `docs/security/ocap-deviations.md` §
 //! `native-git-broker-exec-floor`.
+//!
+//! # Without the `confine` feature (#3160)
+//!
+//! A build of newt-core without its `confine` feature does not compile the executor. The
+//! names that code outside this module imports stay, as the refusals in `executor_off`:
+//! [`ConstrainedExecutor`] refuses every call with [`ExecRefused::ConfinementUnenforceable`]
+//! before a scratch directory or a process exists, and the three fence probes report no
+//! fence. [`BACKEND_COMPILED`] says which build this is.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use newt_policy::caveats::{Caveats, Scope};
 
+#[cfg(feature = "confine")]
 mod executor;
+#[cfg(not(feature = "confine"))]
+mod executor_off;
 mod sandbox_policy;
 
+#[cfg(feature = "confine")]
 pub use executor::{
+    cgroup_subtree_kill_available, kernel_fs_fence_available, net_guard_available,
+    ConstrainedExecutor,
+};
+#[cfg(not(feature = "confine"))]
+pub use executor_off::{
     cgroup_subtree_kill_available, kernel_fs_fence_available, net_guard_available,
     ConstrainedExecutor,
 };
@@ -140,6 +157,14 @@ pub enum NetGrant {
 /// authority. The child starts env-EMPTY — [`env`](Self::env) grants are the
 /// child's *entire* environment.
 #[derive(Debug, Clone)]
+// Without `confine` no executor reads `origin`, `program`, `args`, `cwd`, `net_grant`,
+// `net_guard_bin` or `timeout`. The unit tests read `origin`, `args`, `net_grant` and
+// `timeout`, so `program`, `cwd` and `net_guard_bin` are unread in a test build too: the
+// expectation holds in every build without `confine`.
+#[cfg_attr(
+    not(feature = "confine"),
+    expect(dead_code, reason = "only the executor reads the spawn description")
+)]
 pub struct ExecRequest {
     origin: ExecOrigin,
     program: String,
@@ -307,7 +332,8 @@ impl ExecRequest {
 pub enum ExecRefused {
     /// The fence could not be kernel-enforced on this platform/kernel, so the
     /// spawn was refused rather than run unconfined (#10). Carries the honest
-    /// reason from `agent-bridle`.
+    /// reason from `agent-bridle`; a build without the `confine` feature carries
+    /// `CONFINE_OFF_REASON` instead.
     ConfinementUnenforceable(String),
     /// The gate refused to mint the confinement (e.g. the program is outside the
     /// exec allow-list, or the call budget is exhausted).
@@ -331,6 +357,21 @@ impl std::fmt::Display for ExecRefused {
 }
 
 impl std::error::Error for ExecRefused {}
+
+/// Whether this build compiled the confinement backend: newt-core's `confine` feature is on,
+/// as it is by default. Without it [`ConstrainedExecutor`] refuses every call (#3160).
+pub const BACKEND_COMPILED: bool = cfg!(feature = "confine");
+
+/// The reason a build without the backend gives: in the refusal [`ConstrainedExecutor`]
+/// returns and in the OCAP verdict on the executor.
+pub(crate) const CONFINE_OFF_REASON: &str =
+    "this build has no confinement backend (cargo feature `confine` is off)";
+
+/// The refusal [`ConstrainedExecutor`] returns without the backend. The one place it is built.
+#[cfg(not(feature = "confine"))]
+fn off_refusal() -> ExecRefused {
+    ExecRefused::ConfinementUnenforceable(CONFINE_OFF_REASON.to_owned())
+}
 
 /// The result of a completed confined run: the child's exit outcome, its
 /// captured output, and the OS sandbox that was ACTUALLY applied (honest — never
@@ -357,6 +398,7 @@ pub(crate) struct WindowsJob {
 
 #[cfg(target_os = "windows")]
 impl WindowsJob {
+    #[cfg(feature = "confine")]
     fn for_child(child: &std::process::Child) -> Option<Self> {
         use std::os::windows::io::AsRawHandle;
         Self::for_process(child.as_raw_handle())
@@ -413,6 +455,7 @@ impl WindowsJob {
         Some(Self { handle })
     }
 
+    #[cfg(feature = "confine")]
     fn terminate(&self) {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // SAFETY: `handle` is owned by this RAII wrapper. Termination is
@@ -1632,6 +1675,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", feature = "confine"))]
 #[path = "confined_exec_git_tests.rs"]
 mod git_read_race_tests;
