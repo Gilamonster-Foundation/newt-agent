@@ -1,20 +1,23 @@
 //! A test that reads outside the crate cannot run from the published package, so it
-//! must not ship (#3164). A test reads outside the crate in one of three ways:
+//! must not ship (#3164). This guard knows four ways a test reads outside the crate:
 //!
 //! - it declares `mod common;`: `tests/common` is the workspace's shared source scanner,
 //!   it reads sibling crates, and it is excluded from the package;
-//! - it embeds a file above the crate, `include_str!("../../..")` or `include_bytes!`, so
-//!   it cannot compile in an unpacked package;
-//! - it walks up from `CARGO_MANIFEST_DIR`, so it reads whatever sits beside the unpacked
-//!   package. The rule reads the whole file: one that names `CARGO_MANIFEST_DIR` and
-//!   goes up from any path (`.parent()`, `.ancestors()`, `.pop()`, or a `..` segment in a
-//!   string, as in `join("../newt-tui/src/chat.rs")`) is taken to walk up, so the rule
-//!   errs toward excluding a test that stays inside.
+//! - it embeds a file above the crate with `include_str!`, `include_bytes!`, `include!`
+//!   or `#[path]`, so it cannot compile in an unpacked package;
+//! - it walks up from `CARGO_MANIFEST_DIR`, so it may read above the unpacked package.
+//!   The rule reads the whole file: one that names `CARGO_MANIFEST_DIR` and goes up from
+//!   any path (`.parent()`, `.ancestors()`, `.pop()`, or a `..` segment in a string, as
+//!   in `join("../newt-tui/src/chat.rs")`) is taken to walk up;
+//! - it runs cargo (`Command::new(env!("CARGO"))` or `Command::new("cargo")`), which
+//!   resolves the workspace around its working directory, by default the crate's.
 //!
-//! This guard checks that rule on the top-level `tests/*.rs` files, and checks that no
-//! file under a test directory reads outside the crate except `tests/common`, which is
-//! excluded whole. It is excluded from the package itself: its twin below looks for
-//! tests the package does not ship, so it can only pass in the workspace.
+//! The last two err toward excluding: a test that walks up only to a file the package
+//! also ships, or runs cargo in a directory of its own, is excluded too. This guard
+//! checks the top-level `tests/*.rs` files, and checks that no file under a test
+//! directory reads outside the crate except under `tests/common`, which is excluded
+//! whole. It is excluded from the package itself: its twin below looks for tests the
+//! package does not ship, so it can only pass in the workspace.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -48,16 +51,25 @@ fn declares_mod_common(source: &str) -> bool {
     })
 }
 
-/// Does `source` embed a file above the crate? From `tests/`, `../../` leaves it.
-fn embeds_outside_the_crate(source: &str) -> bool {
-    ["include_str!", "include_bytes!"].iter().any(|embed| {
-        source.match_indices(embed).any(|(at, _)| {
-            source[at + embed.len()..]
-                .trim_start()
-                .strip_prefix('(')
-                .is_some_and(|rest| rest.trim_start().starts_with("\"../../"))
+/// Does `source`, a file `depth` directories below the crate root, embed a file above
+/// the crate? Each form takes a path relative to the file's directory, so `depth + 1`
+/// leading `../` leave the crate; a raw string's `r` and `#` are skipped.
+fn embeds_outside_the_crate(source: &str, depth: usize) -> bool {
+    let up = format!("\"{}", "../".repeat(depth + 1));
+    ["include_str!", "include_bytes!", "include!", "#[path"]
+        .iter()
+        .any(|embed| {
+            source.match_indices(embed).any(|(at, _)| {
+                let rest = source[at + embed.len()..].trim_start();
+                let rest = rest
+                    .strip_prefix('(')
+                    .or_else(|| rest.strip_prefix('='))
+                    .unwrap_or("");
+                rest.trim_start()
+                    .trim_start_matches(['r', '#'])
+                    .starts_with(&up)
+            })
         })
-    })
 }
 
 /// Does `source` walk up from the crate's own directory? See the module doc: the whole
@@ -76,11 +88,18 @@ fn walks_up_from_the_crate(source: &str) -> bool {
         .any(|up| source.contains(up))
 }
 
-/// Does `source` read outside the crate, in any of the three ways the module doc names?
-fn reads_outside_the_crate(source: &str) -> bool {
+/// Does `source` run cargo? Cargo resolves the workspace around its working directory.
+fn runs_cargo(source: &str) -> bool {
+    source.contains("Command::new(env!(\"CARGO\"))") || source.contains("Command::new(\"cargo\")")
+}
+
+/// Does `source`, `depth` directories below the crate root, read outside the crate in
+/// any of the four ways the module doc names?
+fn reads_outside_the_crate(source: &str, depth: usize) -> bool {
     declares_mod_common(source)
-        || embeds_outside_the_crate(source)
+        || embeds_outside_the_crate(source, depth)
         || walks_up_from_the_crate(source)
+        || runs_cargo(source)
 }
 
 /// The `.rs` files under `tests`'s subdirectories that read outside the crate, as paths
@@ -90,11 +109,12 @@ fn nested_reading_outside_the_crate(dir: &Path, root: &Path, found: &mut Vec<Str
         let path = entry.expect("a directory entry").path();
         if path.is_dir() {
             nested_reading_outside_the_crate(&path, root, found);
-        } else if path.extension().is_some_and(|ext| ext == "rs")
-            && reads_outside_the_crate(&std::fs::read_to_string(&path).unwrap_or_default())
-        {
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
             let relative = path.strip_prefix(root).expect("under the crate");
-            found.push(relative.to_string_lossy().replace('\\', "/"));
+            let depth = relative.components().count() - 1;
+            if reads_outside_the_crate(&std::fs::read_to_string(&path).unwrap_or_default(), depth) {
+                found.push(relative.to_string_lossy().replace('\\', "/"));
+            }
         }
     }
 }
@@ -107,6 +127,7 @@ fn reading_outside_the_crate(tests: &Path) -> Vec<String> {
         if path.extension().is_some_and(|ext| ext == "rs")
             && reads_outside_the_crate(
                 &std::fs::read_to_string(&path).expect("a test file is readable"),
+                1,
             )
         {
             found.push(format!(
@@ -138,8 +159,8 @@ fn a_test_that_reads_outside_the_crate_is_excluded_from_the_package() {
         .collect();
     assert!(
         unexcluded.is_empty(),
-        "these tests read outside the crate, so they cannot run from the package; add them \
-         to `exclude` in newt-core/Cargo.toml: {unexcluded:?}"
+        "these tests read outside the crate, so they may not run from the package; add \
+         them to `exclude` in newt-core/Cargo.toml: {unexcluded:?}"
     );
     let mut nested = Vec::new();
     for entry in std::fs::read_dir(root.join("tests")).expect("tests/ is readable") {
@@ -148,12 +169,18 @@ fn a_test_that_reads_outside_the_crate_is_excluded_from_the_package() {
             nested_reading_outside_the_crate(&path, root, &mut nested);
         }
     }
-    nested.sort();
-    assert_eq!(
-        nested,
-        ["tests/common/mod.rs"],
-        "only `tests/common`, excluded whole, may read outside the crate from a test \
-         directory; this guard checks top-level files only, so extend it to cover the others"
+    let (common, other): (Vec<_>, Vec<_>) = nested
+        .into_iter()
+        .partition(|path| path.starts_with("tests/common/"));
+    assert!(
+        common.iter().any(|path| path == "tests/common/mod.rs"),
+        "the nested scan must see `tests/common/mod.rs`; found {common:?}"
+    );
+    assert!(
+        other.is_empty(),
+        "these files under a test directory read outside the crate, and only `tests/common` \
+         is excluded whole; exclude their directory with every test that declares it, and \
+         extend this guard to check that: {other:?}"
     );
 }
 
@@ -170,6 +197,7 @@ fn the_scan_sees_each_way_out_of_the_crate() {
         "tests/content_addressable_ratchet.rs",
         "tests/prompt_window_is_sealed.rs",
         "tests/tenacity_exact_family_ratchet.rs",
+        "tests/closure_ledger.rs",
     ] {
         assert!(
             found.iter().any(|found| found == test),
@@ -184,17 +212,29 @@ fn the_predicates_read_every_way_out_of_the_crate() {
         "const R: &str = include_str!(\"../../docs/r.toml\");",
         "include_bytes!( \"../../x.bin\")",
         "include_str!(\n    \"../../newt-tui/src/lib.rs\"\n)",
+        "include_str!(r\"../../x\")",
+        "include_str!(r#\"../../x\"#)",
+        "include!(\"../../x.rs\")",
+        "#[path = \"../../vendor/x.rs\"]\nmod x;",
     ] {
-        assert!(embeds_outside_the_crate(embeds), "{embeds:?}");
-        assert!(reads_outside_the_crate(embeds), "{embeds:?}");
+        assert!(embeds_outside_the_crate(embeds, 1), "{embeds:?}");
+        assert!(reads_outside_the_crate(embeds, 1), "{embeds:?}");
     }
     for inside in [
         "include_str!(\"../src/lib.rs\")",
         "include_str!(\"fixtures/a.txt\")",
+        "#[path = \"support/x.rs\"]\nmod x;",
         "// ../../docs",
+        "format!(\"include!(r#\\\"{}\\\"#);\", path)",
     ] {
-        assert!(!embeds_outside_the_crate(inside), "{inside:?}");
+        assert!(!embeds_outside_the_crate(inside, 1), "{inside:?}");
     }
+    // One directory deeper, `../../` still stays inside the crate.
+    assert!(!embeds_outside_the_crate(
+        "include_str!(\"../../src/x.rs\")",
+        2
+    ));
+    assert!(embeds_outside_the_crate("include_str!(\"../../../x\")", 2));
     for walks in [
         "Path::new(env!(\"CARGO_MANIFEST_DIR\"))\n    .parent()\n    .unwrap();",
         "Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"..\");",
@@ -205,7 +245,7 @@ fn the_predicates_read_every_way_out_of_the_crate() {
          source(\"../newt-tui/src/chat.rs\");",
     ] {
         assert!(walks_up_from_the_crate(walks), "{walks:?}");
-        assert!(reads_outside_the_crate(walks), "{walks:?}");
+        assert!(reads_outside_the_crate(walks, 1), "{walks:?}");
     }
     for stays in [
         "Path::new(env!(\"CARGO_MANIFEST_DIR\")).join(\"tests/ui/x.rs\");",
@@ -214,6 +254,14 @@ fn the_predicates_read_every_way_out_of_the_crate() {
     ] {
         assert!(!walks_up_from_the_crate(stays), "{stays:?}");
     }
+    for runs in [
+        "let out = Command::new(env!(\"CARGO\")).args([\"metadata\"]).output();",
+        "Command::new(\"cargo\").arg(\"tree\")",
+    ] {
+        assert!(runs_cargo(runs), "{runs:?}");
+        assert!(reads_outside_the_crate(runs, 1), "{runs:?}");
+    }
+    assert!(!runs_cargo("let cargo = PathBuf::from(env!(\"CARGO\"));"));
 }
 
 #[test]
