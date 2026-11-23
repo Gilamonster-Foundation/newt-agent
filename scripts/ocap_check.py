@@ -513,20 +513,26 @@ def run_self_tests() -> int:
             )
             planted.unlink()
 
-    # 7. Messages print repo-relative paths with forward slashes on every platform: a
-    #    Windows path printed as-is ("newt-core\src\planted.rs") failed the needles above
-    #    there (#3201 review).
+    # 7. A printed path has forward slashes on every platform: a Windows path printed as-is
+    #    ("newt-core\src\planted.rs") failed the needles above there (#3201 review). This
+    #    pins the helper's output for a Windows path, and that each function that prints a
+    #    path calls the helper; a host here has one path flavour, so it cannot run them on
+    #    Windows paths.
     win_root = PureWindowsPath(r"C:\repo")
     win_file = PureWindowsPath(r"C:\repo\newt-core\src\planted.rs")
     expect("paths-print-with-forward-slashes", _shown(win_file, win_root) == "newt-core/src/planted.rs")
     expect("relative-paths-print-as-given", _shown(PurePath("newt-policy/src/x.rs")) == "newt-policy/src/x.rs")
+    for printer in (check_register, check_code_guards, check_launch_authority_reads,
+                    _capability_referenced_in):
+        expect(f"{printer.__name__}-prints-paths-through-_shown",
+               "_shown" in printer.__code__.co_names)
 
     if failures:
         for f in failures:
             print(f"  SELF-TEST FAIL: {f}", file=sys.stderr)
         print(
-            f"\nocap-check --self-test FAILED ({len(failures)}) — the GATED/BOUNDED machinery is "
-            "not grounded; a cosmetic relabel could pass. Fix check_state_proofs.",
+            f"\nocap-check --self-test FAILED ({len(failures)}) — each check named above no "
+            "longer catches what it guards; fix that check before trusting ocap-check.",
             file=sys.stderr,
         )
         return 1
