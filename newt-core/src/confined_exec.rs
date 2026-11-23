@@ -74,12 +74,13 @@ use std::time::Duration;
 use newt_policy::caveats::{Caveats, Scope};
 
 mod executor;
+mod sandbox_policy;
 
-pub(crate) use executor::runtime_sandbox_policy;
 pub use executor::{
     cgroup_subtree_kill_available, kernel_fs_fence_available, net_guard_available,
     ConstrainedExecutor,
 };
+pub(crate) use sandbox_policy::runtime_sandbox_policy;
 
 /// The trust class of the code being executed — the axis that decides how hard
 /// the executor must confine before it will run anything.
