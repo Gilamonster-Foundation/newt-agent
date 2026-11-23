@@ -72,6 +72,24 @@ jobs:
               -- --ignored --test-threads=1
           done
 
+      # #3195: the carried-tool pack grounds, on a real filesystem: a symlinked
+      # executable finds the pack in its keg (macOS reports the link's own path
+      # for current_exe), and pinning grants a pack in an owner-only directory
+      # but not one that is group-writable or under a session write root.
+      - name: Run carried-tool pack grounding
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for test in \
+            a_real_symlinked_executable_finds_the_pack_in_its_keg \
+            pinning_grants_a_trusted_pack_and_refuses_an_untrusted_one
+          do
+            bash .github/scripts/cargo-test-nonempty.sh \
+              --require-test "$test" \
+              -p newt-core --lib "$test" \
+              -- --ignored --test-threads=1
+          done
+
       - name: Run MCP import CLI real-resource tests
         shell: bash
         run: >-
@@ -265,8 +283,9 @@ jobs:
           -p newt-core --lib a_hostile_path_git_never_runs_during_network_read_approval
           -- --ignored --test-threads=1
 
-      # #3148: a remote whose URL is a path on this machine is fetched inside the
-      # fence with no network prompt, and an https remote is not waved through.
+      # #3148: a remote whose URL is a path on this machine resolves, through the
+      # real remote configuration, to the local-remote verdict with no network
+      # prompt, and an https remote is not waved through.
       - name: Run local-path remote grounding
         if: runner.os != 'Windows'
         shell: bash
