@@ -1,0 +1,25 @@
+[package]
+name = "newt-fdguard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt-Agent descriptor guard: close ambient file descriptors on spawn and open beneath a held directory root (a copy of agent-bridle-fdguard)"
+keywords = ["capability", "sandbox", "file-descriptor", "cloexec", "agent"]
+categories = ["development-tools", "os::unix-apis"]
+# It embeds ../vendor at compile time, which a published package does not have.
+exclude = ["tests/vendor_identity.rs"]
+
+# The code is agent-bridle-fdguard's, unchanged, so it keeps that crate's lint table
+# rather than the workspace's: the workspace clippy lints would flag bridle's own style.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+libc.workspace = true

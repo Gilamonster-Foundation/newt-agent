@@ -60,6 +60,7 @@ const LEDGER: &[(&str, usize)] = &[
     ("newt-launch", 10),
     ("tests-pty", 10),
     ("newt-refactor-evidence", 10),
+    ("newt-fdguard", 10),
     ("newt-router", 20),
     ("newt-skills", 30),
     ("plugins-protocol", 40),

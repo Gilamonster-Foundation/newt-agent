@@ -4846,6 +4846,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-fdguard"
+version = "0.8.6"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "newt-flock"
 version = "0.8.6"
 dependencies = [

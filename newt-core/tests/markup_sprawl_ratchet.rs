@@ -1746,8 +1746,8 @@ fn the_real_workspace_root_set_is_unchanged() {
     let roots = production_roots(&workspace_root());
     assert_eq!(
         roots.len(),
-        32,
-        "31 production members + newt-web; a change here rescopes every \
+        33,
+        "32 production members + newt-web; a change here rescopes every \
          law and every baseline. Moved 21 -> 22 by #1828 A2.0, which adds \
          the `newt-interaction` protocol crate; 22 -> 23 by the \
          `crates/newt-launch` launch-configuration crate; 23 -> 24 by \
@@ -1759,7 +1759,8 @@ fn the_real_workspace_root_set_is_unchanged() {
          helper in scripts/eval/rust-evidence (#2804); 29 -> 30 adds `newt-flock`, the \
          verified read-only flock follower (agent-mesh#109 step 12a); 30 -> 31 adds `newt-router`, the tier \
          router extracted from newt-core (#2234); 31 -> 32 adds `newt-policy`, the policy layer \
-         extracted from newt-core (#3160). All production laws also scan \
+         extracted from newt-core (#3160); 32 -> 33 adds `newt-fdguard`, the descriptor guard \
+         copied from agent-bridle-fdguard (#3160). All production laws also scan \
          these new crates; their existing baselines do not increase"
     );
     for member in [
