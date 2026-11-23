@@ -10,8 +10,9 @@
 //! the confined git broker into `git_hardening/build_reads.rs` and
 //! `git_staging/confined.rs` (with its tests), which are not listed. Every other file
 //! under them is listed, test files included, except `git_hardening/commit_view_tests.rs`,
-//! which the next step compiles only with `confine`; none has named a bridle crate since
-//! #3223 moved them onto newt-fdguard.
+//! which a later step of #3160 compiles only with `confine`. None of the listed files
+//! under them has named a bridle crate since #3223 moved `git_staging/held_root.rs` and
+//! `git_staging/tool_diagnostics/repair.rs` onto newt-fdguard.
 //!
 //! The list only grows: each later step of #3160 adds the files it frees of bridle, and
 //! the step that makes the bridle dependencies optional deletes this file, because from
