@@ -53,19 +53,21 @@ fn ends_item(header: &str) -> bool {
 /// test-only top-level item, less whole-line comments.
 ///
 /// A test-only item starts at a column-0 `#[cfg(test)]` or `#[cfg(all(test, ..))]`. Its
-/// header is the next line that is not an attribute or a comment; the item ends there if
-/// the header ends in `;` or `}`, else at the next column-0 line that starts with `}`, `)`
-/// or `]`, which in rustfmt's layout (CI checks it) is the item's closing line. Any other
-/// column-0 line inside the item, such as a string literal's continuation, does not end
-/// it. A test attribute anywhere else is not recognised, so the code under it is read: the
-/// scan errs toward reporting.
+/// header is the next line that is not an attribute or a comment. The item ends there if
+/// the header ends in `;` or `}`. If the header ends in `{`, the item ends at the next
+/// column-0 line that starts with `}`: in rustfmt's layout (CI checks it) that is the
+/// item's closing line, and no other line inside the item starts at column 0 with `}`.
+/// Any other header (a `const` broken after `=`, a multi-line signature, a multi-line
+/// attribute) is read as production code, with everything after it, and so is the code
+/// under a test attribute that is not at column 0: the scan errs toward reporting. One
+/// known limit: `code_part` cuts a line at its first `//`, even inside a string.
 fn production_lines(src: &str) -> Vec<(usize, &str)> {
     let mut lines = Vec::new();
     let mut state = State::Code;
     for (index, line) in src.lines().enumerate() {
         let trimmed = line.trim();
         state = match state {
-            State::TestItem if line.starts_with(['}', ')', ']']) => State::Code,
+            State::TestItem if line.starts_with('}') => State::Code,
             State::TestItem => State::TestItem,
             State::TestAttributes
                 if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") =>
@@ -73,7 +75,11 @@ fn production_lines(src: &str) -> Vec<(usize, &str)> {
                 State::TestAttributes
             }
             State::TestAttributes if ends_item(trimmed) => State::Code,
-            State::TestAttributes => State::TestItem,
+            State::TestAttributes if code_part(trimmed).ends_with('{') => State::TestItem,
+            State::TestAttributes => {
+                lines.push((index + 1, line));
+                State::Code
+            }
             State::Code if is_test_attribute(line) => {
                 // The item can share the attribute's line: `#[cfg(test)] mod t;`.
                 let rest = line.split_once(']').map_or("", |(_, rest)| code_part(rest));
@@ -81,8 +87,11 @@ fn production_lines(src: &str) -> Vec<(usize, &str)> {
                     State::TestAttributes
                 } else if ends_item(rest) {
                     State::Code
-                } else {
+                } else if rest.ends_with('{') {
                     State::TestItem
+                } else {
+                    lines.push((index + 1, line));
+                    State::Code
                 }
             }
             State::Code => {
@@ -164,6 +173,14 @@ fn the_scan_reads_each_production_line_and_no_test_code() {
     let column_zero_string = "#[cfg(test)]\nmod tests {\n    const S: &str = \"a\nb\";\n    \
                               use agent_bridle::Gate;\n}\nuse agent_bridle::Gate;\n";
     assert_eq!(naming_bridle(column_zero_string), [7]);
+    // A test-only item whose header does not end in `{` has no column-0 closer, so the
+    // scan reads on: a `const` broken after `=`, a byte-string fixture, a same-line one.
+    let broken_const = "#[cfg(test)]\nconst X: &str =\n    \"s\";\nuse agent_bridle::Gate;\n";
+    assert_eq!(naming_bridle(broken_const), [4]);
+    let string_fixture = "#[cfg(test)]\nconst Y: &[u8] = b\"a\nb\";\nuse agent_bridle::Gate;\n";
+    assert_eq!(naming_bridle(string_fixture), [4]);
+    let same_line = "#[cfg(test)] static Z: &str =\n    \"s\";\nuse agent_bridle::Gate;\n";
+    assert_eq!(naming_bridle(same_line), [3]);
     assert_eq!(
         naming_bridle("#[cfg(any(test, unix))]\nuse agent_bridle::Gate;\n"),
         [2]
