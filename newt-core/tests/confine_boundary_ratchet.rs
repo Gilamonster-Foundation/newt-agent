@@ -14,7 +14,7 @@
 //! bridle crate since #3223 moved `git_staging/held_root.rs` and
 //! `git_staging/tool_diagnostics/repair.rs` onto newt-fdguard. Governed Git (`native_git`,
 //! the commit broker and `git_staging/confined.rs`) is compiled only with `confine` too; the
-//! step that gated it added the four files #3235 moved out of `native_git` and the gh read
+//! step that gated it listed the four files #3235 lifted out of `native_git` and the gh read
 //! tests, the tool catalog, and five test files that gate single broker tests or part of one.
 //!
 //! The list only grows: each later step of #3160 adds the files it frees of bridle, and
