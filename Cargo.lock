@@ -4977,6 +4977,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "newt-core",
+ "newt-fdguard",
  "newt-policy",
  "reqwest",
  "serde",

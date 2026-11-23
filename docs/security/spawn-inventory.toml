@@ -15,9 +15,10 @@
 #   confined            Already spawned through the confined boundary
 #                       (`agent_bridle::ConfinedCommand::spawn_tokio`), or a
 #                       descendant inheriting that worker's kernel fence.
-#   confined-unix-only  Confined as above on Unix only; the non-Unix twin is a raw
-#                       `tokio::process::Command` (env-scrubbed, recorded
-#                       `SandboxKind::None`) — advisory, NOT confined.
+#   confined-unix-only  Confined as above on Unix with the `confine` feature; the
+#                       twin, built on non-Unix targets and without `confine`, is a raw
+#                       `tokio::process::Command` (env-scrubbed, descriptors denied on
+#                       Unix, recorded `SandboxKind::None`) — advisory, NOT confined.
 #   git-helper          Runs a trusted `git` binary against the workspace to READ
 #                       state (diff/status/evidence) or set local identity. Cannot
 #                       execute attacker-authored code by itself; still to be
@@ -88,7 +89,7 @@
 "newt-core/src/agentic/claim_check.rs"     = { count = 1, class = "test", note = "#2552: one raw `git` fixture helper inside the file's cfg(test) module (repo setup in an owned tempdir, fixed argv, no model input). Production git here goes through git_hardening::metadata_git (git_in); no production spawn." }
 "newt-core/src/atomic_fs.rs"                = { count = 4, class = "test", note = "all raw process spawns are inside the #[cfg(test)] module: ignored real-resource acceptance tests re-exec the current test binary to prove killed-owner lock reclamation and serialized two-reclaimer takeover across Unix and Windows" }
 "newt-core/src/scratch/build.rs"            = { count = 1, class = "test", note = "one raw process spawn inside the #[cfg(test)] module: re-execs the current test binary, filtered to just itself, to set umask 0o002 in a disposable child rather than this (parallel, shared) libtest process — proves a group-friendly umask does not break the managed-scratch fixture (#2659/#2658 follow-up)" }
-"newt-mcp-client/src/lib.rs"               = { count = 2, class = "confined-unix-only", note = "MCP stdio. Unix: ConfinedCommand::spawn_tokio (inside the boundary). Non-Unix: raw tokio::process::Command, env_clear plus the explicit env grants, recorded SandboxKind::None (advisory, unconfined); a workspace-protected session refuses it." }
+"newt-mcp-client/src/lib.rs"               = { count = 2, class = "confined-unix-only", note = "MCP stdio. Unix with `confine`: ConfinedCommand::spawn_tokio (inside the boundary). Non-Unix, or without `confine`: raw tokio::process::Command, env_clear plus the explicit env grants, descriptors denied on Unix (newt_fdguard), recorded SandboxKind::None (advisory, unconfined); a workspace-protected session refuses it." }
 "newt-core/src/confined_exec.rs"           = { count = 1, class = "trusted-infra", note = "(#2294) macOS-only selected_developer_directory() runs FIXED `/usr/bin/xcode-select -p` (env_clear, cwd /, stdin null, no repo/model input) once to add the system toolchain dir to the sandbox READ policy; it cannot route through the executor because run() builds its policy from this very call. The executor itself moved to confined_exec/executor.rs (#3160)." }
 "newt-core/src/confined_exec/executor.rs"  = { count = 1, class = "confined", note = "THE ConstrainedExecutor itself — ConfinedCommand::spawn with a Kernel strength floor (fail-closed); the seam the agent-exec-todo-p4 sites migrate onto. Moved from confined_exec.rs (#3160)." }
 "newt-core/src/native_git_broker.rs"       = { count = 2, class = "confined", note = "Native Git's original hook executes only inside the authenticated helper that already inherits the kernel fence. It preserves hook stdio while clearing broker environment and withholding private authority file descriptors; no host-side unconfined spawn is introduced. The second site is the Unix-only cfg(test) regression fixture that launches fixed /bin/sh to prove an original hook closing stdin cannot refuse a successful native Git operation." }

@@ -6,6 +6,7 @@ use newt_core::Scope;
 
 struct Fixture {
     _temp: tempfile::TempDir,
+    #[cfg(feature = "confine")]
     protected: std::path::PathBuf,
     program: std::path::PathBuf,
     base: Caveats,
@@ -39,6 +40,7 @@ impl Fixture {
         guard.validate_caveats(&base).unwrap();
         Self {
             _temp: temp,
+            #[cfg(feature = "confine")]
             protected,
             program,
             base,
@@ -47,6 +49,7 @@ impl Fixture {
     }
 }
 
+#[cfg(feature = "confine")]
 #[test]
 fn prepared_stdio_rejects_the_configured_commands_protected_read() {
     let f = Fixture::new();
@@ -57,15 +60,14 @@ fn prepared_stdio_rejects_the_configured_commands_protected_read() {
             &f.base,
             secret_command.to_str().unwrap(),
             Some(&f.guard),
-            &SandboxRoots::from(&agent_bridle::SandboxPolicy::default()),
-            true
+            Some(&SandboxRoots::from(&agent_bridle::SandboxPolicy::default()))
         )
         .is_err(),
         "the configured command changes actual executable-read authority after session admission"
     );
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "confine"))]
 #[test]
 fn prepared_stdio_validates_its_actual_implicit_read_policy() {
     let f = Fixture::new();
@@ -79,8 +81,7 @@ fn prepared_stdio_validates_its_actual_implicit_read_policy() {
             &f.base,
             f.program.to_str().unwrap(),
             Some(&f.guard),
-            &SandboxRoots::from(&policy),
-            true
+            Some(&SandboxRoots::from(&policy))
         )
         .is_err(),
         "the launcher's implicit read roots must be checked, not another launcher's defaults"
@@ -90,24 +91,17 @@ fn prepared_stdio_validates_its_actual_implicit_read_policy() {
 #[test]
 fn protected_stdio_refuses_advisory_transport_but_preserves_legacy_selection() {
     let f = Fixture::new();
-    let roots = SandboxRoots::from(&agent_bridle::SandboxPolicy::default());
     assert!(
-        prepare_stdio_caveats(
-            &f.base,
-            f.program.to_str().unwrap(),
-            Some(&f.guard),
-            &roots,
-            false
-        )
-        .is_err(),
+        prepare_stdio_caveats(&f.base, f.program.to_str().unwrap(), Some(&f.guard), None).is_err(),
         "protected sessions require actual local process confinement"
     );
     assert!(
-        prepare_stdio_caveats(&f.base, f.program.to_str().unwrap(), None, &roots, false).is_ok(),
+        prepare_stdio_caveats(&f.base, f.program.to_str().unwrap(), None, None).is_ok(),
         "legacy advisory behavior remains explicit and unchanged"
     );
 }
 
+#[cfg(feature = "confine")]
 #[test]
 fn lawful_prepared_stdio_preserves_each_other_authority_axis() {
     let f = Fixture::new();
@@ -115,8 +109,7 @@ fn lawful_prepared_stdio_preserves_each_other_authority_axis() {
         &f.base,
         f.program.to_str().unwrap(),
         Some(&f.guard),
-        &SandboxRoots::from(&agent_bridle::SandboxPolicy::default()),
-        true,
+        Some(&SandboxRoots::from(&agent_bridle::SandboxPolicy::default())),
     )
     .unwrap();
     assert_eq!(
@@ -132,7 +125,7 @@ fn lawful_prepared_stdio_preserves_each_other_authority_axis() {
 /// Grounds the shared prepared-authority guard in the real confined stdio
 /// spawn. The control launches the same symlinked executable and writes a
 /// workspace marker; protected admission must prevent that launch entirely.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "confine"))]
 #[tokio::test]
 #[ignore = "real confined stdio subprocess; filesystem integration tier"]
 async fn protected_stdio_refuses_before_native_process_effects() {
@@ -179,4 +172,50 @@ async fn protected_stdio_refuses_before_native_process_effects() {
         Some("done")
     );
     assert_eq!(std::fs::read(&marker).unwrap(), b"spawned");
+}
+
+/// The advisory transport refuses a workspace-protected session before any process exists:
+/// it has no sandbox substrate to validate the session's authority against. The command below
+/// does not exist, so had a spawn been tried first, the error would be the spawn's. No process
+/// runs here; the confined transport's refusal is grounded on a real child by
+/// `protected_stdio_refuses_before_native_process_effects`.
+#[cfg(not(all(unix, feature = "confine")))]
+#[test]
+fn the_advisory_arm_refuses_a_protected_session_before_any_process_exists() {
+    use newt_core::mcp::{McpServerEntry, McpTrust, TransportKind};
+    // Resolving the guarded path reads the filesystem and creates nothing: it is never made.
+    let guard =
+        WorkspaceProtection::new(&[std::env::temp_dir().join("newt-advisory-guard")], &[]).unwrap();
+    let entry = McpServerEntry {
+        name: "advisory-protected".into(),
+        enabled: true,
+        transport: TransportKind::Stdio,
+        command: Some("/nonexistent/newt-never-run".into()),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        login_argv: Vec::new(),
+        request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
+        trust: McpTrust::Trusted,
+        origin: None,
+    };
+    let admitted = newt_core::mcp::admit(&entry).unwrap();
+    let error =
+        match StdioTransport::spawn_with_protection(&admitted, &Caveats::top(), Some(&guard)) {
+            Ok(_) => panic!("a protected session must be refused by the advisory transport"),
+            Err(error) => error,
+        };
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("requires native process confinement"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("spawning MCP server"),
+        "a spawn was attempted before the refusal: {text}"
+    );
 }

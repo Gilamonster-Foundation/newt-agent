@@ -11,6 +11,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `newt-mcp-client` has a `confine` feature, on by default (#3160). Without it the crate names
+  no agent-bridle crate: stdio servers are spawned advisory (environment scrubbed, inherited
+  descriptors denied on Unix, no OS sandbox, `SandboxKind::None`, refused for a
+  workspace-protected session) and HTTP uses the DNS-pinned client alone, so no loopback
+  egress proxy is started. A default build behaves as before; only the wording of the
+  advisory warning on Windows changes.
 - `newt_mcp_client::SandboxKind` is `newt_core::sandbox_seam::SandboxKind`, a newt-core enum
   with bridle's six variant names; it was `agent_bridle::SandboxKind`, with no alias (#3160).
   Its variant names and `Debug` text are unchanged; it has no `Default`, `Serialize` or

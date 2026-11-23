@@ -99,6 +99,13 @@ request_timeout_secs = 180
 The resolved value is clamped to `[1s, MAX_REQUEST_TIMEOUT]` (600s), so even a
 patient server still gives up on a genuinely wedged call.
 
+## Build features
+
+`confine` (default) spawns stdio servers under agent-bridle's OS sandbox and fences
+HTTP egress through its loopback proxy. Without it, stdio servers spawn advisory
+(environment scrubbed, no OS sandbox, refused when workspace protection is on) and
+HTTP uses the DNS-pinned client for the one origin alone.
+
 ## License
 
 Apache-2.0

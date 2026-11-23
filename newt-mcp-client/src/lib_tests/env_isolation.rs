@@ -112,7 +112,12 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
             ..Caveats::top()
         };
         let mut transport = StdioTransport::spawn(&admitted, &caveats).unwrap();
+        // With `confine` the restricted `fs_write` is kernel-enforced; without it the
+        // server is spawned advisory, with the same environment.
+        #[cfg(feature = "confine")]
         assert_ne!(transport.sandbox_kind, SandboxKind::None);
+        #[cfg(not(feature = "confine"))]
+        assert_eq!(transport.sandbox_kind, SandboxKind::None);
         let line = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             transport.stdout.next_line(),
@@ -132,7 +137,7 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
 /// bound refused every such spawn outright ("backend authority on the Net
 /// axis is not decidable ... (L3 BOUND)"), which is exactly what broke
 /// `newt doctor`'s MCP server listing in CI.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "confine"))]
 #[tokio::test]
 #[ignore = "real confined stdio subprocess; integration tier"]
 async fn stdio_spawn_under_net_none_does_not_l3_bound_refuse() {
@@ -177,7 +182,7 @@ async fn stdio_spawn_under_net_none_does_not_l3_bound_refuse() {
 /// pinned by this same test as a "known limitation"; fixed here in newt
 /// rather than in bridle, since bridle correctly has no way to know a
 /// spawned child can't bind a hostname allow-list).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "confine"))]
 #[tokio::test]
 #[ignore = "real confined stdio subprocess; integration tier"]
 async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_refused() {
@@ -224,7 +229,7 @@ async fn stdio_spawn_under_a_host_scoped_net_grant_is_narrowed_and_not_l3_bound_
 /// cargo test -p newt-mcp-client --lib -- --ignored --test-threads=1 \
 ///   stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt
 /// ```
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 #[ignore = "real Seatbelt stdio subprocess; macOS weekly/release lane, single-threaded"]
 async fn stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt() {
