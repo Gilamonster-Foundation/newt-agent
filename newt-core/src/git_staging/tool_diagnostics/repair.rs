@@ -1,6 +1,6 @@
 //! Repair authority is bound before consent; pathnames are then display only.
 use super::*;
-use agent_bridle_fdguard::{GrantedRoot, RootIdentity};
+use newt_fdguard::{GrantedRoot, RootIdentity};
 use std::fs::{File, Metadata};
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

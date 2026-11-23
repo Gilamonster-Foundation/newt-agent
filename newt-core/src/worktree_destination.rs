@@ -6,7 +6,7 @@
 //! refuses other owners, nonempty directories and modes other than 0700.
 //! Failure retains the directory; pathname checks cannot make unlink conditional
 //! on a held object, so this module never deletes a directory.
-use agent_bridle_fdguard::GrantedRoot;
+use newt_fdguard::GrantedRoot;
 use rustix::fs::{fstat, mkdirat, openat, Mode, OFlags};
 use std::path::{Path, PathBuf};
 

@@ -74,6 +74,9 @@
 #     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
+#   - newt-fdguard's real-resource tests, mcp-import-real.yml (weekly + release,
+#     Linux/macOS, #3160): the copied agent-bridle-fdguard suite, #[ignore]d in
+#     the unit tier, and bridle_differential.rs's grounds, --ignored --test-threads=1.
 #   - patch read/write symlink containment, mcp-import-real.yml (weekly +
 #     release, Linux/macOS): newt-tools patch::tests::{apply_whole_files,
 #     read_contained_opt,fuzzy_patch,diffy_patch}_denies_symlink_escape_object_bound,
@@ -503,8 +506,8 @@ cargo fmt --all -- --check
 # them as ignored tests and skips them here: they are no longer excluded below.
 # Their real bodies still run only under `-- --ignored`:
 #   native_git_broker_pipeline  .github/workflows/native-git-broker-real.yml
-#                               (weekly, release tags, PRs touching newt-core
-#                               or agent-toolchain) and macos-confined-contract.yml
+#                               (weekly, release tags, PRs touching one of the
+#                               paths it lists) and macos-confined-contract.yml
 #   brush_build_pipeline        macos-confined-contract.yml, which runs only its
 #                               linked_worktree_build_reads row
 #   macos_exec_basenames        newt-tui-pty.yml (root-owned gh copy)

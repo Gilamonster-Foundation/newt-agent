@@ -14,7 +14,7 @@ name: Native Git broker real tier (#2693)
 # Tiering (CLAUDE.md "Testing strategy"): a real kernel-fence + real-git
 # real-resource test is OUT of the per-PR unit run. It runs here in the
 # WEEKLY tier (schedule), the RELEASE tier (on v* tags), and on any PR that
-# touches newt-core or agent-toolchain (#2947): #2906 broke it on main and
+# touches one of the paths below (#2947): #2906 broke it on main and
 # only the next weekly run saw it. A healthy run takes a few minutes; the job
 # timeout is what fails a deadlock, since a blocked single-thread runtime can
 # signal nothing from inside. Never a push gate. Linux-only: the binary's own
@@ -39,6 +39,7 @@ on:
       - "newt-core/**"
       - "newt-policy/**"
       - "agent-toolchain/**"
+      - "newt-fdguard/**"
       - "Cargo.lock"
       - ".github/workflows/native-git-broker-real.yml"
   workflow_dispatch: {}
