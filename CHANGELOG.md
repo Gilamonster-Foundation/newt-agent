@@ -38,6 +38,10 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   499 s to about 200 s, and `target/` from 62 GB to 22 GB. A backtrace keeps file and line. A
   debugger finds the `.dwo` files while `target/` stays where it was built. Windows builds
   produce the same output as before.
+- `newt_core::confined_exec::CgroupHandle` (Linux) is no longer public; it had no public
+  constructor or method. The executor moved to a private child module of `confined_exec`,
+  and `ConstrainedExecutor`, `kernel_fs_fence_available`, `net_guard_available` and
+  `cgroup_subtree_kill_available` are re-exported where they were (#3160).
 
 ### Fixed
 
