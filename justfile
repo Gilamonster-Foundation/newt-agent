@@ -265,6 +265,13 @@ check:
     # (#1828) is the inward protocol layer and must build with no feature at
     # all — the configuration the wyvern/headless tier leaves it in.
     cargo test -p newt-interaction --no-default-features || rc=1
+    # PIPELINE PARITY: mirrors the "clippy (newt-mcp-client, confine off)" and "test
+    # (newt-mcp-client, confine off)" steps in ci.yml's lean job (#3160). `-p
+    # newt-mcp-client` alone: features are additive, so a second package that takes the
+    # crate's defaults turns `confine` back on. The `cargo tree` probe that follows them in
+    # CI is not repeated here.
+    cargo clippy -p newt-mcp-client --no-default-features --all-targets -- -D warnings || rc=1
+    cargo test -p newt-mcp-client --no-default-features || rc=1
     # PIPELINE PARITY: mirrors the "cross-language conformance (external
     # consumer)" step in .github/workflows/ci.yml. Pure stdlib Python, ~0.5s.
     # `--self-test` pins its BLAKE3 against the published vectors, `verify`
