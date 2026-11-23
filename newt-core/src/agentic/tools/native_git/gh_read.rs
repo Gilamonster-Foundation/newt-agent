@@ -178,7 +178,7 @@ pub(in crate::agentic::tools) fn execute(
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
-    #[cfg(test)] probe: Option<&super::super::gh_read_tests::Probe>,
+    #[cfg(test)] probe: Option<&super::super::command_probe::Probe>,
 ) -> String {
     let command = match GovernedCommand::parse(source) {
         Ok(command) => command,

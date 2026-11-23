@@ -31,7 +31,7 @@ use newt_policy::permissions::PermissionGate;
 pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// Resource-only probe for the real run_command route; absent in production.
     #[cfg(test)]
-    pub(crate) command_probe: Option<&'a super::gh_read_tests::Probe>,
+    pub(crate) command_probe: Option<&'a super::command_probe::Probe>,
     pub(crate) command_budget: crate::RunCommandBudget,
     /// Empty in legacy fixtures: use the default POSIX guidance.
     pub(crate) shell_dialect: &'static str,

@@ -1,28 +1,8 @@
 //! In-memory acceptance through the production run_command dispatcher.
+use super::command_probe::Probe;
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
-pub(crate) struct Probe {
-    pub(super) host: AtomicUsize,
-    pub(super) confined: AtomicUsize,
-    pub(super) remote: String,
-    pub(super) calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
-    pub(super) output: String,
-    pub(super) exit_code: i32,
-}
-
-impl Default for Probe {
-    fn default() -> Self {
-        Self {
-            host: AtomicUsize::new(0),
-            confined: AtomicUsize::new(0),
-            remote: "github.com/owner/repo".into(),
-            calls: Default::default(),
-            output: "issue 1".into(),
-            exit_code: 0,
-        }
-    }
-}
 impl Probe {
     pub(in crate::agentic::tools) fn run(
         &self,

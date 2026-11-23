@@ -4,6 +4,9 @@
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:15 EDT | Date: 2026-08-12
 
 #[cfg(test)]
+#[path = "tools_tests/command_probe.rs"]
+mod command_probe;
+#[cfg(test)]
 mod gh_read_tests;
 mod worktree;
 use worktree::execute as execute_tool_inner;

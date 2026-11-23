@@ -2690,7 +2690,7 @@ async fn a_commit_in_a_command_the_inspector_cannot_read_is_refused_before_anyth
         "git commit --allow-empty -m direct; \
          find . -maxdepth 0 -exec timeout 30 git commit --allow-empty -m delegated \\;",
     ] {
-        let probe = crate::agentic::tools::gh_read_tests::Probe::default();
+        let probe = crate::agentic::tools::command_probe::Probe::default();
         let mut gate = MockGate::new(true, &caveats);
         let mut display = ToolDisplay::new(Vec::<u8>::new(), false, 80, 20, false);
         let result = execute_tool_inner(
