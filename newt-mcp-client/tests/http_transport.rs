@@ -372,6 +372,7 @@ fn persisted_plaintext_authorization_is_rejected_by_the_shared_transport() {
 /// `HttpTransport::connect` only builds the client (and binds a loopback proxy
 /// for the gated case). The proxy's per-host refusal itself is proven in
 /// agent-bridle.
+#[cfg(feature = "confine")]
 #[test]
 fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
     use newt_mcp_client::HttpTransport;
@@ -397,6 +398,48 @@ fn http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant() {
     assert!(!HttpTransport::connect(&admitted, &Caveats::top())
         .expect("build")
         .egress_proxied());
+
+    // Deny-all is enforced by the shared transport itself before DNS/dial.
+    let deny = Caveats {
+        net: Scope::only([] as [String; 0]),
+        ..Caveats::top()
+    };
+    let error = match HttpTransport::connect(&admitted, &deny) {
+        Ok(_) => panic!("deny-all must refuse the HTTP origin"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("outside the session net"),
+        "{error:#}"
+    );
+}
+
+/// Without `confine` there is no egress proxy: the grant that engages it in the default build
+/// (a general remote-host list) gets the DNS-pinned client instead, and `egress_proxied` stays
+/// false, as it does for `net: All`. Deny-all is still refused by the transport itself. The
+/// twin of `http_connect_wires_the_egress_proxy_only_under_a_remote_host_grant`; no network
+/// here either, for the same reason.
+#[cfg(not(feature = "confine"))]
+#[test]
+fn http_connect_never_builds_a_proxy_without_confine() {
+    use newt_mcp_client::HttpTransport;
+    use newt_policy::caveats::{Caveats, Scope};
+
+    let entry = http_entry("http://8.8.8.8/mcp".to_string(), BTreeMap::new());
+    let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry admits");
+
+    for net in [Scope::only(["8.8.8.8".to_string()]), Scope::All] {
+        let caveats = Caveats {
+            net: net.clone(),
+            ..Caveats::top()
+        };
+        assert!(
+            !HttpTransport::connect(&admitted, &caveats)
+                .expect("build")
+                .egress_proxied(),
+            "net {net:?}: a build without `confine` has no egress proxy"
+        );
+    }
 
     // Deny-all is enforced by the shared transport itself before DNS/dial.
     let deny = Caveats {

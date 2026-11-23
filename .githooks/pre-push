@@ -81,6 +81,12 @@
 #   - newt-fdguard's real-resource tests, mcp-import-real.yml (weekly + release,
 #     Linux/macOS, #3160): the copied agent-bridle-fdguard suite, #[ignore]d in
 #     the unit tier, and bridle_differential.rs's grounds, --ignored --test-threads=1.
+#   - newt-mcp-client's confine-off stdio grounds, mcp-import-real.yml (weekly + release,
+#     Linux/macOS, #3160): `env_isolation_tests::` under --no-default-features with
+#     --ignored --test-threads=1: the advisory spawn scrubs the environment
+#     (stdio_spawn_does_not_leak_secret_env), keeps the parent's TZ and the server's
+#     override (stdio_timezone_preserves_parent_and_server_override) and closes an ambient
+#     descriptor (lean_stdio_spawn_does_not_inherit_an_ambient_descriptor).
 #   - patch read/write symlink containment, mcp-import-real.yml (weekly +
 #     release, Linux/macOS): newt-tools patch::tests::{apply_whole_files,
 #     read_contained_opt,fuzzy_patch,diffy_patch}_denies_symlink_escape_object_bound,
@@ -177,6 +183,14 @@
 #   - `cargo check -p newt-flock --lib --locked` (ci.yml lint job): the read-only
 #     library without dev-dependencies; its fixture's writer features hide a
 #     production-only build break from every test/clippy run (#2973)
+#   - the confine-off newt-mcp-client gate (#3160), ci.yml lean job: that crate alone, no
+#     default features (its one default feature is `confine`): `cargo clippy -p
+#     newt-mcp-client --no-default-features --all-targets -- -D warnings`, `cargo test -p
+#     newt-mcp-client --no-default-features`, and a `cargo tree` probe that the crate lists
+#     agent-bridle among its direct dependencies with `confine` and not without it. `just
+#     check` runs the clippy and test lines on Unix; this hook builds default features
+#     only, so a build without `confine` (a spawn with no OS sandbox, a pinned HTTP
+#     client) is not exercised by this hook.
 #   - feature-gated test targets compile (ci.yml lint job, #2971): `cargo check
 #     --tests` for newt-tui under native-permission-test / rich-tui /
 #     rich-tui,live-spill and newt-core under ast, the combinations the

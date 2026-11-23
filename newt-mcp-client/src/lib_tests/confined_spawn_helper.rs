@@ -1,6 +1,7 @@
 use super::*;
 use newt_core::mcp::{McpServerEntry, TransportKind};
 
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn mcp_spawn_tool_is_a_trivial_minting_stub() {
     let tool = McpSpawnTool;
@@ -14,6 +15,7 @@ async fn mcp_spawn_tool_is_a_trivial_minting_stub() {
     );
 }
 
+#[cfg(feature = "confine")]
 #[test]
 fn mint_spawn_context_authorizes_any_leash() {
     use newt_policy::caveats::Scope;
@@ -111,6 +113,7 @@ fn spawn_caveats_narrows_host_net_to_none_and_preserves_session() {
     assert_eq!(spawn_caveats(&none_session, "node").net, Scope::none());
 }
 
+#[cfg(feature = "confine")]
 #[test]
 fn log_confinement_covers_advisory_and_confined() {
     // Both branches — smoke (no panic); the honest posture the surface reads.
@@ -207,6 +210,7 @@ fn trusted_env_literal_without_token_resolves_verbatim() {
 /// Seatbelt then refuses every `net:none` stdio MCP child on macOS. Grounded by
 /// the macOS real-resource test
 /// `env_isolation_tests::stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt`.
+#[cfg(feature = "confine")]
 #[test]
 fn mcp_spawn_declares_audited_piped_piped_null_stdio() {
     use agent_bridle::ConfinedStdio;
@@ -226,6 +230,7 @@ fn mcp_spawn_declares_audited_piped_piped_null_stdio() {
 
 /// #3033: a Seatbelt refusal names the non-root precondition; any other spawn
 /// failure keeps the plain context.
+#[cfg(feature = "confine")]
 #[test]
 fn spawn_failure_notice_names_non_root_only_for_a_seatbelt_refusal() {
     let refused = spawn_failure_notice("gmail", "/opt/py/bin/python3.12", true);

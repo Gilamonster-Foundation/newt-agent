@@ -7,11 +7,14 @@
 //! tool list, and routes a namespaced call to the right server.
 //!
 //! It connects **stdio** and **streamable-HTTP** servers. A spawned **stdio**
-//! server now runs *inside* the session's Caveats leash (#1243 Leg 3): its
-//! process is confined by [`agent_bridle::ConfinedCommand`] to the same
-//! authority as a `run_command`, instead of running ambient with the host's
-//! full authority. (Remote **HTTP** tools still run with whatever authority
-//! their own server has; only their egress host is net-gated, #1156.)
+//! server runs *inside* the session's Caveats leash (#1243 Leg 3) when
+//! `newt_mcp_client` is built with its `confine` feature, which is the default:
+//! its process is confined by agent-bridle to the same authority as a
+//! `run_command`, instead of running ambient with the host's full authority.
+//! Without `confine`, and on Windows, [`newt_mcp_client::StdioTransport`] spawns
+//! it advisory: environment scrubbed, no OS sandbox. (Remote **HTTP** tools still
+//! run with whatever authority their own server has; only their egress host is
+//! net-gated, #1156.)
 //!
 //! Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:53 EDT | Date: 2026-08-12
 
@@ -80,9 +83,10 @@ pub(crate) enum Confinement {
     /// A spawned stdio server confined by a kernel OS sandbox — the achieved
     /// `SandboxKind` name (e.g. `Landlock`, `Seatbelt`).
     Confined(String),
-    /// A spawned stdio server that ran through the `ConfinedCommand` boundary but
-    /// with no OS sandbox enforcing the leash — advisory only (a `top()` grant,
-    /// or a host without Landlock/Seatbelt).
+    /// A spawned stdio server with no OS sandbox enforcing the leash — advisory
+    /// only: a `top()` grant or a host without Landlock/Seatbelt (both spawned
+    /// through the `ConfinedCommand` boundary on Unix), Windows, or a build without
+    /// `confine`.
     Advisory,
     /// A remote (HTTP) server — no local process to confine.
     Remote,

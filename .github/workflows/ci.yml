@@ -469,6 +469,39 @@ jobs:
       - name: test (newt-interaction, inward protocol layer)
         if: always()
         run: cargo test -p newt-interaction --no-default-features
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. The justfile `check` recipe
+      # mirrors the clippy and test lines (PIPELINE PARITY there); the `cargo tree` probe
+      # after them is not repeated locally.
+      #
+      # #3160: `confine`, newt-mcp-client's confinement layer, is that crate's one default
+      # feature, so `--no-default-features` turns it off. The crate then names no
+      # agent-bridle crate: stdio servers spawn advisory and HTTP uses the DNS-pinned
+      # client alone. `-p newt-mcp-client` ALONE, one invocation per step: features are
+      # additive, so a second package that depends on the crate with its defaults turns
+      # `confine` back on and the step passes on a build that is not confine-off.
+      # newt-core still comes in with its default features, as it does for every dependent,
+      # so these steps prove this crate's own edge and not a bridle-free closure.
+      - name: clippy (newt-mcp-client, confine off)
+        if: always()
+        run: cargo clippy -p newt-mcp-client --no-default-features --all-targets -- -D warnings
+      - name: test (newt-mcp-client, confine off)
+        if: always()
+        run: cargo test -p newt-mcp-client --no-default-features
+      # The probe asks cargo for the crate's direct dependencies on every target (`--target
+      # all`), with `confine` and without it. The first check is the control: the grep has
+      # to find the agent-bridle edge when `confine` is on. `--color never` because this
+      # workflow sets CARGO_TERM_COLOR to always and the list is read as text.
+      - name: newt-mcp-client depends on agent-bridle only with confine (#3160)
+        if: always()
+        run: |
+          edges() { cargo tree --color never -p newt-mcp-client "$@" -e normal --target all --depth 1 --prefix none; }
+          with=$(edges)
+          without=$(edges --no-default-features)
+          echo "direct dependencies with confine:"; echo "$with"
+          echo "direct dependencies without it:"; echo "$without"
+          bridle() { grep -q '^agent-bridle v' <<<"$1"; }
+          bridle "$with" || { echo "::error::the probe cannot see the agent-bridle edge when confine is on"; exit 1; }
+          if bridle "$without"; then echo "::error::newt-mcp-client depends on agent-bridle without confine"; exit 1; fi
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)

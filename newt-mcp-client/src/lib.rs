@@ -23,9 +23,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // The OS-sandbox posture a stdio server achieved (honest record on
-// `ConnectedServer`, surfaced by `/mcp`). Re-exported so consumers can name it
-// without a direct agent-bridle dependency.
-pub use agent_bridle::SandboxKind;
+// `ConnectedServer`, surfaced by `/mcp`). newt-core's own enum, which names bridle's
+// kinds one for one, so this crate's API names no bridle type (#3160).
+pub use newt_core::sandbox_seam::SandboxKind;
 
 mod net_policy;
 pub use net_policy::{HttpNetGrantRequired, HttpNetworkPolicy};
@@ -38,7 +38,8 @@ pub use net_policy::{HttpNetGrantRequired, HttpNetworkPolicy};
 /// silently dialed); `Advisory` means neither fence is in force — either an
 /// `All` net grant, or (for a spawned stdio child) a host where the loopback
 /// fence is not emittable (e.g. Linux Landlock, which cannot address-fence), so
-/// the child's egress is unmediated.
+/// the child's egress is unmediated. Without the `confine` feature there is no
+/// proxy, so only a pinned private origin is `Gated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetPosture {
     /// Egress fenced against an `n`-host allow-list or pinned origin set.
@@ -49,33 +50,46 @@ pub enum NetPosture {
 
 /// The net posture for a connection: `Gated(host-count)` when the egress proxy
 /// engaged or a private HTTP origin was DNS-pinned, else `Advisory`. The proxy
-/// host count comes from [`agent_bridle::net_egress_proxy_hosts`]; a pinned
-/// origin is exactly one host.
+/// host count comes from [`proxy_host_count`]; a pinned origin is exactly one
+/// host.
 fn net_posture(caveats: &Caveats, proxied: bool, private_origin_pinned: bool) -> NetPosture {
     if private_origin_pinned {
         NetPosture::Gated(1)
     } else if proxied {
-        NetPosture::Gated(
-            agent_bridle::net_egress_proxy_hosts(caveats)
-                .map(|h| h.len())
-                .unwrap_or(0),
-        )
+        NetPosture::Gated(proxy_host_count(caveats))
     } else {
         NetPosture::Advisory
     }
 }
-// Confined stdio spawn (Unix): the child's stdio comes back as tokio pipe ends
-// from `agent_bridle::ConfinedCommand::spawn_tokio`.
-#[cfg(unix)]
+
+/// How many hosts agent-bridle's egress proxy admits for `caveats`.
+#[cfg(feature = "confine")]
+fn proxy_host_count(caveats: &Caveats) -> usize {
+    agent_bridle::net_egress_proxy_hosts(caveats)
+        .map(|h| h.len())
+        .unwrap_or(0)
+}
+
+/// Without `confine` no egress proxy is ever started, so `net_posture` is never told
+/// that one engaged and this is not reached.
+#[cfg(not(feature = "confine"))]
+fn proxy_host_count(_caveats: &Caveats) -> usize {
+    0
+}
+
+// Confined stdio spawn (Unix, `confine`): the child's stdio comes back as tokio pipe
+// ends from `agent_bridle::ConfinedCommand::spawn_tokio`.
+#[cfg(all(unix, feature = "confine"))]
 use agent_bridle::{
     ChildNetworkPolicy, ConfinedCommand, ConfinedTokioChild, Gate, SandboxPolicy, Tool,
     ToolContext, ToolResult,
 };
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 use tokio::net::unix::pipe;
-// Non-Unix has no OS-sandbox spawn primitive yet, so the stdio child is spawned
-// via tokio's process API (advisory confinement — env-scrubbed, no kernel jail).
-#[cfg(not(unix))]
+// Without a Unix host and `confine` there is no OS-sandbox spawn primitive, so the
+// stdio child is spawned via tokio's process API (advisory confinement —
+// env-scrubbed, no kernel jail).
+#[cfg(not(all(unix, feature = "confine")))]
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Latest handshake-era MCP protocol version this client implements.
@@ -788,10 +802,10 @@ fn resolve_env_grants(entry: &McpServerEntry) -> Result<Vec<(String, String)>> {
 /// gate. The confined spawn admission-checks the *program*, not this tool's
 /// name, so the identity is immaterial. Module-scoped (not a local type) so its
 /// trivial trait impl is unit-testable.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 struct McpSpawnTool;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 #[async_trait::async_trait]
 impl Tool for McpSpawnTool {
     fn name(&self) -> &str {
@@ -807,7 +821,7 @@ impl Tool for McpSpawnTool {
 
 /// Mint the spawn [`ToolContext`] the only legitimate way — through the gate —
 /// bounded by the session `caveats`.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 fn mint_spawn_context(caveats: &Caveats) -> Result<ToolContext> {
     Gate::new(0)
         .authorize(&McpSpawnTool, caveats)
@@ -845,17 +859,24 @@ fn spawn_caveats(session: &Caveats, command: &str) -> Caveats {
 }
 
 /// Prepare the exact server authority before environment resolution or spawning.
+///
+/// `roots` is the sandbox substrate the confined transport launches with. The advisory
+/// transport has none (`None`), and a workspace-protected session needs one, so it is
+/// refused.
 fn prepare_stdio_caveats(
     session: &Caveats,
     command: &str,
     protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
-    roots: &SandboxRoots,
-    confined_transport: bool,
+    roots: Option<&SandboxRoots>,
 ) -> Result<Caveats> {
     let prepared = spawn_caveats(session, command);
     if let Some(protection) = protection {
-        anyhow::ensure!(confined_transport,
-            "workspace-protected stdio MCP requires native process confinement; the advisory transport is unavailable for this session");
+        let Some(roots) = roots else {
+            anyhow::bail!(
+                "workspace-protected stdio MCP requires native process confinement; the \
+                 advisory transport is unavailable for this session"
+            );
+        };
         protection
             .validate_with_sandbox_roots(&prepared, roots)
             .context("workspace-protected MCP authority refused")?;
@@ -868,7 +889,7 @@ fn prepare_stdio_caveats(
 /// unaudited, so Seatbelt resolves `net:none` to `Unknown` and admission
 /// refuses every such spawn on macOS. Piped stdin/stdout carry JSON-RPC; stderr
 /// is discarded so server logging cannot corrupt the stream.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 fn mcp_child_stdio() -> [agent_bridle::ConfinedStdio; 3] {
     [
         agent_bridle::ConfinedStdio::Piped,
@@ -881,7 +902,7 @@ fn mcp_child_stdio() -> [agent_bridle::ConfinedStdio; 3] {
 /// precondition an operator can act on (#3033): bridle admits a `net:none`
 /// child only for an unprivileged caller, so newt running as root is refused
 /// even with audited stdio.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 fn spawn_failure_notice(name: &str, command: &str, seatbelt_refusal: bool) -> String {
     let mut notice = format!("spawning MCP server `{name}` ({command}) confined");
     if seatbelt_refusal {
@@ -896,7 +917,7 @@ fn spawn_failure_notice(name: &str, command: &str, seatbelt_refusal: bool) -> St
 /// Log the confinement actually achieved — honest, never over-claimed.
 /// [`SandboxKind::None`] means the leash on this child is advisory only (no OS
 /// sandbox enforced it on this host). Surfacing this in `/mcp` is a follow-up.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 fn log_confinement(name: &str, kind: SandboxKind) {
     if kind == SandboxKind::None {
         tracing::warn!(
@@ -910,12 +931,12 @@ fn log_confinement(name: &str, kind: SandboxKind) {
 
 /// Stdio transport: a spawned subprocess speaking newline-delimited JSON-RPC.
 ///
-/// On Unix the child is launched through [`agent_bridle::ConfinedCommand`] so it
-/// runs *inside* the same OCAP boundary as `run_command` — the exec admission-
-/// check, the OS sandbox (Landlock/Seatbelt), and the env scrub all apply
-/// (#1243 Leg 3). Its stdio is the tokio pipe ends of a kill-on-drop
-/// [`ConfinedTokioChild`].
-#[cfg(unix)]
+/// On Unix, with the `confine` feature, the child is launched through
+/// [`agent_bridle::ConfinedCommand`] so it runs *inside* the same OCAP boundary as
+/// `run_command` — the exec admission-check, the OS sandbox (Landlock/Seatbelt), and
+/// the env scrub all apply (#1243 Leg 3). Its stdio is the tokio pipe ends of a
+/// kill-on-drop [`ConfinedTokioChild`]. Anywhere else the child is spawned advisory.
+#[cfg(all(unix, feature = "confine"))]
 pub struct StdioTransport {
     /// Kept alive so the child is killed and reaped when this transport drops
     /// (`ConfinedTokioChild`'s kill-on-drop).
@@ -926,25 +947,28 @@ pub struct StdioTransport {
     sandbox_kind: SandboxKind,
 }
 
-/// Stdio transport (non-Unix): `ConfinedCommand::spawn_tokio` (Landlock/Seatbelt)
-/// is Unix-only, so the child is spawned via tokio's process API with a scrubbed
-/// environment but WITHOUT an OS sandbox — advisory confinement (see #1255 honest
-/// limitations; Windows AppContainer pipe bridging is a future concern).
-#[cfg(not(unix))]
+/// Stdio transport (advisory): `ConfinedCommand::spawn_tokio` (Landlock/Seatbelt) is
+/// Unix-only, and this crate depends on agent-bridle only with `confine`, so on a
+/// non-Unix host or without that feature the child is spawned via tokio's process API
+/// with a scrubbed environment but WITHOUT an OS sandbox — advisory confinement (see
+/// #1255 honest limitations; Windows AppContainer pipe bridging is a future concern).
+/// On Unix its inherited descriptors are denied, as the confined spawn denies them.
+#[cfg(not(all(unix, feature = "confine")))]
 pub struct StdioTransport {
     /// Kept alive so the child is not reaped while we hold its pipes
     /// (`kill_on_drop` tears it down when this transport drops).
     _child: Child,
     stdin: ChildStdin,
     stdout: tokio::io::Lines<BufReader<ChildStdout>>,
-    /// Always `None` off Unix — no OS sandbox confined the spawn here.
+    /// Always `None` here — no OS sandbox confined the spawn.
     sandbox_kind: SandboxKind,
 }
 
 impl StdioTransport {
     /// The OS sandbox actually applied to this stdio child — the honest
     /// confinement posture surfaced by `/mcp`. [`SandboxKind::None`] means the
-    /// leash was advisory only (a `top()` grant, or a host without the sandbox).
+    /// leash was advisory only (a `top()` grant, a host without the sandbox, or a
+    /// build without `confine`).
     #[must_use]
     pub fn sandbox_kind(&self) -> SandboxKind {
         self.sandbox_kind
@@ -955,14 +979,14 @@ impl StdioTransport {
     /// remote-host `net` grant — but ONLY where the loopback fence is emittable
     /// (macOS Seatbelt today; Linux Landlock cannot address-fence, so it stays
     /// `false` there and the child's egress is honestly advisory). Always
-    /// `false` off Unix.
+    /// `false` off Unix and without `confine`.
     #[must_use]
     pub fn egress_proxied(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "confine"))]
         {
             self._child.egress_proxied()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(all(unix, feature = "confine")))]
         {
             false
         }
@@ -972,18 +996,18 @@ impl StdioTransport {
     /// was refused (#196) — the exfil-attempt signal, empty when unproxied.
     #[must_use]
     pub fn refused_hosts(&self) -> Vec<String> {
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "confine"))]
         {
             self._child.refused_hosts()
         }
-        #[cfg(not(unix))]
+        #[cfg(not(all(unix, feature = "confine")))]
         {
             Vec::new()
         }
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 impl StdioTransport {
     /// Spawn a stdio MCP server **confined** by the session `caveats`.
     ///
@@ -1021,8 +1045,9 @@ impl StdioTransport {
         // host-scoped session grant to `none`, so the child's net is always `All`
         // or `none` here.
         // `DenyDirect` is then a no-op on `All`, and resolves `none` to
-        // `Kernel`-decidable on Linux. Non-Unix MCP takes the raw Tokio path
-        // (`#[cfg(not(unix))]` below) — env-scrubbed but unconfined.
+        // `Kernel`-decidable on Linux. The advisory transport
+        // (`#[cfg(not(all(unix, feature = "confine")))]` below) takes the raw Tokio path —
+        // env-scrubbed but unconfined.
         // Same floor `confined_exec::runtime_sandbox_policy` already applies
         // to `run_command`.
         let sandbox_policy = std::sync::Arc::new(SandboxPolicy {
@@ -1033,8 +1058,7 @@ impl StdioTransport {
             caveats,
             command,
             protection,
-            &SandboxRoots::from(&*sandbox_policy),
-            true,
+            Some(&SandboxRoots::from(&*sandbox_policy)),
         )?;
         let cx = mint_spawn_context(&prepared).with_context(|| {
             format!("authorizing confined spawn of MCP server `{}`", entry.name)
@@ -1058,7 +1082,7 @@ impl StdioTransport {
                 let notice = spawn_failure_notice(&entry.name, command, seatbelt_refusal);
                 anyhow::Error::new(e).context(notice)
             })?;
-        let sandbox_kind = child.sandbox_kind;
+        let sandbox_kind = SandboxKind::from(child.sandbox_kind);
         log_confinement(&entry.name, sandbox_kind);
 
         let stdin = child
@@ -1076,12 +1100,12 @@ impl StdioTransport {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "confine")))]
 impl StdioTransport {
-    /// Spawn a stdio MCP server (non-Unix): env-scrubbed but WITHOUT an OS
-    /// sandbox — the confined `spawn_tokio` primitive is Unix-only. `caveats` is
-    /// accepted for signature parity and to keep the boundary explicit; it does
-    /// not yet kernel-confine here.
+    /// Spawn a stdio MCP server (advisory): env-scrubbed but WITHOUT an OS
+    /// sandbox — the confined `spawn_tokio` primitive needs a Unix host and the
+    /// `confine` feature. `caveats` is accepted for signature parity and to keep
+    /// the boundary explicit; it does not kernel-confine here.
     pub fn spawn(admitted: &newt_core::mcp::AdmittedServer<'_>, caveats: &Caveats) -> Result<Self> {
         Self::spawn_with_protection(admitted, caveats, None)
     }
@@ -1093,32 +1117,34 @@ impl StdioTransport {
         caveats: &Caveats,
         protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
     ) -> Result<Self> {
-        // Admission is a compile-time precondition (see the Unix `spawn`).
+        // Admission is a compile-time precondition (see the confined `spawn`).
         let entry = admitted.entry();
         let command = entry
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
-        let _prepared = prepare_stdio_caveats(
-            caveats,
-            command,
-            protection,
-            &SandboxRoots::from(&agent_bridle::SandboxPolicy::default()),
-            false,
-        )?;
+        // No sandbox roots: a protected session is refused here, before anything runs.
+        let _prepared = prepare_stdio_caveats(caveats, command, protection, None)?;
         let grants = resolve_env_grants(entry)?;
-        let mut child = Command::new(command)
-            .args(&entry.args)
+        let mut cmd = Command::new(command);
+        cmd.args(&entry.args)
             .env_clear()
             .envs(grants)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // A descriptor the parent left open with close-on-exec cleared would reach the
+        // child: an ambient capability. The confined spawn closes them (agent-bridle#319);
+        // with no bridle here, the guard does.
+        #[cfg(unix)]
+        newt_fdguard::deny_inherited_fds(cmd.as_std_mut());
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning MCP server `{}` ({command})", entry.name))?;
         tracing::warn!(
-            "MCP server `{}`: spawned ADVISORY-only — the OS-sandbox confined spawn is Unix-only",
+            "MCP server `{}`: spawned ADVISORY-only — the OS-sandbox confined spawn needs a \
+             Unix host and the `confine` feature",
             entry.name
         );
         let stdin = child
@@ -1151,6 +1177,13 @@ impl Transport for StdioTransport {
     }
 }
 
+/// What keeps an egress proxy alive for the life of an [`HttpTransport`]: bridle's
+/// handle with `confine`. Without it no proxy is ever started and the type has no value.
+#[cfg(feature = "confine")]
+type EgressProxy = agent_bridle::ProxyHandle;
+#[cfg(not(feature = "confine"))]
+type EgressProxy = std::convert::Infallible;
+
 /// Streamable-HTTP transport for the supported handshake-era MCP revisions.
 ///
 /// Each [`Transport::send`] `POST`s one JSON-RPC message to the server's single
@@ -1180,8 +1213,9 @@ pub struct HttpTransport {
     inbox: VecDeque<String>,
     /// #1243 Leg 4: the loopback egress proxy the `client` routes through, when
     /// the net grant warranted one. Held for the transport's lifetime (dropping
-    /// it tears the proxy down); `Some` iff egress is per-host gated.
-    _proxy: Option<agent_bridle::ProxyHandle>,
+    /// it tears the proxy down); `Some` iff egress is per-host gated. Never
+    /// `Some` without `confine`.
+    _proxy: Option<EgressProxy>,
     /// An explicitly granted hostname (or the existing loopback development
     /// exception) resolved to at least one non-global address and was bound
     /// directly to that screened, immutable address set.
@@ -1500,6 +1534,57 @@ fn build_pinned_client(
         .context("building DNS-pinned HTTP client")
 }
 
+/// The client for an origin that resolved to public addresses, and the egress proxy it
+/// routes through when the net grant warrants one.
+#[cfg(feature = "confine")]
+fn public_origin_client(
+    entry: &McpServerEntry,
+    caveats: &Caveats,
+    origin: &ResolvedOrigin,
+) -> Result<(reqwest::Client, Option<EgressProxy>)> {
+    // Fail-closed: a grant that WARRANTS a proxy but whose loopback
+    // listener cannot bind must refuse the connection, never dial
+    // unmediated. When no proxy is warranted, pin the screened public
+    // answer so a second DNS lookup cannot rebind it to a private IP.
+    let proxy = agent_bridle::start_egress_proxy(caveats)
+        .with_context(|| format!("MCP server `{}`: starting egress proxy", entry.name))?;
+    if let Some(handle) = &proxy {
+        let addr = format!("http://{}", handle.addr());
+        let client = reqwest::Client::builder()
+            .timeout(resolve_timeout(entry))
+            .redirect(reqwest::redirect::Policy::none())
+            .proxy(reqwest::Proxy::all(&addr).with_context(|| {
+                format!("MCP server `{}`: routing through egress proxy", entry.name)
+            })?)
+            .build()
+            .with_context(|| format!("building HTTP client for MCP server `{}`", entry.name))?;
+        Ok((client, proxy))
+    } else {
+        Ok((
+            build_pinned_client(origin, resolve_timeout(entry), false)?,
+            None,
+        ))
+    }
+}
+
+/// Without `confine` there is no egress proxy to start. A public origin gets the
+/// DNS-pinned client alone: it reaches the one origin the grant admitted, follows no
+/// redirect and no environment proxy, and resolves nothing a second time. For a single
+/// origin that is the bound the proxy would add. The posture stays `Advisory`.
+// ponytail: `Gated(1)` is the exact label, but `private_origin_pinned` means a private
+// origin today; widen that flag if a build without `confine` is ever shipped.
+#[cfg(not(feature = "confine"))]
+fn public_origin_client(
+    entry: &McpServerEntry,
+    _caveats: &Caveats,
+    origin: &ResolvedOrigin,
+) -> Result<(reqwest::Client, Option<EgressProxy>)> {
+    Ok((
+        build_pinned_client(origin, resolve_timeout(entry), false)?,
+        None,
+    ))
+}
+
 #[cfg(test)]
 fn exact_host_is_explicitly_granted(caveats: &Caveats, host: &str) -> bool {
     HttpNetworkPolicy::new(&caveats.net).explicitly_grants_host(host)
@@ -1671,12 +1756,14 @@ impl HttpTransport {
     /// request. Resolves and screens the endpoint once; the protocol handshake
     /// happens later in `initialize`.
     ///
-    /// #1243 Leg 4: under a general remote-host `net` grant the client is bound
-    /// to the loopback egress proxy ([`agent_bridle::start_egress_proxy`]) via
-    /// `reqwest::Proxy::all`, so per-call traffic AND redirects are enforced
-    /// against the allow-list — not only the connect-time host (#1156). An
-    /// exact private-host grant instead uses the screened DNS-pinned client,
-    /// because the general proxy intentionally rejects RFC1918 destinations.
+    /// #1243 Leg 4: with `confine`, under a general remote-host `net` grant the
+    /// client is bound to the loopback egress proxy (agent-bridle's
+    /// `start_egress_proxy`) via `reqwest::Proxy::all`, so per-call traffic AND
+    /// redirects are enforced against the allow-list — not only the connect-time
+    /// host (#1156). An exact private-host grant instead uses the screened
+    /// DNS-pinned client, because the general proxy intentionally rejects RFC1918
+    /// destinations. Without `confine` there is no proxy, and every grant uses
+    /// that client.
     pub fn connect(
         admitted: &newt_core::mcp::AdmittedServer<'_>,
         caveats: &Caveats,
@@ -1846,32 +1933,8 @@ impl HttpTransport {
                 true,
             )
         } else {
-            // Fail-closed: a grant that WARRANTS a proxy but whose loopback
-            // listener cannot bind must refuse the connection, never dial
-            // unmediated. When no proxy is warranted, pin the screened public
-            // answer so a second DNS lookup cannot rebind it to a private IP.
-            let proxy = agent_bridle::start_egress_proxy(caveats)
-                .with_context(|| format!("MCP server `{}`: starting egress proxy", entry.name))?;
-            if let Some(handle) = &proxy {
-                let addr = format!("http://{}", handle.addr());
-                let client = reqwest::Client::builder()
-                    .timeout(resolve_timeout(entry))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .proxy(reqwest::Proxy::all(&addr).with_context(|| {
-                        format!("MCP server `{}`: routing through egress proxy", entry.name)
-                    })?)
-                    .build()
-                    .with_context(|| {
-                        format!("building HTTP client for MCP server `{}`", entry.name)
-                    })?;
-                (client, proxy, false)
-            } else {
-                (
-                    build_pinned_client(&origin, resolve_timeout(entry), false)?,
-                    None,
-                    false,
-                )
-            }
+            let (client, proxy) = public_origin_client(entry, caveats, &origin)?;
+            (client, proxy, false)
         };
         Ok(Self {
             client,
@@ -1887,7 +1950,7 @@ impl HttpTransport {
 
     /// Whether this client's egress is fenced through the loopback proxy
     /// (#1243 Leg 4) — cross-platform (the client points itself at the proxy;
-    /// no kernel fence needed).
+    /// no kernel fence needed). Never true without `confine`.
     #[must_use]
     pub fn egress_proxied(&self) -> bool {
         self._proxy.is_some()
@@ -2192,9 +2255,9 @@ async fn finish_connect(
     })
 }
 
-/// Connect to one discovered **stdio** server: spawn (confined by `caveats`),
-/// initialize, list tools. The child runs inside the session's OCAP boundary —
-/// see [`StdioTransport::spawn`].
+/// Connect to one discovered **stdio** server: spawn (confined by `caveats` with the
+/// `confine` feature, advisory without it), initialize, list tools. With `confine` the
+/// child runs inside the session's OCAP boundary — see [`StdioTransport::spawn`].
 pub async fn connect_stdio(
     admitted: &newt_core::mcp::AdmittedServer<'_>,
     caveats: &Caveats,
@@ -2239,9 +2302,9 @@ pub async fn connect_stdio_with_protection(
 /// tools. Use this for `TransportKind::Http` entries (the legacy SSE-only
 /// transport is not supported).
 ///
-/// #1243 Leg 4: under a general remote-host `net` grant the client is routed
-/// through the loopback egress proxy, so EVERY request and redirect is subject
-/// to the per-host allow-list — not just the one connect-time host check
+/// #1243 Leg 4: with `confine`, under a general remote-host `net` grant the client
+/// is routed through the loopback egress proxy, so EVERY request and redirect is
+/// subject to the per-host allow-list — not just the one connect-time host check
 /// (#1156). A non-granted host is refused per-call.
 pub async fn connect_http(
     admitted: &newt_core::mcp::AdmittedServer<'_>,
