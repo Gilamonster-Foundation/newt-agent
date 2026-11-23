@@ -221,7 +221,7 @@ impl ExecRequest {
     /// Plain caveats alone cannot carry descriptor-bound authority.
     #[must_use]
     pub fn with_build_git_reads(mut self, workspace: &Path) -> Self {
-        let (paths, held) = crate::git_hardening::build_git_reads(workspace);
+        let (paths, held) = crate::git_hardening::build_reads::build_git_reads(workspace);
         if let Scope::Only(reads) = &mut self.caveats.fs_read {
             reads.extend(paths);
             self.held_read_roots.extend(held);

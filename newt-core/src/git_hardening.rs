@@ -40,6 +40,7 @@
 //! omit that override so ordinary native diffs retain their meaning.
 
 mod branch;
+pub(crate) mod build_reads;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod ref_namespace;
 mod scoped_read;
@@ -299,52 +300,6 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
         path_to_string(&git_dir),
         path_to_string(&common_dir.join("objects")),
     ]
-}
-
-/// Build metadata reads retain the objects acquired at session bootstrap or
-/// verified adoption. Linux installs rules from these held descriptors.
-/// Seatbelt remains path-only: verify before preparing the request, but a
-/// replacement after that check can redirect its pathname-based profile.
-/// No descriptor-isolation claim is made for Seatbelt; Windows gets no extra
-/// metadata authority until equivalent held-object support is available.
-pub(crate) fn build_git_reads(
-    workspace: &Path,
-) -> (Vec<String>, Vec<crate::sandbox_seam::HeldReadRoot>) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let checked = || -> Option<_> {
-            verified_identity(workspace)?;
-            let identity = cached_identity(workspace)?;
-            identity.held.verify().ok()?;
-            let mut paths = Vec::new();
-            #[allow(unused_mut)]
-            let mut handles = Vec::new();
-            for (path, root) in [
-                (&identity.held.common_dir, &identity.held.common_root),
-                (&identity.held.git_dir, &identity.held.git_root),
-            ] {
-                let path = path_to_string(path);
-                // Constructor checks the path/fd pairing again; no second open.
-                let held = agent_bridle::HeldReadRoot::bind(
-                    path.clone(),
-                    root.as_fd().try_clone_to_owned().ok()?,
-                )
-                .ok()?;
-                paths.push(path);
-                #[cfg(target_os = "linux")]
-                handles.push(held);
-                #[cfg(target_os = "macos")]
-                let _ = held;
-            }
-            Some((paths, handles))
-        };
-        checked().unwrap_or_default()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = workspace;
-        (Vec::new(), Vec::new())
-    }
 }
 
 /// `(common_dir, absolute_git_dir)` when the identity [`own_gitdir_grants`]
