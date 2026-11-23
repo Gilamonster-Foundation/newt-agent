@@ -8,7 +8,10 @@
 //! (`workspace_protection`) and the smart-harness frame check (`config::smart_harness`) read,
 //! so both read them from this type and neither names bridle.
 //!
-//! The `From<&agent_bridle::SandboxPolicy>` impl is the one conversion that knows bridle.
+//! [`SandboxKind`] is the OS sandbox a confined run reports it ran under
+//! (`confined_exec::ConfinedOutput`).
+//!
+//! The two `From` impls are the only conversions that know bridle.
 
 /// The paths a launcher's sandbox adds to a child's explicit filesystem `Caveats`, each list as
 /// the launcher's policy resolves it. The guard and the frame check count every list as
@@ -44,9 +47,42 @@ impl From<&agent_bridle::SandboxPolicy> for SandboxRoots {
     }
 }
 
+/// The OS sandbox that actually confined a child: the kind its launcher reports, never the
+/// kind that was asked for. `None` means no OS sandbox, so the leash was advisory only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxKind {
+    /// A Landlock ruleset (Linux).
+    Landlock,
+    /// A Seatbelt profile (macOS).
+    Seatbelt,
+    /// An AppContainer token (Windows).
+    AppContainer,
+    /// A minimal-rootfs mount-namespace jail (Linux).
+    MinimalRootfs,
+    /// A micro-VM guest (Linux).
+    MicroVm,
+    /// No OS sandbox: advisory only.
+    None,
+}
+
+/// The kind bridle's launcher reports, variant for variant. There is no wildcard arm, so a kind
+/// bridle adds stops this compiling instead of reading as `None`.
+impl From<agent_bridle::SandboxKind> for SandboxKind {
+    fn from(kind: agent_bridle::SandboxKind) -> Self {
+        match kind {
+            agent_bridle::SandboxKind::Landlock => Self::Landlock,
+            agent_bridle::SandboxKind::Seatbelt => Self::Seatbelt,
+            agent_bridle::SandboxKind::AppContainer => Self::AppContainer,
+            agent_bridle::SandboxKind::MinimalRootfs => Self::MinimalRootfs,
+            agent_bridle::SandboxKind::MicroVm => Self::MicroVm,
+            agent_bridle::SandboxKind::None => Self::None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SandboxRoots;
+    use super::{SandboxKind, SandboxRoots};
 
     /// `roots` holds each of `policy`'s four lists as bridle resolves it, which is how bridle
     /// reads them when it builds the sandbox.
@@ -85,5 +121,28 @@ mod tests {
         let roots = SandboxRoots::runtime();
         assert_resolved(&roots, &crate::confined_exec::runtime_sandbox_policy());
         assert!(!roots.base_read_paths.is_empty());
+    }
+
+    /// Each kind bridle's launcher reports becomes the newt-core kind of the same name, which
+    /// prints the same: the move check and the confined-git refusal print it.
+    #[test]
+    fn the_sandbox_kind_is_the_one_bridle_reports() {
+        use agent_bridle::SandboxKind as Bridle;
+        let mut names = std::collections::BTreeSet::new();
+        for (theirs, ours) in [
+            (Bridle::Landlock, SandboxKind::Landlock),
+            (Bridle::Seatbelt, SandboxKind::Seatbelt),
+            (Bridle::AppContainer, SandboxKind::AppContainer),
+            (Bridle::MinimalRootfs, SandboxKind::MinimalRootfs),
+            (Bridle::MicroVm, SandboxKind::MicroVm),
+            (Bridle::None, SandboxKind::None),
+        ] {
+            let converted = SandboxKind::from(theirs);
+            assert_eq!(converted, ours, "{theirs:?}");
+            assert_eq!(format!("{converted:?}"), format!("{theirs:?}"));
+            names.insert(format!("{converted:?}"));
+        }
+        // Anti-vacuous: six kinds with six different names.
+        assert_eq!(names.len(), 6);
     }
 }

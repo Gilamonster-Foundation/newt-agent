@@ -36,11 +36,12 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use agent_bridle::{seatbelt_is_supported, Caveats, Sandbox, SandboxKind, Scope, SeatbeltSandbox};
+use agent_bridle::{seatbelt_is_supported, Caveats, Sandbox, Scope, SeatbeltSandbox};
 use newt_core::confined_exec::{
     workspace_confined_caveats, ConfinedOutput, ConstrainedExecutor, ExecOrigin, ExecRefused,
     ExecRequest, NetGrant,
 };
+use newt_core::sandbox_seam::SandboxKind;
 use serial_test::serial;
 use tempfile::tempdir;
 

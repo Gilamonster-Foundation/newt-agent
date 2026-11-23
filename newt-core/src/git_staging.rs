@@ -1201,15 +1201,15 @@ fn execute_confined_git(
 /// The sandbox the executor REPORTS it applied must be the platform's kernel
 /// fence (Landlock on Linux, Seatbelt on macOS).  An advisory run or the wrong
 /// kind refuses regardless of exit status.
-fn require_kernel_fence(kind: agent_bridle::SandboxKind) -> Result<(), String> {
+fn require_kernel_fence(kind: crate::sandbox_seam::SandboxKind) -> Result<(), String> {
     #[cfg(target_os = "linux")]
-    let expected = agent_bridle::SandboxKind::Landlock;
+    let expected = crate::sandbox_seam::SandboxKind::Landlock;
     #[cfg(target_os = "macos")]
-    let expected = agent_bridle::SandboxKind::Seatbelt;
+    let expected = crate::sandbox_seam::SandboxKind::Seatbelt;
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let expected = agent_bridle::SandboxKind::None; // always refuses below
+    let expected = crate::sandbox_seam::SandboxKind::None; // always refuses below
 
-    if kind == expected && kind != agent_bridle::SandboxKind::None {
+    if kind == expected && kind != crate::sandbox_seam::SandboxKind::None {
         Ok(())
     } else {
         Err(format!(
@@ -2204,7 +2204,7 @@ mod tests {
     /// no kernel fence was applied, and the copy is refused even on success.
     #[test]
     fn require_kernel_fence_refuses_advisory_sandbox() {
-        assert!(require_kernel_fence(agent_bridle::SandboxKind::None).is_err());
+        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::None).is_err());
     }
 
     // --- Item 3 (A2): sticky-directory negative controls ----------------------
@@ -2513,24 +2513,24 @@ file:/h/.gitconfig\0credential.interactive\0";
 
     #[test]
     fn an_advisory_sandbox_is_refused_even_after_a_successful_run() {
-        assert!(require_kernel_fence(agent_bridle::SandboxKind::None).is_err());
+        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::None).is_err());
         // The expected kernel-fence kind is platform-specific: Landlock on Linux,
         // Seatbelt on macOS — the other kind is wrong and must also be refused.
         #[cfg(target_os = "linux")]
         assert_eq!(
-            require_kernel_fence(agent_bridle::SandboxKind::Landlock),
+            require_kernel_fence(crate::sandbox_seam::SandboxKind::Landlock),
             Ok(())
         );
         #[cfg(target_os = "macos")]
         assert_eq!(
-            require_kernel_fence(agent_bridle::SandboxKind::Seatbelt),
+            require_kernel_fence(crate::sandbox_seam::SandboxKind::Seatbelt),
             Ok(())
         );
         // Wrong sandbox kind on the current platform is also refused.
         #[cfg(target_os = "linux")]
-        assert!(require_kernel_fence(agent_bridle::SandboxKind::Seatbelt).is_err());
+        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::Seatbelt).is_err());
         #[cfg(target_os = "macos")]
-        assert!(require_kernel_fence(agent_bridle::SandboxKind::Landlock).is_err());
+        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::Landlock).is_err());
     }
 
     /// Review #2641 r4 finding 4: only an absent alternates file is success.

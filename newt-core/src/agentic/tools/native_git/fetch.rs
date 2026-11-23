@@ -374,7 +374,7 @@ mod tests {
             stderr:
                 b"* [new branch] good -> origin/good\n! [rejected] locked -> origin/locked\nPRIVATE"
                     .to_vec(),
-            sandbox_kind: agent_bridle::SandboxKind::Landlock,
+            sandbox_kind: crate::sandbox_seam::SandboxKind::Landlock,
             timed_out: false,
         };
         for result in [
@@ -407,7 +407,7 @@ mod tests {
                     code: Some(0),
                     stdout: Vec::new(),
                     stderr: stderr.as_bytes().to_vec(),
-                    sandbox_kind: agent_bridle::SandboxKind::Landlock,
+                    sandbox_kind: crate::sandbox_seam::SandboxKind::Landlock,
                     timed_out: false,
                 }),
                 "/staging",

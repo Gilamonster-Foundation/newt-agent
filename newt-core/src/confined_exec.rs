@@ -344,7 +344,7 @@ impl std::error::Error for ExecRefused {}
 
 /// The result of a completed confined run: the child's exit outcome, its
 /// captured output, and the OS sandbox that was ACTUALLY applied (honest — never
-/// over-claimed; [`agent_bridle::SandboxKind::None`] means advisory only).
+/// over-claimed; [`crate::sandbox_seam::SandboxKind::None`] means advisory only).
 #[derive(Debug)]
 pub struct ConfinedOutput {
     /// True iff the child exited with a success status.
@@ -354,7 +354,7 @@ pub struct ConfinedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// The OS sandbox actually applied to the child.
-    pub sandbox_kind: agent_bridle::SandboxKind,
+    pub sandbox_kind: crate::sandbox_seam::SandboxKind,
     /// True iff the child hit its [`ExecRequest::timeout`] and was killed. A
     /// timed-out run is never reported as `success`.
     pub timed_out: bool,
@@ -524,7 +524,7 @@ impl ConstrainedExecutor {
             other => ExecRefused::Authorize(other.to_string()),
         })?;
 
-        let sandbox_kind = child.sandbox_kind;
+        let sandbox_kind = crate::sandbox_seam::SandboxKind::from(child.sandbox_kind);
         // The child leads its own process group (`new_process_group`, pgid ==
         // pid), so one `killpg` reaps the child AND any descendants it left in
         // the group — the child-lifetime containment the raw `Command`s lacked.

@@ -218,7 +218,7 @@ fn checked_output(out: &ConfinedOutput) -> Result<(), String> {
     if out.success
         && out.code == Some(0)
         && !out.timed_out
-        && out.sandbox_kind != agent_bridle::SandboxKind::None
+        && out.sandbox_kind != crate::sandbox_seam::SandboxKind::None
     {
         Ok(())
     } else {

@@ -316,9 +316,9 @@ async fn raw_refs_are_protected(main: &Path, task: &Path) {
         assert_eq!(
             out.sandbox_kind,
             if cfg!(target_os = "macos") {
-                agent_bridle::SandboxKind::Seatbelt
+                newt_core::sandbox_seam::SandboxKind::Seatbelt
             } else {
-                agent_bridle::SandboxKind::Landlock
+                newt_core::sandbox_seam::SandboxKind::Landlock
             }
         );
         if name == "raw_branch" {

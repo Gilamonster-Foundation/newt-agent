@@ -19,9 +19,15 @@ fn confined(root: &Path, program: &str, args: &[&str]) -> newt_core::confined_ex
     let output =
         ConstrainedExecutor::run(&request).expect("native filesystem confinement must spawn");
     #[cfg(target_os = "linux")]
-    assert_eq!(output.sandbox_kind, agent_bridle::SandboxKind::Landlock);
+    assert_eq!(
+        output.sandbox_kind,
+        newt_core::sandbox_seam::SandboxKind::Landlock
+    );
     #[cfg(target_os = "macos")]
-    assert_eq!(output.sandbox_kind, agent_bridle::SandboxKind::Seatbelt);
+    assert_eq!(
+        output.sandbox_kind,
+        newt_core::sandbox_seam::SandboxKind::Seatbelt
+    );
     output
 }
 

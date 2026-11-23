@@ -481,7 +481,7 @@ fn constrained_cmd(
 fn assert_appcontainer(out: &ConfinedOutput) {
     assert_eq!(
         out.sandbox_kind,
-        agent_bridle::SandboxKind::AppContainer,
+        newt_core::sandbox_seam::SandboxKind::AppContainer,
         "expected production route to use AppContainer, got {:?}; stdout={} stderr={}",
         out.sandbox_kind,
         String::from_utf8_lossy(&out.stdout),
