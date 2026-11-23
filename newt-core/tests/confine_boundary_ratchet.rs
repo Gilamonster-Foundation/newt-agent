@@ -25,15 +25,21 @@ const BRIDLE_FREE: &[(&str, &str)] = &[(
 const FORBIDDEN: &[&str] = &["agent_bridle", "agent-bridle"];
 
 /// `line` up to its `//` comment, if it has one. The line is cut at its first `//` only
-/// when it holds no `"` and no `*/` anywhere and no `/*` comes before the `//`. Then no
-/// string or block comment opens before the `//` or ends anywhere on the line, so the cut
-/// text is never code, even when the `//` sits in a string or block comment that opened
-/// on an earlier line, or is the end of one (`*//`). The scan can only over-report: it
-/// reads a `/* */` comment, and a `//` comment on a line that holds a `"` or `*/`, as
-/// code.
+/// when it holds no `"` and no `*/` anywhere, no `/*` comes before the `//`, and it does
+/// not end in `\`. Then no string or block comment opens before the `//` or ends on the
+/// line, and the line does not continue a string, so the cut text is a comment or the
+/// text of a string that opened on an earlier line and holds a raw line break. A path in
+/// `#[path]` or `include!` holds one only if a file name does. Beyond that the scan can
+/// only over-report: it reads a `/* */` comment, and a `//` comment on a line that holds
+/// a `"` or `*/` or ends in `\`, as code.
 fn code_part(line: &str) -> &str {
     match line.find("//") {
-        Some(at) if !line.contains('"') && !line.contains("*/") && !line[..at].contains("/*") => {
+        Some(at)
+            if !line.contains('"')
+                && !line.contains("*/")
+                && !line[..at].contains("/*")
+                && !line.ends_with('\\') =>
+        {
             &line[..at]
         }
         _ => line,
@@ -100,4 +106,8 @@ fn the_scan_reads_every_line_outside_a_comment() {
     assert_eq!(naming_bridle(struct_field), [3]);
     let divided = "fn f() -> u8 {\n    8 /* see\n    *// agent_bridle::N\n}\n";
     assert_eq!(naming_bridle(divided), [3]);
+    // A path continued with `\` keeps its `//` line whole.
+    let continued = "#[path = \"../../vendor/\\\n          //agent-bridle-core/src/\\\n\
+                     lib.rs\"]\nmod core;\n";
+    assert_eq!(naming_bridle(continued), [2]);
 }
