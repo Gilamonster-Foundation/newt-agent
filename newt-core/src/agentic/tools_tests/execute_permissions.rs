@@ -3552,7 +3552,8 @@ async fn gate_allow_without_real_coverage_is_still_denied() {
     );
 }
 
-/// No usable backend means no filesystem lookup, command presentation, or Build grant.
+/// The build helper refuses before its execution line, directory lookup, or Build grant.
+/// The dispatcher's earlier tool-call line is outside this helper's contract.
 #[cfg(not(feature = "confine"))]
 #[tokio::test]
 async fn confine_off_lifecycle_build_refuses_before_asking() {
@@ -3598,6 +3599,7 @@ async fn confine_off_lifecycle_build_refuses_before_asking() {
 }
 
 /// The feature refusal precedes AST validation, file access, and permission requests.
+/// Use the inner seam so terminal discovery and the tool-call clock are not involved.
 #[cfg(not(feature = "confine"))]
 #[tokio::test]
 async fn confine_off_move_from_refuses_at_dispatch() {
@@ -3606,14 +3608,24 @@ async fn confine_off_move_from_refuses_at_dispatch() {
         ..Caveats::top()
     };
     let mut gate = MockGate::new(true, &base);
-    let result = run_tool_gated(
+    let mut display = ToolDisplay::new(Vec::<u8>::new(), false, 80, 20, false);
+    let result = execute_tool_inner(
+        &mut display,
         "write_file",
-        serde_json::json!({"path":"child.rs", "content":"", "move_from":{
+        &serde_json::json!({"path":"child.rs", "content":"", "move_from":{
             "path":"lib.rs", "items":["helper"]
         }}),
-        std::path::Path::new("/p11b-absent-workspace"),
+        "/p11b-absent-workspace",
+        false,
+        20,
         &base,
-        &mut gate,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
     )
     .await;
     assert_eq!(
@@ -3622,6 +3634,7 @@ async fn confine_off_move_from_refuses_at_dispatch() {
     );
     assert!(gate.asks.is_empty());
     assert!(gate.full_access.is_empty());
+    assert!(display.into_inner().is_empty());
 }
 
 #[cfg(feature = "confine")]
