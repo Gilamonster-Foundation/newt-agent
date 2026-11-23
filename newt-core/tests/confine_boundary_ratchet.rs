@@ -43,6 +43,30 @@ fn is_test_attribute(line: &str) -> bool {
         || line.starts_with("#[cfg(all(test)")
 }
 
+/// A code part that leaves a string literal open: an odd number of unescaped `"`, as in
+/// `const J: &str = r#"{`.
+fn opens_string(code: &str) -> bool {
+    let mut quotes = 0;
+    let mut escaped = false;
+    for c in code.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quotes += 1;
+        }
+    }
+    quotes % 2 == 1
+}
+
+/// A header whose item rustfmt closes with a column-0 `}`: it ends in `{`, outside a
+/// string literal.
+fn opens_block(header: &str) -> bool {
+    let code = code_part(header);
+    code.ends_with('{') && !opens_string(code)
+}
+
 /// An item header that is the whole item: `mod tests;`, `fn f() {}`.
 fn ends_item(header: &str) -> bool {
     let code = code_part(header);
@@ -54,13 +78,19 @@ fn ends_item(header: &str) -> bool {
 ///
 /// A test-only item starts at a column-0 `#[cfg(test)]` or `#[cfg(all(test, ..))]`. Its
 /// header is the next line that is not an attribute or a comment. The item ends there if
-/// the header ends in `;` or `}`. If the header ends in `{`, the item ends at the next
-/// column-0 line that starts with `}`: in rustfmt's layout (CI checks it) that is the
-/// item's closing line, and no other line inside the item starts at column 0 with `}`.
-/// Any other header (a `const` broken after `=`, a multi-line signature, a multi-line
-/// attribute) is read as production code, with everything after it, and so is the code
-/// under a test attribute that is not at column 0: the scan errs toward reporting. One
-/// known limit: `code_part` cuts a line at its first `//`, even inside a string.
+/// the header ends in `;` or `}`. If the header ends in `{` outside a string literal, the
+/// item is skipped up to the next column-0 line that starts with `}`, which in rustfmt's
+/// layout (CI checks it) is the item's closing line. Any other header (a `const` broken
+/// after `=`, a string fixture, a multi-line signature or attribute) is read as production
+/// code, with everything after it, and so is the code under a test attribute that is not
+/// at column 0: the scan errs toward reporting.
+///
+/// The scan reads lines, not tokens, so it has limits:
+/// - a column-0 `}` inside a skipped item (a string fixture that closes at column 0, a
+///   `} else {`) ends the skip early and the rest of the item is read; that fails loudly,
+///   since the twin's `#[test]` check fails on any listed file where it happens;
+/// - column-0 `#[cfg(test)]` text inside a production string is taken for an attribute;
+/// - `code_part` cuts a line at its first `//`, even inside a string.
 fn production_lines(src: &str) -> Vec<(usize, &str)> {
     let mut lines = Vec::new();
     let mut state = State::Code;
@@ -75,7 +105,7 @@ fn production_lines(src: &str) -> Vec<(usize, &str)> {
                 State::TestAttributes
             }
             State::TestAttributes if ends_item(trimmed) => State::Code,
-            State::TestAttributes if code_part(trimmed).ends_with('{') => State::TestItem,
+            State::TestAttributes if opens_block(trimmed) => State::TestItem,
             State::TestAttributes => {
                 lines.push((index + 1, line));
                 State::Code
@@ -87,7 +117,7 @@ fn production_lines(src: &str) -> Vec<(usize, &str)> {
                     State::TestAttributes
                 } else if ends_item(rest) {
                     State::Code
-                } else if rest.ends_with('{') {
+                } else if opens_block(rest) {
                     State::TestItem
                 } else {
                     lines.push((index + 1, line));
@@ -181,6 +211,15 @@ fn the_scan_reads_each_production_line_and_no_test_code() {
     assert_eq!(naming_bridle(string_fixture), [4]);
     let same_line = "#[cfg(test)] static Z: &str =\n    \"s\";\nuse agent_bridle::Gate;\n";
     assert_eq!(naming_bridle(same_line), [3]);
+    // A `{` that opens a string fixture is not a block: the scan reads on.
+    let json_fixture = "#[cfg(test)]\nconst J: &str = r#\"{\n    \"a\": 1\n    }\"#;\n\
+                        use agent_bridle::Gate;\nimpl X {\n    fn f(_: agent_bridle::G) {}\n}\n\
+                        use agent_bridle::After;\n";
+    assert_eq!(naming_bridle(json_fixture), [5, 7, 9]);
+    let comment_in_string =
+        "#[cfg(test)]\nconst S: &str = \"fn f() { // x }\";\nuse agent_bridle::Gate;\n";
+    assert_eq!(naming_bridle(comment_in_string), [3]);
+    assert!(opens_string("const J: &str = r#\"{") && !opens_string("let s = \"a\\\"b\";"));
     assert_eq!(
         naming_bridle("#[cfg(any(test, unix))]\nuse agent_bridle::Gate;\n"),
         [2]
