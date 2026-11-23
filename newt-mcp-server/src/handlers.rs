@@ -11,7 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_bridle::{Caveats, Grant, Registry, ToolError};
+use agent_bridle::{Grant, Registry, ToolError};
+use agent_mesh_protocol::Caveats;
 use newt_inference::BackendRegistry;
 use newt_mcp_client::McpToolset;
 use newt_router::{Router, Tier};
@@ -63,7 +64,6 @@ pub fn register_handlers(
         server,
         registry,
         router,
-        bridle_registry(),
         Arc::new(granted.caveats),
         std::env::current_dir().unwrap_or_default(),
         toolset,
@@ -137,7 +137,7 @@ fn register_tools_list(
     server: &mut McpServer,
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
-    read_scope: &agent_bridle::Scope<String>,
+    read_scope: &agent_mesh_protocol::Scope<String>,
 ) {
     let legacy_git_allowed = newt_core::agentic::check_git_read_scope("open", read_scope).is_ok();
     server.register("tools/list", move |_params| {
@@ -244,17 +244,16 @@ fn tool_definitions() -> Value {
 
 // ── tools/call ─────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 fn register_tools_call(
     server: &mut McpServer,
     registry: Arc<BackendRegistry>,
     router: Arc<Router>,
-    bridle: Arc<Registry>,
     granted: Arc<Caveats>,
     workspace: PathBuf,
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
 ) {
+    let bridle = bridle_registry();
     // Mint once, reused across every `shell_run` / `web_fetch` call this
     // session (AB-001, #264): a grant minted per call would reset the
     // `max_calls` budget on every dispatch instead of accounting it
@@ -725,7 +724,6 @@ mod tests {
             &mut server,
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
-            bridle_registry(),
             Arc::new(granted),
             workspace.to_path_buf(),
             toolset,
@@ -742,7 +740,7 @@ mod tests {
     /// A restrictive grant: only the platform echo carrier may exec, capped
     /// call budget. Used by the superseded-`shell_run` regression tests below.
     fn echo_only_grant() -> Caveats {
-        use agent_bridle::{CountBound, Scope};
+        use agent_mesh_protocol::{CountBound, Scope};
         #[cfg(windows)]
         let exec = Scope::only(["cmd.exe".to_string()]);
         #[cfg(not(windows))]
@@ -987,7 +985,7 @@ mod tests {
 
     /// A leash confined to `root` on both fs axes; exec/net untouched.
     fn fenced_to(root: &std::path::Path) -> Caveats {
-        let only = agent_bridle::Scope::only([root.to_string_lossy().into_owned()]);
+        let only = agent_mesh_protocol::Scope::only([root.to_string_lossy().into_owned()]);
         Caveats {
             fs_read: only.clone(),
             fs_write: only,
@@ -1245,7 +1243,8 @@ mod tests {
     async fn scoped_git_is_not_advertised_or_dispatched() {
         let repo = temp_repo();
         let mut granted = Caveats::top();
-        granted.fs_read = agent_bridle::Scope::only([repo.path().to_string_lossy().into_owned()]);
+        granted.fs_read =
+            agent_mesh_protocol::Scope::only([repo.path().to_string_lossy().into_owned()]);
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 40, "method": "tools/call",
             "params": {
@@ -1278,7 +1277,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_commit_denied_under_readonly_grant() {
-        use agent_bridle::Scope;
+        use agent_mesh_protocol::Scope;
         let repo = temp_repo();
         // fs_write empty -> GitCaveats::from_session denies stage/commit (fail-closed).
         let readonly = Caveats {
