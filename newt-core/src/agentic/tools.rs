@@ -4728,6 +4728,11 @@ async fn execute_authorized_tool(
             // commit`), and a source the inspector cannot read gets no broker, so the
             // bare-word trigger sends that source to the same refusal.
             let commit_named = run_command_creates_shell_git_commit(cmd) || git_words::commit_in_an_uninspectable_source(cmd);
+            // Without `confine` the preflight that refuses a commit this lexical check misses,
+            // such as a quoted `'git' 'commit'`, is not compiled, so a commit the inspector
+            // resolves is refused here too (#3160).
+            #[cfg(not(feature = "confine"))]
+            let commit_named = commit_named || commit_requested;
             if governed_git && commit_named && commit_broker.is_none() {
                 let reason = match crate::shell_inspect::inspect_shell(cmd) {
                     Err(error) => format!("shell inspection failed: {error}"),

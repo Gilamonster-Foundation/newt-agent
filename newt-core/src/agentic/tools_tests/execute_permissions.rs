@@ -2808,6 +2808,22 @@ async fn confine_off_commit_is_refused_by_the_existing_no_broker_text() {
     assert_eq!(reached, 0, "{result}");
 }
 
+/// #3160: a commit only the shell inspector resolves, a quoted `'git' 'commit'`, is
+/// refused without `confine` too: the preflight that would refuse it is not compiled, so
+/// the refusal must not depend on the lexical check naming the commit.
+#[cfg(all(unix, not(feature = "confine")))]
+#[tokio::test]
+async fn confine_off_a_quoted_commit_is_refused_before_the_shell_route() {
+    let git_tool = crate::agentic::tools::tests::git_shell_grant::FixtureGitTool;
+    let (result, reached) =
+        shell_route_count("'git' 'commit' --allow-empty -m x", Some(&git_tool)).await;
+    assert!(
+        result.contains("refusing Git commit publication") && result.contains("No command ran"),
+        "{result}"
+    );
+    assert_eq!(reached, 0, "{result}");
+}
+
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.
