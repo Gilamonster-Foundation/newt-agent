@@ -952,11 +952,11 @@ pub fn verify_fs_object_bound() -> Verification {
 /// unconfined — so `Absent` here is honest, not a silent downgrade.
 ///
 /// The complementary half — that ALL attacker-influenced spawn sites route
-/// through this seam (`agent-exec-todo-p4 == 0`) — is the CI-enforced
-/// spawn-inventory gate (`scripts/spawn_inventory.py` over
-/// `docs/security/spawn-inventory.toml`). The integration test
-/// `constrained_executor_truth.rs` ties the two: it fails if the inventory
-/// carries an unmigrated attacker spawn OR if this verifier disagrees with the
+/// through this seam (`agent-exec-todo-p4 == 0`) — is held in CI by two checks over
+/// `docs/security/spawn-inventory.toml`. The spawn-inventory gate
+/// (`scripts/spawn_inventory.py`) keeps each file's spawns at or under its row, and
+/// the integration test `constrained_executor_truth.rs` keeps the
+/// `agent-exec-todo-p4` rows at 0 and fails if this verifier disagrees with the
 /// gate on a fence-available host — so live enforcement, this verifier, and the
 /// register cannot drift apart.
 #[must_use]
@@ -966,9 +966,9 @@ pub fn verify_constrained_executor() -> Verification {
             evidence: "ConstrainedExecutor routes every attacker-influenced spawn through \
                        agent_bridle::ConfinedCommand under a Kernel strength floor: the child is \
                        env-cleared (only explicit grants) and the fs fence is kernel-enforced, \
-                       fail-closed when it cannot be; the CI spawn-inventory gate holds \
-                       agent-exec-todo-p4 at 0 so no attacker spawn bypasses it \
-                       (constrained_executor_truth.rs ties the gate to this verifier)"
+                       fail-closed when it cannot be; in CI the spawn-inventory gate keeps \
+                       each file's spawns within its row and constrained_executor_truth.rs \
+                       holds the agent-exec-todo-p4 rows at 0, so no attacker spawn bypasses it"
                 .into(),
         }
     } else {

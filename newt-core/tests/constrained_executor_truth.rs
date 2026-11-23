@@ -1,7 +1,7 @@
 //! Blocker-1 truth reconciliation for `p4-constrained-executor`.
 //!
-//! The register (`docs/security/ocap-deviations.md`) marks P4 CLOSED and the CI
-//! spawn-inventory gate holds `agent-exec-todo-p4 == 0`, yet the runtime
+//! The register (`docs/security/ocap-deviations.md`) marks P4 CLOSED and the spawn
+//! inventory carries no unmigrated `agent-exec-todo-p4` spawn, yet the runtime
 //! `verify_constrained_executor()` used to hard-code `Absent` — so the three
 //! sources of truth (register, gate, verifier) disagreed. These tests force them
 //! to agree from executable evidence:
@@ -9,7 +9,9 @@
 //! - The **tie test** (unit tier, no real spawn) parses the committed
 //!   `spawn-inventory.toml` and asserts (a) zero unmigrated attacker spawns and
 //!   (b) the verifier's verdict matches this host's fence availability — so the
-//!   gate and the verifier can never drift.
+//!   gate and the verifier can never drift. `scripts/spawn_inventory.py` keeps each
+//!   file's spawns at or under its inventory row; (a) is what holds the
+//!   `agent-exec-todo-p4` rows at 0.
 //! - The **env-clean test** (real-resource, `#[serial]`, Linux) grounds the
 //!   EnvIsolation guarantee: a secret planted in THIS process's environment must
 //!   never reach a child spawned through `ConstrainedExecutor` (the child is
@@ -23,36 +25,62 @@ use newt_core::ocap::verify_constrained_executor;
 const SPAWN_INVENTORY: &str = include_str!("../../docs/security/spawn-inventory.toml");
 
 /// Sum the `count` of every `[files]` row classed `agent-exec-todo-p4` — the unmigrated
-/// attacker-influenced spawns the P4 closure criterion must hold at 0. Each row is
-/// `"path" = { count, class, note }`; a p4 row without an integer count fails here.
-fn unmigrated_attacker_spawn_count(toml_src: &str) -> i64 {
-    let doc: toml::Value = toml::from_str(toml_src).expect("spawn-inventory.toml parses");
-    doc.get("files")
-        .and_then(toml::Value::as_table)
-        .expect("the inventory keeps its rows in a [files] table")
-        .iter()
-        .filter(|(_, row)| {
-            row.get("class").and_then(toml::Value::as_str) == Some("agent-exec-todo-p4")
-        })
-        .map(|(path, row)| {
-            row.get("count")
-                .and_then(toml::Value::as_integer)
-                .unwrap_or_else(|| {
-                    panic!("{path}: an agent-exec-todo-p4 row needs an integer count")
-                })
-        })
-        .sum()
+/// attacker-influenced spawns the P4 closure criterion must hold at 0. Every row is
+/// `"path" = { count, class, note }` under `[files]`, which is the inventory's only
+/// top-level key; a row elsewhere, or a p4 row without a count of 0 or more, is an error.
+fn unmigrated_attacker_spawn_count(toml_src: &str) -> Result<u64, String> {
+    let doc: toml::Value = toml::from_str(toml_src).map_err(|error| error.to_string())?;
+    let top = doc.as_table().ok_or("a TOML document is a table")?;
+    if top.keys().map(String::as_str).ne(["files"]) {
+        let keys: Vec<_> = top.keys().collect();
+        return Err(format!(
+            "the inventory's only top-level key is `files`: {keys:?}"
+        ));
+    }
+    let mut total = 0;
+    for (path, row) in top["files"].as_table().ok_or("`files` is a table")? {
+        if row.get("class").and_then(toml::Value::as_str) != Some("agent-exec-todo-p4") {
+            continue;
+        }
+        total += row
+            .get("count")
+            .and_then(toml::Value::as_integer)
+            .and_then(|count| u64::try_from(count).ok())
+            .ok_or_else(|| {
+                format!("{path}: an agent-exec-todo-p4 row needs a count of 0 or more")
+            })?;
+    }
+    Ok(total)
 }
 
 /// Anti-vacuous twin: the count reads the committed inventory's rows, so a p4 row
-/// added to it is seen. It read the top-level table before, which holds only `[files]`
-/// itself, so the sum was 0 whatever the rows said.
+/// added to it is seen, and a malformed one is an error rather than a 0. It read the
+/// top-level table before, which holds only `[files]` itself, so the sum was 0 whatever
+/// the rows said.
 #[test]
 fn the_count_sees_a_p4_row_in_the_committed_inventory() {
-    let planted = format!(
-        "{SPAWN_INVENTORY}\n\"planted.rs\" = {{ count = 2, class = \"agent-exec-todo-p4\", note = \"planted\" }}\n"
+    let with_row = |fields: &str| {
+        format!(
+            "{SPAWN_INVENTORY}\n\"planted.rs\" = {{ {fields}class = \"agent-exec-todo-p4\", note = \"planted\" }}\n"
+        )
+    };
+    assert_eq!(
+        unmigrated_attacker_spawn_count(&with_row("count = 2, ")),
+        Ok(2)
     );
-    assert_eq!(unmigrated_attacker_spawn_count(&planted), 2);
+    let row_above_files =
+        format!("\"stray.rs\" = {{ count = 1, class = \"agent-exec-todo-p4\", note = \"n\" }}\n{SPAWN_INVENTORY}");
+    for (shape, inventory) in [
+        ("no count", with_row("")),
+        ("a negative count", with_row("count = -1, ")),
+        ("a string count", with_row("count = \"2\", ")),
+        ("a row above [files]", row_above_files),
+    ] {
+        assert!(
+            unmigrated_attacker_spawn_count(&inventory).is_err(),
+            "{shape}"
+        );
+    }
 }
 
 #[test]
@@ -60,7 +88,7 @@ fn verifier_agrees_with_the_spawn_inventory_gate() {
     // (a) the gate: no unmigrated attacker-influenced spawn remains.
     assert_eq!(
         unmigrated_attacker_spawn_count(SPAWN_INVENTORY),
-        0,
+        Ok(0),
         "spawn-inventory.toml carries an unmigrated agent-exec-todo-p4 spawn — the P4 closure \
          criterion, and this verifier's Verified verdict, would be a lie"
     );
