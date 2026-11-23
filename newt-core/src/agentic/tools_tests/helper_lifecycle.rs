@@ -606,6 +606,19 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     assert!(err.contains("⚠ build check could not run"), "got: {err}");
 }
 
+/// Render the executor's typed refusal without building a request or probing the host,
+/// so the per-edit receipt says why the build check could not run (#3160).
+#[cfg(not(feature = "confine"))]
+#[test]
+fn confine_off_build_check_reports_the_refusal() {
+    let out = render_build_check_result(Err(crate::confined_exec::off_refusal()));
+    assert!(out.starts_with("  ⚠ build check could not run: "), "{out}");
+    assert!(
+        out.contains(crate::confined_exec::CONFINE_OFF_REASON),
+        "{out}"
+    );
+}
+
 #[test]
 fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));

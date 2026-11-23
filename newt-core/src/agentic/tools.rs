@@ -1074,7 +1074,13 @@ pub(crate) fn run_build_check(
     let workspace = std::path::Path::new(workspace);
     let req = build_tool_request(workspace, workspace, program, args, network);
 
-    match ConstrainedExecutor::run(&req) {
+    render_build_check_result(ConstrainedExecutor::run(&req))
+}
+
+fn render_build_check_result(
+    run: Result<crate::confined_exec::ConfinedOutput, crate::confined_exec::ExecRefused>,
+) -> String {
+    match run {
         Ok(out) if out.success => "  ✓ build check passed".to_string(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);

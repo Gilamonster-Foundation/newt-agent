@@ -974,11 +974,26 @@ pub fn verify_constrained_executor() -> Verification {
     } else {
         Verification::Absent {
             deviation: "p4-constrained-executor",
-            reason: "the kernel fs fence is unavailable on this host — an AgentInfluenced spawn \
-                     refuses (fail-closed) rather than confine \
-                     (see docs/security/spawn-inventory.toml)"
-                .into(),
+            reason: executor_absent_reason(crate::confined_exec::BACKEND_COMPILED),
         }
+    }
+}
+
+/// Why [`verify_constrained_executor`] reports `Absent`: the executor is not compiled into
+/// this build (`backend_compiled` is false, newt-core's `confine` feature is off), or it is
+/// and this host cannot kernel-enforce the fence it requires. A pure function of its argument,
+/// so both texts can be checked in any build.
+fn executor_absent_reason(backend_compiled: bool) -> String {
+    if backend_compiled {
+        "the kernel fs fence is unavailable on this host — an AgentInfluenced spawn \
+         refuses (fail-closed) rather than confine \
+         (see docs/security/spawn-inventory.toml)"
+            .into()
+    } else {
+        format!(
+            "{} — every ConstrainedExecutor spawn refuses (fail-closed)",
+            crate::confined_exec::CONFINE_OFF_REASON
+        )
     }
 }
 

@@ -9,11 +9,12 @@ use super::*;
 /// Seatbelt remains path-only: verify before preparing the request, but a
 /// replacement after that check can redirect its pathname-based profile.
 /// No descriptor-isolation claim is made for Seatbelt; Windows gets no extra
-/// metadata authority until equivalent held-object support is available.
+/// metadata authority until equivalent held-object support is available. A build
+/// without newt-core's `confine` feature has no executor to hold them: none (#3160).
 pub(crate) fn build_git_reads(
     workspace: &Path,
 ) -> (Vec<String>, Vec<crate::sandbox_seam::HeldReadRoot>) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "confine"))]
     {
         let checked = || -> Option<_> {
             verified_identity(workspace)?;
@@ -43,7 +44,7 @@ pub(crate) fn build_git_reads(
         };
         checked().unwrap_or_default()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(all(any(target_os = "linux", target_os = "macos"), feature = "confine")))]
     {
         let _ = workspace;
         (Vec::new(), Vec::new())

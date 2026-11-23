@@ -201,6 +201,38 @@ fn the_probe_covers_every_tracked_encoding() {
     assert!(!f.is_empty());
 }
 
+/// Without `confine` there is no executor, so the verdict is `Absent` for the register's
+/// deviation, and its reason says the build has no backend, not that this host lacks a fence.
+#[cfg(not(feature = "confine"))]
+#[test]
+fn confine_off_verify_constrained_executor_is_absent_and_names_the_feature() {
+    let Verification::Absent { deviation, reason } = verify_constrained_executor() else {
+        panic!("a build with no executor verified one");
+    };
+    assert_eq!(deviation, "p4-constrained-executor");
+    assert!(reason.contains("`confine`"), "{reason}");
+    assert!(
+        reason.contains(crate::confined_exec::CONFINE_OFF_REASON),
+        "{reason}"
+    );
+}
+
+/// Both reasons come from one helper, so the text that names the feature is checked in the
+/// default build too, which never takes that branch.
+#[test]
+fn executor_absent_reason_names_the_feature_only_when_not_compiled() {
+    let compiled = crate::ocap::executor_absent_reason(true);
+    let off = crate::ocap::executor_absent_reason(false);
+    assert!(
+        compiled.contains("kernel fs fence is unavailable on this host"),
+        "{compiled}"
+    );
+    assert!(!compiled.contains("`confine`"), "{compiled}");
+    assert!(off.contains("`confine`"), "{off}");
+    assert!(off.contains("fail-closed"), "{off}");
+    assert_ne!(compiled, off);
+}
+
 #[test]
 fn verified_reports_no_deviation() {
     let v = Verification::Verified {

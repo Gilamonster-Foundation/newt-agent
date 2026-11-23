@@ -366,22 +366,27 @@ pub fn resolved_confined_default() -> ShellEngine {
 /// confines it in the kernel (L3). Surfaced by `newt doctor` (#926) so the
 /// operator can see what actually enforces a restricted grant here. A restricted
 /// filesystem grant requires a kernel boundary. When that floor cannot be met,
-/// admission refuses the command rather than allowing advisory access.
+/// admission refuses the command rather than allowing advisory access. A build
+/// without newt-core's `confine` feature probes no kernel fence: it reports none, on
+/// any platform (#3160).
 #[must_use]
 pub fn ocap_l3_backend() -> (&'static str, bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(feature = "confine", target_os = "linux"))]
     {
         ("Landlock", agent_bridle::landlock_is_supported())
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "confine", target_os = "macos"))]
     {
         ("Seatbelt", agent_bridle::seatbelt_is_supported())
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(feature = "confine", target_os = "windows"))]
     {
         ("AppContainer", true)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(not(all(
+        feature = "confine",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     {
         ("none", false)
     }
@@ -406,6 +411,15 @@ mod shell_engine_tests {
             brush_private_control_supported(),
             agent_bridle_tool_shell::brush_private_control_supported()
         );
+    }
+
+    /// Without `confine` no kernel fence is probed, on any platform: the L3 backend is
+    /// reported absent, and the confined default engine is the portable one (#3160).
+    #[cfg(not(feature = "confine"))]
+    #[test]
+    fn confine_off_l3_backend_is_none_false() {
+        assert_eq!(super::ocap_l3_backend(), ("none", false));
+        assert_eq!(super::resolved_confined_default(), ShellEngine::SafeSubset);
     }
 
     #[test]

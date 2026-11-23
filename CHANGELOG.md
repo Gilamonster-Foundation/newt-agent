@@ -59,6 +59,10 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   constructor or method. The executor moved to a private child module of `confined_exec`,
   and `ConstrainedExecutor`, `kernel_fs_fence_available`, `net_guard_available` and
   `cgroup_subtree_kill_available` are re-exported where they were (#3160).
+- `newt_core::confined_exec::BACKEND_COMPILED` says whether newt-core was built with its
+  `confine` feature, which is on by default. Without it `ConstrainedExecutor::run` and
+  `run_async` refuse every call with `ExecRefused::ConfinementUnenforceable`, and the three
+  fence probes report no fence (#3160). A default build behaves as before.
 
 ### Fixed
 

@@ -298,7 +298,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), feature = "confine"))]
     #[test]
     fn implicit_sandbox_read_roots_cannot_expose_private_keys() {
         let Some(root) = SandboxRoots::runtime().base_read_paths.into_iter().next() else {
