@@ -4980,6 +4980,7 @@ dependencies = [
  "newt-fdguard",
  "newt-policy",
  "reqwest",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

@@ -130,6 +130,92 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
     }
 }
 
+/// Grounds the advisory spawn's descriptor hygiene (#3160). A descriptor the parent holds with
+/// close-on-exec cleared is inherited across exec by a plain spawn, and an inherited descriptor
+/// is a capability the child was never granted (agent-bridle#319). The confined spawn closes it;
+/// without `confine` there is no bridle to do that, so the advisory spawn calls
+/// `newt_fdguard::deny_inherited_fds`, and this test fails when that call is missing.
+///
+/// The oracle is the child's own descriptor table, listed by `ls`, never a shell redirection:
+/// a shell answers `>&N` from descriptors of its own (newt-fdguard's `tests/hostile_fds.rs`
+/// says why). The descriptor sits above everything this process holds, so the child opens no
+/// descriptor with its number. Needs a kernel with `close_range` (Linux 5.11), as the confined
+/// spawn does.
+///
+/// ```text
+/// cargo test -p newt-mcp-client --no-default-features --lib -- --ignored --test-threads=1 \
+///   lean_stdio_spawn_does_not_inherit_an_ambient_descriptor
+/// ```
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(not(feature = "confine"))]
+#[tokio::test]
+#[ignore = "real stdio subprocess; Linux and macOS weekly/release lane, single-threaded"]
+async fn lean_stdio_spawn_does_not_inherit_an_ambient_descriptor() {
+    use rustix::io::{fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd, FdFlags};
+    use std::os::fd::AsRawFd;
+
+    let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+    let ambient = fcntl_dupfd_cloexec(null, 100).expect("duplicate above the descriptors held");
+    fcntl_setfd(&ambient, FdFlags::empty()).expect("clear close-on-exec");
+    // The control: the descriptor is inheritable, so a spawn that keeps it passes it on.
+    assert!(
+        fcntl_getfd(&ambient).expect("read the flags").is_empty(),
+        "the descriptor must not be close-on-exec"
+    );
+    let number = ambient.as_raw_fd().to_string();
+    #[cfg(target_os = "linux")]
+    let table = "/proc/self/fd";
+    #[cfg(target_os = "macos")]
+    let table = "/dev/fd";
+    let entry = McpServerEntry {
+        name: "fd-probe".into(),
+        enabled: true,
+        transport: TransportKind::Stdio,
+        command: Some("ls".into()),
+        args: vec![table.into()],
+        env: BTreeMap::new(),
+        url: None,
+        headers: BTreeMap::new(),
+        login_argv: Vec::new(),
+        request_timeout_secs: None,
+        oauth_client_id: None,
+        oauth_scopes: None,
+        oauth_callback_port: None,
+        trust: newt_core::mcp::McpTrust::Trusted,
+        origin: None,
+    };
+    let admitted = newt_core::mcp::admit(&entry).expect("trusted test entry admits");
+    let mut transport = StdioTransport::spawn(&admitted, &Caveats::top()).expect("spawn");
+    let mut listed = Vec::new();
+    while let Some(line) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        transport.stdout.next_line(),
+    )
+    .await
+    .expect("the listing must finish")
+    .expect("listing output")
+    {
+        listed.push(line);
+    }
+    // The oracle reads a real table: stdio, and the directory `ls` itself opened.
+    for stdio in ["0", "1", "2"] {
+        assert!(
+            listed.iter().any(|line| line == stdio),
+            "no descriptor {stdio} in {listed:?}"
+        );
+    }
+    assert!(
+        listed
+            .iter()
+            .any(|line| line.parse::<i32>().is_ok_and(|n| n >= 3)),
+        "no descriptor above stdio in {listed:?}"
+    );
+    assert!(
+        !listed.contains(&number),
+        "descriptor {number}, left open by the parent, reached the advisory child: {listed:?}"
+    );
+}
+
 /// Regression for the agent-bridle 0.8 upgrade: a `net: none` stdio MCP
 /// server — the common/default posture, no `net` allowlist configured — must
 /// still be SPAWNABLE. Before `StdioTransport::spawn` set `child_network:

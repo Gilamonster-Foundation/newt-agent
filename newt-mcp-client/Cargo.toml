@@ -68,5 +68,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # workspace dir + spawn-side-effect marker that grounds the mocked admit() gate.
 tempfile.workspace = true
 
+# `lean_stdio_spawn_does_not_inherit_an_ambient_descriptor` clears close-on-exec on a
+# descriptor it holds. Already newt-core's dependency (Linux, macOS): a safe `fcntl`.
+[target.'cfg(unix)'.dev-dependencies]
+rustix.workspace = true
+
 [lints]
 workspace = true

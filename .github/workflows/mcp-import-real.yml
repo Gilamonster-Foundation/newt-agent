@@ -231,6 +231,20 @@ jobs:
           stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt
           -- --ignored --test-threads=1
 
+      # HOOK PARITY: CI-only; named in the `.githooks/pre-push` CI-only list. #3160: the
+      # advisory stdio spawn a build without `confine` uses, on real children: the
+      # environment scrub, the parent's TZ with the server's override, and the ambient
+      # descriptor the confined spawn would have closed. Not run on Windows: the filter's
+      # tests need `sh` and `ls`, and the Windows spawn is the advisory one in every build.
+      - name: Run stdio MCP confine-off acceptance (#3160)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test lean_stdio_spawn_does_not_inherit_an_ambient_descriptor
+          -p newt-mcp-client --no-default-features --lib env_isolation_tests::
+          -- --ignored --test-threads=1
+
       - name: Run MCP HTTP transport acceptance suite
         shell: bash
         run: >-
