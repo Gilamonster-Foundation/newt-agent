@@ -252,9 +252,9 @@ rustix.workspace = true
 [features]
 default = ["markdown", "confine"]
 # The confinement layer (#3160): every use of agent-bridle in this crate. On
-# by default. Today it gates nothing; each later step of #3160 moves one piece
-# behind it, and the last makes the agent-bridle dependencies optional and
-# lists them here as `dep:` entries. `windows-appcontainer` and
+# by default. Governed Git was the first piece moved behind it; each later step
+# of #3160 moves another, and the last makes the agent-bridle dependencies
+# optional and lists them here as `dep:` entries. `windows-appcontainer` and
 # `macos-seatbelt` are parts of it and list it. Features are additive, so
 # `confine` is off only when newt-core is built on its own with
 # `--no-default-features`: never under `--workspace`, and never beside a crate

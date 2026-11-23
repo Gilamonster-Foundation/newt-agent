@@ -10,9 +10,12 @@
 //! the confined git broker into `git_hardening/build_reads.rs` and
 //! `git_staging/confined.rs` (with its tests), which are not listed. Every other file
 //! under them is listed, test files included, except `git_hardening/commit_view_tests.rs`,
-//! which a later step of #3160 compiles only with `confine`. None of the listed files
-//! under them has named a bridle crate since #3223 moved `git_staging/held_root.rs` and
-//! `git_staging/tool_diagnostics/repair.rs` onto newt-fdguard.
+//! which is compiled only with `confine`. None of the listed files under them has named a
+//! bridle crate since #3223 moved `git_staging/held_root.rs` and
+//! `git_staging/tool_diagnostics/repair.rs` onto newt-fdguard. Governed Git (`native_git`,
+//! the commit broker and `git_staging/confined.rs`) is compiled only with `confine` too; the
+//! step that gated it listed the four files #3235 lifted out of `native_git` and the gh read
+//! tests, the tool catalog, and five test files that gate single broker tests or part of one.
 //!
 //! The list only grows: each later step of #3160 adds the files it frees of bridle, and
 //! the step that makes the bridle dependencies optional deletes this file, because from
@@ -22,6 +25,46 @@
 
 /// The files that name no agent-bridle crate outside a comment, by repository path.
 const BRIDLE_FREE: &[(&str, &str)] = &[
+    (
+        "newt-core/src/agentic/tools/catalog.rs",
+        include_str!("../src/agentic/tools/catalog.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools/git_words.rs",
+        include_str!("../src/agentic/tools/git_words.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools/governed_command.rs",
+        include_str!("../src/agentic/tools/governed_command.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools/publication.rs",
+        include_str!("../src/agentic/tools/publication.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools_tests/command_probe.rs",
+        include_str!("../src/agentic/tools_tests/command_probe.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools_tests/command_shape_contract.rs",
+        include_str!("../src/agentic/tools_tests/command_shape_contract.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools_tests/helper_catalog.rs",
+        include_str!("../src/agentic/tools_tests/helper_catalog.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools_tests/helper_git_shell_grant.rs",
+        include_str!("../src/agentic/tools_tests/helper_git_shell_grant.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools_tests/worktree_adoption_refs.rs",
+        include_str!("../src/agentic/tools_tests/worktree_adoption_refs.rs"),
+    ),
+    (
+        "newt-core/src/agentic/tools_tests/worktree_adoption_sibling.rs",
+        include_str!("../src/agentic/tools_tests/worktree_adoption_sibling.rs"),
+    ),
     (
         "newt-core/src/confined_exec.rs",
         include_str!("../src/confined_exec.rs"),

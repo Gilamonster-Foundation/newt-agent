@@ -3,6 +3,7 @@
 use newt_fdguard::{GrantedRoot, RootIdentity};
 use std::fs::File;
 use std::io;
+#[cfg(feature = "confine")]
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
@@ -53,6 +54,8 @@ impl HeldRoot {
         }
     }
 
+    /// For the confined copy's fence, which only a `confine` build compiles (#3160).
+    #[cfg(feature = "confine")]
     #[cfg(target_os = "linux")]
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         match self {

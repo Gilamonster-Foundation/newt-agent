@@ -897,7 +897,9 @@ fn windows_2776_default_route_and_child_environment() {
     assert!(ShellRoute::Cmd.sentence().contains("cmd.exe /C"));
 }
 
-/// #2796: all provider catalogs carry the publication recipe, whatever the dialect.
+/// #2796: all provider catalogs carry the publication recipe, whatever the dialect,
+/// one space after the sentence before it.
+#[cfg(feature = "confine")]
 #[test]
 fn publish_2796_catalog_guidance() {
     for dialect in ["", "POSIX", "cmd.exe /C"] {
@@ -906,7 +908,28 @@ fn publish_2796_catalog_guidance() {
             dialect,
         );
         let description = defs[0]["function"]["description"].as_str().unwrap();
-        assert!(description.contains("To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials."), "{description}");
+        assert!(description.contains("exit status. To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials. "), "{description}");
+    }
+}
+
+/// #3160: without `confine` there is no publication broker, so the description
+/// does not tell the model there is one.
+#[cfg(not(feature = "confine"))]
+#[test]
+fn confine_off_run_command_description_promises_no_publication_broker() {
+    for dialect in ["", "POSIX", "cmd.exe /C"] {
+        let defs = crate::agentic::tools::catalog::tool_definitions_with_dialect(
+            Default::default(),
+            dialect,
+        );
+        let description = defs[0]["function"]["description"].as_str().unwrap();
+        assert!(
+            description.starts_with(
+                "Run a command in the workspace shell and return its output and exit status. "
+            ) && !description.contains("To publish")
+                && !description.contains("broker"),
+            "{description}"
+        );
     }
 }
 

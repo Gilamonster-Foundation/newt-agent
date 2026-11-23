@@ -1256,6 +1256,15 @@ resolved in a later release:
   confined fetch may read. On Linux the fence anchors on the held
   descriptors (`agent_bridle::HeldReadRoot`), which closes the window;
   `verify_identities` stays as defence in depth.
+- A newt-core built without its `confine` feature (#3160) has none of these
+  brokers and none of their checks: no push, PR-create, gh read, fetch or
+  commit broker, and no preflight refusal, data-loss confirmation or
+  network-read prompt in `run_command`. With OCAP on, the existing no-broker
+  refusal still stops a `git commit` that the lexical check or the shell
+  inspector names, and every other command takes the shell route; with OCAP
+  off and no preset floor that forbids them, they run on the host, as in any
+  build. No released build turns `confine` off: every crate that depends on
+  newt-core takes its default features.
 
 ### Native commit cancellation: lease shutdown is not tree completion (#2686)
 

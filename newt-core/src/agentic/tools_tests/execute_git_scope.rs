@@ -43,6 +43,8 @@ async fn scoped_act_git_discovery_does_not_advertise_legacy_operations() {
         .await
         .expect("legacy fixture has no durable writer")
         .unwrap();
+        // Only a build with `confine` says `git` in the run_command description (#3160).
+        #[cfg(feature = "confine")]
         assert!(out.contains("- run_command —"), "{out}");
         assert!(!out.contains("- git —"), "legacy Git stays internal: {out}");
     }
