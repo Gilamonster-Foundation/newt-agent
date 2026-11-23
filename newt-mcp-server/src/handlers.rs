@@ -1773,7 +1773,8 @@ mod tests {
     #[cfg(not(feature = "confine"))]
     #[tokio::test]
     async fn lean_catalog_omits_the_confined_tools() {
-        let resp = rpc_with_caveats(
+        let resp = rpc_in(
+            std::path::Path::new("/never/read/workspace"),
             Caveats::top(),
             &serde_json::json!({
                 "jsonrpc": "2.0", "id": 70, "method": "tools/list", "params": {}
@@ -1807,7 +1808,8 @@ mod tests {
                 serde_json::json!({ "url": "http://example.invalid/" }),
             ),
         ] {
-            let resp = rpc_with_caveats(
+            let resp = rpc_in(
+                std::path::Path::new("/never/read/workspace"),
                 Caveats::top(),
                 &serde_json::json!({
                     "jsonrpc": "2.0", "id": 71, "method": "tools/call",
