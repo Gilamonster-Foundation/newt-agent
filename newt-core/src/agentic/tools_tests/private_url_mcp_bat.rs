@@ -18,7 +18,7 @@ const REVIEW_TOOL: &str = "review_source__get_review";
 const USER_REVIEW_URL: &str = "https://reviews.example.test/reviews/42";
 // Numeric loopback is the deterministic simulated DNS result for the private
 // review host. `Caveats::top()` intentionally does not opt it into private-IP
-// access, so the real agent-bridle SSRF guard refuses it before any connection.
+// access, so the real SSRF guard (`crate::web_fetch`) refuses it before any connection.
 const PRIVATE_FETCH_TARGET: &str = "http://127.0.0.1/reviews/42";
 const MCP_RESULT: &str = "authenticated review 42 loaded";
 

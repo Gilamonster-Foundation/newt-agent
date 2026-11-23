@@ -120,15 +120,17 @@ uuid.workspace = true
 #  - crossterm — the inline progress the loop prints (tool calls, retries,
 #    trim notices); headless callers run with `color: false`,
 #  - newt-skills — the `use_skill` tool body loader,
-#  - agent-bridle — the Caveats-confined `shell` / `web_fetch` tools that
-#    `execute_tool` routes `run_command` / `web_fetch` through.
+#  - agent-bridle — the Caveats-confined `shell` tool that `execute_tool`
+#    routes `run_command` through (`web_fetch` is newt-core's own module, #3160).
 chrono.workspace = true
 crossterm.workspace = true
 newt-interaction.workspace = true
 newt-policy.workspace = true
 newt-router.workspace = true
 newt-skills.workspace = true
-reqwest.workspace = true
+# `gzip`: `web_fetch` decodes gzip as agent-bridle-tool-web's client does, and that
+# decides whether a body's declared length is refused or its stream is cut (#3160).
+reqwest = { workspace = true, features = ["gzip"] }
 # Already in reqwest's dependency graph; bounded HTTP/1.1 over the gh socket.
 httparse = "1.10.1"
 tokio.workspace = true
@@ -140,7 +142,7 @@ tokio.workspace = true
 # the 0.7.14 release carries BOTH that
 # output-observer API (#1235's need) AND `spawn_tokio` (#254) for the confined
 # stdio-MCP boundary (#1243 Leg 3). `spawn-tokio` = the tokio-native confined
-# spawn newt-mcp-client uses; the rest are the confined shell/web engines.
+# spawn newt-mcp-client uses; the rest are the confined shell engines.
 # 0.7.15 adds `ChildNetworkPolicy::DenyDirect` — the seccomp `socket()`-family
 # egress deny installed on the confining thread, closing the UDP/DNS/raw leg the
 # Landlock TCP-only net rule misses. This is the seam the b1 run_command floor
@@ -149,11 +151,18 @@ tokio.workspace = true
 # spawned children (before it a confined child's whole environment was
 # PWD/SHLVL/_, so a build could not find `cc`, and the seam — HOME, TMPDIR, the
 # passthrough list — never arrived). No `[patch]`: this is the published crate.
-agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
+agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
+# Only `web_fetch_parity_tests` uses it: the tool `web_fetch` is copied from (#3160).
+agent-bridle-tool-web = "0.8.0-rc.7"
 agent-bridle-tool-shell = { version = "0.8.0-rc.7", features = ["brush"] }
 agent-bridle-fdguard = "0.8.0-rc.7"
 # The shell parser behind `shell_inspect` (#3160): the version agent-bridle-tool-shell pins.
 brush-parser = { package = "brush-ocap-parser", version = "=0.5.0-rc.1" }
+# The resolver and the HTML-to-Markdown pair behind `web_fetch` (#3160): the versions
+# agent-bridle-tool-web pins.
+hickory-resolver = "0.26"
+dom_smoothie = "0.17"
+htmd = "0.5"
 tempfile = "3"
 
 # Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,

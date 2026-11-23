@@ -112,9 +112,10 @@ rich-tui = ["dep:tui-textarea", "dep:precedence-ladder", "dep:newtui", "newt-cor
 embedded = ["newt-inference/embedded"]
 
 # NOTE (Step 9.7): the direct agent-bridle dependency moved to newt-core with
-# `execute_tool` — the bridle leash now confines `run_command` / `web_fetch`
-# from inside `newt_core::agentic`. See newt-core/Cargo.toml for the rationale
-# and the stub-shell caveat (reubeno/brush#1184).
+# `execute_tool` — the bridle leash now confines `run_command` from inside
+# `newt_core::agentic`; `web_fetch` is newt-core's own module (#3160). See
+# newt-core/Cargo.toml for the rationale and the stub-shell caveat
+# (reubeno/brush#1184).
 
 # The shared pty harness for the real-resource tier (#1410) — replaces the
 # byte-identical copy `prompt_visibility_test` used to carry. libc-only, no

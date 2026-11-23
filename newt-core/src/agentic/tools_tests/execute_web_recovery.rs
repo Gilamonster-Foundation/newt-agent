@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_fetch::WebFetchError;
 
 struct CatalogOnlyMcp(Vec<serde_json::Value>);
 
@@ -45,7 +46,7 @@ async fn web_fetch_gate_deny_dispatches_under_original_caveats() {
 }
 
 /// Regression for the field report: github.com is outside the default net
-/// scope, so a TUI-provided gate must be consulted before the bridle leash
+/// scope, so a TUI-provided gate must be consulted before the `web_fetch` leash
 /// returns the denial to the model.
 #[tokio::test]
 async fn web_fetch_github_denial_consults_permission_gate() {
@@ -143,7 +144,7 @@ async fn private_address_fetch_failure_routes_to_connected_mcp_first() {
 }
 
 /// HTTP authentication failures are structured successful transports in
-/// agent-bridle. Newt must not feed their login/error body to the model as
+/// `crate::web_fetch`. Newt must not feed their login/error body to the model as
 /// page evidence; both statuses take the same MCP-first route.
 #[test]
 fn unauthorized_fetch_results_route_to_connected_mcp_not_error_body() {
@@ -217,6 +218,25 @@ fn private_address_fetch_without_mcp_keeps_original_failure() {
         PromptDisposition::Act,
     );
     assert_eq!(out, format!("error: {error}"));
+}
+
+/// The fixtures here are written by hand. This is the refusal `crate::web_fetch`
+/// returns for a private address (a documentation-range literal, refused before
+/// any socket opens): `is_private_address_fetch_error` recognizes it, and
+/// `web_fetch_denial_host` does not journal it.
+#[tokio::test]
+async fn web_fetch_ssrf_refusal_takes_the_private_address_route() {
+    let url = "http://192.0.2.1/reviews/42";
+    let caveats = Caveats {
+        net: Scope::All,
+        ..Caveats::top()
+    };
+    let err = crate::web_fetch::fetch(&caveats, serde_json::json!({ "url": url }))
+        .await
+        .expect_err("a documentation-range address is refused");
+    let reason = err.to_string();
+    assert!(is_private_address_fetch_error(&reason), "{reason}");
+    assert_eq!(web_fetch_denial_host(url, &err), None, "{reason}");
 }
 
 #[test]
@@ -556,7 +576,7 @@ async fn web_fetch_allowed_host_appends_nothing() {
     let _out = run_tool_gated(
         "web_fetch",
         // Reserved TEST-NET-1 address (RFC 5737). `net: Scope::All` clears the
-        // net leash's OWN check, but agent-bridle-tool-web's separate SSRF
+        // net leash's OWN check, but `crate::web_fetch`'s separate SSRF
         // screen (`net_guard::screen_host`) still rejects it as a
         // private/loopback-shaped address not opted into via `net_private` —
         // a genuine dispatch failure (`NetGuardError::PrivateAddress`), not a
@@ -592,7 +612,7 @@ async fn web_fetch_allowed_host_appends_nothing() {
 /// `DENIAL_JOURNAL_PATH_ENV` under the SAME lock, so this scenario's
 /// set/dispatch/remove window can't be observed mid-flight by another
 /// thread's denial.
-fn assert_web_fetch_denial_journals(url: &str, err: &agent_bridle::ToolError, want_hosts: &[&str]) {
+fn assert_web_fetch_denial_journals(url: &str, err: &WebFetchError, want_hosts: &[&str]) {
     let _env_lock = crate::process_env::lock();
     let dir = tempfile::TempDir::new().unwrap();
     let journal = dir.path().join("denial-journal.jsonl");
@@ -688,7 +708,7 @@ fn redirect_denial_journals_the_redirect_target_round1_journaled_the_original_ho
     );
     assert_round1_journals(url, &format!("denied: {reason}"), &["a.example.com"]);
 
-    let err = agent_bridle::ToolError::denied(reason);
+    let err = WebFetchError::denied(reason);
     assert_eq!(
         web_fetch_denial_host(url, &err).as_deref(),
         Some("b.example.net"),
@@ -717,7 +737,7 @@ fn malformed_redirect_location_round1_forged_a_phantom_record() {
     );
     assert_round1_journals(url, &format!("denied: {wrapped}"), &["a.example.com"]);
 
-    let err = agent_bridle::ToolError::denied(wrapped);
+    let err = WebFetchError::denied(wrapped);
     assert_eq!(
         web_fetch_denial_host(url, &err),
         None,
@@ -726,23 +746,21 @@ fn malformed_redirect_location_round1_forged_a_phantom_record() {
     assert_web_fetch_denial_journals(url, &err, &[]);
 }
 
-/// #2645 round 3: `ToolError::Denied` isn't the only variant with a
-/// `Display`-visible string — `web_fetch_denial_host` must never even try
-/// `parse_net_denial_host` on anything else, no matter what the text says.
+/// #2645 round 3: `web_fetch_denial_host` must never even try
+/// `parse_net_denial_host` on a variant other than `Denied`. This was
+/// `non_denied_variant_never_journals_even_with_matching_text`, which built
+/// bridle's `ToolError::Other` around the matching text; `WebFetchError` has no
+/// variant with free text outside `Denied` (#3160), so that input cannot be
+/// built. What remains: the two refusals with fixed text never journal.
 #[test]
-fn non_denied_variant_never_journals_even_with_matching_text() {
+fn budget_and_generation_refusals_never_journal() {
     let url = "https://a.example.com/start";
-    // `NotFound`'s Display is fixed ("no such tool: ..."), so construct a
-    // variant whose *message* would satisfy the anchor if the code matched
-    // on text instead of the variant — proving the variant match, not the
-    // text shape, is what gates this.
-    let err = agent_bridle::ToolError::Other(anyhow::anyhow!(
-        "network access to \"b.example.net\" is not within the granted authority"
-    ));
-    assert_eq!(
-        web_fetch_denial_host(url, &err),
-        None,
-        "only the Denied variant is ever inspected"
-    );
-    assert_web_fetch_denial_journals(url, &err, &[]);
+    for err in [WebFetchError::Budget, WebFetchError::Generation] {
+        assert_eq!(
+            web_fetch_denial_host(url, &err),
+            None,
+            "only the Denied variant is ever inspected: {err}"
+        );
+        assert_web_fetch_denial_journals(url, &err, &[]);
+    }
 }

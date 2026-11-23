@@ -75,8 +75,8 @@ execution" via an OS sandbox is the rung above, and it is **not occupied yet**.
   reference monitor in our own process — **not** a kernel fence, and it does
   **not** govern what a spawned subprocess does. Widened by explicit
   `--read`/`--write` grants.
-- **`web_fetch` net leash** (agent-bridle `net` axis): host allow-list + SSRF
-  screen. Real; not bypassed by `--yolo`.
+- **`web_fetch` net leash** (newt-core's `web_fetch` module, a copy of agent-bridle's
+  `net` axis, #3160): host allow-list + SSRF screen. Real; not bypassed by `--yolo`.
 - **Delegated execution** (forge-fetch): the harness holds the token and runs the
   fetch out-of-band (HTTPS-only, no-redirect); the agent holds a request channel,
   never the credential. Genuinely faithful.
