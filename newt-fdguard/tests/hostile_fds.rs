@@ -1,9 +1,10 @@
 // newt-fdguard: tests/hostile_fds.rs of agent-bridle-fdguard 0.8.0-rc.7 (Apache-2.0, Copyright
 // 2026 Shawn Hartsock), for #3160. One edit: its three calls of `deny_inherited_fds` name this
-// crate, `newt_fdguard`, where the original names `agent_bridle_fdguard`. Its prose still says
+// crate, `newt_fdguard`, where the original names `agent_bridle_fdguard`, and each test carries
+// an `#[ignore]` line for the weekly real-resource tier. Its prose still says
 // agent-bridle (`cargo test -p agent-bridle-fdguard` is `cargo test -p newt-fdguard` here).
 // tests/vendor_identity.rs holds it equal to the vendored file with that one edit.
-// ---- end of newt header: below is agent-bridle-fdguard's file, with that one edit ----
+// ---- end of newt header: below is agent-bridle-fdguard's file, with those edits ----
 //! Hostile descriptor-inheritance tests for the confined-spawn guard
 //! (agent-bridle#319 / #352), through the **public** API only.
 //!
@@ -368,6 +369,7 @@ fn temp_file(tag: &str) -> (std::path::PathBuf, std::fs::File) {
 
 /// An ordinary inherited file descriptor.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn an_ambient_file_descriptor_is_closed_in_the_confined_child() {
     let _guard = fd_lock();
     let (path, file) = temp_file("file");
@@ -381,6 +383,7 @@ fn an_ambient_file_descriptor_is_closed_in_the_confined_child() {
 
 /// A socket — a descriptor that is a *network* capability, not a file one.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn an_ambient_socket_descriptor_is_closed_in_the_confined_child() {
     let _guard = fd_lock();
     let (sock, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
@@ -393,6 +396,7 @@ fn an_ambient_socket_descriptor_is_closed_in_the_confined_child() {
 /// A pipe write end — the shape a leaked descriptor takes when a parent forgets
 /// to close the other side of an IPC channel.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn an_ambient_pipe_descriptor_is_closed_in_the_confined_child() {
     let _guard = fd_lock();
     let mut fds: [libc::c_int; 2] = [-1, -1];
@@ -411,6 +415,7 @@ fn an_ambient_pipe_descriptor_is_closed_in_the_confined_child() {
 /// a well-behaved close-on-exec one — the guard must catch the copy, not just
 /// the original.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn a_duplicated_descriptor_is_closed_in_the_confined_child() {
     let _guard = fd_lock();
     let (path, file) = temp_file("dup");
@@ -494,6 +499,7 @@ fn probe_fd_ceiling() -> u64 {
 /// macOS box this puts the descriptor at 61439, one below
 /// `kern.maxfilesperproc`, the highest number `dup2` accepts there.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn a_descriptor_near_the_top_of_the_table_is_closed_in_the_confined_child() {
     let _guard = fd_lock();
     let (path, file) = temp_file("high");
@@ -534,6 +540,7 @@ fn a_descriptor_near_the_top_of_the_table_is_closed_in_the_confined_child() {
 /// (dup2 to 61439 succeeds, 61440 fails `EBADF`), *not* the soft
 /// `RLIMIT_NOFILE` of 1048576 — which is why the guard mins the two.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn the_kernel_refuses_a_descriptor_at_or_above_the_derived_ceiling() {
     let _guard = fd_lock();
     let Ok(ceiling) = RawFd::try_from(kernel_fd_ceiling()) else {
@@ -579,6 +586,7 @@ fn the_kernel_refuses_a_descriptor_at_or_above_the_derived_ceiling() {
 /// stdio is *delegated*, not ambient: fds 0/1/2 must survive the guard, in both
 /// directions. This is the intentional-inheritance half of the invariant.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn delegated_stdio_survives_the_confined_spawn() {
     // The shell here is only an echo: it round-trips bytes through fds 0/1/2.
     // It is never asked whether a descriptor exists — that question goes to
@@ -616,6 +624,7 @@ fn delegated_stdio_survives_the_confined_spawn() {
 /// copy is inheritable) across many guarded spawns, and the child reports on
 /// the whole band of descriptor numbers the churn can reach.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn concurrent_descriptor_creation_never_reaches_the_confined_child() {
     let _guard = fd_lock();
     let (path, file) = temp_file("churn");
@@ -684,6 +693,7 @@ fn concurrent_descriptor_creation_never_reaches_the_confined_child() {
 /// Marking (rather than closing) descriptors is what keeps std's exec-status
 /// pipe alive to carry that error, on both legs.
 #[test]
+#[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
 fn a_missing_confined_program_still_reports_not_found() {
     let mut cmd = Command::new("/nonexistent/agent-bridle-fdguard-hostile-xyzzy");
     cmd.stdout(Stdio::null()).stderr(Stdio::null());

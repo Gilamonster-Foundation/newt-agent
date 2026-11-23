@@ -3,10 +3,11 @@
 // Below the last header line is the published src/lib.rs: lines 1-260 of
 // vendor/agent-bridle-fdguard/src/lib.rs. The Newt patch that follows them there,
 // `duplicate_control_socket`, is not copied: only the vendored agent-bridle-tool-shell calls
-// it. The copied prose still says agent-bridle; it is kept byte for byte.
+// it. The copied prose still says agent-bridle; it is kept byte for byte, except that its one
+// real-resource test carries an `#[ignore]` line for the weekly real-resource tier.
 // tests/vendor_identity.rs holds this copy equal to the vendored file, and
 // tests/bridle_differential.rs compares the two crates while bridle is a dependency.
-// ---- end of newt header: everything below is agent-bridle-fdguard's, byte for byte ----
+// ---- end of newt header: everything below is agent-bridle-fdguard's, except the `#[ignore]` lines ----
 //! Close *ambient* file descriptors on a confined spawn (agent-bridle#319).
 //!
 //! An already-open descriptor is itself an object capability. A confined child
@@ -253,6 +254,7 @@ mod tests {
     /// the error surfaces correctly. This test FAILS on an immediate-close
     /// variant and PASSES with close-on-exec marking.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn deny_inherited_fds_reports_a_missing_program_as_not_found() {
         let mut cmd = Command::new("/nonexistent/agent-bridle-fdguard-missing-xyzzy");
         cmd.stdout(Stdio::null()).stderr(Stdio::null());

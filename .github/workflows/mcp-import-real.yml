@@ -320,6 +320,18 @@ jobs:
           -p newt-tui --features rich-tui --lib cockpit::presenter::tests::a_real_terminal_
           -- --ignored --test-threads=1
 
+      # #3160: newt-fdguard's real-resource tests: the copied agent-bridle-fdguard
+      # suite (real files, descriptors and child processes, #[ignore]d in the
+      # per-PR unit tier) and the differential's grounds against bridle's crate.
+      - name: Run newt-fdguard real-resource tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test an_ambient_file_descriptor_is_closed_in_the_confined_child
+          -p newt-fdguard
+          -- --ignored --test-threads=1
+
       # PR #3108: keep host-wide AppContainer preparation last so the preceding
       # Windows grounds retain their unprepared host and run even if launcher
       # acquisition fails. Use the same bounded preparation as ordinary CI.

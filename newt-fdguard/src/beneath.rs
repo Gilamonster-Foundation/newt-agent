@@ -1,7 +1,8 @@
 // newt-fdguard: src/beneath.rs of agent-bridle-fdguard 0.8.0-rc.7 (Apache-2.0, Copyright 2026
-// Shawn Hartsock), copied unchanged for #3160; its prose still says agent-bridle.
+// Shawn Hartsock), copied for #3160; its prose still says agent-bridle. One change: each test
+// that touches a real filesystem carries an `#[ignore]` line for the weekly real-resource tier.
 // tests/vendor_identity.rs holds it equal to vendor/agent-bridle-fdguard/src/beneath.rs.
-// ---- end of newt header: everything below is agent-bridle-fdguard's, byte for byte ----
+// ---- end of newt header: everything below is agent-bridle-fdguard's, except the `#[ignore]` lines ----
 //! Race-free bounded opens beneath a granted root (agent-bridle#351/#354,
 //! ADR 0026 slice 2).
 //!
@@ -710,6 +711,7 @@ mod tests {
     /// In-scope opens work: create-truncate, append, then read back — all
     /// through one acquired handle.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn in_scope_write_append_read_roundtrip() {
         let root = tmp_root("roundtrip");
         std::fs::create_dir(root.join("sub")).unwrap();
@@ -738,6 +740,7 @@ mod tests {
     /// and the refusal must classify as a resolution refusal (#354 item 6:
     /// enforcement outcome and evidence classification agree).
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn symlink_component_escape_is_refused() {
         let root = tmp_root("swap");
         let outside = tmp_root("swap-outside");
@@ -778,6 +781,7 @@ mod tests {
     /// A symlink as the FINAL component is refused too (Conservative: even one
     /// that resolves in-root — honest callers pass canonical paths).
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn symlink_final_component_is_refused() {
         let root = tmp_root("final");
         std::fs::write(root.join("real.txt"), b"real").unwrap();
@@ -794,6 +798,7 @@ mod tests {
     /// An in-root symlink at an INTERMEDIATE component is refused too — the
     /// Conservative posture is about symlinks per se, not only escapes.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn symlink_intermediate_in_root_is_refused() {
         let root = tmp_root("mid");
         std::fs::create_dir(root.join("realdir")).unwrap();
@@ -810,6 +815,7 @@ mod tests {
 
     /// `..` and absolute components never reach the kernel: refused up front.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn dotdot_and_absolute_rel_are_refused() {
         let root = tmp_root("dotdot");
         let granted = GrantedRoot::acquire(&root).expect("acquire");
@@ -833,6 +839,7 @@ mod tests {
     /// An empty `rel` reads the root directory handle itself; a write open of
     /// the root itself is refused up front on every platform.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn empty_rel_opens_the_root_for_read_and_refuses_write() {
         let root = tmp_root("self");
         let granted = GrantedRoot::acquire(&root).expect("acquire");
@@ -858,6 +865,7 @@ mod tests {
     /// component instead of walking through it. This test FAILS against the
     /// pathname-reopen design and PASSES with symlink-free acquisition.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn ancestor_symlink_swap_at_acquisition_is_refused() {
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -898,6 +906,7 @@ mod tests {
     /// through the handle, while pathname re-resolution (the old failure mode)
     /// is redirected to the imposter.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn ancestor_rename_after_acquisition_does_not_redirect() {
         let base = tmp_root("anc-rename");
         std::fs::create_dir_all(base.join("parent/root")).unwrap();
@@ -944,6 +953,7 @@ mod tests {
     /// can never be redirected into the imposter, while pathname
     /// re-resolution reaches the imposter.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn root_replacement_after_acquisition_fails_closed() {
         let base = tmp_root("root-replace");
         let root_path = base.join("root");
@@ -995,6 +1005,7 @@ mod tests {
     /// Adopting a non-directory descriptor is refused (ENOTDIR): a file fd is
     /// not a root authority.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn from_owned_fd_refuses_a_non_directory() {
         let root = tmp_root("adopt");
         std::fs::write(root.join("f.txt"), b"x").unwrap();
@@ -1008,6 +1019,7 @@ mod tests {
     /// Adopting an already-authoritative directory descriptor works and never
     /// consults the pathname (the provenance is deliberately wrong here).
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn from_owned_fd_adopts_a_directory_without_pathname_authority() {
         let root = tmp_root("adopt-dir");
         std::fs::write(root.join("f.txt"), b"via-fd").unwrap();
@@ -1038,6 +1050,7 @@ mod tests {
     /// PR already had to fix once. Verified natively on Linux and on macOS
     /// 26.5.2 / xnu-12377 arm64.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn o_nofollow_alone_opens_through_an_intermediate_symlink() {
         let root = tmp_root("nofollow-control");
         std::fs::create_dir_all(root.join("real/leaf")).unwrap();
@@ -1122,6 +1135,7 @@ mod tests {
     /// as a path component — classifies as a resolution refusal, so
     /// enforcement outcome and evidence classification agree.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn enotdir_classifies_as_a_resolution_refusal() {
         let root = tmp_root("enotdir");
         std::fs::write(root.join("afile"), b"not a dir").unwrap();
@@ -1158,6 +1172,7 @@ mod tests {
     /// hard failure instead.
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn a_grant_includes_nested_mounts_and_no_xdev_would_refuse_them() {
         // Any parent whose child sits on a different `st_dev` is a mount
         // transition. `/dev` → `/dev/shm` is preferred because it is writable,
@@ -1228,6 +1243,7 @@ mod tests {
     /// Identity and clone semantics: a clone shares the object identity; the
     /// identity survives (is unchanged by) namespace mutation of the pathname.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn identity_is_stable_and_shared_by_clones() {
         let base = tmp_root("identity");
         let root_path = base.join("root");

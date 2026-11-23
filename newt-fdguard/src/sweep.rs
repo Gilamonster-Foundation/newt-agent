@@ -1,7 +1,8 @@
 // newt-fdguard: src/sweep.rs of agent-bridle-fdguard 0.8.0-rc.7 (Apache-2.0, Copyright 2026
-// Shawn Hartsock), copied unchanged for #3160; its prose still says agent-bridle.
+// Shawn Hartsock), copied for #3160; its prose still says agent-bridle. One change: each test
+// that touches real descriptors or a child carries an `#[ignore]` line for the weekly tier.
 // tests/vendor_identity.rs holds it equal to vendor/agent-bridle-fdguard/src/sweep.rs.
-// ---- end of newt header: everything below is agent-bridle-fdguard's, byte for byte ----
+// ---- end of newt header: everything below is agent-bridle-fdguard's, except the `#[ignore]` lines ----
 //! Parent-side planning for the macOS descriptor sweep (agent-bridle#319/#352).
 //!
 //! macOS has no `close_range(2)`, so the confined-spawn guard has to walk the
@@ -464,6 +465,7 @@ mod tests {
     /// The enumeration leg actually sees a descriptor placed near the top of the
     /// table — it is not silently reporting only the low, dense range.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn the_enumeration_leg_sees_a_descriptor_high_in_the_table() {
         let _guard = fd_lock();
         let Some(target) = owned_slot_above_table(64) else {
@@ -501,6 +503,7 @@ mod tests {
     /// the OS probes alone. Regression for agent-bridle#352: an unsupported
     /// descriptor universe must not fall back to "spawn anyway".
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn a_refused_plan_fails_the_spawn_and_the_program_never_runs() {
         let marker = std::env::temp_dir().join(format!(
             "fdguard-refusal-{}-{}",
@@ -546,6 +549,7 @@ mod tests {
     /// `tests/hostile_fds.rs` for why a shell cannot be trusted with this
     /// question on Darwin.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn a_truncated_sweep_bound_leaks_a_descriptor_the_honest_bound_closes() {
         let _guard = fd_lock();
         let Some(target) = owned_slot_above_table(32) else {
@@ -591,6 +595,7 @@ mod tests {
     /// [`plan_sweep_bound`], dispatched by [`install`] (the production path),
     /// and the spawn must fail rather than sweep what fits.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn a_required_range_wider_than_the_supported_range_refuses_the_spawn() {
         let plan = plan_sweep_bound(Some(SWEEP_CAP + 1), highest_open_fd())
             .map(|bound| libc::c_int::try_from(bound).unwrap());
@@ -614,6 +619,7 @@ mod tests {
     /// limit. Uses the real `/dev/fd` enumeration with a synthetic (lowered)
     /// allocation limit, so no process-wide `setrlimit` is needed.
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn a_lowered_allocation_limit_never_shrinks_the_bound_below_the_open_table() {
         let _guard = fd_lock();
         let Some(target) = owned_slot_above_table(16) else {
@@ -654,6 +660,7 @@ mod tests {
     /// clamp on exactly the configuration that would otherwise pass vacuously.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "real-resource: weekly/release tier; real files, descriptors or child processes"]
     fn the_planned_bound_tracks_the_kernel_ceiling_rather_than_a_constant() {
         let _guard = fd_lock();
         let maxfiles = max_files_per_proc().expect("kern.maxfilesperproc must be readable");

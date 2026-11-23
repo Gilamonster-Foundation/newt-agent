@@ -74,6 +74,9 @@
 #     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
 #     needs the macOS kernel and a non-root caller).
+#   - newt-fdguard's real-resource tests, mcp-import-real.yml (weekly + release,
+#     Linux/macOS, #3160): the copied agent-bridle-fdguard suite, #[ignore]d in
+#     the unit tier, and bridle_differential.rs's grounds, --ignored --test-threads=1.
 #   - patch read/write symlink containment, mcp-import-real.yml (weekly +
 #     release, Linux/macOS): newt-tools patch::tests::{apply_whole_files,
 #     read_contained_opt,fuzzy_patch,diffy_patch}_denies_symlink_escape_object_bound,
