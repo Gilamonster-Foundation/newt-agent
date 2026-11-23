@@ -241,16 +241,23 @@ check:
     # ownership underneath them.
     cargo test -p newt-agent --no-default-features || rc=1
     cargo test -p newt-tui || rc=1
-    # PIPELINE PARITY: mirrors the "clippy (newt-core lean tier, no default
-    # features)" step in ci.yml's lean job. #1890 — the lean `-p newt-agent`
+    # PIPELINE PARITY: mirrors the "clippy (newt-core lean tier, markdown off)"
+    # step in ci.yml's lean job. #1890 — the lean `-p newt-agent`
     # line above is clean and always was, so newt-core's OWN lean config had no
     # gate and had stopped COMPILING (an unresolved `markup::spans` import, not
     # a lint). The wyvern tier depends on this configuration; it is why
     # `markup::plain` and `markup::table` are unconditional. Clippy only — see
     # the ci.yml step's comment: the lean tests are the same ungated tests the
     # workspace run already covers, and they include a real-file-lock test
-    # (dock_registry) seen failing under load.
-    cargo clippy -p newt-core --no-default-features --all-targets -- -D warnings || rc=1
+    # (dock_registry) seen failing under load. `confine` is a default feature
+    # too (#3160), so the line names it: it stays the markdown-off gate.
+    cargo clippy -p newt-core --no-default-features --features confine --all-targets -- -D warnings || rc=1
+    # PIPELINE PARITY: mirrors the "clippy (newt-core, confine off)" step in
+    # ci.yml's lean job (#3160): every default feature but `confine`. `-p
+    # newt-core` alone: features are additive, so `--workspace`, or a second
+    # crate that takes newt-core's defaults, turns `confine` back on. The probe
+    # that follows that step in CI is not repeated here.
+    cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings || rc=1
     # PIPELINE PARITY: the "vendor crossterm regression gate (newt #2644)" ci.yml step.
     just check-vendor-crossterm || rc=1
     # PIPELINE PARITY: mirrors the "test (newt-interaction, inward protocol
