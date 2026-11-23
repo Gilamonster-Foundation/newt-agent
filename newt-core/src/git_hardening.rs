@@ -3628,7 +3628,9 @@ mod governed_push_config_tests {
     }
 }
 
-/// [`commit_invocation_caveats`] reads only the session it is given; no git runs.
+/// The early return of [`commit_invocation_caveats`]: a session scoped elsewhere comes
+/// back as it is, before the workspace is read, so no git runs here. The full-access path
+/// reads the workspace and runs git, and its tests live in `own_gitdir_grant_tests`.
 #[cfg(test)]
 mod commit_invocation_caveats_tests {
     use super::*;
