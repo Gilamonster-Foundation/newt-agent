@@ -4732,8 +4732,8 @@ version = "0.8.6"
 dependencies = [
  "age",
  "agent-bridle",
- "agent-bridle-fdguard",
  "agent-bridle-tool-shell",
+ "agent-bridle-tool-web",
  "agent-mesh-protocol 0.7.1",
  "agent-toolchain",
  "anyhow",
@@ -4745,6 +4745,7 @@ dependencies = [
  "content-addressable",
  "crossterm",
  "diffy",
+ "dom_smoothie",
  "dunce",
  "ed25519-dalek",
  "futures-util",
@@ -4752,11 +4753,14 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "grit-lib",
+ "hickory-resolver",
+ "htmd",
  "http",
  "httparse",
  "ignore",
  "libc",
  "markdown-table-formatter",
+ "newt-fdguard",
  "newt-harness",
  "newt-interaction",
  "newt-policy",
@@ -4843,6 +4847,14 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "wiremock",
+]
+
+[[package]]
+name = "newt-fdguard"
+version = "0.8.6"
+dependencies = [
+ "agent-bridle-fdguard",
+ "libc",
 ]
 
 [[package]]

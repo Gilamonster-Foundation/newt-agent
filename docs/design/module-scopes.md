@@ -1,6 +1,6 @@
 # Feature Proposal: Module Scopes (principal + context for a running agent)
 
-> **Status:** Draft — proposal, not normative · **Owner:** hartsock · **Last review:** 2026-08-16 · **Builds on:** [ocap_confinement_model.md](../decisions/ocap_confinement_model.md), [agentic_object_capability_security.md](../decisions/agentic_object_capability_security.md), [agent_bridle_publishing.md](../decisions/agent_bridle_publishing.md), [1528b3-cid-spill-identity.md](../decisions/1528b3-cid-spill-identity.md), `newt-identity`, `newt_core::caveats`, `agent-bridle-core` (`Registry`, `Gate`, `Tool::required`, `ToolContext`) · **Supersedes/Superseded by:** —
+> **Status:** Draft — proposal, not normative · **Owner:** hartsock · **Last review:** 2026-08-16 · **Builds on:** [ocap_confinement_model.md](../decisions/ocap_confinement_model.md), [agentic_object_capability_security.md](../decisions/agentic_object_capability_security.md), [agent_bridle_publishing.md](../decisions/agent_bridle_publishing.md), [1528b3-cid-spill-identity.md](../decisions/1528b3-cid-spill-identity.md), `newt-identity`, `newt_policy::caveats`, `agent-bridle-core` (`Registry`, `Gate`, `Tool::required`, `ToolContext`) · **Supersedes/Superseded by:** —
 
 Tracking: [#1737](https://github.com/Gilamonster-Foundation/newt-agent/issues/1737) (A3 — Kit = package / provenance; Module = principal + Grant,
 under the [#1734](https://github.com/Gilamonster-Foundation/newt-agent/issues/1734) companion train);
@@ -53,9 +53,9 @@ Module
 ```
 
 **Crate placement.** `Module`, `ScopedKitView`, `ResourceBudget` and `Mailbox` live in **`newt-core`**
-(`newt_core::module`), beside every reuse target below (`caveats`, `SteeringInbox`,
-`SessionRegistry` / `OutputSink`, `DockRegistry`, `metrics::TokenUsage`, the widened `newt_core::kit`
-catalog). `newt-identity` depends on `newt-core` (`newt-identity/Cargo.toml`), so newt-core cannot call
+(`newt_core::module`), beside every reuse target below but `caveats`, which `newt-policy` holds
+(#3160): `SteeringInbox`, `SessionRegistry` / `OutputSink`, `DockRegistry`, `metrics::TokenUsage`,
+the widened `newt_core::kit` catalog. `newt-identity` depends on `newt-core` (`newt-identity/Cargo.toml`), so newt-core cannot call
 `newt_identity::attenuate` / `enforced_caveats` by name — but both are one-line wrappers over
 agent-mesh-protocol calls newt-core already has (`AgentKey::delegate(meta)` and
 `key.cert().verify()` + clone; newt-core depends on `agent-mesh-protocol` directly). The first Module
@@ -432,7 +432,7 @@ the matrix root's Grant (the operating key's caveats) is the ceiling.
 ## Dependencies and acceptance
 
 ```
-Bridle authority (Gate, granted Caveats, meet, ToolContext)   ── exists (agent-bridle-core, newt-core caveats)
+Bridle authority (Gate, granted Caveats, meet, ToolContext)   ── exists (agent-bridle-core, newt-policy caveats)
         │
         ├─▶ Kit = package / interface / provenance   (kit-system.md, #1737)
         └─▶ Module = principal / context (this doc, #1737; lineage #739)
@@ -453,7 +453,7 @@ Acceptance criteria for a first Module PR (no schedule; ship when green):
    refusal.
 3. `ScopedKitView::visible()` is a pure function of `(selection data, grant)`: it never calls the
    Gate, never charges a call, yields no `dyn Tool` or handle, and each listed `effective` equals
-   `grant.meet(&export.required.bridle)` — which for `shell` / `web_fetch` equals
+   `grant.meet(&export.required.bridle)` — which for `shell` equals
    `grant.meet(&tool.required())` (property test; a spy Gate asserts zero `authorize` calls during
    enumeration).
 4. Resource-budget exhaustion (tokens / memory / concurrency) produces `Ready → Draining` and an
@@ -481,7 +481,7 @@ Unit tier fully mocked (`mockall` for `CrewRunner`/hooks/Gate, in-memory registr
 
 | Concept here | Widen this, don't fork |
 |---|---|
-| Grant, `meet`, `leq`, call budget | `newt_core::caveats::Caveats` (agent-mesh-protocol), Bridle `Gate` (`with_budget`, `charge_one`, `ToolContext::check_*`) — one Gate per module |
+| Grant, `meet`, `leq`, call budget | `newt_policy::caveats::Caveats` (agent-mesh-protocol), Bridle `Gate` (`with_budget`, `charge_one`, `ToolContext::check_*`) — one Gate per module |
 | Child attenuation, host clamp | `CrewRunner::crew_clamp()` (`caveats.meet(crew_clamp)`, #739), `newt_identity::attenuate` / `enforced_caveats` (lifted into `newt-core`, re-exported by `newt-identity`) |
 | Root widening / operating mode | `PermissionGate` + `widen_caveats` (upstream of the Gate), `OperatingModeControl` |
 | Kit selection per role | `RoleProfile`, `Loadout.kit` + `[bundles.*]`, `newt_core::kit`, `ExposureProfile` |

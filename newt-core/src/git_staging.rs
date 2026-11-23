@@ -380,7 +380,7 @@ fn effective_uid() -> u32 {
 mod held_root;
 
 /// The session's read roots, bound ONCE per broker call as held file or directory
-/// handles (INV-BENEATH, `agent-bridle-fdguard/src/beneath.rs`): the handle
+/// handles (INV-BENEATH, `newt-fdguard/src/beneath.rs`): the handle
 /// is the authority, the canonical path is its provenance. Every planning
 /// read opens beneath a held handle, and the confined copy's roots are
 /// admitted only after each handle's identity is re-verified against the
@@ -484,7 +484,7 @@ impl HeldRoots {
         match self.handles[idx].open_read(&beneath) {
             Ok(file) => Ok(Some(file)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) if agent_bridle_fdguard::is_resolution_refusal(&e) => Err(format!(
+            Err(e) if newt_fdguard::is_resolution_refusal(&e) => Err(format!(
                 "refused: '{}/{}' contains a symlink; planning reads must not follow symlinks",
                 anchor.display(),
                 rel.display()

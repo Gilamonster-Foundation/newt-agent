@@ -497,6 +497,7 @@ jobs:
           - agent-toolchain
           - newt-carried-tools
           - newt-data
+          - newt-fdguard
           - newt-interaction
           - newt-launch
           - newt-policy

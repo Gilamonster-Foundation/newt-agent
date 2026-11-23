@@ -256,14 +256,14 @@ impl Drop for Base {
     }
 }
 
-/// Held filesystem identity, using existing Bridle Unix capabilities and the
+/// Held filesystem identity, using the newt-fdguard Unix capabilities and the
 /// already-used same-file Windows handle. Windows handles deny delete-sharing
 /// for every ancestor except the known owned base, whose own held handle
 /// retains that protection while descendants share its DELETE access.
 struct Directory {
     path: PathBuf,
     #[cfg(unix)]
-    root: agent_bridle_fdguard::GrantedRoot,
+    root: newt_fdguard::GrantedRoot,
     #[cfg(windows)]
     ancestors: Vec<same_file::Handle>,
     /// Path whose held handle owns DELETE access without DELETE sharing. A
@@ -294,7 +294,7 @@ impl Directory {
             return Err(refused("build scratch path is not canonical"));
         }
         #[cfg(unix)]
-        let root = agent_bridle_fdguard::GrantedRoot::acquire(path)?;
+        let root = newt_fdguard::GrantedRoot::acquire(path)?;
         #[cfg(windows)]
         let ancestors = {
             use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -436,7 +436,7 @@ impl Directory {
             )
             .map_err(io::Error::from)?;
             let child = Self {
-                root: agent_bridle_fdguard::GrantedRoot::from_owned_fd(fd, &path)?,
+                root: newt_fdguard::GrantedRoot::from_owned_fd(fd, &path)?,
                 path,
             };
             child.check()?;
