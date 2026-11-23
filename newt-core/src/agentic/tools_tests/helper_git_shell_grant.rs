@@ -1002,6 +1002,7 @@ impl crate::agentic::git_tool::GitTool for FixtureGitTool {
 /// axis `Unknown` and admission refuses L3 BOUND (`ExecOutcome::Denied`)
 /// before any git runs, which is the posture `newt-cli`'s cfg(macos) probe
 /// and doctor tests already pin.
+#[cfg(feature = "confine")]
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_failure_not_passed() {
@@ -1086,6 +1087,7 @@ async fn an_orphan_detached_commit_through_the_full_dispatch_reports_a_typed_fai
 }
 
 /// Like [`real_git`], but returns trimmed stdout.
+#[cfg(feature = "confine")]
 #[cfg(target_os = "linux")]
 fn real_git_output(dir: &std::path::Path, args: &[&str]) -> String {
     let home = tempfile::tempdir().unwrap();

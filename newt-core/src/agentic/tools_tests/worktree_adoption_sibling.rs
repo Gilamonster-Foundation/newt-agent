@@ -233,36 +233,40 @@ async fn plan_release_preserves_worktree_adoption() {
         );
         assert!(root.join(".git/worktrees/task/index").is_file());
         // The same bounded-read exact-approval path must reach the governed
-        // commit broker, not merely write the task's index.
-        let original_ref = std::fs::read(root.join(".git/refs/heads/main")).unwrap();
-        let original_index = std::fs::read(root.join(".git/index")).unwrap();
-        let config = std::fs::read(root.join(".git/config")).unwrap();
-        let (text, outcome) = super::refs_tests::run(
-            "git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m changed",
-            &target,
-            &root,
-            &base,
-            &session,
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            Some(ExecOutcome::Passed),
-            "governed commit: {text}"
-        );
-        assert_ne!(
-            std::fs::read(root.join(".git/refs/heads/task")).unwrap(),
-            original_ref
-        );
-        assert_eq!(
-            std::fs::read(root.join(".git/refs/heads/main")).unwrap(),
-            original_ref
-        );
-        assert_eq!(
-            std::fs::read(root.join(".git/index")).unwrap(),
-            original_index
-        );
-        assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), config);
+        // commit broker, not merely write the task's index. Only a `confine`
+        // build has the commit broker (#3160).
+        #[cfg(feature = "confine")]
+        {
+            let original_ref = std::fs::read(root.join(".git/refs/heads/main")).unwrap();
+            let original_index = std::fs::read(root.join(".git/index")).unwrap();
+            let config = std::fs::read(root.join(".git/config")).unwrap();
+            let (text, outcome) = super::refs_tests::run(
+                "git -c user.name=Fixture -c user.email=fixture@example.invalid commit -m changed",
+                &target,
+                &root,
+                &base,
+                &session,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                Some(ExecOutcome::Passed),
+                "governed commit: {text}"
+            );
+            assert_ne!(
+                std::fs::read(root.join(".git/refs/heads/task")).unwrap(),
+                original_ref
+            );
+            assert_eq!(
+                std::fs::read(root.join(".git/refs/heads/main")).unwrap(),
+                original_ref
+            );
+            assert_eq!(
+                std::fs::read(root.join(".git/index")).unwrap(),
+                original_index
+            );
+            assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), config);
+        }
 
         // A new planning phase after adoption must not lose
         // the task root or its projected authority on operator approval.

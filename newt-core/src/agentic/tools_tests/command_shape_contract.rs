@@ -618,6 +618,8 @@ rows! {
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+// The commit broker answers; without `confine` there is none (#3160).
+#[cfg(feature = "confine")]
 confined_task_commit, Confined, Adopted, "git commit -m contract", Some(Passed), Task, true, false, "", None, "";
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
@@ -658,9 +660,11 @@ plain_which_gh, Plain, Fresh, "which gh", Some(Passed), Original, false, false, 
 confined_build, Confined, Restricted, "cd ../task && cargo check 2>&1 | tail -5", Some(Denied), Task, true, true, "capability denied", Some(DenialKind::Build), "";
 plain_build, Plain, Restricted, "cd ../task && cargo check 2>&1 | tail -5", Some(Denied), Task, true, true, "", Some(DenialKind::Exec), "";
 #[cfg(unix)]
+#[cfg(feature = "confine")]
 broker_push, Confined, Restricted, "git push origin", None, Task, true, true, "failed(refused_by_harness)", None, "";
 plain_push, Plain, Publish, "git push origin", Some(Passed), Task, true, false, "task", None, "";
 #[cfg(unix)]
+#[cfg(feature = "confine")]
 broker_pr, Confined, Restricted, "gh pr create --base main --head task --title contract --body contract", None, Task, true, true, "failed(refused_by_harness)", None, "";
 plain_pr, Plain, Bound, "gh pr create --base main --head task --title contract --body contract", Some(Failed), Task, true, false, "Unrecognized option", None, "";
 missing_cwd, Plain, Bound, "cd missing && git status", Some(Unavailable), Neither, true, false, "does not exist", None, "";
@@ -718,8 +722,10 @@ readonly_git_alias_refused, Confined, Fresh, "git worktree add -b task ../task &
 confined_missing_b, Confined, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 nested_plain, Plain, Fresh, "git worktree add -b task .worktrees/task", Some(Passed), Original, true, false, "", None, "";
 #[cfg(windows)]
+#[cfg(feature = "confine")]
 broker_push, Confined, Restricted, "git push origin", None, Task, true, true, "not available under Windows", None, "";
 #[cfg(windows)]
+#[cfg(feature = "confine")]
 broker_pr, Confined, Restricted, "gh pr create --base main --head task --title contract --body contract", None, Task, true, true, "not available under Windows", None, "";
 
 }

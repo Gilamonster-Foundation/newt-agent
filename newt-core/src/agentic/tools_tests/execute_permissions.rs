@@ -2555,6 +2555,7 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
 /// `request_permissions`/`PendingRerun` replay in `tools.rs`, which still
 /// excludes every commit-broker command (`commit_broker_used`) regardless of
 /// whether the interactive gate above was consulted.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 async fn broker_bearing_commit_denial_now_consults_the_gate() {
@@ -2725,6 +2726,86 @@ async fn a_commit_in_a_command_the_inspector_cannot_read_is_refused_before_anyth
         );
         assert!(gate.asks.is_empty(), "{command}: {:?}", gate.asks);
     }
+}
+
+/// #3160: one `run_command` through the production dispatcher with OCAP on, and how
+/// many times it reached the shell route, which the probe stands in for. The workspace
+/// is virtual: no repository, process or network is involved.
+async fn shell_route_count(
+    command: &str,
+    git_tool: Option<&dyn crate::agentic::git_tool::GitTool>,
+) -> (String, usize) {
+    let _env = crate::process_env::lock();
+    let _ocap_on = crate::launch_authority::ScopedAuthority::new(false, false);
+    let caveats = Caveats {
+        fs_write: Scope::only(["/virtual-workspace".into()]),
+        ..Caveats::top()
+    };
+    let probe = crate::agentic::tools::command_probe::Probe::default();
+    let mut gate = MockGate::new(false, &caveats);
+    let mut display = ToolDisplay::new(Vec::<u8>::new(), false, 80, 20, false);
+    let result = execute_tool_inner(
+        &mut display,
+        "run_command",
+        &serde_json::json!({ "command": command }),
+        "/virtual-workspace",
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        ToolCollaborators {
+            command_probe: Some(&probe),
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            git_tool,
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    let reached = probe.confined.load(std::sync::atomic::Ordering::SeqCst);
+    (result, reached)
+}
+
+/// #3160: with `confine` the push and PR-create brokers take a standalone `git push`
+/// and `gh pr create` before the shell route. Each command is one the broker refuses
+/// from its argv alone, so the counter, not the broker's answer, is the assertion.
+#[cfg(feature = "confine")]
+#[tokio::test]
+async fn confine_on_push_and_pr_create_never_reach_the_shell_route() {
+    for command in ["git push --force origin", "gh pr create --web"] {
+        let (result, reached) = shell_route_count(command, None).await;
+        assert_eq!(reached, 0, "{command}: {result}");
+    }
+}
+
+/// #3160: without `confine` no broker is compiled, so the same commands take the
+/// shell route, as they do when the session asserts OCAP off.
+#[cfg(not(feature = "confine"))]
+#[tokio::test]
+async fn confine_off_push_and_pr_create_reach_the_shell_route() {
+    for command in ["git push --force origin", "gh pr create --web"] {
+        let (result, reached) = shell_route_count(command, None).await;
+        assert_eq!(reached, 1, "{command}: {result}");
+    }
+}
+
+/// #3160: without `confine` there is no commit broker, so a commit that would get one
+/// is refused with the existing no-broker text before the shell route, even with a
+/// commit policy at hand.
+#[cfg(all(unix, not(feature = "confine")))]
+#[tokio::test]
+async fn confine_off_commit_is_refused_by_the_existing_no_broker_text() {
+    let git_tool = crate::agentic::tools::tests::git_shell_grant::FixtureGitTool;
+    let (result, reached) =
+        shell_route_count("git commit --allow-empty -m x", Some(&git_tool)).await;
+    assert!(
+        result.contains("refusing Git commit publication")
+            && result.contains("native commit attribution/signing policy is unavailable")
+            && result.contains("No command ran"),
+        "{result}"
+    );
+    assert_eq!(reached, 0, "{result}");
 }
 
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.

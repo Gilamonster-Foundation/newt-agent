@@ -46,7 +46,9 @@ pub(super) async fn run(
 
 /// #2748: grounds the positive-scope model in real worktree add, checkout -b,
 /// and commit. New refs/reflogs must work while original files/HEAD/index and
-/// its checked-out branch remain unchanged, including packed branch refs.
+/// its checked-out branch remain unchanged, including packed branch refs. The
+/// commits go through the commit broker, which only a `confine` build has (#3160).
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     let _env = crate::process_env::lock();
