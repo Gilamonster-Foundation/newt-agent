@@ -29,8 +29,8 @@ const FORBIDDEN: &[&str] = &["agent_bridle", "agent-bridle"];
 /// not end in `\`. Then no string or block comment opens before the `//` or ends on the
 /// line, and the line does not continue a string, so the cut text is a comment or the
 /// text of a string that opened on an earlier line and holds a raw line break. A path in
-/// `#[path]` or `include!` holds one only if a file name does. Beyond that the scan can
-/// only over-report: it reads a `/* */` comment, and a `//` comment on a line that holds
+/// `#[path]` or `include!` holds one only if a file name does. Beyond that the cut errs
+/// only toward reporting: it reads a `/* */` comment, and a `//` comment on a line that holds
 /// a `"` or `*/` or ends in `\`, as code.
 fn code_part(line: &str) -> &str {
     match line.find("//") {
@@ -46,7 +46,10 @@ fn code_part(line: &str) -> &str {
     }
 }
 
-/// The numbers of the lines of `src` that name an agent-bridle crate outside a comment.
+/// The numbers of the lines of `src` that name an agent-bridle crate outside a comment. A
+/// name counts when one line spells it whole, so one split by a `\` continuation, written
+/// with an escape or built with `concat!` is not seen; each of those is deliberate, and
+/// the compiler is the proof once the bridle dependencies are optional.
 fn naming_bridle(src: &str) -> Vec<usize> {
     src.lines()
         .enumerate()
