@@ -90,6 +90,29 @@ jobs:
               -- --ignored --test-threads=1
           done
 
+      # The macOS Seatbelt adversarial suite, behind newt-core's macos-seatbelt
+      # feature: real sandbox-exec admission, network and filesystem denial.
+      # No lane ran it, and one of its tests went stale unseen after #2730.
+      - name: Run macOS Seatbelt adversarial suite
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test seatbelt_build_with_a_host_list_runs_without_network
+          -p newt-core --features macos-seatbelt --test macos_seatbelt_adversarial
+          -- --ignored --test-threads=1
+
+      # #2730's own macOS ground: a host-scoped session's build child runs
+      # under Seatbelt. No lane selected it.
+      - name: "Run #2730's host-scoped build ground"
+        if: runner.os == 'macOS'
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test host_scoped_build_child_runs_cargo_version
+          -p newt-core --features macos-seatbelt --test build_network_macos
+          -- --ignored --test-threads=1
+
       # #3195's third pack ground, under the real macOS kernel sandbox: with a
       # bare `tail` grant, the gate keeps an unpinned pack off the PATH so the
       # host's `tail` runs, and a pinned pack's `tail` runs.
