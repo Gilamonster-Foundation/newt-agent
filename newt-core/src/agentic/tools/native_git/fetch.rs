@@ -26,7 +26,7 @@
 //! or remote it does not handle: a flag it does not model, a local-path
 //! remote, a session that cannot write the repository.
 
-use super::push_command::GovernedCommand;
+use super::super::governed_command::GovernedCommand;
 use super::{ensure_net_granted, invocation, is_git, PermissionGate};
 use crate::git_staging as staging;
 use agent_mesh_protocol::caveats::Scope;

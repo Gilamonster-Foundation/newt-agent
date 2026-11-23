@@ -66,6 +66,7 @@ pub(crate) use path_suggest::resolve_tool_path;
 use path_suggest::{artifact_locator, FileIoError};
 pub(crate) mod exposure;
 mod git_words;
+mod governed_command;
 mod grep_tool;
 mod live_output;
 mod native_git;

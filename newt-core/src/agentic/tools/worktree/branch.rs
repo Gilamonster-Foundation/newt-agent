@@ -1,6 +1,6 @@
 //! #2748: exact new-branch commands use bounded native writes, never broad
 //! refs-directory grants to a shell. All other commands retain the fence.
-use super::super::{native_git::push_command::GovernedCommand, shell, PermissionRequest};
+use super::super::{governed_command::GovernedCommand, shell, PermissionRequest};
 use crate::{worktree_adoption::AdoptedWorktree, Caveats, ExecOutcome};
 use newt_policy::caveats::CaveatsExt;
 use std::path::Path;

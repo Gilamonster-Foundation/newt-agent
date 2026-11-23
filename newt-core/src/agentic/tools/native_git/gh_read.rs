@@ -1,6 +1,9 @@
 //! Host-side gh reads. Shares PR-create's source-bound parser, gate, trusted
 //! executables and private staging directory; never executes model shell text.
-use super::*;
+use super::{
+    ensure_net_granted, inspect_shell, is_gh, literal, Caveats, CaveatsExt, GovernedCommand, Path,
+    PermissionGate, ShellInspection,
+};
 use crate::git_staging as staging;
 
 pub(in crate::agentic::tools) struct ReadOutcome {
@@ -177,7 +180,7 @@ pub(in crate::agentic::tools) fn execute(
     gate: &mut Option<&mut dyn PermissionGate>,
     #[cfg(test)] probe: Option<&super::super::gh_read_tests::Probe>,
 ) -> String {
-    let command = match push_command::GovernedCommand::parse(source) {
+    let command = match GovernedCommand::parse(source) {
         Ok(command) => command,
         Err(reason) => return format!("refused: {reason}"),
     };

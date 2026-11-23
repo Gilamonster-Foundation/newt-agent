@@ -6,13 +6,13 @@ pub(super) mod fetch;
 #[cfg(unix)]
 mod gh_http;
 pub(super) mod gh_read;
-pub(super) mod push_command;
 mod push_failure;
 use push_failure::classify_failure;
 
 use super::git_words::{
     bare_git_invocations, git_verb_in, invocation, is_gh, is_git, literal, unresolved,
 };
+use super::governed_command::GovernedCommand;
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::git_caveats::GitCaveats;
 use crate::shell_inspect::{inspect_shell, ShellInspection};
@@ -363,16 +363,16 @@ pub(super) fn execute_governed_push(
     observed: Option<&std::sync::OnceLock<crate::git_staging::Outcome>>,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
-        return format!("{unavailable}. {}", push_command::RETRY);
+        return format!("{unavailable}. {PUSH_RETRY}");
     }
-    let command = match push_command::GovernedCommand::parse(source) {
+    let command = match GovernedCommand::parse(source) {
         Ok(command) => command,
-        Err(reason) => return format!("refused: {reason}. {}", push_command::RETRY),
+        Err(reason) => return format!("refused: {reason}. {PUSH_RETRY}"),
     };
     // These parser errors contain only harness-authored text, never config or
     // child diagnostics. Do not collapse an actionable syntax error into F6.
     if let Err(reason) = parse_governed_push(&command.argv) {
-        return format!("{reason}. {}", push_command::RETRY);
+        return format!("{reason}. {PUSH_RETRY}");
     }
     // The read roots are bound ONCE, before planning, and the same held
     // handles serve planning reads and the confined copy's admission.
@@ -384,13 +384,13 @@ pub(super) fn execute_governed_push(
     if let (Some(slot), Ok(outcome)) = (observed, &result) {
         let _ = slot.set(outcome.clone());
     }
-    render_governed_result(&command, result, push_command::RETRY)
+    render_governed_result(&command, result, PUSH_RETRY)
 }
 
 /// Only harness-authored reasons cross the fixed-form boundary; raw config
 /// and child diagnostics remain private for both governed publication paths.
 fn render_governed_result(
-    command: &push_command::GovernedCommand,
+    command: &GovernedCommand,
     result: Result<crate::git_staging::Outcome, crate::git_staging::Refusal>,
     retry: &str,
 ) -> String {
@@ -474,7 +474,7 @@ fn plan_governed_push(
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
 
-    let command = push_command::GovernedCommand::parse(source).map_err(str::to_owned)?;
+    let command = GovernedCommand::parse(source).map_err(str::to_owned)?;
     let request = parse_governed_push(&command.argv)?;
 
     // Finding 6 (issue-1188 review #2641): the broker runs outside the
@@ -685,6 +685,8 @@ struct GovernedPrCreate {
     requested_head: Option<String>,
 }
 
+const PUSH_RETRY: &str = "Retry with run_command using the worktree as cwd and command `git push origin` (or `git push --dry-run origin` for a dry run).";
+
 const PR_CREATE_RETRY: &str = "Retry with run_command using the worktree as cwd and command `gh pr create --base <default-branch> --head <current-branch> --title '<title>' --body '<body>'`.";
 
 fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, &'static str> {
@@ -759,7 +761,7 @@ pub(super) fn execute_governed_pr_create(
     if let Err(unavailable) = broker_available(caveats) {
         return format!("{unavailable}. {PR_CREATE_RETRY}");
     }
-    let command = match push_command::GovernedCommand::parse(source) {
+    let command = match GovernedCommand::parse(source) {
         Ok(command) => command,
         Err(reason) => return format!("refused: {reason}. {PR_CREATE_RETRY}"),
     };
@@ -853,7 +855,7 @@ fn plan_governed_pr_create(
 
     let syntax_refusal =
         |reason: &'static str| staging::Refusal::from(reason.to_string()).with_reason(reason);
-    let command = push_command::GovernedCommand::parse(source).map_err(syntax_refusal)?;
+    let command = GovernedCommand::parse(source).map_err(syntax_refusal)?;
     let request = parse_governed_pr_create(&command.argv).map_err(syntax_refusal)?;
 
     // Finding 6: same cwd authority/exec binding as the push broker.
@@ -3402,9 +3404,9 @@ mod governed_push_tests {
         // Test-only destination seam: real Git and a real bare remote, without
         // relaxing the production planner's github.com destination check.
         plan.url = remote.path().to_string_lossy().into_owned();
-        let command = push_command::GovernedCommand::parse("git push origin").unwrap();
+        let command = GovernedCommand::parse("git push origin").unwrap();
         let result = run_push_test(&plan, &caveats);
-        let text = render_governed_result(&command, result, push_command::RETRY);
+        let text = render_governed_result(&command, result, PUSH_RETRY);
         assert!(
             text.contains("remote branch 'task' already exists"),
             "{text}"
