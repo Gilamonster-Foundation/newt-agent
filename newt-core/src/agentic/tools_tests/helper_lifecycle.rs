@@ -606,16 +606,12 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     assert!(err.contains("⚠ build check could not run"), "got: {err}");
 }
 
-/// Without `confine` the build check reaches the refusal through the arm it already has for
-/// a spawn that cannot run, so the per-edit receipt says why (#3160).
+/// Render the executor's typed refusal without building a request or probing the host,
+/// so the per-edit receipt says why the build check could not run (#3160).
 #[cfg(not(feature = "confine"))]
 #[test]
 fn confine_off_build_check_reports_the_refusal() {
-    let out = run_build_check(
-        passing_build_check_cmd(),
-        "/definitely/not/a/dir",
-        &crate::Scope::none(),
-    );
+    let out = render_build_check_result(Err(crate::confined_exec::off_refusal()));
     assert!(out.starts_with("  ⚠ build check could not run: "), "{out}");
     assert!(
         out.contains(crate::confined_exec::CONFINE_OFF_REASON),

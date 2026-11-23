@@ -369,7 +369,7 @@ pub(crate) const CONFINE_OFF_REASON: &str =
 
 /// The refusal [`ConstrainedExecutor`] returns without the backend. The one place it is built.
 #[cfg(not(feature = "confine"))]
-fn off_refusal() -> ExecRefused {
+pub(crate) fn off_refusal() -> ExecRefused {
     ExecRefused::ConfinementUnenforceable(CONFINE_OFF_REASON.to_owned())
 }
 
