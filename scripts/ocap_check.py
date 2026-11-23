@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -118,7 +118,7 @@ def parse_register(text: str):
 
 def check_register(res: Result):
     if not REGISTER.exists():
-        res.err(f"deviation register not found at {REGISTER.relative_to(REPO)} — "
+        res.err(f"deviation register not found at {_shown(REGISTER, REPO)} — "
                 "the honesty gate has no source of truth (merge the docs PR or restore it)")
         return set(), {}
     text = REGISTER.read_text(encoding="utf-8")
@@ -167,7 +167,7 @@ def check_code_guards(res: Result, known_ids: set, entries: dict):
                 continue
             danger_sites += 1
             dev_id = dm.group(1)
-            rel = path.relative_to(REPO)
+            rel = _shown(path, REPO)
             if dev_id not in known_ids:
                 res.err(f"{rel}:{i+1} declares OCAP-DANGER:{dev_id}, which is not a registered "
                         "deviation — register it before shipping the capability")
@@ -207,7 +207,7 @@ def check_launch_authority_reads(res: Result, repo: Path = REPO):
             for i, line in enumerate(lines):
                 m = AUTHORITY_ENV_READ_RE.search(line)
                 if m:
-                    rel = path.relative_to(repo)
+                    rel = _shown(path, repo)
                     res.err(
                         f"{rel}:{i+1} reads authority env var {m.group(1)!r} directly — deep "
                         "libraries must decide authority via launch_authority::current() (the "
@@ -229,6 +229,16 @@ def _list_field(field_re, body):
     # Stop at the first line break — the field is a single line.
     raw = raw.splitlines()[0] if raw else raw
     return [s.strip() for s in re.split(r"[,\s]+", raw) if s.strip()]
+
+
+def _shown(path, root=None) -> str:
+    """A repo-relative path as messages print it: forward slashes on every platform, so a
+    message and a check that greps it agree on Windows too."""
+    # Keep a path object's own flavour: `PurePath(windows_path)` re-parses it as the host's.
+    rel = path if isinstance(path, PurePath) else PurePath(path)
+    if root is not None:
+        rel = rel.relative_to(root)
+    return rel.as_posix()
 
 
 def _rust_texts():
@@ -306,7 +316,7 @@ def _capability_referenced_in(sym: str, texts: dict):
         prod = _strip_test_blocks(_strip_comments(t))
         for line in prod.splitlines():
             if ref_re.search(line) and not def_line_re.search(line):
-                hits.append(str(rel))
+                hits.append(_shown(rel))
                 break
     return sorted(hits)
 
@@ -502,6 +512,14 @@ def run_self_tests() -> int:
                 any(f"{crate}/src/planted.rs" in e for e in r.errors),
             )
             planted.unlink()
+
+    # 7. Messages print repo-relative paths with forward slashes on every platform: a
+    #    Windows path printed as-is ("newt-core\src\planted.rs") failed the needles above
+    #    there (#3201 review).
+    win_root = PureWindowsPath(r"C:\repo")
+    win_file = PureWindowsPath(r"C:\repo\newt-core\src\planted.rs")
+    expect("paths-print-with-forward-slashes", _shown(win_file, win_root) == "newt-core/src/planted.rs")
+    expect("relative-paths-print-as-given", _shown(PurePath("newt-policy/src/x.rs")) == "newt-policy/src/x.rs")
 
     if failures:
         for f in failures:
