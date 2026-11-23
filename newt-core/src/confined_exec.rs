@@ -174,7 +174,7 @@ pub struct ExecRequest {
     scratch_dirs: Vec<PathBuf>,
     /// Read roots the caller holds as directory descriptors: the Landlock
     /// fence anchors on them instead of re-opening the root by path.
-    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
+    held_read_roots: Vec<crate::sandbox_seam::HeldReadRoot>,
 }
 
 impl ExecRequest {
@@ -204,14 +204,14 @@ impl ExecRequest {
     }
 
     /// Anchor the fence's read rules for these roots on the descriptors the
-    /// caller holds ([`agent_bridle::HeldReadRoot`]), so a root swapped at
+    /// caller holds ([`crate::sandbox_seam::HeldReadRoot`]), so a root swapped at
     /// its pathname after the caller's check is outside the fence. Each root
     /// must also be in `caveats.fs_read`; this changes how the fence is
     /// built, never what is admitted.
     #[must_use]
     pub fn held_read_roots(
         mut self,
-        roots: impl IntoIterator<Item = agent_bridle::HeldReadRoot>,
+        roots: impl IntoIterator<Item = crate::sandbox_seam::HeldReadRoot>,
     ) -> Self {
         self.held_read_roots.extend(roots);
         self
@@ -229,7 +229,7 @@ impl ExecRequest {
         self
     }
 
-    pub(crate) fn build_held_read_roots(&self) -> Vec<agent_bridle::HeldReadRoot> {
+    pub(crate) fn build_held_read_roots(&self) -> Vec<crate::sandbox_seam::HeldReadRoot> {
         self.held_read_roots.clone()
     }
 

@@ -1406,7 +1406,7 @@ pub(super) async fn exec_confined_command_with_broker(
     spill_store: Option<&dyn SpillStore>,
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
-    command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
+    command_broker: Option<std::sync::Arc<dyn crate::sandbox_seam::CommandBroker>>,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     // #2636 finding 1 / #2681: typed signal for a structured pre-exec denial
     // — set to the missing authority set whenever a STRUCTURED denial (a

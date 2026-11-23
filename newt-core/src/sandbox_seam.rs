@@ -12,6 +12,18 @@
 //! (`confined_exec::ConfinedOutput`).
 //!
 //! The two `From` impls are the only conversions that know bridle.
+//!
+//! [`HeldReadRoot`] and [`CommandBroker`] are bridle's own types, named from here by the
+//! executor's request and the build's Git reads (their held read roots) and by the confined
+//! shell's entry point (its broker). Only bridle's fence reads a held root, and only bridle's
+//! shell calls a broker.
+
+/// A read root the caller holds as a descriptor, which the executor's Landlock fence anchors
+/// on. Bridle's type: its one constructor checks the descriptor against the path.
+pub use agent_bridle::HeldReadRoot;
+/// What the confined shell asks before it runs a resolved command (the native Git commit
+/// broker). Bridle's trait: its methods take bridle's command and context types.
+pub use agent_bridle_tool_shell::CommandBroker;
 
 /// The paths a launcher's sandbox adds to a child's explicit filesystem `Caveats`, each list as
 /// the launcher's policy resolves it. The guard and the frame check count every list as
@@ -82,7 +94,8 @@ impl From<agent_bridle::SandboxKind> for SandboxKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{SandboxKind, SandboxRoots};
+    use super::{CommandBroker, HeldReadRoot, SandboxKind, SandboxRoots};
+    use std::sync::Arc;
 
     /// `roots` holds each of `policy`'s four lists as bridle resolves it, which is how bridle
     /// reads them when it builds the sandbox.
@@ -145,4 +158,11 @@ mod tests {
         // Anti-vacuous: six kinds with six different names.
         assert_eq!(names.len(), 6);
     }
+
+    // The two names are bridle's own types, not look-alikes. Each coercion compiles only when
+    // its two types are one: a newtype does not coerce, and in this direction neither does a
+    // trait that extends bridle's.
+    const _: fn(agent_bridle::HeldReadRoot) -> HeldReadRoot = |root| root;
+    const _: fn(Arc<dyn agent_bridle_tool_shell::CommandBroker>) -> Arc<dyn CommandBroker> =
+        |broker| broker;
 }

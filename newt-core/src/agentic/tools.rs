@@ -4703,7 +4703,7 @@ async fn execute_authorized_tool(
             let commit_broker = if commit_requested {
                 match git_tool.and_then(|tool| tool.native_commit_policy()) {
                     Some(policy) => match crate::native_git_broker::NativeGitBroker::new(policy) {
-                        Ok(broker) => Some(broker as std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>),
+                        Ok(broker) => Some(broker as std::sync::Arc<dyn crate::sandbox_seam::CommandBroker>),
                         Err(error) => return host_return(format!("error: native Git commit broker: {error}")),
                     },
                     None => None,
