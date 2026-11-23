@@ -18,6 +18,8 @@ use agent_toolchain::native_git::helper::{decode_request, HookRequest, HookRespo
 use agent_toolchain::native_git::{CommitBroker, CommitPolicy, MAX_COMMIT_BYTES};
 use content_addressable::ContentAddressable;
 
+use crate::git_hardening::commit_parents;
+
 #[path = "native_git_broker_common_view.rs"]
 mod common_view;
 
@@ -798,28 +800,6 @@ fn old_ref_matches(head: Option<&str>, old: &str) -> bool {
     }
 }
 
-/// #2682 round 2 (`git_hardening::advance_own_branch_ref`): also reused
-/// host-side to verify the fast-forward/amend shape of a commit landed with
-/// HEAD detached, before the bounded `update-ref` that publishes it.
-pub(crate) fn commit_parents(commit: &[u8]) -> Result<Vec<String>, String> {
-    let boundary = commit
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .ok_or("commit has no message boundary")?;
-    std::str::from_utf8(&commit[..boundary])
-        .map_err(|error| error.to_string())?
-        .lines()
-        .filter_map(|line| line.strip_prefix("parent "))
-        .map(|parent| {
-            if valid_oid(parent) {
-                Ok(parent.to_owned())
-            } else {
-                Err("invalid Git parent identifier".into())
-            }
-        })
-        .collect()
-}
-
 /// Dispatch before CLI parsing, only for the fixed Git hook/signer entrypoints.
 /// Environment and argv merely select a role; the private client authenticates
 /// each message, and the host independently binds the actual parent Git image.
@@ -1007,5 +987,44 @@ mod tests {
         )
         .unwrap();
         assert!(child.wait().unwrap().success());
+    }
+
+    /// `git_hardening::commit_parents` checks parents with `git_staging::is_hex_oid`
+    /// and this module checks every other oid with `valid_oid`: the two must agree
+    /// on every input.
+    #[test]
+    fn valid_oid_agrees_with_is_hex_oid() {
+        let multibyte = "\u{e9}".repeat(20);
+        assert_eq!(
+            multibyte.len(),
+            40,
+            "a 40-byte string that is not 40 characters"
+        );
+        let rows = [
+            String::new(),
+            "a".repeat(39),
+            "a".repeat(40),
+            "a".repeat(41),
+            "A".repeat(40),
+            "f".repeat(63),
+            "f".repeat(64),
+            "F".repeat(64),
+            "f".repeat(65),
+            "g".repeat(40),
+            format!("{}g", "a".repeat(39)),
+            multibyte,
+        ];
+        for oid in &rows {
+            assert_eq!(
+                super::valid_oid(oid),
+                crate::git_staging::is_hex_oid(oid),
+                "{oid:?}"
+            );
+        }
+        let accepted = rows.iter().filter(|oid| super::valid_oid(oid)).count();
+        assert_eq!(
+            accepted, 4,
+            "40 or 64 hex digits of either case, nothing else"
+        );
     }
 }
