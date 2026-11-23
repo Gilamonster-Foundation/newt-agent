@@ -413,6 +413,15 @@ mod shell_engine_tests {
         );
     }
 
+    /// Without `confine` no kernel fence is probed, on any platform: the L3 backend is
+    /// reported absent, and the confined default engine is the portable one (#3160).
+    #[cfg(not(feature = "confine"))]
+    #[test]
+    fn confine_off_l3_backend_is_none_false() {
+        assert_eq!(super::ocap_l3_backend(), ("none", false));
+        assert_eq!(super::resolved_confined_default(), ShellEngine::SafeSubset);
+    }
+
     #[test]
     fn env_passthrough_default_is_minimal() {
         // Minimal by design — the confined shell is a trust boundary. HOME is the

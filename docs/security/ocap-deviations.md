@@ -879,7 +879,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   enforcement. `newt-core/tests/constrained_executor_truth.rs` ties the three sources: it fails if the
   spawn-inventory gate carries an unmigrated attacker spawn OR if the verifier disagrees with the gate on
   a fence-available host, and a real-resource test proves a parent-only secret never reaches a confined
-  child (grounds the `EnvIsolation = Enforced` claim).
+  child (grounds the `EnvIsolation = Enforced` claim). A newt-core built without its `confine`
+  feature (#3160) compiles no executor: every `ConstrainedExecutor` call is refused with
+  `ExecRefused::ConfinementUnenforceable` before a scratch directory or a process exists, the
+  fence probes report no fence, and this verifier reports `Absent`, naming the feature (the
+  `confine_off` tests in `newt-core`).
 - **Status:** CLOSED (migration + confinement + #8 env-isolation) — inventory gate (step-4.1),
   fail-closed executor + kernel-backed adversarial proof (step-4.2), build_check (step-4.3), crew +
   calibrated read fence (step-4.4), roadmap verify + newt-tui reclassify (step-4.5), yolo reclassify +

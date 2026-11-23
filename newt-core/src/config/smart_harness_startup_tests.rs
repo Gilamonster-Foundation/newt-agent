@@ -15,6 +15,36 @@ fn mutable_anchor_refusal_names_the_offending_path() {
     assert!(error.contains(bin.to_str().unwrap()), "{error}");
 }
 
+/// Without `confine` no kernel fence is probed, so the optional smart harness is refused at
+/// admission, with the message a host without Landlock or Seatbelt gets. Admission stops
+/// before it resolves the storage directory, so nothing touches the disk.
+#[cfg(not(feature = "confine"))]
+#[test]
+fn confine_off_smart_harness_is_refused_at_admission() {
+    let _authority = crate::launch_authority::ScopedAuthority::new(false, false);
+    let workspace = std::path::PathBuf::from("/newt-virtual-workspace");
+    let caveats = crate::confined_exec::workspace_confined_caveats(&workspace);
+    let launch = HarnessLaunch {
+        workspace: &workspace,
+        caveats: &caveats,
+        frame_dir: None,
+        resume_from: None,
+        hermetic: false,
+    };
+    let mut notices = Vec::new();
+    let admitted =
+        SmartHarnessConfig::default().admit_startup(&launch, |n| notices.push(n.to_owned()));
+    assert!(admitted.is_none());
+    assert_eq!(notices.len(), 1);
+    assert!(
+        notices[0]
+            .contains("requires object-bound filesystem tools and a supported kernel sandbox"),
+        "{}",
+        notices[0]
+    );
+    assert!(notices[0].contains("No frame was opened or resumed"));
+}
+
 /// Ground the admission check in a real symlink replacement: no independent
 /// PATH directory rule may make the private frame readable through workspace/bin.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "confine"))]

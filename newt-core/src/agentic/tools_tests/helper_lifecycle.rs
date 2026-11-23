@@ -606,6 +606,23 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     assert!(err.contains("⚠ build check could not run"), "got: {err}");
 }
 
+/// Without `confine` the build check reaches the refusal through the arm it already has for
+/// a spawn that cannot run, so the per-edit receipt says why (#3160).
+#[cfg(not(feature = "confine"))]
+#[test]
+fn confine_off_build_check_reports_the_refusal() {
+    let out = run_build_check(
+        passing_build_check_cmd(),
+        "/definitely/not/a/dir",
+        &crate::Scope::none(),
+    );
+    assert!(out.starts_with("  ⚠ build check could not run: "), "{out}");
+    assert!(
+        out.contains(crate::confined_exec::CONFINE_OFF_REASON),
+        "{out}"
+    );
+}
+
 #[test]
 fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     let base = crate::confined_exec::workspace_confined_caveats(std::path::Path::new("/ws"));
