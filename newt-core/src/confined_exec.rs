@@ -368,9 +368,17 @@ pub(crate) const CONFINE_OFF_REASON: &str =
     "this build has no confinement backend (cargo feature `confine` is off)";
 
 /// The refusal [`ConstrainedExecutor`] returns without the backend. The one place it is built.
-#[cfg(not(feature = "confine"))]
 pub(crate) fn off_refusal() -> ExecRefused {
     ExecRefused::ConfinementUnenforceable(CONFINE_OFF_REASON.to_owned())
+}
+
+/// Refuse before a caller requests authority or prepares files for an unavailable backend.
+pub(crate) fn require_backend() -> Result<(), ExecRefused> {
+    if BACKEND_COMPILED {
+        Ok(())
+    } else {
+        Err(off_refusal())
+    }
 }
 
 /// The result of a completed confined run: the child's exit outcome, its

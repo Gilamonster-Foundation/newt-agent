@@ -1,9 +1,14 @@
 //! Completed calls must survive an interrupted sibling in the same provider batch.
+//! Durable completion fixtures require confinement to admit tools against disk-backed
+//! frames. The independent progress and reader-source tests below stay available without it.
 use super::*;
+#[cfg(feature = "confine")]
 use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
 use crate::launch_authority::{self, LaunchAuthority};
 
+#[cfg(feature = "confine")]
 const TOOL: &str = "durability__get_result";
+#[cfg(feature = "confine")]
 const COMPLETED: &str = "first call completed: durable payload";
 
 /// Match production startup on the current-thread test runtime: authority
@@ -24,6 +29,7 @@ impl Drop for ConfinedLaunch {
     }
 }
 
+#[cfg(feature = "confine")]
 struct InterruptedBatch {
     started: Arc<tokio::sync::Notify>,
     calls: Vec<String>,
@@ -32,6 +38,7 @@ struct InterruptedBatch {
     effect_text: String,
 }
 
+#[cfg(feature = "confine")]
 #[async_trait::async_trait]
 impl McpTools for InterruptedBatch {
     fn handles(&self, name: &str) -> bool {
@@ -58,6 +65,7 @@ impl McpTools for InterruptedBatch {
     }
 }
 
+#[cfg(feature = "confine")]
 fn batch_reply(wire: &str) -> serde_json::Value {
     let calls = ["a", "b", "c"]
         .into_iter()
@@ -91,10 +99,12 @@ fn batch_reply(wire: &str) -> serde_json::Value {
     }
 }
 
+#[cfg(feature = "confine")]
 async fn completed_call_survives_cancelled_sibling(wire: &str) {
     recovered_after_sibling(wire, false, false).await;
 }
 
+#[cfg(feature = "confine")]
 async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
     let _launch = ConfinedLaunch::new();
     let server = MockServer::start().await;
@@ -313,6 +323,7 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
 /// the MCP fixture writes a real file for A and deterministically blocks B.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn ollama_completed_call_survives_cancelled_sibling() {
     completed_call_survives_cancelled_sibling("ollama").await;
 }
@@ -320,6 +331,7 @@ async fn ollama_completed_call_survives_cancelled_sibling() {
 /// Grounds OpenAI's parallel-call reply shape in the same real-storage boundary.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn openai_completed_call_survives_cancelled_sibling() {
     completed_call_survives_cancelled_sibling("openai").await;
 }
@@ -327,6 +339,7 @@ async fn openai_completed_call_survives_cancelled_sibling() {
 /// Grounds Anthropic's multiple tool-use blocks in the real-storage boundary.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn anthropic_completed_call_survives_cancelled_sibling() {
     completed_call_survives_cancelled_sibling("anthropic").await;
 }
@@ -334,10 +347,12 @@ async fn anthropic_completed_call_survives_cancelled_sibling() {
 /// Grounds Responses call/output identity retention in the real-storage boundary.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn responses_completed_call_survives_cancelled_sibling() {
     completed_call_survives_cancelled_sibling("responses").await;
 }
 
+#[cfg(feature = "confine")]
 fn content(message: &serde_json::Value) -> Option<&str> {
     message
         .get("content")
@@ -345,6 +360,7 @@ fn content(message: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+#[cfg(feature = "confine")]
 fn backend(wire: &str) -> BackendKind {
     match wire {
         "ollama" => BackendKind::Ollama,
@@ -353,6 +369,7 @@ fn backend(wire: &str) -> BackendKind {
     }
 }
 
+#[cfg(feature = "confine")]
 fn answer_reply(wire: &str) -> serde_json::Value {
     let text = "Recovery reviewed.";
     match wire {
@@ -369,6 +386,7 @@ fn answer_reply(wire: &str) -> serde_json::Value {
     }
 }
 
+#[cfg(feature = "confine")]
 fn invocation_ids(
     directory: &std::path::Path,
     mut head: content_addressable::ContentId,
@@ -396,10 +414,12 @@ fn invocation_ids(
 }
 
 // Restore permissions even if an assertion or tool future unwinds.
+#[cfg(feature = "confine")]
 struct CheckpointPermissions {
     path: std::path::PathBuf,
     original: std::fs::Permissions,
 }
+#[cfg(feature = "confine")]
 impl CheckpointPermissions {
     fn read_only(path: &std::path::Path) -> Self {
         use std::os::unix::fs::PermissionsExt;
@@ -411,6 +431,7 @@ impl CheckpointPermissions {
         }
     }
 }
+#[cfg(feature = "confine")]
 impl Drop for CheckpointPermissions {
     fn drop(&mut self) {
         std::fs::set_permissions(&self.path, self.original.clone())
@@ -418,6 +439,7 @@ impl Drop for CheckpointPermissions {
     }
 }
 
+#[cfg(feature = "confine")]
 struct ReturningBatch {
     calls: Vec<String>,
     outputs: Vec<String>,
@@ -427,6 +449,7 @@ struct ReturningBatch {
     permissions: Option<CheckpointPermissions>,
 }
 
+#[cfg(feature = "confine")]
 #[async_trait::async_trait]
 impl McpTools for ReturningBatch {
     fn handles(&self, name: &str) -> bool {
@@ -461,6 +484,7 @@ impl McpTools for ReturningBatch {
 /// observation, while the host's bounded large-output view retains its source.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn all_four_completed_batches_preserve_observed_errors_and_large_sources() {
     let _launch = ConfinedLaunch::new();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
@@ -576,6 +600,7 @@ async fn all_four_completed_batches_preserve_observed_errors_and_large_sources()
 /// B is never polled, and cold recovery records uncertainty without replay.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn all_four_persistence_failures_preserve_return_and_stop_before_next_tool() {
     let _launch = ConfinedLaunch::new();
     for wire in ["ollama", "openai", "anthropic", "responses"] {
@@ -663,6 +688,7 @@ async fn all_four_persistence_failures_preserve_return_and_stop_before_next_tool
 /// the provider's ordinary cancellation return path or replaying old calls.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn all_four_abrupt_future_drops_preserve_completed_calls() {
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         recovered_after_sibling(wire, true, false).await;
@@ -673,6 +699,7 @@ async fn all_four_abrupt_future_drops_preserve_completed_calls() {
 /// fresh session retrieves the full source after the old spill store is gone.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn all_four_spill_backed_returns_survive_cancelled_siblings() {
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         recovered_after_sibling(wire, false, true).await;
@@ -683,10 +710,12 @@ async fn all_four_spill_backed_returns_survive_cancelled_siblings() {
 /// input blocks: admission and cold continuation keep the original envelope.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn openai_proxy_native_batch_preserves_completed_calls() {
     recovered_after_sibling("openai_native", false, false).await;
 }
 
+#[cfg(feature = "confine")]
 fn assert_request_closure(body: &serde_json::Value, wire: &str) {
     let ids = ["call_a", "call_b", "call_c"];
     if wire == "responses" {
@@ -784,12 +813,14 @@ fn assert_request_closure(body: &serde_json::Value, wire: &str) {
 /// the actual result plus the reason its claimed spill source was refused.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn all_four_bad_spill_returns_remain_observed_without_scheduling_siblings() {
     for wire in ["ollama", "openai", "anthropic", "responses"] {
         bad_spill_return(wire, false, false).await;
     }
 }
 
+#[cfg(feature = "confine")]
 async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
     use crate::agentic::content_spill::{SessionSpillStore, SpillProvenance, SpillStore};
     let _launch = ConfinedLaunch::new();
@@ -937,6 +968,7 @@ async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
 /// cold restore: the failure reason must not copy raw unresolved wire markers.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn responses_missing_spill_failure_allows_operator_continuation() {
     bad_spill_return("responses", false, true).await;
 }
@@ -945,6 +977,7 @@ async fn responses_missing_spill_failure_allows_operator_continuation() {
 /// preserving the original returned bytes without poisoning the next request.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn responses_malformed_spill_failure_allows_operator_continuation() {
     bad_spill_return("responses", true, true).await;
 }
@@ -954,11 +987,13 @@ async fn responses_malformed_spill_failure_allows_operator_continuation() {
 /// One `write_file` (arms the brake), then `list_dir` forever; from request
 /// `idless_at` on, the call carries NO id, so the loop re-asks instead of
 /// running it (#2500).
+#[cfg(feature = "confine")]
 struct WriteThenIdle {
     n: std::sync::atomic::AtomicUsize,
     idless_at: Option<usize>,
 }
 
+#[cfg(feature = "confine")]
 impl wiremock::Respond for WriteThenIdle {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
         let n = self.n.fetch_add(1, Ordering::SeqCst);
@@ -982,6 +1017,7 @@ impl wiremock::Respond for WriteThenIdle {
 }
 
 /// The `control` of every outcome the smart harness journalled, oldest first.
+#[cfg(feature = "confine")]
 fn journalled_outcomes(
     directory: &std::path::Path,
     mut head: content_addressable::ContentId,
@@ -1013,6 +1049,7 @@ fn journalled_outcomes(
 
 /// Runs write-then-idle under the smart harness with `stop_after` idle rounds;
 /// returns the end reason, the requests served, and the journalled outcomes.
+#[cfg(feature = "confine")]
 async fn brake_under_smart_harness(
     stop_after: usize,
     idless_at: Option<usize>,
@@ -1082,6 +1119,7 @@ async fn brake_under_smart_harness(
 /// tools-disabled summary request.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn the_no_progress_stop_ends_a_smart_harness_turn_typed_and_incomplete() {
     let (result, reason, requests, outcomes) = brake_under_smart_harness(2, None).await;
     let (text, _) = result.expect("the stop is a typed end, not an error");
@@ -1110,6 +1148,7 @@ async fn the_no_progress_stop_ends_a_smart_harness_turn_typed_and_incomplete() {
 /// `continue` then `incomplete`, so the typed stop must not become an `Err`.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
     let (result, reason, _requests, outcomes) = brake_under_smart_harness(1, Some(1)).await;
     let (text, _) = result.expect("the stop must not turn into an error after a re-ask");

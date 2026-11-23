@@ -388,7 +388,7 @@ impl WorkspaceDir {
     }
 
     /// Check that a path still names this held directory (optimistic observation).
-    #[cfg(feature = "ast")]
+    #[cfg(all(feature = "ast", feature = "confine"))]
     pub(crate) fn still_named_by(&self, path: &Path) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt;
         let held = File::from(self.root.try_clone()?).metadata()?;
@@ -398,7 +398,7 @@ impl WorkspaceDir {
 
     /// Publish a staged regular file without replacing an existing destination.
     /// Both parents stay bound to this capability; linkat fails with EEXIST.
-    #[cfg(feature = "ast")]
+    #[cfg(all(feature = "ast", feature = "confine"))]
     pub(crate) fn link_new(&self, from: &Path, to: &Path) -> io::Result<()> {
         let (from_dir, from_name) = self.parent_dir_and_name(from)?;
         let (to_dir, to_name) = self.parent_dir_and_name(to)?;

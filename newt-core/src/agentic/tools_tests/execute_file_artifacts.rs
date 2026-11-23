@@ -203,10 +203,21 @@ async fn build_check_mutation_is_not_recorded_as_the_governed_write_postimage() 
     )
     .await;
 
-    assert!(out.contains("build check passed"), "got: {out}");
+    if cfg!(feature = "confine") {
+        assert!(out.contains("build check passed"), "got: {out}");
+    } else {
+        assert!(
+            out.contains(crate::confined_exec::CONFINE_OFF_REASON),
+            "{out}"
+        );
+    }
     assert_eq!(
         std::fs::read(ws.path().join("target.txt")).unwrap(),
-        build_hook
+        if cfg!(feature = "confine") {
+            build_hook.as_slice()
+        } else {
+            governed.as_slice()
+        }
     );
     let artifact = sink.only_artifact();
     assert_eq!(artifact.metadata()["operation"], "write_file");

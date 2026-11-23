@@ -1,9 +1,11 @@
 //! #2733 round 5: every Git authorization requires an authenticated identity.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 use super::round2_tests::dispatch;
 use super::*;
+#[cfg(all(unix, feature = "confine"))]
+use crate::worktree_adoption::WorktreeSession;
 #[cfg(unix)]
-use crate::{worktree_adoption::WorktreeSession, Scope};
+use crate::Scope;
 
 /// #2733: no path-qualified or basename-equivalent Git can authorize a batch.
 #[test]
@@ -52,6 +54,7 @@ fn worktree_adoption_round5_git_identity_sweep() {
 
 /// #2733 round 5: ground the Git identity classifier in real dispatch. A native rm
 /// image named git must not delete the sentinel before the adoption boundary.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]

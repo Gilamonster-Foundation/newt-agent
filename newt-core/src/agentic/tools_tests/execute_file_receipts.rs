@@ -469,7 +469,14 @@ async fn a_failed_build_check_keeps_the_verified_tool_change() {
     )
     .await;
     assert!(output.contains("Modified (+1 -1)"), "{output}");
-    assert!(output.contains("build check failed"), "{output}");
+    if cfg!(feature = "confine") {
+        assert!(output.contains("build check failed"), "{output}");
+    } else {
+        assert!(
+            output.contains(crate::confined_exec::CONFINE_OFF_REASON),
+            "{output}"
+        );
+    }
     assert!(
         seen.contains("-old") && seen.contains("+tool bytes"),
         "{seen}"
@@ -477,7 +484,11 @@ async fn a_failed_build_check_keeps_the_verified_tool_change() {
     assert!(!seen.contains("+build bytes"), "{seen}");
     assert_eq!(
         std::fs::read_to_string(ws.path().join("state.txt")).unwrap(),
-        "build bytes\n"
+        if cfg!(feature = "confine") {
+            "build bytes\n"
+        } else {
+            "tool bytes\n"
+        }
     );
 }
 
@@ -961,7 +972,7 @@ async fn move_from_rejects_duplicate_items_before_mutation() {
     )
     .await;
     assert!(output.starts_with("error:"), "{output}");
-    #[cfg(feature = "ast")]
+    #[cfg(all(feature = "ast", feature = "confine"))]
     assert!(output.contains("unique, nonempty item names"), "{output}");
     assert_eq!(
         std::fs::read_to_string(ws.path().join("lib.rs")).unwrap(),

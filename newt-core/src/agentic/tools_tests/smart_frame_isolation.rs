@@ -658,6 +658,7 @@ async fn smart_find_refuses_the_unbound_recursive_walker() {
 /// sessions refuse it for the same reason until the walker retains directory
 /// capability (#2677 review). Linux/macOS only, like the find test: elsewhere
 /// the durable smart harness refuses every filesystem tool up front.
+#[cfg(feature = "confine")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[serial_test::serial]
@@ -903,6 +904,7 @@ async fn private_frame_cannot_leak_through_write_shrink_or_edit_preview() {
 /// Ground worktree support in real Git administrative files and confined file
 /// edits. An external worktree is usable only with its own explicit grant;
 /// its parent directory and private frame remain outside that grant.
+#[cfg(feature = "confine")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[serial_test::serial]
@@ -1009,7 +1011,7 @@ async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
 }
 
 /// #2731: forward operation approval only where durable-frame isolation is
-/// supported. Windows must refuse before prompting, even for a narrow fence;
+/// supported. Without a compiled backend (or on Windows), refuse before prompting;
 /// widening the fence must never expose private frame storage on any platform.
 #[test]
 fn cold_cache_fetch_frame_gate_preserves_protection() {
@@ -1057,13 +1059,13 @@ fn cold_cache_fetch_frame_gate_preserves_protection() {
             refusal: None,
         };
         let decision = gate.ask_dependency_fetch(&prepared, &request);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(all(feature = "confine", any(target_os = "linux", target_os = "macos")))]
         assert!(
             matches!(decision, PermissionDecision::Allow(_)),
             "unexpected frame refusal: {:?}",
             gate.refusal
         );
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(all(feature = "confine", any(target_os = "linux", target_os = "macos"))))]
         {
             assert!(matches!(decision, PermissionDecision::Deny));
             assert!(gate.refusal.as_deref().is_some_and(|reason| reason.contains(
@@ -1079,6 +1081,9 @@ fn cold_cache_fetch_frame_gate_preserves_protection() {
     }
     assert_eq!(
         inner.0,
-        usize::from(cfg!(any(target_os = "linux", target_os = "macos")))
+        usize::from(cfg!(all(
+            feature = "confine",
+            any(target_os = "linux", target_os = "macos")
+        )))
     );
 }

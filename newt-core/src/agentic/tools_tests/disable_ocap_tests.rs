@@ -1492,6 +1492,7 @@ fn routing_disabled_requires_exactly_1_and_is_independent_of_ocap() {
 /// `cargo` subprocess): the denial message alone proves the call reached the
 /// build lane (not the 60s `run_command` exec path) and that it carries the
 /// model's LITERAL argv, never a resolved phase command.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn routed_cargo_test_reaches_the_confined_build_lane() {
     struct RecordingDenyGate {
@@ -2198,6 +2199,7 @@ async fn a_routed_short_timeout_wrapper_honours_its_own_wall_not_the_lane_wall()
 /// output comfortably exceeds any trim window this test uses. Offline, no
 /// deps — `cargo check` never touches the network for a dependency-free
 /// crate.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 fn write_failing_scratch_crate(dir: &std::path::Path) {
     std::fs::write(
@@ -2215,6 +2217,7 @@ fn write_failing_scratch_crate(dir: &std::path::Path) {
 /// A scratch crate whose `cargo check` genuinely PASSES but still emits
 /// substantial output: 10 unused-variable warnings (compiles clean, exit 0
 /// — a warning is not a failure), each its own diagnostic block.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 fn write_passing_scratch_crate(dir: &std::path::Path) {
     std::fs::write(
@@ -2244,6 +2247,7 @@ fn write_passing_scratch_crate(dir: &std::path::Path) {
 /// depend on it.
 // The build lane fail-closes on Windows: a network-denied build needs a kernel
 // egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
@@ -2303,6 +2307,7 @@ async fn a_failing_build_piped_to_tail_still_reports_the_real_failure() {
 
 /// A requested tail is a view of the captured build, not permission to discard
 /// earlier diagnostics. Recover an omitted error through the normal spill API.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_trimmed_build_retains_full_diagnostics_for_retrieval() {
@@ -2378,6 +2383,7 @@ async fn a_trimmed_build_retains_full_diagnostics_for_retrieval() {
 /// command route to the build lane instead, which reports cargo's REAL
 /// exit code — a failure must still render as a failure, never masked by
 /// the echo's synthetic success.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_failing_build_with_a_trailing_exit_echo_still_reports_the_real_failure() {
@@ -2438,6 +2444,7 @@ async fn a_failing_build_with_a_trailing_exit_echo_still_reports_the_real_failur
 /// comment for why `cargo`, not `just`.
 // The build lane fail-closes on Windows: a network-denied build needs a kernel
 // egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lines() {
@@ -2498,6 +2505,7 @@ async fn a_passing_build_piped_to_head_keeps_the_pass_and_trims_to_the_first_lin
 /// would from an ordinary shell, never report the toolchain missing.
 // The build lane fail-closes on Windows: a network-denied build needs a kernel
 // egress floor (Linux seccomp guard / macOS Seatbelt) that Windows lacks.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() {
@@ -2563,6 +2571,7 @@ async fn routed_cargo_plus_stable_resolves_the_toolchain_in_the_confined_lane() 
 /// this case — nothing to say beyond the routed note itself.
 // `write_passing_scratch_crate` (a real build-lane dispatch) is
 // `#[cfg(not(windows))]`; see its own doc for why.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_noop_cd_to_the_workspace_root_still_routes_and_says_so() {
@@ -2617,6 +2626,7 @@ async fn a_noop_cd_to_the_workspace_root_still_routes_and_says_so() {
 /// directory it actually ran in.
 // `write_passing_scratch_crate` (a real build-lane dispatch) is
 // `#[cfg(not(windows))]`; see its own doc for why.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn a_cd_prefixed_subdirectory_routes_and_says_so() {
@@ -2674,6 +2684,7 @@ async fn a_cd_prefixed_subdirectory_routes_and_says_so() {
 /// F38 (a): `lifecycle {"phase":"check"}` (no action, defaults to run) when
 /// the resolved command starts with a build tool (cargo) must route to the
 /// build lane and request Build authority — not fail in the run lane.
+#[cfg(feature = "confine")]
 #[cfg(not(windows))]
 #[tokio::test]
 async fn lifecycle_run_of_build_tool_requests_build_authority() {

@@ -633,6 +633,7 @@ confined_task_ref_wrapper, Confined, Adopted, "git branch followup; echo done", 
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "confine")]
 confined_local_push, Confined, AdoptedPublish, "confined-executor git push", Some(Passed), Task, true, false, "", None, "";
 // Row (c), PR #2814: the macOS job selects plan_mode::tests, including
 // the regression proving blank plan approval -> Approved.

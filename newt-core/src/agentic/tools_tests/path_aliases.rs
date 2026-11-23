@@ -3,6 +3,7 @@ use crate::{Caveats, Scope};
 
 /// macOS /tmp is a host alias, not the per-child disposable TMPDIR. Ground
 /// permission matching in actual adoption, file dispatch, and confined writes.
+#[cfg(feature = "confine")]
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "native Seatbelt and Git persistence proof"]

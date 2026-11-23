@@ -508,6 +508,7 @@ async fn worktree_notice_compound_refusal_teaches_standalone_b_form() {
 
 /// #2753: ground the recovery notice in Git's actual checked-out-branch error
 /// through the same dispatch that would otherwise adopt a successful worktree.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     let _env = crate::process_env::lock();
@@ -612,6 +613,7 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
 
 /// #2753 addendum: adopting a throwaway check worktree must disclose the edits
 /// it freezes without launching a status probe.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
     let _env = crate::process_env::lock();
@@ -672,6 +674,7 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
 }
 
 /// #2753: echoed text is not evidence of Git's already-used branch failure.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn worktree_notice_echo_does_not_forge_git_error() {
     worktree_notice_unrelated_failure(
@@ -681,6 +684,7 @@ async fn worktree_notice_echo_does_not_forge_git_error() {
 }
 
 /// #2753: a quoted invalid start operand is not an already-used branch error.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn worktree_notice_quoted_operand_does_not_forge_git_error() {
     worktree_notice_unrelated_failure(
@@ -689,6 +693,7 @@ async fn worktree_notice_quoted_operand_does_not_forge_git_error() {
     .await;
 }
 
+#[cfg(feature = "confine")]
 async fn worktree_notice_unrelated_failure(source: &str) {
     let _env = crate::process_env::lock();
     let _engine =

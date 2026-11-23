@@ -54,7 +54,7 @@ mod dependency_fetch;
 mod dispatch;
 pub(super) mod file_capture;
 mod file_change;
-#[cfg(feature = "ast")]
+#[cfg(all(feature = "ast", feature = "confine"))]
 mod move_from;
 mod navigation;
 mod path_suggest;
@@ -1479,6 +1479,18 @@ async fn run_confined_build_lane(
     wall: std::time::Duration,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
+    if let Err(refusal) = crate::confined_exec::require_backend() {
+        return render_confined_build_result(
+            Err(refusal),
+            None,
+            trim,
+            tool_output_lines,
+            color,
+            tool_offload,
+            spill_store,
+            presentation,
+        );
+    }
     presentation.execution_command(display, &cwd.to_string_lossy());
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
     let (root, cwd) = match build_shell::build_directory(workspace, cwd, caveats) {
@@ -5582,9 +5594,11 @@ async fn execute_authorized_tool(
                 return "error: write_file needs `path` — nothing was written".to_string();
             }
             if args.get("move_from").is_some() {
-                #[cfg(not(feature = "ast"))]
+                #[cfg(not(feature = "confine"))]
+                return "error: move_from requires a build with the confine feature; nothing changed".into();
+                #[cfg(all(feature = "confine", not(feature = "ast")))]
                 return "error: move_from requires a build with the ast feature; nothing changed".into();
-                #[cfg(feature = "ast")]
+                #[cfg(all(feature = "confine", feature = "ast"))]
                 {
                     let moved = match move_from::execute(args, workspace, caveats, smart_harness, &mut permission_gate) {
                         Ok(moved) => moved,

@@ -94,6 +94,7 @@ async fn adoption_2759_nested_creation_is_refused_before_git() {
 
 /// #2759: an actual filesystem fence must not ask to grant rm; genuine exec
 /// misses must not be mislabeled as that fence, even after an allow-once reply.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn adoption_2759_filesystem_and_exec_denials_stay_distinct() {
     let _env = crate::process_env::lock();

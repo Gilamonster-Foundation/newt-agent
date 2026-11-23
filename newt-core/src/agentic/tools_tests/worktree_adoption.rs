@@ -250,6 +250,7 @@ async fn call(
 
 /// #2733: ground command-observation and positive-scope unit tests in real
 /// Git creation and actual interpreter writes under the native kernel fence.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement, git and python3"]

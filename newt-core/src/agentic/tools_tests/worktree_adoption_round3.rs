@@ -1,12 +1,13 @@
 //! #2733: recognition must not disappear behind an ambiguous earlier command.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 use super::round2_tests::dispatch;
 use super::*;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 use crate::{worktree_adoption::WorktreeSession, Scope};
 
 /// Ground fail-closed creation recognition in actual Git dispatch: neither
 /// prefix may let git clean delete the original sentinel before adoption.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 async fn prefix_preserves_sentinel(prefix: &str) {
     assert!(crate::confined_exec::kernel_fs_fence_available());
@@ -67,6 +68,7 @@ async fn prefix_preserves_sentinel(prefix: &str) {
 }
 
 /// #2733 round 3: a preceding cwd command must not erase creation recognition.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]
@@ -75,6 +77,7 @@ async fn worktree_adoption_round3_cd_prefix_preserves_sentinel() {
 }
 
 /// #2733 round 3: a nonliteral earlier Git operand must not erase recognition.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]
@@ -84,6 +87,7 @@ async fn worktree_adoption_round3_dynamic_git_prefix_preserves_sentinel() {
 
 /// #2733: the same nonliteral prefix with an already-allowed shell variable
 /// demonstrates the boundary independently of the shell's $UNSET allowlist.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]
@@ -220,6 +224,7 @@ fn worktree_adoption_round4_display_identity() {
 
 /// #2733 round 4: ground the display classifier in real dispatch. A native rm
 /// image named tail must not delete the sentinel before the adoption boundary.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]

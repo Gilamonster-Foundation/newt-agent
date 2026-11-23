@@ -1,5 +1,27 @@
 use super::*;
 
+/// The build lane's early backend check uses the executor's existing refusal renderer.
+#[test]
+fn build_lane_refusal_renders_as_unavailable_error() {
+    let refusal = crate::confined_exec::ExecRefused::ConfinementUnenforceable(
+        crate::confined_exec::CONFINE_OFF_REASON.into(),
+    );
+    let expected = format!("error: {refusal}");
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
+    let (text, outcome) = render_confined_build_result(
+        Err(refusal),
+        None,
+        None,
+        20,
+        false,
+        false,
+        None,
+        &mut display,
+    );
+    assert_eq!(text, expected);
+    assert_eq!(outcome, crate::ExecOutcome::Unavailable);
+}
+
 #[test]
 fn lifecycle_unavailable_run_suggests_explicit_build_with_same_phase_and_dir() {
     for dir in [None, Some("nested project")] {

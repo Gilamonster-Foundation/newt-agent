@@ -1,7 +1,10 @@
 //! #2757: ground destination approvals in real confined Git with bounded reads.
 use super::*;
+#[cfg(feature = "confine")]
 use crate::worktree_adoption::WorktreeSession;
-use crate::{ExecOutcome, Scope};
+#[cfg(feature = "confine")]
+use crate::ExecOutcome;
+use crate::Scope;
 use newt_policy::permissions::widen_caveats;
 
 #[derive(Default)]
@@ -52,8 +55,10 @@ impl PermissionGate for AllowOnce {
     }
 }
 
+#[cfg(feature = "confine")]
 #[derive(Default)]
 struct Notices(Vec<String>);
+#[cfg(feature = "confine")]
 impl ToolPresentation for Notices {
     fn preview(&mut self, text: &str, _: usize) {
         self.0.push(text.into());
@@ -62,7 +67,9 @@ impl ToolPresentation for Notices {
     fn override_result(&mut self, _: String) {}
 }
 
+#[cfg(feature = "confine")]
 struct ReadOnly;
+#[cfg(feature = "confine")]
 impl PermissionGate for ReadOnly {
     fn ask_dependency_fetch(
         &mut self,
@@ -89,6 +96,7 @@ impl PermissionGate for ReadOnly {
 /// the new .git file. An approved task destination must also remain usable
 /// after the one creation call and a Plan/approval cycle, without opening any
 /// neighboring checkout or restoring writes to the original checkout.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn plan_release_preserves_worktree_adoption() {
     let _env = crate::process_env::lock();

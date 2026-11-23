@@ -760,7 +760,7 @@ checksum = "00"
     /// admits the approved fixed fetch, fills a missing crate archive, and an
     /// offline Cargo check then succeeds. Run the compiled test binary with a
     /// disposable CARGO_HOME containing only a copied public registry index.
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "confine"))]
     #[tokio::test]
     #[ignore = "native macOS, explicit scratch CARGO_HOME, crates.io downloads"]
     async fn native_macos_cold_cache_fetch_and_offline_rebuild() {
