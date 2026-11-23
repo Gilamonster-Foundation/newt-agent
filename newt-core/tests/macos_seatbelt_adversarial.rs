@@ -793,41 +793,55 @@ fn seatbelt_operator_network_grant_keeps_build_filesystem_confined() {
     assert_eq!(received, "operator-granted");
 }
 
-/// Grounds the restricted cases of the build-network unit test against L3:
-/// unsupported network authority must never be promoted to an unrestricted
-/// grant to make a command run. The positive counterpart is the build test above.
+/// Grounds the build-network narrowing (#2730) against L3: a build granted a host list
+/// is neither refused nor given that host. Seatbelt cannot name an arbitrary host (ADR
+/// 0015), so the host list narrows to deny-all, the build runs under Seatbelt, and a
+/// loopback connect the parent can make fails in the child: the grant is never promoted
+/// to an unrestricted one. Before #2730 this shape was refused before spawn, which this
+/// test (then `seatbelt_build_without_unrestricted_network_grant_refuses_before_spawn`)
+/// asserted.
 #[test]
-#[ignore = "real Seatbelt admission"]
+#[ignore = "real Seatbelt admission and a loopback socket"]
 #[serial]
-fn seatbelt_build_without_unrestricted_network_grant_refuses_before_spawn() {
-    // A general remote-host allowlist is NOT `net_direct_denied` (agent-bridle
-    // ADR 0015: SBPL cannot name an arbitrary host, so this shape is left
-    // ambient and reported `Unknown`/`Advisory`, unaffected by agent-bridle#405's
-    // promotion) — it must still refuse before spawn. `Scope::none()` no longer
-    // belongs in this test; see `seatbelt_build_deny_all_net_now_runs` below.
+fn seatbelt_build_with_a_host_list_runs_without_network() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // The parent reaches the port, so a refused connect in the child is the sandbox's.
+    std::net::TcpStream::connect(("127.0.0.1", port)).expect("the listener accepts the parent");
     let ws = tempdir().unwrap();
-    let network = Scope::only(["example.test".into()]);
+    let marker = ws.path().join("ran");
+    let script = format!(
+        "echo ran > {}; /usr/bin/nc -G 2 -z 127.0.0.1 {port}",
+        marker.display()
+    );
     let request = newt_core::confined_exec::build_tool_request(
         ws.path(),
         ws.path(),
         "/bin/sh",
-        ["-c", "echo ran > forbidden-marker"],
-        &network,
+        ["-c", &script],
+        &Scope::only(["example.test".into()]),
     );
-    let error = ConstrainedExecutor::run(&request).unwrap_err();
+    let out = ConstrainedExecutor::run(&request)
+        .expect("a host-list build grant narrows to deny-all and is admitted (#2730)");
+    assert_seatbelt(&out);
     assert!(
-        matches!(&error, ExecRefused::ConfinementUnenforceable(_)),
-        "{error}"
+        marker.exists(),
+        "the admitted build must have run: stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(error.to_string().contains("Net axis"), "{error}");
-    assert!(!ws.path().join("forbidden-marker").exists());
+    assert!(
+        !out.success,
+        "the loopback connect must be kernel-denied: stdout={:?} stderr={:?}",
+        out.stdout, out.stderr
+    );
 }
 
 /// newt-agent#2673 / agent-bridle#405 (ADR 0015 amendment E6): `net: none`
 /// (deny-all, zero `mach:` grants) is now a deputy-complete Kernel witness,
 /// so a build-tool request under it ADMITS instead of refusing "Net axis"
-/// before spawn — this used to be part of the test above, asserting the
-/// OPPOSITE, before the Mach-deputy audit this promotion backs existed. The
+/// before spawn — this used to be part of the refusal test that the test above
+/// replaced, asserting the OPPOSITE, before the Mach-deputy audit this promotion backs
+/// existed. The
 /// real kernel still has no network: this is a pure admission proof, not a
 /// network-reachability one (that is `seatbelt_net_deny_all_runs_kernel_denied`,
 /// above).
