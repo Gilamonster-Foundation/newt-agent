@@ -4732,7 +4732,6 @@ version = "0.8.6"
 dependencies = [
  "age",
  "agent-bridle",
- "agent-bridle-fdguard",
  "agent-bridle-tool-shell",
  "agent-mesh-protocol 0.7.1",
  "agent-toolchain",
@@ -4757,6 +4756,7 @@ dependencies = [
  "ignore",
  "libc",
  "markdown-table-formatter",
+ "newt-fdguard",
  "newt-harness",
  "newt-interaction",
  "newt-policy",

@@ -151,7 +151,8 @@ tokio.workspace = true
 # passthrough list — never arrived). No `[patch]`: this is the published crate.
 agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
 agent-bridle-tool-shell = { version = "0.8.0-rc.7", features = ["brush"] }
-agent-bridle-fdguard = "0.8.0-rc.7"
+# The descriptor guard, newt's own copy of agent-bridle-fdguard (#3160).
+newt-fdguard.workspace = true
 # The shell parser behind `shell_inspect` (#3160): the version agent-bridle-tool-shell pins.
 brush-parser = { package = "brush-ocap-parser", version = "=0.5.0-rc.1" }
 tempfile = "3"

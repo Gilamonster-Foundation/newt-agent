@@ -911,7 +911,7 @@ fn run_helper(
                 }
                 // This helper already inherits the kernel fence. Preserve the
                 // hook's stdio while withholding all private authority FDs.
-                agent_bridle_fdguard::deny_inherited_fds(&mut command);
+                newt_fdguard::deny_inherited_fds(&mut command);
                 match command.spawn() {
                     Ok(mut child) => {
                         if reads_stdin {
