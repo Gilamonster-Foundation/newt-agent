@@ -11,6 +11,10 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `newt_mcp_client::SandboxKind` is `newt_core::sandbox_seam::SandboxKind`, a newt-core enum
+  with bridle's six variant names; it was `agent_bridle::SandboxKind`, with no alias (#3160).
+  Its variant names and `Debug` text are unchanged; it has no `Default`, `Serialize` or
+  `Deserialize`.
 - `newt_core::confined_exec::ConfinedOutput::sandbox_kind` is
   `newt_core::sandbox_seam::SandboxKind`, a newt-core enum with bridle's six variant names; it
   was `agent_bridle::SandboxKind`, with no alias. Convert with `SandboxKind::from` (#3160).

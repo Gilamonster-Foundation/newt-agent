@@ -112,7 +112,7 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
             ..Caveats::top()
         };
         let mut transport = StdioTransport::spawn(&admitted, &caveats).unwrap();
-        assert_ne!(transport.sandbox_kind, agent_bridle::SandboxKind::None);
+        assert_ne!(transport.sandbox_kind, SandboxKind::None);
         let line = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             transport.stdout.next_line(),
@@ -258,8 +258,13 @@ async fn stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt() {
         });
         assert_eq!(t.sandbox_kind(), SandboxKind::Seatbelt);
         let spawned = spawn_caveats(&caveats, "/bin/cat");
-        let mechanism = ConfinementMechanism::new(t.sandbox_kind(), ChildNetworkPolicy::DenyDirect)
-            .with_stdio_posture(StdioPosture::Audited);
+        // Bridle's kind, which `ConfinementMechanism` takes: the assertion above is that it is
+        // the one the child ran under.
+        let mechanism = ConfinementMechanism::new(
+            agent_bridle::SandboxKind::Seatbelt,
+            ChildNetworkPolicy::DenyDirect,
+        )
+        .with_stdio_posture(StdioPosture::Audited);
         assert_eq!(
             enforcement_report(&spawned, mechanism).net,
             Some(AxisEnforcement::Kernel),

@@ -23,9 +23,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 // The OS-sandbox posture a stdio server achieved (honest record on
-// `ConnectedServer`, surfaced by `/mcp`). Re-exported so consumers can name it
-// without a direct agent-bridle dependency.
-pub use agent_bridle::SandboxKind;
+// `ConnectedServer`, surfaced by `/mcp`). newt-core's own enum, which names bridle's
+// kinds one for one, so this crate's API names no bridle type (#3160).
+pub use newt_core::sandbox_seam::SandboxKind;
 
 mod net_policy;
 pub use net_policy::{HttpNetGrantRequired, HttpNetworkPolicy};
@@ -1058,7 +1058,7 @@ impl StdioTransport {
                 let notice = spawn_failure_notice(&entry.name, command, seatbelt_refusal);
                 anyhow::Error::new(e).context(notice)
             })?;
-        let sandbox_kind = child.sandbox_kind;
+        let sandbox_kind = SandboxKind::from(child.sandbox_kind);
         log_confinement(&entry.name, sandbox_kind);
 
         let stdin = child
