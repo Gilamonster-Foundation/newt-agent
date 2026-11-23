@@ -365,9 +365,9 @@ async fn check(row: Row) {
         assert_eq!(
             output.sandbox_kind,
             if cfg!(target_os = "macos") {
-                agent_bridle::SandboxKind::Seatbelt
+                crate::sandbox_seam::SandboxKind::Seatbelt
             } else {
-                agent_bridle::SandboxKind::Landlock
+                crate::sandbox_seam::SandboxKind::Landlock
             },
             "local push must use the native kernel fence"
         );

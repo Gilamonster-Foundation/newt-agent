@@ -9,11 +9,11 @@ fn check_receipt_requires_real_zero_and_confinement() {
         code: Some(0),
         stdout: Vec::new(),
         stderr: Vec::new(),
-        sandbox_kind: agent_bridle::SandboxKind::None,
+        sandbox_kind: crate::sandbox_seam::SandboxKind::None,
         timed_out: false,
     };
     assert!(checked_output(&output).is_err());
-    output.sandbox_kind = agent_bridle::SandboxKind::Landlock;
+    output.sandbox_kind = crate::sandbox_seam::SandboxKind::Landlock;
     assert!(checked_output(&output).is_ok());
     output.success = false;
     output.code = Some(101);

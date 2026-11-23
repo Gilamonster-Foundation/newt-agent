@@ -174,7 +174,7 @@ pub struct ExecRequest {
     scratch_dirs: Vec<PathBuf>,
     /// Read roots the caller holds as directory descriptors: the Landlock
     /// fence anchors on them instead of re-opening the root by path.
-    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
+    held_read_roots: Vec<crate::sandbox_seam::HeldReadRoot>,
 }
 
 impl ExecRequest {
@@ -204,14 +204,14 @@ impl ExecRequest {
     }
 
     /// Anchor the fence's read rules for these roots on the descriptors the
-    /// caller holds ([`agent_bridle::HeldReadRoot`]), so a root swapped at
+    /// caller holds ([`crate::sandbox_seam::HeldReadRoot`]), so a root swapped at
     /// its pathname after the caller's check is outside the fence. Each root
     /// must also be in `caveats.fs_read`; this changes how the fence is
     /// built, never what is admitted.
     #[must_use]
     pub fn held_read_roots(
         mut self,
-        roots: impl IntoIterator<Item = agent_bridle::HeldReadRoot>,
+        roots: impl IntoIterator<Item = crate::sandbox_seam::HeldReadRoot>,
     ) -> Self {
         self.held_read_roots.extend(roots);
         self
@@ -229,7 +229,7 @@ impl ExecRequest {
         self
     }
 
-    pub(crate) fn build_held_read_roots(&self) -> Vec<agent_bridle::HeldReadRoot> {
+    pub(crate) fn build_held_read_roots(&self) -> Vec<crate::sandbox_seam::HeldReadRoot> {
         self.held_read_roots.clone()
     }
 
@@ -344,7 +344,7 @@ impl std::error::Error for ExecRefused {}
 
 /// The result of a completed confined run: the child's exit outcome, its
 /// captured output, and the OS sandbox that was ACTUALLY applied (honest — never
-/// over-claimed; [`agent_bridle::SandboxKind::None`] means advisory only).
+/// over-claimed; [`crate::sandbox_seam::SandboxKind::None`] means advisory only).
 #[derive(Debug)]
 pub struct ConfinedOutput {
     /// True iff the child exited with a success status.
@@ -354,7 +354,7 @@ pub struct ConfinedOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// The OS sandbox actually applied to the child.
-    pub sandbox_kind: agent_bridle::SandboxKind,
+    pub sandbox_kind: crate::sandbox_seam::SandboxKind,
     /// True iff the child hit its [`ExecRequest::timeout`] and was killed. A
     /// timed-out run is never reported as `success`.
     pub timed_out: bool,
@@ -524,7 +524,7 @@ impl ConstrainedExecutor {
             other => ExecRefused::Authorize(other.to_string()),
         })?;
 
-        let sandbox_kind = child.sandbox_kind;
+        let sandbox_kind = crate::sandbox_seam::SandboxKind::from(child.sandbox_kind);
         // The child leads its own process group (`new_process_group`, pgid ==
         // pid), so one `killpg` reaps the child AND any descendants it left in
         // the group — the child-lifetime containment the raw `Command`s lacked.

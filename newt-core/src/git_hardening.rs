@@ -307,7 +307,9 @@ pub fn own_gitdir_shell_write_grant(workspace: &Path) -> Vec<String> {
 /// replacement after that check can redirect its pathname-based profile.
 /// No descriptor-isolation claim is made for Seatbelt; Windows gets no extra
 /// metadata authority until equivalent held-object support is available.
-pub(crate) fn build_git_reads(workspace: &Path) -> (Vec<String>, Vec<agent_bridle::HeldReadRoot>) {
+pub(crate) fn build_git_reads(
+    workspace: &Path,
+) -> (Vec<String>, Vec<crate::sandbox_seam::HeldReadRoot>) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let checked = || -> Option<_> {

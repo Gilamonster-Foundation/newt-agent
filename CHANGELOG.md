@@ -11,6 +11,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `newt_core::confined_exec::ConfinedOutput::sandbox_kind` is
+  `newt_core::sandbox_seam::SandboxKind`, a newt-core enum with bridle's six variant names; it
+  was `agent_bridle::SandboxKind`, with no alias. Convert with `SandboxKind::from` (#3160).
 - `web_fetch` runs through `newt_core::web_fetch` (`fetch`, `WebFetchError`), a copy of
   agent-bridle-tool-web 0.8.0-rc.7, instead of agent-bridle's `WebFetchTool` (#3160). Its
   requests send the user agent `newt-agent/<version>` where they sent

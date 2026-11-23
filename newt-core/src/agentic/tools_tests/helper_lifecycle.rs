@@ -724,7 +724,7 @@ fn cold_cache_recovery_is_visible_to_model_and_operator() {
             stdout: b"build header\n".to_vec(),
             stderr: b"error: cache missing\n".to_vec(),
             timed_out: false,
-            sandbox_kind: agent_bridle::SandboxKind::None,
+            sandbox_kind: crate::sandbox_seam::SandboxKind::None,
         };
         let note = "note: automatic locked fetch was declined by the operator";
         let (model, outcome) = render_confined_build_result(

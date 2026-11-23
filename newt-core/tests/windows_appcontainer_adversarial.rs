@@ -481,7 +481,7 @@ fn constrained_cmd(
 fn assert_appcontainer(out: &ConfinedOutput) {
     assert_eq!(
         out.sandbox_kind,
-        agent_bridle::SandboxKind::AppContainer,
+        newt_core::sandbox_seam::SandboxKind::AppContainer,
         "expected production route to use AppContainer, got {:?}; stdout={} stderr={}",
         out.sandbox_kind,
         String::from_utf8_lossy(&out.stdout),
@@ -1193,7 +1193,7 @@ unsafe fn create_permissive_pipe(path: &str) -> windows_sys::Win32::Foundation::
     ) != 0;
     assert!(ok, "convert permissive pipe SDDL");
 
-    let mut sa = SECURITY_ATTRIBUTES {
+    let sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd.cast(),
         bInheritHandle: 0,
@@ -1207,7 +1207,7 @@ unsafe fn create_permissive_pipe(path: &str) -> windows_sys::Win32::Foundation::
         512,
         512,
         2_000,
-        &mut sa,
+        &sa,
     );
     LocalFree(sd.cast());
     if handle == INVALID_HANDLE_VALUE {
@@ -1329,7 +1329,7 @@ impl InheritableFile {
             CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
             bInheritHandle: 1,
@@ -1339,7 +1339,7 @@ impl InheritableFile {
             path_w.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &mut sa,
+            &sa,
             CREATE_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
             std::ptr::null_mut(),

@@ -69,7 +69,7 @@ fn legitimate_in_workspace_write_runs_confined() {
         );
         assert_eq!(
             out.sandbox_kind,
-            agent_bridle::SandboxKind::Landlock,
+            newt_core::sandbox_seam::SandboxKind::Landlock,
             "the child must actually be Landlock-confined, not advisory"
         );
     } else {
@@ -184,7 +184,10 @@ fn hostile_child_cannot_open_a_network_connection() {
         let r = confined_sh(ws.path(), "true");
         if landlock_available() {
             let out = r.expect("confined run under Landlock");
-            assert_eq!(out.sandbox_kind, agent_bridle::SandboxKind::Landlock);
+            assert_eq!(
+                out.sandbox_kind,
+                newt_core::sandbox_seam::SandboxKind::Landlock
+            );
         } else {
             assert!(matches!(r, Err(ExecRefused::ConfinementUnenforceable(_))));
         }
@@ -426,7 +429,7 @@ fn a_real_confined_cargo_check_succeeds_under_the_narrowed_read_set() {
         .expect("a confined cargo check must run under Landlock on this host");
     assert_eq!(
         out.sandbox_kind,
-        agent_bridle::SandboxKind::Landlock,
+        newt_core::sandbox_seam::SandboxKind::Landlock,
         "the build must actually be Landlock-confined, not advisory"
     );
     assert!(
