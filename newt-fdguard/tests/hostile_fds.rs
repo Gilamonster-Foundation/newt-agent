@@ -1,9 +1,9 @@
 // newt-fdguard: tests/hostile_fds.rs of agent-bridle-fdguard 0.8.0-rc.7 (Apache-2.0, Copyright
-// 2026 Shawn Hartsock), for #3160. One edit: its three calls of `deny_inherited_fds` name this
-// crate, `newt_fdguard`, where the original names `agent_bridle_fdguard`, and each test carries
-// an `#[ignore]` line for the weekly real-resource tier. Its prose still says
-// agent-bridle (`cargo test -p agent-bridle-fdguard` is `cargo test -p newt-fdguard` here).
-// tests/vendor_identity.rs holds it equal to the vendored file with that one edit.
+// 2026 Shawn Hartsock), for #3160. Two edits: its three calls of `deny_inherited_fds` name this
+// crate, `newt_fdguard`, where the original names `agent_bridle_fdguard`, and every test but the
+// child entrypoint carries an `#[ignore]` line for the weekly real-resource tier. Its prose still
+// says agent-bridle (`cargo test -p agent-bridle-fdguard` is `cargo test -p newt-fdguard` here).
+// tests/vendor_identity.rs holds it equal to the vendored file with those two edits.
 // ---- end of newt header: below is agent-bridle-fdguard's file, with those edits ----
 //! Hostile descriptor-inheritance tests for the confined-spawn guard
 //! (agent-bridle#319 / #352), through the **public** API only.

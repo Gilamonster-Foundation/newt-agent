@@ -3,8 +3,9 @@
 //! stops where the vendored Newt patch begins, `tests/hostile_fds.rs` names this crate in its
 //! three calls, and each test that touches a real filesystem, real descriptors or a child
 //! process carries one `IGNORED` line, because this repo's per-PR unit tier is fully mocked;
-//! those tests run in the weekly real-resource lane. A change on either side turns a test here
-//! red: port it below the header, or decide to diverge and change this file in the same commit.
+//! those tests run in the weekly real-resource lane, and each file's list of them is pinned
+//! below by name. A change on either side turns a test here red: port it below the header, or
+//! decide to diverge and change this file in the same commit.
 //!
 //! The files are embedded at compile time, so nothing here reads the filesystem. The package
 //! excludes this file: a published crate has no `../vendor`.
@@ -32,7 +33,8 @@ const IGNORED: &str =
 const PUBLISHED_LIB_LINES: usize = 260;
 
 /// The copy below its header: everything after the first line that starts with the sentinel.
-/// Every line above it must be a comment or an inner attribute, so no code hides in a header.
+/// Every line above it must be a `//` comment, so no code hides in a header, an inner attribute
+/// such as `#![cfg(any())]` included.
 fn body(copy: &str) -> Result<&str, String> {
     let mut offset = 0;
     for (index, line) in copy.split_inclusive('\n').enumerate() {
@@ -40,7 +42,7 @@ fn body(copy: &str) -> Result<&str, String> {
         if line.starts_with(SENTINEL) {
             return Ok(&copy[offset..]);
         }
-        if !(line.starts_with("//") || line.starts_with("#![")) {
+        if !line.starts_with("//") {
             let number = index + 1;
             return Err(format!("header line {number} is code: {line:?}"));
         }
@@ -63,45 +65,99 @@ fn first_difference(copy: &str, original: &str) -> Option<String> {
     }
 }
 
-/// `body` without its `IGNORED` lines, and how many there were. Only a line that is exactly
-/// `IGNORED`, after indentation, is dropped: an `#[ignore]` with any other reason is a
-/// difference like any other.
-fn without_ignored(body: &str) -> (String, usize) {
+/// `body` without its `IGNORED` lines, and the test each one marks: the function declared on
+/// the next line. Only a line that is exactly `IGNORED`, after indentation, is dropped: an
+/// `#[ignore]` with any other reason is a difference like any other.
+fn without_ignored(body: &str) -> (String, Vec<String>) {
     let mut kept = String::with_capacity(body.len());
-    let mut dropped = 0;
-    for line in body.split_inclusive('\n') {
+    let mut marked = Vec::new();
+    let mut lines = body.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
         if line.trim() == IGNORED {
-            dropped += 1;
+            marked.push(declared_fn(lines.peek().copied().unwrap_or_default()));
         } else {
             kept.push_str(line);
         }
     }
-    (kept, dropped)
+    (kept, marked)
 }
 
+/// The name of the function `line` declares, or the whole trimmed line when it declares none,
+/// so a weekly-tier line above anything but a test shows up in the report.
+fn declared_fn(line: &str) -> String {
+    let line = line.trim();
+    line.strip_prefix("fn ")
+        .and_then(|rest| rest.split_once('('))
+        .map_or_else(|| line.to_string(), |(name, _)| name.to_string())
+}
+
+/// `copy` is `original` below its header, apart from the `IGNORED` lines, and those mark
+/// exactly the tests named in `weekly`, in file order: moving the line to another test is a
+/// difference, not only adding or dropping one.
 #[track_caller]
-fn assert_copy(name: &str, copy: &str, original: &str, ignored: usize) {
+fn assert_copy(name: &str, copy: &str, original: &str, weekly: &[&str]) {
     let body = body(copy).unwrap_or_else(|why| panic!("{name}: {why}"));
-    let (body, dropped) = without_ignored(body);
-    assert_eq!(
-        dropped, ignored,
-        "{name}: {dropped} tests are moved to the weekly tier, {ignored} expected"
-    );
+    let (body, marked) = without_ignored(body);
+    assert_eq!(marked, weekly, "{name}: the tests moved to the weekly tier");
     if let Some(difference) = first_difference(&body, original) {
         panic!("{name} is not the vendored file: {difference}");
     }
 }
 
+/// The tests each copy moves to the weekly tier, in file order.
+const WEEKLY_LIB: &[&str] = &["deny_inherited_fds_reports_a_missing_program_as_not_found"];
+const WEEKLY_BENEATH: &[&str] = &[
+    "in_scope_write_append_read_roundtrip",
+    "symlink_component_escape_is_refused",
+    "symlink_final_component_is_refused",
+    "symlink_intermediate_in_root_is_refused",
+    "dotdot_and_absolute_rel_are_refused",
+    "empty_rel_opens_the_root_for_read_and_refuses_write",
+    "ancestor_symlink_swap_at_acquisition_is_refused",
+    "ancestor_rename_after_acquisition_does_not_redirect",
+    "root_replacement_after_acquisition_fails_closed",
+    "from_owned_fd_refuses_a_non_directory",
+    "from_owned_fd_adopts_a_directory_without_pathname_authority",
+    "o_nofollow_alone_opens_through_an_intermediate_symlink",
+    "enotdir_classifies_as_a_resolution_refusal",
+    "a_grant_includes_nested_mounts_and_no_xdev_would_refuse_them",
+    "identity_is_stable_and_shared_by_clones",
+];
+const WEEKLY_SWEEP: &[&str] = &[
+    "the_enumeration_leg_sees_a_descriptor_high_in_the_table",
+    "a_refused_plan_fails_the_spawn_and_the_program_never_runs",
+    "a_truncated_sweep_bound_leaks_a_descriptor_the_honest_bound_closes",
+    "a_required_range_wider_than_the_supported_range_refuses_the_spawn",
+    "a_lowered_allocation_limit_never_shrinks_the_bound_below_the_open_table",
+    "the_planned_bound_tracks_the_kernel_ceiling_rather_than_a_constant",
+];
+const WEEKLY_HOSTILE_FDS: &[&str] = &[
+    "an_ambient_file_descriptor_is_closed_in_the_confined_child",
+    "an_ambient_socket_descriptor_is_closed_in_the_confined_child",
+    "an_ambient_pipe_descriptor_is_closed_in_the_confined_child",
+    "a_duplicated_descriptor_is_closed_in_the_confined_child",
+    "a_descriptor_near_the_top_of_the_table_is_closed_in_the_confined_child",
+    "the_kernel_refuses_a_descriptor_at_or_above_the_derived_ceiling",
+    "delegated_stdio_survives_the_confined_spawn",
+    "concurrent_descriptor_creation_never_reaches_the_confined_child",
+    "a_missing_confined_program_still_reports_not_found",
+];
+
 #[test]
 fn beneath_is_the_vendored_file() {
     assert!(VENDORED_BENEATH.contains("pub struct GrantedRoot"));
-    assert_copy("src/beneath.rs", COPY_BENEATH, VENDORED_BENEATH, 15);
+    assert_copy(
+        "src/beneath.rs",
+        COPY_BENEATH,
+        VENDORED_BENEATH,
+        WEEKLY_BENEATH,
+    );
 }
 
 #[test]
 fn sweep_is_the_vendored_file() {
     assert!(VENDORED_SWEEP.contains("pub(crate) fn plan_sweep_bound("));
-    assert_copy("src/sweep.rs", COPY_SWEEP, VENDORED_SWEEP, 6);
+    assert_copy("src/sweep.rs", COPY_SWEEP, VENDORED_SWEEP, WEEKLY_SWEEP);
 }
 
 #[test]
@@ -114,20 +170,25 @@ fn lib_is_the_vendored_file_without_the_newt_patch() {
     assert_eq!(patch.matches("pub fn ").count(), 1, "{patch}");
     let patched = "pub fn duplicate_control_socket(";
     assert!(patch.contains(patched), "{patch}");
-    assert_copy("src/lib.rs", COPY_LIB, &published, 1);
+    assert_copy("src/lib.rs", COPY_LIB, &published, WEEKLY_LIB);
     assert!(!body(COPY_LIB).unwrap().contains("duplicate_control_socket"));
 }
 
 #[test]
 fn hostile_fds_is_the_vendored_file_with_this_crates_name() {
-    // The one edit is the three calls. A vendored change that names the crate a fourth time
-    // fails here, so it is a decision, not a silent rewrite.
+    // Besides the weekly-tier lines, the one edit is the three calls. A vendored change that
+    // names the crate a fourth time fails here, so it is a decision, not a silent rewrite.
     let old = "agent_bridle_fdguard";
     assert_eq!(VENDORED_HOSTILE_FDS.matches(old).count(), 3);
     let call = "agent_bridle_fdguard::deny_inherited_fds(&mut cmd);";
     assert_eq!(VENDORED_HOSTILE_FDS.matches(call).count(), 3);
     let renamed = VENDORED_HOSTILE_FDS.replace(old, "newt_fdguard");
-    assert_copy("tests/hostile_fds.rs", COPY_HOSTILE_FDS, &renamed, 9);
+    assert_copy(
+        "tests/hostile_fds.rs",
+        COPY_HOSTILE_FDS,
+        &renamed,
+        WEEKLY_HOSTILE_FDS,
+    );
 }
 
 /// The comparer can fail: a changed byte, a missing line and an extra line are each reported
@@ -151,28 +212,45 @@ fn the_comparer_reports_a_difference() {
 }
 
 /// A copy with no sentinel, or with code above it, is refused, so an empty file, a headerless
-/// one or one that hides code in its header cannot pass.
+/// one or one that hides code in its header cannot pass. An inner attribute is code: in a
+/// header, `#![cfg(any())]` would empty a test binary and `#![allow(..)]` would lift a lint.
 #[test]
 fn a_copy_without_a_header_is_refused() {
     assert!(body("").is_err());
     assert!(body(VENDORED_BENEATH).is_err());
     let hidden = format!("fn above() {{}}\n{SENTINEL} ----\n{VENDORED_BENEATH}");
     assert!(body(&hidden).is_err());
+    for attribute in ["#![cfg(any())]", "#![allow(unsafe_op_in_unsafe_fn)]"] {
+        let hidden = format!("// a header\n{attribute}\n{SENTINEL} ----\n{VENDORED_BENEATH}");
+        assert!(
+            body(&hidden).is_err(),
+            "{attribute} passed as a header line"
+        );
+    }
     let honest = format!("// a header\n{SENTINEL} ----\n{VENDORED_BENEATH}");
     assert_eq!(body(&honest), Ok(VENDORED_BENEATH));
 }
 
-/// Only the exact weekly-tier line is dropped, and every one is counted: an `#[ignore]` with
-/// another reason, or a code line, stays a difference.
+/// Only the exact weekly-tier line is dropped, and each one names the test it marks: an
+/// `#[ignore]` with another reason stays a difference, the same line on another test names
+/// that test, and a line above anything but a function names the line.
 #[test]
 fn only_the_weekly_tier_line_is_dropped() {
-    let original = "#[test]\nfn a() {}\n";
-    let moved = format!("#[test]\n    {IGNORED}\nfn a() {{}}\n");
-    assert_eq!(without_ignored(&moved), (original.to_string(), 1));
-    let other = "#[test]\n#[ignore = \"flaky\"]\nfn a() {}\n";
-    let (kept, dropped) = without_ignored(other);
-    assert_eq!(dropped, 0);
+    let original = "#[test]\nfn a() {}\n#[test]\nfn b() {}\n";
+    let on_a = format!("#[test]\n    {IGNORED}\nfn a() {{}}\n#[test]\nfn b() {{}}\n");
+    assert_eq!(
+        without_ignored(&on_a),
+        (original.to_string(), vec!["a".to_string()])
+    );
+    let on_b = format!("#[test]\nfn a() {{}}\n#[test]\n    {IGNORED}\nfn b() {{}}\n");
+    assert_eq!(
+        without_ignored(&on_b),
+        (original.to_string(), vec!["b".to_string()])
+    );
+    let other = "#[test]\n#[ignore = \"flaky\"]\nfn a() {}\n#[test]\nfn b() {}\n";
+    let (kept, marked) = without_ignored(other);
+    assert!(marked.is_empty());
     assert!(first_difference(&kept, original).is_some());
-    let twice = format!("{IGNORED}\n{IGNORED}\n{original}");
-    assert_eq!(without_ignored(&twice), (original.to_string(), 2));
+    let twice = format!("{IGNORED}\n{IGNORED}\nfn a() {{}}\n");
+    assert_eq!(without_ignored(&twice).1, [IGNORED, "a"]);
 }
