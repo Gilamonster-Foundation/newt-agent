@@ -195,7 +195,7 @@ pub fn caveats_from_envelope(envelope: &str) -> Result<newt_core::Caveats, Envel
 mod tests {
     use super::*;
     use agent_mesh_core::{Caveats as AmCaveats, CountBound, Scope, UserKey};
-    // The `permits_*` / `permits_one_more` adaptors live on `newt-core`'s
+    // The `permits_*` / `permits_one_more` adaptors live on `newt-policy`'s
     // extension traits (`agent-mesh-protocol` itself ships algebra only);
     // bring them into scope so the round-trip assertions read as before.
     use newt_policy::{CaveatsExt, CountBoundExt};

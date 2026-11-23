@@ -10,8 +10,8 @@ model (`~/.newt/config.toml`; a project `.newt/config.toml` cannot set
 inference endpoints, credentials or other control-plane keys; the MCP servers
 it declares are kept but marked untrusted, which does not let them connect),
 session and memory types, MCP server
-resolution, metrics, and capability caveat extensions used across the
-workspace.
+resolution and metrics used across the workspace. The capability caveat
+extensions moved to `newt-policy` (#3160).
 
 Turn metrics distinguish an answer from a question awaiting the operator and
 from incomplete narration. `TurnEndReason::AwaitingOperator` serializes as

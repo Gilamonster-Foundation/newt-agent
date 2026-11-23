@@ -6,7 +6,8 @@
 //! enforcement-side types are now literally the same Rust type, so there is no
 //! drift surface between them and no JSON bridge to maintain.
 //!
-//! What stayed in `newt-core` is the **enforcement convenience layer** —
+//! What this module keeps (in `newt-core` until #3160 moved it here) is the
+//! **enforcement convenience layer** —
 //! per-axis `permits_*` adaptors and the `permits_one_more` budget check the
 //! call sites in `newt-coder` and `newt-tui` rely on. Those aren't part of
 //! `agent-mesh-protocol`'s 0.6 surface (the upstream crate ships only the

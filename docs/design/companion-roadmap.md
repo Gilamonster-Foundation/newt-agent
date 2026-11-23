@@ -1,6 +1,6 @@
 # Companion Feature Roadmap (index)
 
-> **Status:** Draft — proposal, not normative · **Owner:** hartsock · **Last review:** 2026-08-16 · **Builds on:** `docs/decisions/ocap_confinement_model.md`, `agent_bridle_publishing.md`, `agentic_object_capability_security.md`, `plain_scroller_tui.md`, `newt_web_htmx.md`, `newt_web_docking.md`; agent-bridle-core `Registry` / `Tool::required()` / `Gate::authorize`, `newt_core::caveats::Caveats`, `newt_core::kit`, `newt_core::session::OutputStream`, `newt_core::reasoning::ThinkFilter`, `newt-identity` · **Supersedes/Superseded by:** —
+> **Status:** Draft — proposal, not normative · **Owner:** hartsock · **Last review:** 2026-08-16 · **Builds on:** `docs/decisions/ocap_confinement_model.md`, `agent_bridle_publishing.md`, `agentic_object_capability_security.md`, `plain_scroller_tui.md`, `newt_web_htmx.md`, `newt_web_docking.md`; agent-bridle-core `Registry` / `Tool::required()` / `Gate::authorize`, `newt_policy::caveats::Caveats`, `newt_core::kit`, `newt_core::session::OutputStream`, `newt_core::reasoning::ThinkFilter`, `newt-identity` · **Supersedes/Superseded by:** —
 
 This index ties together the seven companion-train proposals plus this index (tracked by EPIC
 #1734, milestone v0.10.0). None is normative yet; all are **Draft**. The `exec-mcp-interrupt`

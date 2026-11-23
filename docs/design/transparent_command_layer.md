@@ -136,7 +136,7 @@ honest about the gap (see `docs/decisions/ocap_confinement_model.md`):
   outside the fence regardless of how it names its paths. **This is UNBUILT
   today:** `verify_b1()` returns `Absent` (`sandbox_kind = none`).
 - **What's built today** is the in-process monitor: `lock_fs_to_workspace`
-  (`newt-core::caveats`) enforces the fs scope at `tui_permits_path` for newt's
+  (`newt-policy::caveats`) enforces the fs scope at `tui_permits_path` for newt's
   **native** tools (`read_file`/`write_file`/`list`) — *not* for a spawned
   subprocess. So a file-accessing **command** run via the confined shell is, in
   this build, fail-closed (stubbed, "unavailable"); under `--yolo` it runs on the
