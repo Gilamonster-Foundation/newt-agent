@@ -26,7 +26,7 @@
 //!    plus the validated `credential.*` lines ([`import_credentials`]).
 //! 3. **Confined copy** — `git -C <staging> fetch <workspace repo> <oid>` runs
 //!    under a kernel fence whose RETURNED sandbox kind is checked
-//!    ([`confined_fetch`]); staging's alternates file is then removed and
+//!    ([`confined::confined_fetch`]); staging's alternates file is then removed and
 //!    `fsck --connectivity-only <oid>` proves the approved commit is
 //!    self-contained before any network step runs.
 //! 4. **Dial** — `push <url> <approved-oid>:refs/heads/<branch>` from staging;
@@ -592,41 +592,6 @@ impl HeldRoots {
         }
         Ok(())
     }
-
-    /// The held handles, duplicated, for a fence that anchors on descriptors
-    /// (Linux Landlock): the SAME file or directory objects [`Self::verify_identities`]
-    /// compared, so nothing after that check can re-point the fence by path.
-    /// `HeldReadRoot::bind` re-checks the pairing itself (`fstat` vs `stat`),
-    /// so a root swapped between `verify_identities` and here is still caught
-    /// even if that earlier call were ever skipped.
-    ///
-    /// # Errors
-    /// When a handle cannot be duplicated, or its identity no longer matches
-    /// `root` (defence in depth with [`Self::verify_identities`]).
-    #[cfg(target_os = "linux")]
-    fn held_read_roots(&self) -> Result<Vec<agent_bridle::HeldReadRoot>, Refusal> {
-        self.canonical
-            .iter()
-            .zip(&self.handles)
-            .map(|(root, handle)| {
-                let fd = handle.as_fd().try_clone_to_owned().map_err(|e| {
-                    format!(
-                        "refused: cannot duplicate the handle for read root '{}' ({e})",
-                        root.display()
-                    )
-                })?;
-                agent_bridle::HeldReadRoot::bind(root.to_string_lossy().into_owned(), fd).map_err(
-                    |e| {
-                        format!(
-                            "refused: held read root '{}' failed its identity check ({e})",
-                            root.display()
-                        )
-                        .into()
-                    },
-                )
-            })
-            .collect()
-    }
 }
 
 /// Shorten `path` to `~/…` when it lies under `$HOME`.
@@ -1110,114 +1075,7 @@ pub(crate) fn literal_remote_from_config(text: &str, key: &str) -> Result<String
 // Confined git (F4): the only steps that read workspace objects
 // ---------------------------------------------------------------------------
 
-/// Run the checked git under the existing push-copy policy: `fs_read`/`fs_write`
-/// as given, with the platform network limitation documented below. It is
-/// minted under the `AgentInfluenced` KERNEL floor, and the sandbox kind the
-/// executor ACTUALLY applied is checked afterwards: an advisory
-/// (`SandboxKind::None`) run refuses even if it succeeded.
-///
-/// The exec axis stays unrestricted, as for every other `AgentInfluenced`
-/// spawn (`workspace_confined_caveats`): Landlock delivers exec only at the
-/// interceptor level, so a Kernel floor refuses any restricted exec scope.
-/// The program is the checked git; what its children (`git-upload-pack`,
-/// `rev-list`, `/bin/sh`) can reach is bounded by the kernel-enforced fs and
-/// net axes, which are the fence F4 depends on.
-///
-/// `held` are read roots (also spelled in `fs_read`) whose fence rules anchor
-/// on the caller's descriptors rather than a re-opened path.
-///
-/// # Errors
-/// When the executor refuses, or the applied sandbox was not a kernel fence.
-pub fn run_confined_git(
-    tools: &TrustedTools,
-    args: &[&str],
-    cwd: &Path,
-    session: &Caveats,
-    fs_read: Scope<String>,
-    fs_write: Scope<String>,
-    held: Vec<agent_bridle::HeldReadRoot>,
-) -> Result<crate::confined_exec::ConfinedOutput, String> {
-    execute_confined_git(confined_git_request(
-        tools, args, cwd, session, fs_read, fs_write, held,
-    ))
-}
-
-fn confined_git_request(
-    tools: &TrustedTools,
-    args: &[&str],
-    cwd: &Path,
-    session: &Caveats,
-    fs_read: Scope<String>,
-    fs_write: Scope<String>,
-    held: Vec<agent_bridle::HeldReadRoot>,
-) -> crate::confined_exec::ExecRequest {
-    // The historical push-copy policy, preserved here. Fetch copies additionally
-    // require NetGrant::DenyAll through fetch_copy_request; they must never rely
-    // on this local-source assumption.
-    // macOS Seatbelt is advisory for both net AND exec in this path: the
-    // kernel profile it receives does not prevent the confined copy from
-    // spawning arbitrary children or opening network sockets.  Net is safe
-    // here because the confined fetch reads only a LOCAL workspace — no
-    // network is used — so Scope::All for net causes no real exposure.
-    // Exec is a different story: Seatbelt does NOT kernel-enforce a restricted
-    // exec scope for the copy (it is advisory, unlike Landlock on Linux).
-    // TODO(#2661): bind the exec axis to the trusted git binary + exec-path
-    // via a Landlock EXECUTE rule or an equivalent macOS mechanism; until
-    // that issue lands, the confined copy on macOS has unrestricted exec.
-    // Linux keeps net: none() (enforced by Landlock + seccomp via net-guard).
-    // macOS net=Scope::All follow-up: TODO(#2662) — enforce net:none on macOS.
-    // See docs/security/ocap-deviations.md §mach-xpc-ambient-deputy.
-    #[cfg(target_os = "macos")]
-    let net_scope = Scope::All;
-    #[cfg(not(target_os = "macos"))]
-    let net_scope = Scope::none();
-    let caveats = Caveats {
-        fs_read,
-        fs_write,
-        exec: Scope::All,
-        net: net_scope,
-        ..session.clone()
-    };
-    crate::confined_exec::ExecRequest::new(
-        crate::confined_exec::ExecOrigin::AgentInfluenced,
-        tools.git.to_string_lossy().into_owned(),
-        args.iter().copied(),
-        cwd.to_path_buf(),
-        caveats,
-    )
-    .envs(tools.env.iter().cloned())
-    .held_read_roots(held)
-}
-
-fn execute_confined_git(
-    req: crate::confined_exec::ExecRequest,
-) -> Result<crate::confined_exec::ConfinedOutput, String> {
-    let out = crate::confined_exec::ConstrainedExecutor::run(&req)
-        .map_err(|e| format!("refused: confined git could not run — {e}"))?;
-    require_kernel_fence(out.sandbox_kind)?;
-    Ok(out)
-}
-
-/// The sandbox the executor REPORTS it applied must be the platform's kernel
-/// fence (Landlock on Linux, Seatbelt on macOS).  An advisory run or the wrong
-/// kind refuses regardless of exit status.
-fn require_kernel_fence(kind: crate::sandbox_seam::SandboxKind) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    let expected = crate::sandbox_seam::SandboxKind::Landlock;
-    #[cfg(target_os = "macos")]
-    let expected = crate::sandbox_seam::SandboxKind::Seatbelt;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let expected = crate::sandbox_seam::SandboxKind::None; // always refuses below
-
-    if kind == expected && kind != crate::sandbox_seam::SandboxKind::None {
-        Ok(())
-    } else {
-        Err(format!(
-            "refused: the confined git step was not kernel-enforced \
-             (got {kind:?}, expected {expected:?})"
-        ))
-    }
-}
+pub mod confined;
 
 /// F3 post-copy: `oid` must name a COMMIT in the SELF-CONTAINED staging repo
 /// (after the confined fetch and after alternates are removed). Running this in
@@ -1244,148 +1102,6 @@ pub fn verify_commit_in_staging(
             "refused: '{oid}' is not a commit in the staging repository"
         ))
     }
-}
-
-/// F4: copy the approved commit's reachable objects from the workspace
-/// REPOSITORY (`source_repo`, the common dir — never an objects directory)
-/// into staging with a confined `git fetch`: read = the held read roots
-/// plus staging, write = staging only.
-///
-/// The held roots' identities are verified against what their paths name
-/// NOW ([`HeldRoots::verify_identities`]); on Linux the fence is then built
-/// FROM the held descriptors ([`agent_bridle::HeldReadRoot`]), so a root
-/// swapped at its pathname after that check is outside the fence and the
-/// copy refuses. On macOS the Seatbelt profile admits paths only, so that
-/// window stays open there (residual #8, `docs/security/ocap-deviations.md`).
-///
-/// # Errors
-/// When a held root no longer matches its path, or the confined fetch
-/// cannot run, is not kernel-enforced, or fails.
-pub fn confined_fetch(
-    tools: &TrustedTools,
-    staging: &StagingRepo,
-    source_repo: &Path,
-    oid: &str,
-    session: &Caveats,
-    held: &HeldRoots,
-) -> Result<(), Refusal> {
-    confined_fetch_with(tools, staging, source_repo, oid, session, held, || {})
-}
-
-/// [`confined_fetch`] with `after_verify` run between the identity check and
-/// the fence build — the test seam for that window. Production passes a no-op.
-pub(crate) fn confined_fetch_with(
-    tools: &TrustedTools,
-    staging: &StagingRepo,
-    source_repo: &Path,
-    oid: &str,
-    session: &Caveats,
-    held: &HeldRoots,
-    after_verify: impl FnOnce(),
-) -> Result<(), Refusal> {
-    let staging_dir = staging.path().to_string_lossy().into_owned();
-    let source = source_repo.to_string_lossy();
-    let request = confined_beside_staging(
-        tools,
-        staging,
-        &[
-            "-C",
-            &staging_dir,
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            &source,
-            oid,
-        ],
-        Scope::only([staging_dir.clone()]),
-        session,
-        held,
-        after_verify,
-    )?;
-    let out = execute_confined_git(request)?;
-    if out.success {
-        Ok(())
-    } else {
-        Err("refused: the confined copy of the approved commit failed"
-            .to_string()
-            .into())
-    }
-}
-
-/// One confined git that may read the held roots plus staging and write only
-/// `fs_write`: the fence both directions of the broker share. A push copies
-/// workspace objects INTO staging ([`confined_fetch`]); a fetch seeds staging
-/// the same way and then copies the fetched refs back OUT ([`confined_git`]).
-fn confined_beside_staging(
-    tools: &TrustedTools,
-    staging: &StagingRepo,
-    args: &[&str],
-    fs_write: Scope<String>,
-    session: &Caveats,
-    held: &HeldRoots,
-    after_verify: impl FnOnce(),
-) -> Result<crate::confined_exec::ExecRequest, Refusal> {
-    let staging_dir = staging.path().to_string_lossy().into_owned();
-    held.verify_identities()?;
-    #[cfg(target_os = "linux")]
-    let held_fds = held.held_read_roots()?;
-    #[cfg(not(target_os = "linux"))]
-    let held_fds = Vec::new();
-    after_verify();
-    let fs_read = match held.scope() {
-        Scope::All => Scope::All,
-        Scope::Only(_) => Scope::only(
-            held.canonical()
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .chain([staging_dir]),
-        ),
-    };
-    Ok(confined_git_request(
-        tools,
-        args,
-        staging.path(),
-        session,
-        fs_read,
-        fs_write,
-        held_fds,
-    ))
-}
-
-/// A confined git for the fetch broker: reads the held roots plus staging,
-/// writes only `fs_write`, and requires the executor's deny-all network floor.
-/// macOS admits audited, unprivileged Seatbelt launches with a kernel network
-/// witness; absent that witness, the executor refuses before the copy spawns.
-/// Repository transport configuration cannot relax the floor.
-///
-/// # Errors
-/// As [`confined_fetch`].
-pub fn confined_git(
-    tools: &TrustedTools,
-    staging: &StagingRepo,
-    args: &[&str],
-    fs_write: Scope<String>,
-    session: &Caveats,
-    held: &HeldRoots,
-) -> Result<crate::confined_exec::ConfinedOutput, Refusal> {
-    let request = confined_beside_staging(tools, staging, args, fs_write, session, held, || {})?;
-    Ok(execute_confined_git(fetch_copy_request(request))?)
-}
-
-/// The fetch copy's network floor, independent of the push-copy policy.
-pub(crate) fn fetch_copy_request(
-    request: crate::confined_exec::ExecRequest,
-) -> crate::confined_exec::ExecRequest {
-    request
-        .net_grant(crate::confined_exec::NetGrant::DenyAll)
-        // Reuse the shell's repository-config hardening (hooks, fsmonitor,
-        // SSH, ext transport, etc.). File-only transport also defeats a
-        // repository's protocol.*.allow overrides after URL rewriting.
-        .envs(crate::git_hardening::sandbox_git_env(
-            ("", ""),
-            &Default::default(),
-        ))
-        .env("GIT_ALLOW_PROTOCOL", "file")
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,7 +1614,7 @@ mod tests {
         assert!(!read.is_regular_file(&root));
     }
 
-    fn scope(roots: &[&str]) -> Scope<String> {
+    pub(super) fn scope(roots: &[&str]) -> Scope<String> {
         Scope::only(roots.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
@@ -1906,7 +1622,7 @@ mod tests {
         HeldRoots::bind(fs_read).unwrap()
     }
 
-    fn held(roots: &[&str]) -> HeldRoots {
+    pub(super) fn held(roots: &[&str]) -> HeldRoots {
         held_from(&scope(roots))
     }
 
@@ -1920,7 +1636,7 @@ mod tests {
 
     /// `tempfile::tempdir()` honours the umask (0775 under umask 002); a
     /// trust-checked fixture needs an owner-only directory.
-    fn tempdir() -> tempfile::TempDir {
+    pub(super) fn tempdir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         dir
@@ -1941,7 +1657,11 @@ mod tests {
     /// Tools with a chosen exec-path / gh / write roots, for helper-resolution
     /// tests that need a PLANTED exec-path the real (root-owned) one cannot
     /// provide.
-    fn tools_with(exec_path: &Path, gh: Option<&Path>, write_roots: &[&str]) -> TrustedTools {
+    pub(super) fn tools_with(
+        exec_path: &Path,
+        gh: Option<&Path>,
+        write_roots: &[&str],
+    ) -> TrustedTools {
         TrustedTools {
             git: PathBuf::from("/usr/bin/git"),
             gh: gh.map(Path::to_path_buf),
@@ -2197,14 +1917,6 @@ mod tests {
         // structurally absent — the function signature enforces it.
         let _ =
             verify_commit_in_staging(&tools, &staging, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    }
-
-    /// `require_kernel_fence` refuses an advisory sandbox regardless of outcome.
-    /// This is the descendant-fence proof: a `SandboxKind::None` result means
-    /// no kernel fence was applied, and the copy is refused even on success.
-    #[test]
-    fn require_kernel_fence_refuses_advisory_sandbox() {
-        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::None).is_err());
     }
 
     // --- Item 3 (A2): sticky-directory negative controls ----------------------
@@ -2511,28 +2223,6 @@ file:/h/.gitconfig\0credential.interactive\0";
         assert!(StagingRepo::create(&dir.path().join("state"), &ctx_from(&fs_write)).is_err());
     }
 
-    #[test]
-    fn an_advisory_sandbox_is_refused_even_after_a_successful_run() {
-        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::None).is_err());
-        // The expected kernel-fence kind is platform-specific: Landlock on Linux,
-        // Seatbelt on macOS — the other kind is wrong and must also be refused.
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            require_kernel_fence(crate::sandbox_seam::SandboxKind::Landlock),
-            Ok(())
-        );
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            require_kernel_fence(crate::sandbox_seam::SandboxKind::Seatbelt),
-            Ok(())
-        );
-        // Wrong sandbox kind on the current platform is also refused.
-        #[cfg(target_os = "linux")]
-        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::Seatbelt).is_err());
-        #[cfg(target_os = "macos")]
-        assert!(require_kernel_fence(crate::sandbox_seam::SandboxKind::Landlock).is_err());
-    }
-
     /// Review #2641 r4 finding 4: only an absent alternates file is success.
     /// At cb241800 every removal error was swallowed, so the network step
     /// could run with an alternate still in place.
@@ -2814,127 +2504,6 @@ file:/h/.gitconfig\0credential.interactive\0";
     }
 
     // --- Review r7 P1 #1: the held handle IS the authority --------------------
-
-    /// The canonical read root is REPLACED after binding: deleted and
-    /// recreated at the same pathname with an imposter `HEAD`. Pathname
-    /// re-acquisition would read the imposter (positive control); the held
-    /// handle names the unlinked original and fails closed, so the planning
-    /// read refuses. The copy path refuses too: the handle's identity no
-    /// longer matches what its path names, checked before any git runs.
-    ///
-    /// Measured red (mutation): with `HeldRoots::open_read` re-acquiring the
-    /// anchor by pathname, the planning read returns `imposter`; with
-    /// `verify_identities` removed from `confined_fetch`, the copy proceeds
-    /// against the replacement.
-    #[cfg(unix)]
-    #[test]
-    fn replaced_canonical_root_refuses_the_planning_read_and_the_copy() {
-        let dir = tempdir();
-        let root = dir.path().join("repo");
-        let git_dir = root.join(".git");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/task\n").unwrap();
-        let held = held(&[root.to_str().unwrap()]);
-        assert_eq!(read_head_branch(&git_dir, &held).unwrap(), "task");
-
-        // Replace the root itself: same pathname, a different directory object.
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/imposter\n").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(git_dir.join("HEAD"))
-                .unwrap()
-                .trim(),
-            "ref: refs/heads/imposter",
-            "positive control: the pathname now names the imposter"
-        );
-
-        let err = read_head_branch(&git_dir, &held).unwrap_err().to_string();
-        assert!(
-            !err.contains("imposter"),
-            "the imposter must never be read: {err}"
-        );
-        assert!(err.contains("refused"), "{err}");
-
-        let tools = tools_with(dir.path(), None, &["/some/other/root"]);
-        let staging = StagingRepo::create(&dir.path().join("state"), tools.ctx()).unwrap();
-        let err = confined_fetch(
-            &tools,
-            &staging,
-            &git_dir,
-            &"a".repeat(40),
-            &Caveats::top(),
-            &held,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("no longer names the directory bound at plan time"),
-            "{err}"
-        );
-    }
-
-    /// `held_read_roots` itself refuses a root swapped after `bind`, even with
-    /// no call to `verify_identities` in between: `HeldReadRoot::bind` (vendor
-    /// crate) performs its own `fstat`/`stat` identity check at construction,
-    /// so there is no path through this crate that can produce a held root
-    /// whose label and descriptor disagree about which object they name.
-    ///
-    /// Measured red (#2674 P1): before `HeldReadRoot::bind` validated its
-    /// arguments, `held_read_roots()` alone silently built a held root pairing
-    /// the REPLACEMENT directory's pathname with the ORIGINAL directory's
-    /// descriptor — no error, no call to `verify_identities` required to
-    /// demonstrate it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn held_read_roots_refuses_a_swapped_root_even_without_verify_identities() {
-        let dir = tempdir();
-        let root = dir.path().join("repo");
-        std::fs::create_dir_all(&root).unwrap();
-        let held = held(&[root.to_str().unwrap()]);
-
-        // Swap the root for a new object at the same pathname — deliberately
-        // skip verify_identities() to isolate held_read_roots()'s own check.
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
-
-        let err = held.held_read_roots().unwrap_err().to_string();
-        assert!(err.contains("failed its identity check"), "{err}");
-    }
-
-    /// Release regression: file read grants bind without widening to siblings;
-    /// absent grants remain inert and replacement is refused before admission.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn held_roots_bind_regular_files_without_granting_the_parent() {
-        let dir = tempdir();
-        let root = dir.path().canonicalize().unwrap();
-        let path = root.join("gitconfig");
-        let absent = HeldRoots::bind(&scope(&[path.to_str().unwrap()])).unwrap();
-        assert!(absent.canonical().is_empty());
-        std::fs::write(&path, "[fixture]\n").unwrap();
-        let held = HeldRoots::bind(&scope(&[path.to_str().unwrap()])).unwrap();
-        assert_eq!(held.canonical(), std::slice::from_ref(&path));
-        for _ in 0..2 {
-            assert_eq!(
-                held.read_to_string(&root, Path::new("gitconfig"))
-                    .unwrap()
-                    .as_deref(),
-                Some("[fixture]\n")
-            );
-        }
-        assert!(held.is_regular_file(&path));
-        assert!(!held.is_regular_file(&root));
-        std::fs::write(root.join("sibling"), "private").unwrap();
-        assert!(held.read_to_string(&root, Path::new("sibling")).is_err());
-        assert!(held.read_to_string(&path, Path::new("child")).is_err());
-        held.verify_identities().unwrap();
-        std::fs::rename(&path, root.join("old")).unwrap();
-        std::fs::write(&path, "replacement").unwrap();
-        assert!(held.verify_identities().is_err());
-        #[cfg(target_os = "linux")]
-        assert!(held.held_read_roots().is_err());
-    }
 
     /// File-root .git pointers must be readable repeatedly through cloned fds.
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -258,7 +258,7 @@ fn run(plan: &Plan, caveats: &Caveats, held: &staging::HeldRoots) -> Result<Stri
 
     let seed = format!("+refs/remotes/{remote}/*:refs/seed/*");
     let workspace = plan.cwd.to_string_lossy();
-    let seeded = staging::confined_git(
+    let seeded = staging::confined::confined_git(
         plan.tools,
         &repo,
         &[
@@ -328,7 +328,7 @@ fn run(plan: &Plan, caveats: &Caveats, held: &staging::HeldRoots) -> Result<Stri
     }
     deliver.extend([staging_dir.as_str(), tracking.as_str()]);
     delivery_result(
-        staging::confined_git(
+        staging::confined::confined_git(
             plan.tools,
             &repo,
             &deliver,
