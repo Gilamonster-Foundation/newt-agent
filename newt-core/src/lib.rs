@@ -39,6 +39,7 @@ pub mod event_journal;
 pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;
+#[cfg(feature = "confine")]
 mod native_git_broker;
 pub mod owned_hosts;
 pub mod permission_journal;
@@ -191,7 +192,11 @@ pub mod pyo3_module;
 pub fn maybe_dispatch() -> Option<i32> {
     #[cfg(target_os = "macos")]
     newt_policy::fs_aliases::initialize();
-    native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
+    #[cfg(feature = "confine")]
+    let dispatched = native_git_broker::maybe_dispatch();
+    #[cfg(not(feature = "confine"))]
+    let dispatched: Option<i32> = None;
+    dispatched.or_else(agent_bridle::maybe_dispatch)
 }
 
 /// What a `harness = false` test binary whose real body runs only under

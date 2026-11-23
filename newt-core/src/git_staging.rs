@@ -121,6 +121,7 @@ pub struct Refusal {
 }
 
 impl Refusal {
+    #[cfg(feature = "confine")]
     pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
         self.safe_reason = Some(reason);
         self
@@ -727,6 +728,7 @@ impl TrustedTools {
 
     /// Git's own HTTP transports, using the exec-path and trust context from
     /// authentication. No helper supplied from a model-writable tree is granted.
+    #[cfg(feature = "confine")]
     pub(crate) fn http_transport_helpers(&self) -> Vec<String> {
         ["git-remote-https", "git-remote-http"]
             .iter()
@@ -1075,6 +1077,7 @@ pub(crate) fn literal_remote_from_config(text: &str, key: &str) -> Result<String
 // Confined git (F4): the only steps that read workspace objects
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "confine")]
 pub mod confined;
 
 /// F3 post-copy: `oid` must name a COMMIT in the SELF-CONTAINED staging repo

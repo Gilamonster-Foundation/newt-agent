@@ -770,6 +770,8 @@ fn write_lockfile_natively(
 
 /// Publish an already policy-verified private commit into the real detached
 /// HEAD, using its held admin directory and Git's lock/CAS protocol (#2813).
+/// The commit broker is its one caller, so it is built only with `confine` (#3160).
+#[cfg(feature = "confine")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn publish_detached_head(
     admin: &newt_fdguard::GrantedRoot,
@@ -1382,7 +1384,9 @@ fn rev_parse(identity: &BoundGitIdentity, rev: &str) -> Result<Option<String>, S
 /// The parents a commit's headers name, each a 40- or 64-digit hex oid. The
 /// commit broker reads them, and so does `advance_own_branch_ref` (#2682 round
 /// 2), host-side, to verify the fast-forward/amend shape of a commit landed
-/// with HEAD detached, before the bounded `update-ref` that publishes it.
+/// with HEAD detached, before the bounded `update-ref` that publishes it. On
+/// Windows only the broker reads them, so there it is built only with `confine` (#3160).
+#[cfg(any(target_os = "linux", target_os = "macos", feature = "confine"))]
 pub(crate) fn commit_parents(commit: &[u8]) -> Result<Vec<String>, String> {
     let boundary = commit
         .windows(2)
@@ -3630,6 +3634,7 @@ mod governed_push_config_tests {
 
 /// [`commit_parents`] reads parent headers from commit bytes; no git runs.
 #[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "macos", feature = "confine"))]
 mod commit_parents_tests {
     use super::*;
 
@@ -3729,6 +3734,7 @@ mod governed_push_process_tests {
     }
 }
 
+#[cfg(feature = "confine")]
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "git_hardening/commit_view_tests.rs"]
 mod commit_view_tests;

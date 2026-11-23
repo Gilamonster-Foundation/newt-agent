@@ -5,6 +5,16 @@ use std::sync::LazyLock;
 const FILE_PATH_DESCRIPTION: &str = "Absolute or workspace-relative file path. \
     Preserve an operator-supplied absolute path.";
 
+/// How to publish, in the run_command description (#2949): the brokers recognize only
+/// standalone commands, which a model cannot learn from a result until it fails. Only
+/// a build with `confine` has the brokers (#3160), so only it says so.
+#[cfg(feature = "confine")]
+const PUBLISH_RECIPE: &str = " To publish, run `git push origin` and `gh pr create --base <base> \
+    --head <branch> --title … --body …` as standalone commands; newt brokers them with the \
+    operator's credentials.";
+#[cfg(not(feature = "confine"))]
+const PUBLISH_RECIPE: &str = "";
+
 pub fn tool_definitions() -> serde_json::Value {
     tool_definitions_with_budget(Default::default())
 }
@@ -32,12 +42,10 @@ pub(crate) fn tool_definitions_with_dialect(
             "type": "function",
             "function": {
                 "name": "run_command",
-                // #2949: what the tool does, how to publish (the broker only
-                // recognizes standalone commands, which a model cannot learn
-                // from a result until it fails), the wall, and the dialect.
+                // #2949: what the tool does, how to publish (PUBLISH_RECIPE),
+                // the wall, and the dialect.
                 // Authority and recovery guidance live in the denial result.
-                "description": format!("{} {} {}", "Run a command in the workspace shell and return its output and exit status. \
-                                To publish, run `git push origin` and `gh pr create --base <base> --head <branch> --title … --body …` as standalone commands; newt brokers them with the operator's credentials.", super::shell::run_command_limit_sentence(command_budget), shell_dialect),
+                "description": format!("{}{PUBLISH_RECIPE} {} {}", "Run a command in the workspace shell and return its output and exit status.", super::shell::run_command_limit_sentence(command_budget), shell_dialect),
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -6,7 +6,7 @@
 #[cfg(test)]
 #[path = "tools_tests/command_probe.rs"]
 mod command_probe;
-#[cfg(test)]
+#[cfg(all(test, feature = "confine"))]
 mod gh_read_tests;
 mod worktree;
 use worktree::execute as execute_tool_inner;
@@ -72,6 +72,7 @@ mod git_words;
 mod governed_command;
 mod grep_tool;
 mod live_output;
+#[cfg(feature = "confine")]
 mod native_git;
 pub(crate) mod output_budget;
 mod publication;
@@ -4707,6 +4708,7 @@ async fn execute_authorized_tool(
             let publication_bypass = ocap_disabled() && shell::exec_floor_permits(exec_floor, cmd);
             let governed_git = publication::governed(cmd, publication_bypass, presentation);
             let commit_requested = governed_git && git_words::needs_commit_broker(cmd);
+            #[cfg(feature = "confine")]
             let commit_broker = if commit_requested {
                 match git_tool.and_then(|tool| tool.native_commit_policy()) {
                     Some(policy) => match crate::native_git_broker::NativeGitBroker::new(policy) {
@@ -4718,6 +4720,10 @@ async fn execute_authorized_tool(
             } else {
                 None
             };
+            // Without `confine` there is no commit broker (#3160): the refusal below stops a
+            // commit it names, as for a session without a commit policy.
+            #[cfg(not(feature = "confine"))]
+            let commit_broker = None;
             // #3146: the lexical check misses a commit behind a shell keyword (`then git
             // commit`), and a source the inspector cannot read gets no broker, so the
             // bare-word trigger sends that source to the same refusal.
@@ -4770,6 +4776,7 @@ async fn execute_authorized_tool(
             // where it would either hang against `net: none` or (if that
             // narrowing ever regressed) inherit the session's full net scope
             // inside a hostile-repo-influenced child.
+            #[cfg(feature = "confine")]
             if governed_git && git_words::needs_push_broker(cmd) {
                 return host_return(native_git::execute_governed_push(
                     cmd,
@@ -4779,6 +4786,7 @@ async fn execute_authorized_tool(
                     governed_pr,
                 ));
             }
+            #[cfg(feature = "confine")]
             if governed_git && git_words::needs_pr_create_broker(cmd) {
                 return host_return(native_git::execute_governed_pr_create(
                     cmd,
@@ -4788,6 +4796,7 @@ async fn execute_authorized_tool(
                     governed_pr,
                 ));
             }
+            #[cfg(feature = "confine")]
             if governed_git && native_git::gh_read::recognizes(cmd) {
                 return host_return(native_git::gh_read::execute(
                     cmd,
@@ -4798,6 +4807,7 @@ async fn execute_authorized_tool(
                     command_probe,
                 ));
             }
+            #[cfg(feature = "confine")]
             if governed_git {
                 if let Err(reason) = native_git::preflight(
                     cmd,
@@ -4813,6 +4823,7 @@ async fn execute_authorized_tool(
                 }
             }
             // Broker and fallback share one consent-first dispatch boundary.
+            #[cfg(feature = "confine")]
             let network_read = if governed_git {
                 match native_git::dispatch_network_read(cmd, std::path::Path::new(&run_cwd), caveats, &mut permission_gate) {
                     std::ops::ControlFlow::Continue(approved) => approved,
@@ -4821,6 +4832,14 @@ async fn execute_authorized_tool(
             } else {
                 None
             };
+            // Without `confine` (#3160) none of the above is compiled: no push, PR-create,
+            // gh read or fetch broker, no preflight refusal or confirmation, no network-read
+            // prompt. Those commands take the shell route below unbrokered, and nothing
+            // records a publication in `governed_pr`.
+            #[cfg(not(feature = "confine"))]
+            let _ = governed_pr;
+            #[cfg(not(feature = "confine"))]
+            let network_read: Option<newt_policy::caveats::Caveats> = None;
             let caveats = network_read.as_ref().unwrap_or(caveats);
             let filesystem_requests = match declared_filesystem_requests(args, cmd, &run_cwd) {
                 Ok(requests) => requests,

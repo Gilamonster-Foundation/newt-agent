@@ -1440,6 +1440,7 @@ mod tests {
 
     /// Pure policy guard for the fetch broker; real rewrite refusal grounds it
     /// in the ignored weekly/release tier, including native macOS admission.
+    #[cfg(feature = "confine")]
     #[test]
     fn fetch_copy_requires_deny_all_even_with_ambient_session_network() {
         let baseline = Caveats {
