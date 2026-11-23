@@ -4849,6 +4849,7 @@ dependencies = [
 name = "newt-fdguard"
 version = "0.8.6"
 dependencies = [
+ "agent-bridle-fdguard",
  "libc",
 ]
 

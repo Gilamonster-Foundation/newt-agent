@@ -23,3 +23,6 @@ libc.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
 libc.workspace = true
+# tests/bridle_differential.rs compares this crate with the one it copies, while that one is
+# still in the build (#3160). It resolves to vendor/ through the root [patch.crates-io].
+agent-bridle-fdguard = "0.8.0-rc.7"
