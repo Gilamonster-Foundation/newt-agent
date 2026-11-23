@@ -84,8 +84,9 @@ pub(crate) enum Confinement {
     /// `SandboxKind` name (e.g. `Landlock`, `Seatbelt`).
     Confined(String),
     /// A spawned stdio server with no OS sandbox enforcing the leash — advisory
-    /// only: a `top()` grant or a host without Landlock/Seatbelt (both still spawned
-    /// through the `ConfinedCommand` boundary), or a build without `confine`.
+    /// only: a `top()` grant or a host without Landlock/Seatbelt (both spawned
+    /// through the `ConfinedCommand` boundary on Unix), Windows, or a build without
+    /// `confine`.
     Advisory,
     /// A remote (HTTP) server — no local process to confine.
     Remote,
