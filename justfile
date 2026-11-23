@@ -258,6 +258,13 @@ check:
     # crate that takes newt-core's defaults, turns `confine` back on. The probe
     # that follows that step in CI is not repeated here.
     cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings || rc=1
+    # PIPELINE PARITY: mirrors the "clippy (newt-mcp-server, confine off)" and "test
+    # (newt-mcp-server, confine off)" steps in ci.yml's lean job (#3160). `-p
+    # newt-mcp-server` alone: features are additive, so a second package that takes the
+    # crate's defaults turns `confine` back on. The `cargo tree` probe that follows them in
+    # CI is not repeated here.
+    cargo clippy -p newt-mcp-server --no-default-features --all-targets -- -D warnings || rc=1
+    cargo test -p newt-mcp-server --no-default-features || rc=1
     # PIPELINE PARITY: the "vendor crossterm regression gate (newt #2644)" ci.yml step.
     just check-vendor-crossterm || rc=1
     # PIPELINE PARITY: mirrors the "test (newt-interaction, inward protocol

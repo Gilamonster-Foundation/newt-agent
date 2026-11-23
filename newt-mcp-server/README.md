@@ -10,7 +10,8 @@ A stdio JSON-RPC MCP server exposing:
 - `git` — local embedded Git operations, available only with unrestricted
   filesystem read authority; legacy repository reads cannot yet honor a
   bounded read grant. Operation-class write checks still apply.
-- `shell_run` / `web_fetch` — agent-bridle's confined shell and fetch
+- `shell_run` / `web_fetch` — agent-bridle's confined shell and fetch (the `confine`
+  feature, on by default; a build without it has neither)
 - `goal_run` — tier-routed inference (wired through the Router +
   BackendRegistry; discovers a local Ollama on startup)
 

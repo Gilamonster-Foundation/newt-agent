@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_bridle::{Caveats, Grant, Registry, ToolError};
+#[cfg(feature = "confine")]
+use agent_bridle::{Grant, Registry, ToolError};
+use agent_mesh_protocol::Caveats;
 use newt_inference::BackendRegistry;
 use newt_mcp_client::McpToolset;
 use newt_router::{Router, Tier};
@@ -29,8 +31,10 @@ use crate::server::McpServer;
 /// `shell_run` is the one tool that no longer runs free: it is dispatched
 /// through agent-bridle's Caveats-confined brush shell, under a granted
 /// [`Caveats`] leash sourced from `~/.newt/config.toml` (see
-/// [`crate::caveats`]). The bridle [`Registry`] and the granted leash are
-/// built once here and shared (via `Arc`) into the `tools/call` closure.
+/// [`crate::caveats`]). The bridle registry and the granted leash are
+/// built once and shared (via `Arc`) into the `tools/call` closure.
+/// `shell_run` and `web_fetch` exist only with the `confine` feature: a build
+/// without it lists and dispatches neither.
 ///
 /// `toolset` (#1021 PR 5.3) is the session's connected remote MCP servers
 /// (e.g. `modulex`) — `McpToolset::empty()` when none/no persona. `persona_tools`
@@ -48,7 +52,7 @@ pub fn register_handlers(
     persona_tools: Arc<Option<Vec<String>>>,
 ) {
     let granted = GrantedCaveats::load();
-    // Surface, loudly, whether shell_run is confined or running with full
+    // Surface, loudly, whether the tools are confined or running with full
     // ambient authority. An unconfined default is a WARNING.
     granted.warn_to_stderr();
 
@@ -63,7 +67,6 @@ pub fn register_handlers(
         server,
         registry,
         router,
-        bridle_registry(),
         Arc::new(granted.caveats),
         std::env::current_dir().unwrap_or_default(),
         toolset,
@@ -137,7 +140,7 @@ fn register_tools_list(
     server: &mut McpServer,
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
-    read_scope: &agent_bridle::Scope<String>,
+    read_scope: &agent_mesh_protocol::Scope<String>,
 ) {
     let legacy_git_allowed = newt_core::agentic::check_git_read_scope("open", read_scope).is_ok();
     server.register("tools/list", move |_params| {
@@ -197,6 +200,12 @@ fn tool_definitions() -> Value {
                 "required": ["prompt"]
             }
         }),
+    ]);
+    // The two tools agent-bridle runs. A server built without `confine` has neither, so it
+    // never advertises a tool it cannot run. Their text is what newt-eval's golden pins, and
+    // they stay in this order, after `goal_run`.
+    #[cfg(feature = "confine")]
+    tools.extend([
         serde_json::json!({
             "name": "shell_run",
             "description": "Run a shell command and capture stdout/stderr. Returns exit_code, stdout, stderr, timed_out. Max timeout 300s. CAVEATS-CONFINED: the command runs inside agent-bridle's brush shell under the granted Caveats leash (from ~/.newt/config.toml [caveats]); a command outside the granted exec/fs scope is DENIED (isError) rather than executed.",
@@ -244,21 +253,22 @@ fn tool_definitions() -> Value {
 
 // ── tools/call ─────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 fn register_tools_call(
     server: &mut McpServer,
     registry: Arc<BackendRegistry>,
     router: Arc<Router>,
-    bridle: Arc<Registry>,
     granted: Arc<Caveats>,
     workspace: PathBuf,
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
 ) {
+    #[cfg(feature = "confine")]
+    let bridle = bridle_registry();
     // Mint once, reused across every `shell_run` / `web_fetch` call this
     // session (AB-001, #264): a grant minted per call would reset the
     // `max_calls` budget on every dispatch instead of accounting it
     // cross-call, as the session's single `granted` leash always did.
+    #[cfg(feature = "confine")]
     let grant = Arc::new(bridle.mint_grant((*granted).clone()));
     let workspace: Arc<str> = workspace.to_string_lossy().into();
     server.register("tools/call", move |params| {
@@ -266,8 +276,10 @@ fn register_tools_call(
         // own Arc (the outer closure is `Fn`, not `FnOnce`).
         let registry = registry.clone();
         let router = router.clone();
+        #[cfg(feature = "confine")]
         let bridle = bridle.clone();
         let granted = granted.clone();
+        #[cfg(feature = "confine")]
         let grant = grant.clone();
         let workspace = workspace.clone();
         let toolset = toolset.clone();
@@ -298,7 +310,9 @@ fn register_tools_call(
                 }
                 "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
                 "git" => handle_git(&arguments, &granted),
+                #[cfg(feature = "confine")]
                 "shell_run" => Ok(handle_shell_run(arguments, &bridle, &grant).await),
+                #[cfg(feature = "confine")]
                 "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &grant).await),
                 other if newt_mcp_client::split_namespaced(other).is_some() => {
                     let mut toolset = toolset.lock().await;
@@ -452,6 +466,7 @@ async fn handle_file_tool(name: &str, args: &Value, workspace: &str, granted: &C
 /// the model: it sees *why* it was refused without the call collapsing into a
 /// `-32603`. So this function returns a `Value` directly (the `tools/call`
 /// arm wraps it in `Ok`), and never bubbles a leash error up the transport.
+#[cfg(feature = "confine")]
 async fn handle_shell_run(args: Value, bridle: &Registry, grant: &Grant) -> Value {
     // Validate the one required field. A missing `cmd` is a tool-level mistake,
     // so it comes back as an in-band tool error, matching the leash-denial
@@ -504,6 +519,7 @@ async fn handle_shell_run(args: Value, bridle: &Registry, grant: &Grant) -> Valu
 /// `ToolError::Denied` from `dispatch` (the `net` scope is checked inside the
 /// tool), so there is no in-envelope `denied` flag to lift — we map `Ok` to MCP
 /// text and any `Err` to an in-band MCP tool error.
+#[cfg(feature = "confine")]
 async fn handle_web_fetch(args: Value, bridle: &Registry, grant: &Grant) -> Value {
     if args.get("url").and_then(Value::as_str).is_none() {
         return mcp_error_content("missing required argument: url (must be a string)");
@@ -528,6 +544,7 @@ async fn handle_web_fetch(args: Value, bridle: &Registry, grant: &Grant) -> Valu
 /// etc.) was fragile — a successful command that merely *printed* a denial-like
 /// phrase could be misread, and any wording drift in the leash would silently
 /// break detection. The structured envelope removes both hazards.
+#[cfg(feature = "confine")]
 fn is_denied(envelope: &Value) -> bool {
     envelope
         .get("denied")
@@ -538,6 +555,7 @@ fn is_denied(envelope: &Value) -> bool {
 /// Build a human-readable denial message from the envelope's structured
 /// `denials: [{ kind, target, reason }]` list, joining each entry's `reason`.
 /// Falls back to a generic message when the list is missing or empty.
+#[cfg(feature = "confine")]
 fn denial_reason(envelope: &Value) -> String {
     let reasons: Vec<String> = envelope
         .get("denials")
@@ -630,6 +648,7 @@ fn mcp_error_content(reason: &str) -> Value {
     })
 }
 
+#[cfg(feature = "confine")]
 #[cfg(test)]
 fn bridle_registry() -> Arc<Registry> {
     Arc::new(
@@ -640,6 +659,7 @@ fn bridle_registry() -> Arc<Registry> {
     )
 }
 
+#[cfg(feature = "confine")]
 #[cfg(not(test))]
 fn bridle_registry() -> Arc<Registry> {
     Arc::new(agent_bridle::registry())
@@ -699,8 +719,8 @@ mod tests {
         serde_json::from_str(text.trim()).unwrap()
     }
 
-    /// Like [`rpc`], but wires `tools/call` with an EXPLICIT bridle leash so a
-    /// test can confine `shell_run` deterministically — independent of the
+    /// Like [`rpc`], but wires `tools/call` with an EXPLICIT leash so a
+    /// test can confine the tools deterministically — independent of the
     /// host's `~/.newt/config.toml`. (`register_handlers` would source the
     /// granted Caveats from the real home dir, which a test must not depend
     /// on.) This drives `register_tools_call` directly with a chosen grant.
@@ -725,7 +745,6 @@ mod tests {
             &mut server,
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
-            bridle_registry(),
             Arc::new(granted),
             workspace.to_path_buf(),
             toolset,
@@ -741,8 +760,9 @@ mod tests {
 
     /// A restrictive grant: only the platform echo carrier may exec, capped
     /// call budget. Used by the superseded-`shell_run` regression tests below.
+    #[cfg(feature = "confine")]
     fn echo_only_grant() -> Caveats {
-        use agent_bridle::{CountBound, Scope};
+        use agent_mesh_protocol::{CountBound, Scope};
         #[cfg(windows)]
         let exec = Scope::only(["cmd.exe".to_string()]);
         #[cfg(not(windows))]
@@ -754,6 +774,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "confine")]
     fn echo_command() -> &'static str {
         #[cfg(windows)]
         {
@@ -802,6 +823,7 @@ mod tests {
             assert!(names.contains(&tool), "{tool} missing from {names:?}");
         }
         assert!(names.contains(&"goal_run"));
+        #[cfg(feature = "confine")]
         assert!(names.contains(&"shell_run"));
     }
 
@@ -902,7 +924,9 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"read_file"));
+        #[cfg(feature = "confine")]
         assert!(names.contains(&"shell_run"));
+        #[cfg(feature = "confine")]
         assert!(names.contains(&"web_fetch"));
     }
 
@@ -987,7 +1011,7 @@ mod tests {
 
     /// A leash confined to `root` on both fs axes; exec/net untouched.
     fn fenced_to(root: &std::path::Path) -> Caveats {
-        let only = agent_bridle::Scope::only([root.to_string_lossy().into_owned()]);
+        let only = agent_mesh_protocol::Scope::only([root.to_string_lossy().into_owned()]);
         Caveats {
             fs_read: only.clone(),
             fs_write: only,
@@ -1245,7 +1269,8 @@ mod tests {
     async fn scoped_git_is_not_advertised_or_dispatched() {
         let repo = temp_repo();
         let mut granted = Caveats::top();
-        granted.fs_read = agent_bridle::Scope::only([repo.path().to_string_lossy().into_owned()]);
+        granted.fs_read =
+            agent_mesh_protocol::Scope::only([repo.path().to_string_lossy().into_owned()]);
         let request = serde_json::json!({
             "jsonrpc": "2.0", "id": 40, "method": "tools/call",
             "params": {
@@ -1278,7 +1303,7 @@ mod tests {
 
     #[tokio::test]
     async fn git_commit_denied_under_readonly_grant() {
-        use agent_bridle::Scope;
+        use agent_mesh_protocol::Scope;
         let repo = temp_repo();
         // fs_write empty -> GitCaveats::from_session denies stage/commit (fail-closed).
         let readonly = Caveats {
@@ -1431,6 +1456,7 @@ mod tests {
     /// "unavailable in this build" stub error is retired.
     ///
     /// Not on Windows: see `shell_run_exec_allowlist_is_refused_on_windows`.
+    #[cfg(feature = "confine")]
     #[cfg(not(windows))]
     #[tokio::test]
     async fn shell_run_in_scope_echo_succeeds() {
@@ -1469,6 +1495,7 @@ mod tests {
     /// unconfined (`windows-appcontainer-exec-allowlist` in
     /// `docs/security/ocap-deviations.md`). Flip this back to success when
     /// agent-bridle can admit an exec allowlist on Windows.
+    #[cfg(feature = "confine")]
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_run_exec_allowlist_is_refused_on_windows() {
@@ -1501,6 +1528,7 @@ mod tests {
     /// branch, #783): it is not in the `echo`-only exec grant, so the confined
     /// shell refuses it with a capability denial lifted to an MCP `isError`
     /// (not the old stub "unavailable" error).
+    #[cfg(feature = "confine")]
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_out_of_scope_rm_is_denied() {
@@ -1537,6 +1565,7 @@ mod tests {
     /// pins the contract that we read the machine-readable envelope, never
     /// parse stdout/stderr. (A regression to stderr-grepping would make these
     /// helpers ignore the `denied`/`denials` fields and break.)
+    #[cfg(feature = "confine")]
     #[test]
     fn denial_detection_reads_structured_fields_not_stderr() {
         // A denial envelope: `denied: true`, even with an EMPTY stderr and a
@@ -1590,6 +1619,7 @@ mod tests {
     /// passing here proves the bump to the hardened agent-bridle closed the
     /// bypass *through newt's shell_run*, with the denial seen via the
     /// structured field.
+    #[cfg(feature = "confine")]
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_exec_bypass_is_denied_and_program_does_not_run() {
@@ -1660,6 +1690,7 @@ mod tests {
     /// shell (env-seam branch, #783): the program is not in the `echo`-only exec
     /// grant, so the confined shell refuses it with a capability denial lifted to
     /// an MCP `isError` (not the old stub "unavailable" error).
+    #[cfg(feature = "confine")]
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_bin_rm_path_separator_is_denied() {
@@ -1689,6 +1720,7 @@ mod tests {
 
     /// A missing `cmd` is an in-band tool error (matching the leash-denial
     /// shape), not a transport fault.
+    #[cfg(feature = "confine")]
     #[tokio::test]
     async fn shell_run_missing_cmd_is_in_band_error() {
         let resp = rpc_with_caveats(
@@ -1712,6 +1744,7 @@ mod tests {
     }
 
     /// The `shell_run` tools/list description now advertises the confinement.
+    #[cfg(feature = "confine")]
     #[tokio::test]
     async fn shell_run_description_notes_caveats_confinement() {
         let resp = rpc(&serde_json::json!({
@@ -1728,6 +1761,70 @@ mod tests {
             desc.contains("CAVEATS-CONFINED") || desc.to_lowercase().contains("caveats"),
             "shell_run description should note Caveats confinement: {desc}"
         );
+    }
+
+    // ── without `confine`: neither shell_run nor web_fetch ───────────────────────────────
+    //
+    // In-process like the tests above: an in-memory server, a leash chosen by the test and
+    // no process, file or network. They compile only without `confine`, so only the
+    // confine-off test step (ci.yml's lean job, and `just check`, which mirrors it) runs them.
+
+    /// A server built without `confine` never advertises a tool it cannot run.
+    #[cfg(not(feature = "confine"))]
+    #[tokio::test]
+    async fn lean_catalog_omits_the_confined_tools() {
+        let resp = rpc_in(
+            std::path::Path::new("/never/read/workspace"),
+            Caveats::top(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 70, "method": "tools/list", "params": {}
+            }),
+        )
+        .await;
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for tool in FILE_TOOLS.into_iter().chain(["git", "goal_run"]) {
+            assert!(names.contains(&tool), "{tool} missing from {names:?}");
+        }
+        // Exactly those: the file tools, `git` and `goal_run`.
+        assert_eq!(names.len(), FILE_TOOLS.len() + 2, "{names:?}");
+        assert!(!names.contains(&"shell_run"), "{names:?}");
+        assert!(!names.contains(&"web_fetch"), "{names:?}");
+    }
+
+    /// A call to either confined tool reaches no shell and no fetch: there is nothing to
+    /// reach, so the name falls through to the JSON-RPC "unknown tool" error.
+    #[cfg(not(feature = "confine"))]
+    #[tokio::test]
+    async fn lean_call_to_a_confined_tool_is_an_unknown_tool() {
+        for (tool, arguments) in [
+            ("shell_run", serde_json::json!({ "cmd": "echo hi" })),
+            (
+                "web_fetch",
+                serde_json::json!({ "url": "http://example.invalid/" }),
+            ),
+        ] {
+            let resp = rpc_in(
+                std::path::Path::new("/never/read/workspace"),
+                Caveats::top(),
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 71, "method": "tools/call",
+                    "params": { "name": tool, "arguments": arguments }
+                }),
+            )
+            .await;
+            assert_eq!(resp["error"]["code"], -32603, "{tool}: {resp}");
+            assert_eq!(
+                resp["error"]["message"],
+                format!("unknown tool: {tool}"),
+                "{tool}: {resp}"
+            );
+            assert!(resp["result"].is_null(), "{tool}: {resp}");
+        }
     }
 
     // ── parse_tier — unit tests ─────────────────────────────────────────────

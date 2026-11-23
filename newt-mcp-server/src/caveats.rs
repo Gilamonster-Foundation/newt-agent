@@ -6,6 +6,10 @@
 //! brush-backed confined shell, which runs every command under a granted
 //! [`Caveats`] leash. This module decides *what* that grant is.
 //!
+//! Where this page says `shell_run` it describes a build with the `confine` feature. Without
+//! it the server has neither `shell_run` nor `web_fetch`, the same grant confines its file and
+//! git tools only, and [`GrantedCaveats::banner`] says so.
+//!
 //! Resolution order (first hit wins):
 //!
 //! 1. **`~/.newt/config.toml`**, table **`[caveats]`** — the persistent
@@ -34,7 +38,7 @@ use std::path::{Path, PathBuf};
 use agent_mesh_protocol::{Caveats, CountBound, Scope};
 
 /// Where the granted leash came from — surfaced in the startup log so an
-/// operator can tell, at a glance, whether `shell_run` is confined.
+/// operator can tell, at a glance, whether the tools are confined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaveatsSource {
     /// Loaded from `~/.newt/config.toml` `[caveats]`.
@@ -48,7 +52,7 @@ pub enum CaveatsSource {
 /// The resolved leash plus where it came from.
 #[derive(Debug, Clone)]
 pub struct GrantedCaveats {
-    /// The granted authority every `shell_run` dispatch is confined to.
+    /// The granted authority the confined tools run under.
     pub caveats: Caveats,
     /// Provenance of `caveats`, for the startup banner.
     pub source: CaveatsSource,
@@ -125,6 +129,7 @@ impl GrantedCaveats {
 
     /// A human-readable, one-line provenance banner for stderr. When the leash
     /// is the unconfined default, the line is a prominent WARNING.
+    #[cfg(feature = "confine")]
     #[must_use]
     pub fn banner(&self) -> String {
         match &self.source {
@@ -148,6 +153,28 @@ impl GrantedCaveats {
                  to confine it."
                     .to_string()
             }
+        }
+    }
+
+    /// The banner of a server built without `confine`: it has no `shell_run`, so the grant
+    /// confines the file and git tools, and the banner names those. The WARNING for the
+    /// unconfined default stays.
+    #[cfg(not(feature = "confine"))]
+    #[must_use]
+    pub fn banner(&self) -> String {
+        match &self.source {
+            CaveatsSource::ConfigFile(p) => format!(
+                "newt-mcp-server: the file and git tools are confined by {} [caveats]",
+                p.display()
+            ),
+            CaveatsSource::MalformedConfig(p) => format!(
+                "newt-mcp-server: the file and git tools are fail-closed by malformed config at {}",
+                p.display()
+            ),
+            CaveatsSource::UnconfinedDefault => "WARNING: newt-mcp-server is running UNCONFINED \
+                 (no user config [caveats]); the file and git tools can reach any path the \
+                 process can. Add a [caveats] table to the user config.toml to confine them."
+                .to_string(),
         }
     }
 
@@ -264,5 +291,27 @@ valid_for_generation = "all"
 
         let err = GrantedCaveats::resolve(Some(&dir)).unwrap_err();
         assert!(err.to_string().contains("config.toml"), "got: {err}");
+    }
+
+    /// A server built without `confine` has no `shell_run`, so no banner may name one,
+    /// whatever the source of the leash; each names the tools the leash does confine.
+    /// Nothing here reads the path: the banner only prints it.
+    #[cfg(not(feature = "confine"))]
+    #[test]
+    fn lean_banner_does_not_name_shell_run() {
+        let path = PathBuf::from("/never/read/config.toml");
+        for source in [
+            CaveatsSource::ConfigFile(path.clone()),
+            CaveatsSource::MalformedConfig(path),
+            CaveatsSource::UnconfinedDefault,
+        ] {
+            let banner = GrantedCaveats {
+                caveats: Caveats::top(),
+                source,
+            }
+            .banner();
+            assert!(!banner.contains("shell_run"), "banner: {banner}");
+            assert!(banner.contains("file and git tools"), "banner: {banner}");
+        }
     }
 }
