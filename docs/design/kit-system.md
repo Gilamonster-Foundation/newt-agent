@@ -75,7 +75,7 @@ a sibling ADR.
 | `InterfaceId` | Namespaced, major-versioned string `<namespace>.<name>@<major>` naming a base shape plus domain semantics (`newt.speech.stt@1`) | this doc, §2 |
 | `ContentId` | BLAKE3 CIDv1 over canonical dag-cbor — `content_addressable::ContentId`, the type `SpillCid` wraps per 1528b3 | workspace dep `content-addressable` |
 | `ImplRef` | Where an export executes: `Builtin` · `Native { dylib }` · `Wasm { component }` · `Subprocess { cmd, protocol }` · `Remote { principal, endpoint }` | this doc, §4 |
-| `Caveats` | The signed Bridle wire lattice (six axes) — `agent_mesh_protocol::Caveats`, re-exported at `newt_core::caveats` | agent-mesh-protocol 0.6.3 |
+| `Caveats` | The signed Bridle wire lattice (six axes) — `agent_mesh_protocol::Caveats`, re-exported at `newt_policy::caveats` | agent-mesh-protocol 0.6.3 |
 | `DomainCaveats` | A per-`InterfaceId` lattice obeying the same `top`/`leq`/`meet` laws, composed beside `Caveats` (`GitCaveats` precedent) | the interface's owning crate |
 | `RequiredAuthority` | `{ bridle: Caveats, domain: Option<DomainCaveats> }` — the declared **ceiling** for one export | this doc, §1 |
 | `PrincipalId` | The id of a `newt-identity` `AgentKey` (`AgentKey::fingerprint()`, an agent-mesh-protocol `Fingerprint`); the "P" in the audit sentence. Defined in [module-scopes.md](module-scopes.md); `ActorId` is an alias | `newt-identity` / agent-mesh-protocol |
