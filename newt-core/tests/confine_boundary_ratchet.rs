@@ -25,19 +25,15 @@ const BRIDLE_FREE: &[(&str, &str)] = &[(
 const FORBIDDEN: &[&str] = &["agent_bridle", "agent-bridle"];
 
 /// `line` up to its `//` comment, if it has one. The line is cut at its first `//` only
-/// when no `"` or `/*` comes before it and no `"` or `*/` after it. The cut text then
-/// holds no end of a string or block comment, so it is never code, even when the `//`
-/// sits in a string or block comment that opened on an earlier line. The scan can only
-/// over-report: it reads a `/* */` comment, and a `//` comment that holds a `"` or `*/`,
-/// as code.
+/// when it holds no `"` and no `*/` anywhere and no `/*` comes before the `//`. Then no
+/// string or block comment opens before the `//` or ends anywhere on the line, so the cut
+/// text is never code, even when the `//` sits in a string or block comment that opened
+/// on an earlier line, or is the end of one (`*//`). The scan can only over-report: it
+/// reads a `/* */` comment, and a `//` comment on a line that holds a `"` or `*/`, as
+/// code.
 fn code_part(line: &str) -> &str {
     match line.find("//") {
-        Some(at)
-            if !line[..at].contains('"')
-                && !line[..at].contains("/*")
-                && !line[at..].contains('"')
-                && !line[at..].contains("*/") =>
-        {
+        Some(at) if !line.contains('"') && !line.contains("*/") && !line[..at].contains("/*") => {
             &line[..at]
         }
         _ => line,
@@ -91,7 +87,8 @@ fn the_scan_reads_every_line_outside_a_comment() {
                     fn f() {} // agent_bridle\n";
     assert!(naming_bridle(comments).is_empty());
     // A `//` after a `"` or a `/*` is not taken to start a comment, and neither is one
-    // in a string or block comment that opened on an earlier line and ends on this one.
+    // in a string or block comment that opened on an earlier line and ends on this one,
+    // nor the end of such a comment followed by a division (`*//`).
     assert_eq!(
         naming_bridle("call(\"http://x\", agent_bridle::G);\nf(/* // */ agent_bridle::G);\n"),
         [1, 2]
@@ -101,4 +98,6 @@ fn the_scan_reads_every_line_outside_a_comment() {
     assert_eq!(naming_bridle(match_arm), [4]);
     let struct_field = "struct S {\n    /* see\n    http://b */ g: agent_bridle::G,\n}\n";
     assert_eq!(naming_bridle(struct_field), [3]);
+    let divided = "fn f() -> u8 {\n    8 /* see\n    *// agent_bridle::N\n}\n";
+    assert_eq!(naming_bridle(divided), [3]);
 }
