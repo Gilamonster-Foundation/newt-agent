@@ -179,6 +179,13 @@
 #   - the confine-off newt-core tests (#3160), ci.yml lean job: the tests named
 #     `confine_off`, which only a build without `confine` compiles:
 #     `cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off`
+#   - the confine-off newt-mcp-server gate (#3160), ci.yml lean job: that crate alone, no
+#     default features (its one default feature is `confine`): `cargo clippy -p
+#     newt-mcp-server --no-default-features --all-targets -- -D warnings`, `cargo test -p
+#     newt-mcp-server --no-default-features`, and a `cargo tree` probe that the crate lists
+#     agent-bridle among its direct dependencies with `confine` and not without it. `just
+#     check` runs the clippy and test lines on Unix; this hook builds default features
+#     only, so a server with neither `shell_run` nor `web_fetch` is not exercised by this hook.
 #   - `just msrv` (MSRV toolchain check)
 #   - `cargo check -p newt-flock --lib --locked` (ci.yml lint job): the read-only
 #     library without dev-dependencies; its fixture's writer features hide a
