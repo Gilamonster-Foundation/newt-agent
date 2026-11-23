@@ -268,7 +268,7 @@ Caveats {
 Enforcement is the **existing** path: the worker calls `caveats_for_peer(cert)`
 (`newt-mesh/src/caveats.rs`) which verifies the chain end-to-end and rejects any
 amplification, then the dispatch sites consult `permits_exec` / `permits_fs_*`
-/ `permits_one_more` (the `CaveatsExt` adaptors in `newt-core`). **A fully
+/ `permits_one_more` (the `CaveatsExt` adaptors in `newt-policy`). **A fully
 compromised phone still cannot exceed the down-set it was minted with** —
 safety is structural, not "the model behaved." Because the phone is already
 `⊑` the worker, the `meet(worker, phone)` framing used in §6.4/§7 reduces to

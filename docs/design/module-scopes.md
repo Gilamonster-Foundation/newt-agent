@@ -53,9 +53,9 @@ Module
 ```
 
 **Crate placement.** `Module`, `ScopedKitView`, `ResourceBudget` and `Mailbox` live in **`newt-core`**
-(`newt_core::module`), beside every reuse target below (`caveats`, `SteeringInbox`,
-`SessionRegistry` / `OutputSink`, `DockRegistry`, `metrics::TokenUsage`, the widened `newt_core::kit`
-catalog). `newt-identity` depends on `newt-core` (`newt-identity/Cargo.toml`), so newt-core cannot call
+(`newt_core::module`), beside every reuse target below but `caveats`, which `newt-policy` holds
+(#3160): `SteeringInbox`, `SessionRegistry` / `OutputSink`, `DockRegistry`, `metrics::TokenUsage`,
+the widened `newt_core::kit` catalog. `newt-identity` depends on `newt-core` (`newt-identity/Cargo.toml`), so newt-core cannot call
 `newt_identity::attenuate` / `enforced_caveats` by name — but both are one-line wrappers over
 agent-mesh-protocol calls newt-core already has (`AgentKey::delegate(meta)` and
 `key.cert().verify()` + clone; newt-core depends on `agent-mesh-protocol` directly). The first Module

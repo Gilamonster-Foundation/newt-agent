@@ -2,7 +2,7 @@
 
 Status: design note (no implementation) — the spike comes after this lands
 Crates touched (proposed): new `newt-scheduler`, leaning on `newt-core`
-(`dgx`, `router`, `agentic::driver`, `caveats`), `newt-identity`, and —
+(`dgx`, `agentic::driver`), `newt-router`, `newt-policy` (`caveats`), `newt-identity`, and —
 behind a feature flag, outside the default workspace — `newt-mesh`.
 Related: [Workstream A](./progressive-disclosure-memory.md) and
 [Workstream B](./coder-symbolic-memory.md) (the same disclosure principle at the
@@ -332,8 +332,8 @@ new config.
 ## 6. Crate placement
 
 **Proposed: a new `newt-scheduler` crate** in the default workspace, depending on
-`newt-core` (for `dgx`, `router`, `agentic::driver`, `caveats`) and
-`newt-identity` (for `session_root` / `attenuate`). Rationale:
+`newt-core` (for `dgx`, `agentic::driver`), `newt-router` (for `router`), `newt-policy` (for
+`caveats`) and `newt-identity` (for `session_root` / `attenuate`). Rationale:
 
 - The scheduler is a *consumer* of `newt-core`, not part of its core data model;
   a separate crate keeps `newt-core`'s already-large surface from growing a

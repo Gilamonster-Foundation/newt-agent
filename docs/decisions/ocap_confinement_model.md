@@ -69,7 +69,7 @@ execution" via an OS sandbox is the rung above, and it is **not occupied yet**.
 ## What is built vs. what is the target
 
 **Built and enforced today:**
-- **`lock_fs_to_workspace`** (`newt-core::caveats`): sets the `Caveats` fs
+- **`lock_fs_to_workspace`** (`newt-policy::caveats`): sets the `Caveats` fs
   read/write *scope*. Enforced **in-process** at `tui_permits_path`, and **only
   for newt's native fs tools** (`read_file`/`write_file`/`list`). It is a
   reference monitor in our own process — **not** a kernel fence, and it does
