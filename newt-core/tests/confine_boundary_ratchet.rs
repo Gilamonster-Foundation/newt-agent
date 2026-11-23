@@ -7,8 +7,11 @@
 //! `confined_exec.rs` holds the request, result and refusal types its callers use; the
 //! executor that uses bridle is its child `confined_exec/executor.rs`, which is not
 //! listed. `git_hardening.rs` and `git_staging.rs` came free of bridle when #3229 moved
-//! the confined git broker into their children `git_hardening/build_reads.rs` and
-//! `git_staging/confined.rs`, which are not listed; their other children never named it.
+//! the confined git broker into `git_hardening/build_reads.rs` and
+//! `git_staging/confined.rs` (with its tests), which are not listed. Every other file
+//! under them is listed, test files included, except `git_hardening/commit_view_tests.rs`,
+//! which the next step compiles only with `confine`; none has named a bridle crate since
+//! #3223 moved them onto newt-fdguard.
 //!
 //! The list only grows: each later step of #3160 adds the files it frees of bridle, and
 //! the step that makes the bridle dependencies optional deletes this file, because from
@@ -29,6 +32,10 @@ const BRIDLE_FREE: &[(&str, &str)] = &[
     (
         "newt-core/src/git_hardening/branch.rs",
         include_str!("../src/git_hardening/branch.rs"),
+    ),
+    (
+        "newt-core/src/git_hardening/branch_tests.rs",
+        include_str!("../src/git_hardening/branch_tests.rs"),
     ),
     (
         "newt-core/src/git_hardening/ref_namespace.rs",
@@ -57,6 +64,10 @@ const BRIDLE_FREE: &[(&str, &str)] = &[
     (
         "newt-core/src/git_staging/tool_diagnostics/repair.rs",
         include_str!("../src/git_staging/tool_diagnostics/repair.rs"),
+    ),
+    (
+        "newt-core/src/git_staging/tool_diagnostics/repair/tests.rs",
+        include_str!("../src/git_staging/tool_diagnostics/repair/tests.rs"),
     ),
     (
         "newt-core/src/git_staging/trust_paths.rs",
