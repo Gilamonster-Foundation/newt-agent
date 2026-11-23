@@ -16,6 +16,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use newt_core::mcp::{McpServerEntry, TransportKind};
+use newt_core::sandbox_seam::SandboxRoots;
 use newt_policy::caveats::Caveats;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -848,7 +849,7 @@ fn prepare_stdio_caveats(
     session: &Caveats,
     command: &str,
     protection: Option<&newt_core::workspace_protection::WorkspaceProtection>,
-    policy: &agent_bridle::SandboxPolicy,
+    roots: &SandboxRoots,
     confined_transport: bool,
 ) -> Result<Caveats> {
     let prepared = spawn_caveats(session, command);
@@ -856,7 +857,7 @@ fn prepare_stdio_caveats(
         anyhow::ensure!(confined_transport,
             "workspace-protected stdio MCP requires native process confinement; the advisory transport is unavailable for this session");
         protection
-            .validate_with_sandbox_policy(&prepared, policy)
+            .validate_with_sandbox_roots(&prepared, roots)
             .context("workspace-protected MCP authority refused")?;
     }
     Ok(prepared)
@@ -1028,7 +1029,13 @@ impl StdioTransport {
             child_network: ChildNetworkPolicy::DenyDirect,
             ..SandboxPolicy::default()
         });
-        let prepared = prepare_stdio_caveats(caveats, command, protection, &sandbox_policy, true)?;
+        let prepared = prepare_stdio_caveats(
+            caveats,
+            command,
+            protection,
+            &SandboxRoots::from(&*sandbox_policy),
+            true,
+        )?;
         let cx = mint_spawn_context(&prepared).with_context(|| {
             format!("authorizing confined spawn of MCP server `{}`", entry.name)
         })?;
@@ -1096,7 +1103,7 @@ impl StdioTransport {
             caveats,
             command,
             protection,
-            &agent_bridle::SandboxPolicy::default(),
+            &SandboxRoots::from(&agent_bridle::SandboxPolicy::default()),
             false,
         )?;
         let grants = resolve_env_grants(entry)?;

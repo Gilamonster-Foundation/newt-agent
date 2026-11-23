@@ -141,6 +141,7 @@ pub mod roadmap_eval;
 pub mod roadmap_file;
 pub mod role_profile;
 pub mod runtime;
+pub mod sandbox_seam;
 pub mod sas_confirm;
 pub mod sas_transcript;
 pub mod scope_grounding;

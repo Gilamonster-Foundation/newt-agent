@@ -11,6 +11,9 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `newt_core::workspace_protection::WorkspaceProtection::validate_with_sandbox_policy` is
+  renamed `validate_with_sandbox_roots` and takes `newt_core::sandbox_seam::SandboxRoots`,
+  with no alias (#3160). Convert a launcher's policy with `SandboxRoots::from(&policy)`.
 - The policy layer is its own crate, `newt-policy` (#3160). `newt_core::{caveats, danger, fs_aliases, netguard, paths, permission_challenge, permissions, posture}` are gone, with no re-export, and so are the crate-root names taken from `caveats` and `permissions` (`PermissionGate`, `DenialKind`, `CaveatsExt`, `permits_path` and the rest); import them from `newt_policy`, which supersedes the `newt_core::permissions` and `newt_core::caveats` paths named in the entries below. `CaveatProfile`, `ScopeSpec`, `ScopeKeyword` and `NamedPermissionPreset` moved from `newt_core::role_profile` to `newt_policy::preset`, and `ModeConfig` from `newt_core::config` to `newt_policy::posture`. `posture::build_posture` takes the `[modes]` and `[permission_presets]` tables instead of `&Config`, and its skill loader may return any `Display` error. `git_caveats` and `redact` stay in `newt-core`.
 - The tier router is its own crate, `newt-router`. `newt_core::router` (with `router::Classification`), `newt_core::Router` and `newt_core::Tier` are gone, with no re-export; import them from `newt_router` (#2234).
 - The permission gate moves out of `agentic`: `newt_core::agentic::{PermissionGate, PermissionRequest, PermissionDecision, PermissionRecord, PermissionAction, HumanQuestionOutcome, DenialKind, ChoiceSpec, PersistentDenial, Verdict, widen_caveats, append_denial, load_denials, BOUND_REASON_PREFIX}` are gone, with no re-export. Use `newt_core::permissions::`; the crate-root names (`newt_core::PermissionGate` and the rest that had one) are unchanged (#3140).
