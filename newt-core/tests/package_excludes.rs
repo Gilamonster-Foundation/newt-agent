@@ -13,7 +13,9 @@
 //!   resolves the workspace around its working directory, by default the crate's.
 //!
 //! The last two err toward excluding: a test that walks up only to a file the package
-//! also ships, or runs cargo in a directory of its own, is excluded too. This guard
+//! also ships, or runs cargo in a directory of its own, is excluded too. The cargo rule
+//! knows those two spellings only: cargo spawned through a binding, an environment
+//! variable read at run time or a shell command is not seen. This guard
 //! checks the top-level `tests/*.rs` files, and checks that no file under a test
 //! directory reads outside the crate except under `tests/common`, which is excluded
 //! whole. It is excluded from the package itself: its twin below looks for tests the

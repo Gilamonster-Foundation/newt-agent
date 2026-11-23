@@ -8,7 +8,8 @@ version.workspace = true
 # an extracted package, a vendored copy, a `cargo test` on the published
 # tarball. Excluding them keeps the package self-contained (#1823 A0-9). Every test that
 # reads outside the crate is excluded too: one that declares `mod common;` (because
-# `tests/common` is), embeds a file above the crate, or walks up from CARGO_MANIFEST_DIR.
+# `tests/common` is), embeds a file above the crate, walks up from CARGO_MANIFEST_DIR, or
+# runs cargo.
 # The guard tests/package_excludes.rs fails on one that is not listed here (#3164), and is
 # excluded itself, since its twin looks for tests the package does not ship.
 exclude = [
