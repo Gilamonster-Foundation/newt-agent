@@ -24,14 +24,22 @@ const BRIDLE_FREE: &[(&str, &str)] = &[(
 /// package names, as a `#[path]` into a vendored copy would spell them.
 const FORBIDDEN: &[&str] = &["agent_bridle", "agent-bridle"];
 
-/// `line` up to its `//` comment, if it has one. A `//` starts a comment here only when
-/// no `"` or `/*` comes before it on the line, so a `//` inside a string or a block
-/// comment leaves the whole line to be read: the scan errs toward reporting. It reads one
-/// shape wrongly: inside a multi-line string, a line that starts with `//` is taken for a
-/// comment, so code written after the string closes on that line is not read.
+/// `line` up to its `//` comment, if it has one. The line is cut at its first `//` only
+/// when no `"` or `/*` comes before it and no `"` or `*/` after it. The cut text then
+/// holds no end of a string or block comment, so it is never code, even when the `//`
+/// sits in a string or block comment that opened on an earlier line. The scan can only
+/// over-report: it reads a `/* */` comment, and a `//` comment that holds a `"` or `*/`,
+/// as code.
 fn code_part(line: &str) -> &str {
     match line.find("//") {
-        Some(at) if !line[..at].contains('"') && !line[..at].contains("/*") => &line[..at],
+        Some(at)
+            if !line[..at].contains('"')
+                && !line[..at].contains("/*")
+                && !line[at..].contains('"')
+                && !line[at..].contains("*/") =>
+        {
+            &line[..at]
+        }
         _ => line,
     }
 }
@@ -62,7 +70,7 @@ fn code_that_builds_without_confine_names_no_agent_bridle_crate() {
 }
 
 /// Anti-vacuous twin: the scan reports each way of naming bridle in code, test code
-/// included, and passes over comments.
+/// included, and passes over `//` comments.
 #[test]
 fn the_scan_reads_every_line_outside_a_comment() {
     assert_eq!(naming_bridle("use agent_bridle::Gate;\n"), [1]);
@@ -82,9 +90,15 @@ fn the_scan_reads_every_line_outside_a_comment() {
     let comments = "// agent_bridle\n    /// [`agent_bridle::Gate`]\n//! agent-bridle\n\
                     fn f() {} // agent_bridle\n";
     assert!(naming_bridle(comments).is_empty());
-    // A `//` after a `"` or a `/*` is not taken to start a comment.
+    // A `//` after a `"` or a `/*` is not taken to start a comment, and neither is one
+    // in a string or block comment that opened on an earlier line and ends on this one.
     assert_eq!(
         naming_bridle("call(\"http://x\", agent_bridle::G);\nf(/* // */ agent_bridle::G);\n"),
         [1, 2]
     );
+    let match_arm = "fn f(s: &str) -> u8 {\n    match s {\n        \"a\nhttp://b\" => \
+                     agent_bridle::N,\n        _ => 0,\n    }\n}\n";
+    assert_eq!(naming_bridle(match_arm), [4]);
+    let struct_field = "struct S {\n    /* see\n    http://b */ g: agent_bridle::G,\n}\n";
+    assert_eq!(naming_bridle(struct_field), [3]);
 }
