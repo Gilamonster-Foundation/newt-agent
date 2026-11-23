@@ -73,7 +73,9 @@
 #     and the macOS-only stdio MCP net:none
 #     Seatbelt admission grounding
 #     test (#3033, stdio_spawn_under_net_none_is_admitted_with_net_kernel_on_seatbelt;
-#     needs the macOS kernel and a non-root caller).
+#     needs the macOS kernel and a non-root caller), #3148's local-path remote
+#     ground, and #3195's three carried-tool pack grounds (two on Linux/macOS, one
+#     under the macOS kernel sandbox).
 #   - newt-fdguard's real-resource tests, mcp-import-real.yml (weekly + release,
 #     Linux/macOS, #3160): the copied agent-bridle-fdguard suite, #[ignore]d in
 #     the unit tier, and bridle_differential.rs's grounds, --ignored --test-threads=1.
