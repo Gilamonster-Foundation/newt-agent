@@ -215,7 +215,7 @@ decision points consume. The contract this proposal relies on:
 whisper on a `.wav` declares nothing). It cannot say "microphone capture", "subscribe to session S's
 `ResponseEvent`s", or "publish `PaneEvent`s to pane host H" — and `Gate::authorize` takes a
 `&dyn Tool`. Today only `shell` is in the Bridle `Registry` (`web_fetch` is a builtin since #3160); the Gate is also reached
-directly by the spawn-context tools `ExecSpawnTool` (confined exec, `newt-core/src/confined_exec.rs`)
+directly by the spawn-context tools `ExecSpawnTool` (confined exec, `newt-core/src/confined_exec/executor.rs`)
 and `McpSpawnTool` (MCP subprocess, `newt-mcp-client/src/lib.rs`) — every one of them
 `Action`-shaped. Streams and sessions have no Gate path at all. The workspace
 already solved this once: `GitCaveats` is a *separate small lattice with the same `top`/`leq`/`meet`
