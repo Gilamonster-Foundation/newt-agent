@@ -1,9 +1,8 @@
 //! #2719: source-bound output wrappers around a governed Git/gh command. No shell runs.
 //! Inspection deliberately flattens topology, so we also consume every byte of
 //! the source, accepting only `command [2>&1] [| head ...] [; echo ...]`.
-use super::{inspect_shell, literal};
-
-pub(super) const RETRY: &str = "Retry with run_command using the worktree as cwd and command `git push origin` (or `git push --dry-run origin` for a dry run).";
+use super::git_words::literal;
+use crate::shell_inspect::inspect_shell;
 
 pub(in crate::agentic::tools) struct GovernedCommand {
     pub argv: Vec<String>,

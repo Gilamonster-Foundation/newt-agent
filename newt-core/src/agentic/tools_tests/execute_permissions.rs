@@ -2544,7 +2544,7 @@ async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() 
 
 /// #2689 regression, through the `GitTool`/`PendingRerun` collaborator path:
 /// a denied `git add -A && git commit -q -m probe` (which installs a real
-/// `CommitPolicy`-backed broker, per `native_git::needs_commit_broker`) must
+/// `CommitPolicy`-backed broker, per `git_words::needs_commit_broker`) must
 /// now consult the SAME gate as any other exec denial — this replaces a
 /// round-2 (#2681) test that pinned the OPPOSITE as expected ("the broker
 /// early return must never consult the permission gate"), which was this
@@ -2690,7 +2690,7 @@ async fn a_commit_in_a_command_the_inspector_cannot_read_is_refused_before_anyth
         "git commit --allow-empty -m direct; \
          find . -maxdepth 0 -exec timeout 30 git commit --allow-empty -m delegated \\;",
     ] {
-        let probe = crate::agentic::tools::gh_read_tests::Probe::default();
+        let probe = crate::agentic::tools::command_probe::Probe::default();
         let mut gate = MockGate::new(true, &caveats);
         let mut display = ToolDisplay::new(Vec::<u8>::new(), false, 80, 20, false);
         let result = execute_tool_inner(

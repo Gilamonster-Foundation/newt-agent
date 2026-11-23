@@ -6,11 +6,13 @@ pub(super) mod fetch;
 #[cfg(unix)]
 mod gh_http;
 pub(super) mod gh_read;
-pub(super) mod publication;
-pub(super) mod push_command;
 mod push_failure;
 use push_failure::classify_failure;
 
+use super::git_words::{
+    bare_git_invocations, git_verb_in, invocation, is_gh, is_git, literal, unresolved,
+};
+use super::governed_command::GovernedCommand;
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use crate::git_caveats::GitCaveats;
 use crate::shell_inspect::{inspect_shell, ShellInspection};
@@ -143,92 +145,10 @@ fn hides_git_delete(source: &str) -> bool {
     })
 }
 
-/// Every `git` invocation `source` makes, as `(verb, arguments)`, read from its bare
-/// words without the shell inspector: segments split at shell punctuation, and `git` taken
-/// anywhere in a segment, so `then git commit -m x` and `xargs git branch -d` count.
-/// A tripwire, not a boundary. Words are split at white space and keep their quotes,
-/// so `'git fetch'` or `"git` is not git, but git text inside a longer quoted
-/// string, a comment or a here-document is read as an invocation wherever no quote
-/// touches the `git` or the verb. An obfuscated command stays the confined
-/// executor's.
-fn bare_git_invocations(source: &str) -> Vec<(String, Vec<String>)> {
-    let mut found = Vec::new();
-    for segment in source.split(['|', ';', '&', '\n', '(', ')', '`', '<', '>']) {
-        let words: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
-        for (at, word) in words.iter().enumerate() {
-            if is_git(word) {
-                if let Ok((verb, args, _)) = invocation(&words[at..]) {
-                    found.push((verb.to_string(), args.to_vec()));
-                }
-            }
-        }
-    }
-    found
-}
-
 /// What to do instead when a delete names what it destroys only at runtime.
 const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out \
     literally, for example `git branch -D old-a old-b` or `git worktree remove ../old`; \
     newt then asks the operator.";
-
-/// The first `git` verb in `verbs` that `source` invokes anywhere, nested
-/// constructs included. A loose trigger. In a source the inspector can read, text
-/// that merely mentions Git is not an invocation. In one it cannot read (#3146) the
-/// verb is read from the bare words, see [`bare_git_invocations`], and git text
-/// that no quote touches counts even when nothing would run it. A false hit costs:
-/// one network prompt the command did not need (a decline refuses the command), or
-/// for a push or a commit a refusal of the whole command. Never a missed gate. The
-/// push refusal ends with the push retry text, so a command that only mentioned a
-/// push is told how to push.
-fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
-    fn find(inspection: &ShellInspection, verbs: &[&str]) -> Option<String> {
-        inspection
-            .commands
-            .iter()
-            .find_map(|command| {
-                command
-                    .program
-                    .as_deref()
-                    .filter(|program| is_git(program))?;
-                let verb = invocation(&command.argv)
-                    .ok()
-                    .and_then(|(verb, _, _)| literal(verb))?;
-                verbs.contains(&verb.as_str()).then_some(verb)
-            })
-            .or_else(|| {
-                inspection
-                    .constructs
-                    .iter()
-                    .find_map(|construct| find(construct.inspection.as_deref()?, verbs))
-            })
-    }
-    match inspect_shell(source) {
-        Ok(inspection) => find(&inspection, verbs),
-        // #3146: the shell inspector errors on an `if`, `while`, `until`, `case`, subshell
-        // or brace group, and one anywhere in a command hid every git verb from the
-        // triggers that use this (the network prompt and the commit and push brokers).
-        // Read the bare words instead, as the delete tripwire does.
-        Err(_) => bare_git_invocations(source)
-            .into_iter()
-            .filter_map(|(verb, _)| literal(&verb))
-            .find(|verb| verbs.contains(&verb.as_str())),
-    }
-}
-
-/// Whether `run_command` binds the commit broker to `source`. Only for a source the
-/// inspector can read: the broker covers a commit the shell itself runs, not one a
-/// dispatcher runs (`find -exec`, `timeout`), and telling the two apart takes the inspection.
-pub(super) fn needs_commit_broker(source: &str) -> bool {
-    inspect_shell(source).is_ok() && git_verb_in(source, &["commit"]).is_some()
-}
-
-/// #3146: whether `source`, which the inspector cannot read, runs `git commit` by its bare
-/// words. No broker can be bound to it (see [`needs_commit_broker`]), so `run_command`
-/// refuses the whole command before any of it runs. With the broker bound instead, a direct
-/// commit landed before the confined shell refused the commit a dispatcher ran beside it.
-pub(super) fn commit_in_an_uninspectable_source(source: &str) -> bool {
-    inspect_shell(source).is_err() && git_verb_in(source, &["commit"]).is_some()
-}
 
 /// Git verbs that read from a remote. Pure data: a three-Cs candidate for the
 /// tooling packs once a second forge CLI needs the same prompt.
@@ -356,42 +276,6 @@ fn dispatch_network_read_with(
     }
 }
 
-fn unresolved(detail: &str) -> String {
-    format!("refused: {detail}; native Git ref mutation is not yet supported by the repository authority adapter")
-}
-
-fn is_gh(program: &str) -> bool {
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    name.eq_ignore_ascii_case("gh") || name.eq_ignore_ascii_case("gh.exe")
-}
-
-/// issue-1188: is `source` a `git push` invocation anywhere in it (a loose
-/// trigger; unlike [`needs_commit_broker`] it also fires on the bare words of a
-/// source the inspector cannot read)? A `true` here routes the
-/// WHOLE `run_command` call to [`execute_governed_push`] instead of the
-/// confined shell — that function applies the source-bound/fixed-argv
-/// check and refuses anything this loose scan admits but the broker cannot
-/// safely execute. Harmless output wrappers are interpreted in-process (#2719).
-pub(super) fn needs_push_broker(source: &str) -> bool {
-    git_verb_in(source, &["push"]).is_some()
-}
-
-/// issue-1188 amendment A4: is `source` a `gh pr create` invocation anywhere
-/// in it? Same loose-trigger/strict-execute split as [`needs_push_broker`].
-pub(super) fn needs_pr_create_broker(source: &str) -> bool {
-    fn contains(inspection: &ShellInspection) -> bool {
-        inspection.commands.iter().any(|command| {
-            command.program.as_deref().is_some_and(is_gh)
-                && command.argv.get(1).and_then(|a| literal(a)).as_deref() == Some("pr")
-                && command.argv.get(2).and_then(|a| literal(a)).as_deref() == Some("create")
-        }) || inspection
-            .constructs
-            .iter()
-            .any(|construct| construct.inspection.as_deref().is_some_and(contains))
-    }
-    inspect_shell(source).is_ok_and(|inspection| contains(&inspection))
-}
-
 /// issue-1188 amendment A1/A2: the exact push this broker will execute —
 /// never taken verbatim from the model's argv, only VALIDATED against it. The
 /// remote name is the only thing the model's command may choose; the branch
@@ -479,16 +363,16 @@ pub(super) fn execute_governed_push(
     observed: Option<&std::sync::OnceLock<crate::git_staging::Outcome>>,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
-        return format!("{unavailable}. {}", push_command::RETRY);
+        return format!("{unavailable}. {PUSH_RETRY}");
     }
-    let command = match push_command::GovernedCommand::parse(source) {
+    let command = match GovernedCommand::parse(source) {
         Ok(command) => command,
-        Err(reason) => return format!("refused: {reason}. {}", push_command::RETRY),
+        Err(reason) => return format!("refused: {reason}. {PUSH_RETRY}"),
     };
     // These parser errors contain only harness-authored text, never config or
     // child diagnostics. Do not collapse an actionable syntax error into F6.
     if let Err(reason) = parse_governed_push(&command.argv) {
-        return format!("{reason}. {}", push_command::RETRY);
+        return format!("{reason}. {PUSH_RETRY}");
     }
     // The read roots are bound ONCE, before planning, and the same held
     // handles serve planning reads and the confined copy's admission.
@@ -500,13 +384,13 @@ pub(super) fn execute_governed_push(
     if let (Some(slot), Ok(outcome)) = (observed, &result) {
         let _ = slot.set(outcome.clone());
     }
-    render_governed_result(&command, result, push_command::RETRY)
+    render_governed_result(&command, result, PUSH_RETRY)
 }
 
 /// Only harness-authored reasons cross the fixed-form boundary; raw config
 /// and child diagnostics remain private for both governed publication paths.
 fn render_governed_result(
-    command: &push_command::GovernedCommand,
+    command: &GovernedCommand,
     result: Result<crate::git_staging::Outcome, crate::git_staging::Refusal>,
     retry: &str,
 ) -> String {
@@ -590,7 +474,7 @@ fn plan_governed_push(
     use crate::git_staging as staging;
     staging::preflight_availability(caveats).map_err(|e| e.to_string())?;
 
-    let command = push_command::GovernedCommand::parse(source).map_err(str::to_owned)?;
+    let command = GovernedCommand::parse(source).map_err(str::to_owned)?;
     let request = parse_governed_push(&command.argv)?;
 
     // Finding 6 (issue-1188 review #2641): the broker runs outside the
@@ -801,6 +685,8 @@ struct GovernedPrCreate {
     requested_head: Option<String>,
 }
 
+const PUSH_RETRY: &str = "Retry with run_command using the worktree as cwd and command `git push origin` (or `git push --dry-run origin` for a dry run).";
+
 const PR_CREATE_RETRY: &str = "Retry with run_command using the worktree as cwd and command `gh pr create --base <default-branch> --head <current-branch> --title '<title>' --body '<body>'`.";
 
 fn parse_governed_pr_create(argv: &[String]) -> Result<GovernedPrCreate, &'static str> {
@@ -875,7 +761,7 @@ pub(super) fn execute_governed_pr_create(
     if let Err(unavailable) = broker_available(caveats) {
         return format!("{unavailable}. {PR_CREATE_RETRY}");
     }
-    let command = match push_command::GovernedCommand::parse(source) {
+    let command = match GovernedCommand::parse(source) {
         Ok(command) => command,
         Err(reason) => return format!("refused: {reason}. {PR_CREATE_RETRY}"),
     };
@@ -969,7 +855,7 @@ fn plan_governed_pr_create(
 
     let syntax_refusal =
         |reason: &'static str| staging::Refusal::from(reason.to_string()).with_reason(reason);
-    let command = push_command::GovernedCommand::parse(source).map_err(syntax_refusal)?;
+    let command = GovernedCommand::parse(source).map_err(syntax_refusal)?;
     let request = parse_governed_pr_create(&command.argv).map_err(syntax_refusal)?;
 
     // Finding 6: same cwd authority/exec binding as the push broker.
@@ -1095,57 +981,6 @@ fn ensure_net_granted(
             "refused: operator did not grant network access to '{host}'"
         )),
     }
-}
-
-pub(super) fn is_git(program: &str) -> bool {
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    name.eq_ignore_ascii_case("git") || name.eq_ignore_ascii_case("git.exe")
-}
-
-/// Resolve a single argument with the shell inspector's word parser. Argument data is not
-/// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
-pub(super) fn literal(word: &str) -> Option<String> {
-    crate::shell_inspect::literal_shell_word(word).ok()
-}
-
-/// Find the native verb without translating argv. Repository/config selectors
-/// remain usable for reads, but mutation cannot rely on the caller's cwd then.
-pub(super) fn invocation(argv: &[String]) -> Result<(&str, &[String], bool), String> {
-    let mut index = 1;
-    let mut same_repository = true;
-    while let Some(word) = argv.get(index) {
-        match word.as_str() {
-            "--no-pager" | "--paginate" | "--no-optional-locks" => index += 1,
-            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" => {
-                same_repository = false;
-                index += 2;
-            }
-            option
-                if option.starts_with("--git-dir=")
-                    || option.starts_with("--work-tree=")
-                    || option.starts_with("--namespace=")
-                    || option.starts_with("--config-env=")
-                    || option.starts_with("--exec-path=")
-                    || option == "--bare" =>
-            {
-                same_repository = false;
-                index += 1;
-            }
-            "--literal-pathspecs"
-            | "--glob-pathspecs"
-            | "--noglob-pathspecs"
-            | "--icase-pathspecs"
-            | "--no-replace-objects" => index += 1,
-            "--version" | "--help" | "--html-path" | "--man-path" | "--info-path" => {
-                return Ok(("help", &[], true));
-            }
-            verb if !verb.starts_with('-') => {
-                return Ok((verb, &argv[index + 1..], same_repository));
-            }
-            _ => return Err(unresolved("unresolved Git global options")),
-        }
-    }
-    Ok(("help", &[], true))
 }
 
 fn inspect_commands(
@@ -1411,6 +1246,9 @@ fn refuse_protected_branch(cwd: &Path, branch: &str, caveats: &Caveats) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use super::super::git_words::{
+        commit_in_an_uninspectable_source, needs_commit_broker, needs_push_broker,
+    };
     use super::super::{
         disable_ocap_tests::{env_lock, EnvVar},
         execute_tool_with_collaborators, PermissionDecision, PermissionRequest, ToolCollaborators,
@@ -2622,6 +2460,7 @@ mod tests {
 /// broker's own request) and every F6 sink against the actual processes.
 #[cfg(all(test, unix))]
 mod governed_push_tests {
+    use super::super::git_words::{needs_pr_create_broker, needs_push_broker};
     use super::*;
     use newt_policy::caveats::Scope;
     use std::io::{Read as _, Write as _};
@@ -3565,9 +3404,9 @@ mod governed_push_tests {
         // Test-only destination seam: real Git and a real bare remote, without
         // relaxing the production planner's github.com destination check.
         plan.url = remote.path().to_string_lossy().into_owned();
-        let command = push_command::GovernedCommand::parse("git push origin").unwrap();
+        let command = GovernedCommand::parse("git push origin").unwrap();
         let result = run_push_test(&plan, &caveats);
-        let text = render_governed_result(&command, result, push_command::RETRY);
+        let text = render_governed_result(&command, result, PUSH_RETRY);
         assert!(
             text.contains("remote branch 'task' already exists"),
             "{text}"

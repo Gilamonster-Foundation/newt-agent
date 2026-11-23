@@ -4,6 +4,9 @@
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:15 EDT | Date: 2026-08-12
 
 #[cfg(test)]
+#[path = "tools_tests/command_probe.rs"]
+mod command_probe;
+#[cfg(test)]
 mod gh_read_tests;
 mod worktree;
 use worktree::execute as execute_tool_inner;
@@ -65,10 +68,13 @@ pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) use path_suggest::resolve_tool_path;
 use path_suggest::{artifact_locator, FileIoError};
 pub(crate) mod exposure;
+mod git_words;
+mod governed_command;
 mod grep_tool;
 mod live_output;
 mod native_git;
 pub(crate) mod output_budget;
+mod publication;
 mod read_history;
 pub(crate) use read_history::ReadHistory;
 mod shell;
@@ -4699,8 +4705,8 @@ async fn execute_authorized_tool(
             // support; they keep the explicit guard below.
             // Match the ordinary host route: an explicit preset floor still wins.
             let publication_bypass = ocap_disabled() && shell::exec_floor_permits(exec_floor, cmd);
-            let governed_git = native_git::publication::governed(cmd, publication_bypass, presentation);
-            let commit_requested = governed_git && native_git::needs_commit_broker(cmd);
+            let governed_git = publication::governed(cmd, publication_bypass, presentation);
+            let commit_requested = governed_git && git_words::needs_commit_broker(cmd);
             let commit_broker = if commit_requested {
                 match git_tool.and_then(|tool| tool.native_commit_policy()) {
                     Some(policy) => match crate::native_git_broker::NativeGitBroker::new(policy) {
@@ -4715,7 +4721,7 @@ async fn execute_authorized_tool(
             // #3146: the lexical check misses a commit behind a shell keyword (`then git
             // commit`), and a source the inspector cannot read gets no broker, so the
             // bare-word trigger sends that source to the same refusal.
-            let commit_named = run_command_creates_shell_git_commit(cmd) || native_git::commit_in_an_uninspectable_source(cmd);
+            let commit_named = run_command_creates_shell_git_commit(cmd) || git_words::commit_in_an_uninspectable_source(cmd);
             if governed_git && commit_named && commit_broker.is_none() {
                 let reason = match crate::shell_inspect::inspect_shell(cmd) {
                     Err(error) => format!("shell inspection failed: {error}"),
@@ -4764,7 +4770,7 @@ async fn execute_authorized_tool(
             // where it would either hang against `net: none` or (if that
             // narrowing ever regressed) inherit the session's full net scope
             // inside a hostile-repo-influenced child.
-            if governed_git && native_git::needs_push_broker(cmd) {
+            if governed_git && git_words::needs_push_broker(cmd) {
                 return host_return(native_git::execute_governed_push(
                     cmd,
                     std::path::Path::new(&run_cwd),
@@ -4773,7 +4779,7 @@ async fn execute_authorized_tool(
                     governed_pr,
                 ));
             }
-            if governed_git && native_git::needs_pr_create_broker(cmd) {
+            if governed_git && git_words::needs_pr_create_broker(cmd) {
                 return host_return(native_git::execute_governed_pr_create(
                     cmd,
                     std::path::Path::new(&run_cwd),
@@ -4919,7 +4925,7 @@ async fn execute_authorized_tool(
                 workspace
             };
             let invocation_caveats = if commit_broker.is_some() {
-                match crate::native_git_broker::NativeGitBroker::invocation_caveats(
+                match crate::git_hardening::commit_invocation_caveats(
                     caveats, std::path::Path::new(commit_workspace),
                 ) {
                     Ok(invocation) => invocation,
