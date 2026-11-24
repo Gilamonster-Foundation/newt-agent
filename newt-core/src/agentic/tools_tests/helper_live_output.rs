@@ -282,6 +282,7 @@ async fn host_bypass_publishes_output_before_command_completion() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn bridled_shell_forwards_live_bytes_without_changing_the_envelope() {
     // Restricted-exec proofs must not inherit another test's temporary engine.
     let _env = super::disable_ocap_tests::env_lock().await;

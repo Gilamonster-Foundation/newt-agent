@@ -176,9 +176,11 @@
 #     that touches a file the pin reads does run the pin here, as an ordinary
 #     newt-core test: newt-core/tests/confine_gate_parity_ratchet.rs holds the
 #     two gates, the Windows copy and the command quoted in this bullet equal.
-#   - the confine-off newt-core tests (#3160), ci.yml lean job: the tests named
-#     `confine_off`, which only a build without `confine` compiles:
-#     `cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off`
+#   - the confine-off newt-core tests (#3160), ci.yml lean job: off-only refusals
+#     plus portable route, build classification, floor and recorder predicates.
+#     HOOK PARITY / PIPELINE PARITY: this CI-ONLY selector mirrors ci.yml exactly;
+#     justfile does not repeat it (the existing core clippy gates remain there).
+#     `cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off route_selection_tests build_shell::tests exec_floor_permits_ exec_floor_refuses_ shadow_records_iff`
 #   - the confine-off newt-mcp-server gate (#3160), ci.yml lean job: that crate alone, no
 #     default features (its one default feature is `confine`): `cargo clippy -p
 #     newt-mcp-server --no-default-features --all-targets -- -D warnings`, `cargo test -p

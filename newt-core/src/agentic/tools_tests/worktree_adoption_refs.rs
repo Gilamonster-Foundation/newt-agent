@@ -402,6 +402,7 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
 /// #2757: permission approval adds only the exact prepared destination and lets
 /// the same preflighted creation complete for sibling and separate temp roots.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn adoption_refs_approved_external_destination_is_adopted() {
     struct Allow(Vec<PermissionRequest>);
     impl PermissionGate for Allow {

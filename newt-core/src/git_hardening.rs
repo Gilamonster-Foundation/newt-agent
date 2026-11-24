@@ -64,6 +64,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// which Git correctly rejects once that group is disabled by AppContainer.
 /// This changes only fixture ownership, not the DACL or production Git policy.
 #[cfg(all(test, windows))]
+#[cfg(feature = "confine")]
 pub(crate) fn own_git_test_fixture(repo: &Path) {
     let output = Command::new("pwsh.exe")
         .args(["-NoProfile", "-NonInteractive", "-File"])

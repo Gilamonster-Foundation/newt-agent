@@ -12,6 +12,7 @@
 
 const LIVE_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 const LIVE_OUTPUT_QUEUE_CHUNKS: usize = 32;
+#[cfg(feature = "confine")]
 const LIVE_OUTPUT_OBSERVER_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 const LIVE_OUTPUT_FINISH_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 const LIVE_OUTPUT_OPEN: u8 = 0;
@@ -115,6 +116,7 @@ impl LiveOutputRelay {
     }
 }
 
+#[cfg(feature = "confine")]
 impl agent_bridle::ShellOutputObserver for LiveOutputRelay {
     fn on_output(
         &self,
@@ -201,6 +203,7 @@ impl LiveOutputSession {
         self.closed = true;
     }
 
+    #[cfg(feature = "confine")]
     pub(super) fn finish_after_observer(&mut self) {
         if self.closed {
             return;

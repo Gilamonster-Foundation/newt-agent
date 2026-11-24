@@ -2150,6 +2150,7 @@ fn exec_denial_is_replay_safe(target: &str, cmd: &str) -> bool {
 /// Exec` before the text predicate is even consulted; a net denial always
 /// falls through to the existing "granted; re-run your command" path (its
 /// manual retry), never an automatic replay.
+#[cfg(any(test, feature = "confine"))]
 fn requests_are_replay_safe(requests: &[PermissionRequest], cmd: &str) -> bool {
     requests.iter().all(|request| {
         request.kind == DenialKind::Exec && exec_denial_is_replay_safe(&request.target, cmd)
@@ -4874,6 +4875,7 @@ async fn execute_authorized_tool(
                     return executed(result);
                 }
             }
+            #[cfg(feature = "confine")]
             if let Some(program) = build_shell::confined_build_program(cmd, ocap_disabled()) {
                 // #2636 (round1 finding 3): a build denial is NEVER eligible
                 // for #2628 replay. `build_shell::execute` enforces the
@@ -5030,7 +5032,7 @@ async fn execute_authorized_tool(
             )
             .await;
             #[cfg(test)]
-            if let Some(probe) = command_probe {
+            if let Some(probe) = command_probe.filter(|probe| !probe.io_only) {
                 probe.confined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return "confined child has no host-network authority".into();
             }

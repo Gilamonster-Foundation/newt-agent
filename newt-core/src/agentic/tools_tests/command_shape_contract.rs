@@ -31,8 +31,10 @@ enum Setup {
     // Linux unit rows retain these setups; macOS native counterparts run
     // in the production binary. Shared matching still names the variants.
     #[cfg_attr(any(not(unix), target_os = "macos"), allow(dead_code))]
+    #[cfg(feature = "confine")]
     Adopted,
     #[cfg_attr(any(not(unix), target_os = "macos"), allow(dead_code))]
+    #[cfg(feature = "confine")]
     AdoptedPublish,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -166,7 +168,12 @@ async fn check(row: Row) {
         .unwrap();
         session.record_task_worktree(&task.canonicalize().unwrap(), "task");
     }
-    if matches!(row.setup, Setup::Publish | Setup::AdoptedPublish) {
+    if match row.setup {
+        Setup::Publish => true,
+        #[cfg(feature = "confine")]
+        Setup::AdoptedPublish => true,
+        _ => false,
+    } {
         let remote = temp_root.as_path().join("remote.git");
         git(
             &root,
@@ -254,13 +261,11 @@ async fn check(row: Row) {
     let _routing = EnvVar::set("NEWT_NO_ROUTE", "0");
     let mut caveats = Caveats {
         net: Scope::none(),
-        fs_write: Scope::only([if matches!(
-            row.setup,
-            Setup::Fresh | Setup::Adopted | Setup::AdoptedPublish
-        ) {
-            temp_root.as_path()
-        } else {
-            &task
+        fs_write: Scope::only([match row.setup {
+            Setup::Fresh => temp_root.as_path(),
+            #[cfg(feature = "confine")]
+            Setup::Adopted | Setup::AdoptedPublish => temp_root.as_path(),
+            _ => &task,
         }
         .to_string_lossy()
         .into_owned()]),
@@ -269,7 +274,7 @@ async fn check(row: Row) {
     if row.setup == Setup::Restricted {
         caveats.exec = Scope::none();
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "confine"))]
     if matches!(row.setup, Setup::Adopted | Setup::AdoptedPublish) {
         confined_setup(
             "git worktree add -b task ../task",
@@ -337,7 +342,7 @@ async fn check(row: Row) {
     let directory = OnceLock::new();
     let receipt = OnceLock::new();
     let mut gate = Gate::default();
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "confine"))]
     let fixture_git = crate::agentic::tools::tests::git_shell_grant::FixtureGitTool;
     let out = if row.command == "confined-executor git push" {
         use crate::confined_exec::{ConstrainedExecutor, ExecOrigin, ExecRequest};
@@ -406,7 +411,7 @@ async fn check(row: Row) {
             &mut crate::agentic::NoMcp,
             ToolCollaborators {
                 worktree_session: Some(&session),
-                #[cfg(unix)]
+                #[cfg(all(unix, feature = "confine"))]
                 git_tool: matches!(row.setup, Setup::Adopted | Setup::AdoptedPublish)
                     .then_some(&fixture_git as &dyn crate::agentic::git_tool::GitTool),
                 execution: Some(&execution),
@@ -501,7 +506,12 @@ async fn check(row: Row) {
             );
         }
     }
-    if matches!(row.setup, Setup::Publish | Setup::AdoptedPublish) {
+    if match row.setup {
+        Setup::Publish => true,
+        #[cfg(feature = "confine")]
+        Setup::AdoptedPublish => true,
+        _ => false,
+    } {
         let expected =
             crate::agentic::claim_check::git_head(task.to_str().unwrap(), &Scope::All).unwrap();
         let remote = temp_root.as_path().join("remote.git/refs/heads/task");
@@ -572,7 +582,7 @@ async fn check(row: Row) {
 }
 
 /// Unit-dispatch setup. The native binary grounds this in production Brush.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "confine"))]
 async fn confined_setup(command: &str, root: &Path, caveats: &Caveats, session: &WorktreeSession) {
     let execution = OnceLock::new();
     let text = worktree::execute(
@@ -610,7 +620,9 @@ macro_rules! rows {
         }
     )*};
 }
-use ExecOutcome::{Denied, Failed, Passed, Unavailable};
+#[cfg(any(unix, feature = "confine"))]
+use ExecOutcome::Denied;
+use ExecOutcome::{Failed, Passed, Unavailable};
 #[rustfmt::skip]
 rows! {
 // name, mode, setup, command, outcome, cwd, bound, refusal, text, gate, claim
@@ -625,8 +637,10 @@ confined_task_commit, Confined, Adopted, "git commit -m contract", Some(Passed),
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
 // Detached-wrapper repair must preserve the raw standalone command's contract.
+#[cfg(feature = "confine")]
 confined_task_ref_update, Confined, Adopted, "git branch followup", Some(Failed), Task, true, false, "", None, "";
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 confined_task_ref_wrapper, Confined, Adopted, "git branch followup; echo done", Some(Denied), Task, true, true, "git checkout -b followup", None, "";
 // Owned local remote via the kernel-confined executor; the governed broker's
 // local-URL refusal is a separate control in the macOS job.
@@ -644,6 +658,7 @@ missing_b, Plain, Fresh, "git worktree add ../task absent", Some(Failed), Origin
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "confine")]
 confined_creation, Confined, Fresh, "git worktree add -b task ../task", Some(Passed), Original, true, false, "", None, "";
 default_cwd, Plain, Bound, "git branch --show-current", Some(Passed), Task, true, false, "task", None, "";
 relative_read, Plain, Bound, "read_file marker", None, Neither, true, false, "task marker", None, "";
@@ -651,14 +666,18 @@ confined_read, Confined, Bound, "read_file marker", None, Neither, true, false, 
 #[cfg(any(unix, feature = "windows-appcontainer"))]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "confine")]
 which_git, Confined, Fresh, "which git", Some(Passed), Original, false, false, "git", None, "";
 #[cfg(any(unix, feature = "windows-appcontainer"))]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "confine")]
 which_gh, Confined, Fresh, "which gh", Some(Passed), Original, false, false, "gh", None, "";
 plain_which_git, Plain, Fresh, "which git", Some(Passed), Original, false, false, "git", None, "";
 plain_which_gh, Plain, Fresh, "which gh", Some(Passed), Original, false, false, "gh", None, "";
+#[cfg(feature = "confine")]
 confined_build, Confined, Restricted, "cd ../task && cargo check 2>&1 | tail -5", Some(Denied), Task, true, true, "capability denied", Some(DenialKind::Build), "";
+#[cfg(feature = "confine")]
 plain_build, Plain, Restricted, "cd ../task && cargo check 2>&1 | tail -5", Some(Denied), Task, true, true, "", Some(DenialKind::Exec), "";
 #[cfg(unix)]
 #[cfg(feature = "confine")]
@@ -685,27 +704,33 @@ confined_compound, Confined, Fresh, "git worktree add -b task ../task 2>&1 | tai
 // the live branch/path; the argv and shell structure are otherwise exact.
 // Native macOS positive runs with production Brush in contract_siblings.rs.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 readonly_git_r5, Confined, Fresh, "git worktree add -b task ../task . 2>&1 | tail -5 && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
 readonly_git_status, Confined, Fresh, "git worktree add -b task ../task HEAD && git status -s", Some(Denied), Neither, false, true, "standalone literal", None, "";
 // Native macOS positive runs with production Brush in contract_siblings.rs.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 readonly_git_revparse, Confined, Fresh, "git worktree add -b task ../task main && git rev-parse --abbrev-ref HEAD", Some(Passed), Original, true, false, "main", None, "";
 // Native macOS positive runs with production Brush in contract_siblings.rs.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 readonly_git_sha, Confined, Fresh, "git worktree add -b task ../task FIXTURE_COMMIT && git branch --show-current", Some(Passed), Original, true, false, "main", None, "";
 #[cfg(unix)]
 readonly_git_log_compact, Confined, Fresh, "git worktree add -b task ../task HEAD && git log --oneline -5", Some(Denied), Neither, false, true, "standalone literal", None, "";
 // Native macOS positive runs with production Brush in contract_siblings.rs.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 readonly_git_worktree_list, Confined, Fresh, "git worktree add -b task ../task HEAD && git worktree list", Some(Passed), Original, true, false, "[task]", None, "";
 #[cfg(unix)]
 readonly_git_porcelain, Confined, Fresh, "git worktree add -b task ../task HEAD && git status --porcelain", Some(Denied), Neither, false, true, "standalone literal", None, "";
 // Native macOS positive runs with production Brush in contract_siblings.rs.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 readonly_git_head, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse HEAD", Some(Passed), Original, true, false, "Adopted task worktree", None, "";
 // Native macOS positive runs with production Brush in contract_siblings.rs.
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "confine")]
 readonly_git_toplevel, Confined, Fresh, "git worktree add -b task ../task HEAD && git rev-parse --show-toplevel", Some(Passed), Original, true, false, "original", None, "";
 #[cfg(unix)]
 readonly_git_commit_refused, Confined, Fresh, "git worktree add -b task ../task && git commit -m bad", Some(Denied), Neither, false, true, "Do not create the branch in the original checkout", None, "";
@@ -720,6 +745,7 @@ readonly_git_alias_refused, Confined, Fresh, "git worktree add -b task ../task &
 #[cfg(unix)]
 // Native macOS counterpart runs with production Brush in the harness=false binary.
 #[cfg(not(target_os = "macos"))]
+#[cfg(feature = "confine")]
 confined_missing_b, Confined, Fresh, "git worktree add ../task absent", Some(Failed), Original, false, false, "-b", None, "";
 nested_plain, Plain, Fresh, "git worktree add -b task .worktrees/task", Some(Passed), Original, true, false, "", None, "";
 #[cfg(windows)]

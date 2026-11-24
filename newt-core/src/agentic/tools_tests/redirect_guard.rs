@@ -120,6 +120,7 @@ async fn host_lane_refuses_every_same_file_redirect_form_and_never_touches_the_f
 // run everywhere, because the guard fires before any exec.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn confined_lane_still_runs_forms_that_are_not_a_same_file_redirect() {
     let _l = env_lock().await;
     let _off = EnvVar::unset("NEWT_DISABLE_OCAP");

@@ -27,7 +27,11 @@ async fn lifecycle_retains_source_when_configuration_changes_after_resolution() 
             "run",
             "echo retained-lifecycle-source",
             "git worktree prune --expire now",
-            ExecOutcome::Passed,
+            if crate::confined_exec::BACKEND_COMPILED {
+                ExecOutcome::Passed
+            } else {
+                ExecOutcome::Unavailable
+            },
         ),
         (
             "run",
@@ -99,6 +103,8 @@ async fn lifecycle_retains_source_when_configuration_changes_after_resolution() 
         assert_eq!(&*configuration.borrow(), replacement);
         if expected == ExecOutcome::Passed {
             assert!(out.contains("retained-lifecycle-source"), "{out}");
+        } else if expected == ExecOutcome::Unavailable {
+            assert!(out.contains("this build has no confined shell"), "{out}");
         } else {
             assert!(out.contains(super::NOTICE), "{out}");
         }

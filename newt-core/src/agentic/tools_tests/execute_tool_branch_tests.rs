@@ -60,6 +60,7 @@ async fn run_tool(
 /// allow (with caveats widened by exactly the requested grants) or deny.
 struct MockGate {
     allow: bool,
+    authority_calls: usize,
     base: Caveats,
     asks: Vec<(String, String)>,
     /// `kind:target` of each request recorded as a full-access pre-approval.
@@ -70,6 +71,7 @@ impl MockGate {
     fn new(allow: bool, base: &Caveats) -> Self {
         Self {
             allow,
+            authority_calls: 0,
             base: base.clone(),
             asks: Vec::new(),
             full_access: Vec::new(),
@@ -78,17 +80,46 @@ impl MockGate {
 }
 
 impl super::PermissionGate for MockGate {
+    fn refresh_caveats(&mut self, base: &Caveats) -> PermissionDecision {
+        self.authority_calls += 1;
+        PermissionDecision::Allow(base.clone())
+    }
+
+    fn apply_command_retry(&mut self, _: &str, _: &str, base: &Caveats) -> Caveats {
+        self.authority_calls += 1;
+        base.clone()
+    }
+
+    fn apply_pending_once(&mut self, _: DenialKind, _: &str, base: &Caveats) -> Caveats {
+        self.authority_calls += 1;
+        base.clone()
+    }
+
+    fn consume_pending_once(&mut self, _: DenialKind, _: &str) {
+        self.authority_calls += 1;
+    }
+
+    fn queue_pending_once(&mut self, _: DenialKind, _: &str) {
+        self.authority_calls += 1;
+    }
+
+    fn queue_command_retry(&mut self, _: &str, _: &str, _: &[PermissionRequest]) {
+        self.authority_calls += 1;
+    }
+
     fn ask_dependency_fetch(
         &mut self,
         _prepared: &newt_policy::caveats::Caveats,
         _request: &newt_policy::permissions::PermissionRequest,
     ) -> newt_policy::permissions::PermissionDecision {
+        self.authority_calls += 1;
         newt_policy::permissions::PermissionDecision::Deny
     }
     fn ask_full_access(
         &mut self,
         requests: &[super::PermissionRequest],
     ) -> super::PermissionDecision {
+        self.authority_calls += 1;
         self.full_access.extend(
             requests
                 .iter()
@@ -103,6 +134,7 @@ impl super::PermissionGate for MockGate {
         ))
     }
     fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+        self.authority_calls += 1;
         for r in requests {
             self.asks
                 .push((r.tool.clone(), format!("{}:{}", r.kind.as_str(), r.target)));
@@ -122,6 +154,7 @@ impl super::PermissionGate for MockGate {
     // #728: this gate exercises the GRANT path only; it has no human to
     // answer free-text questions, so it reports no operator available.
     fn ask_question(&mut self, _question: &str) -> HumanQuestionOutcome {
+        self.authority_calls += 1;
         HumanQuestionOutcome::Unavailable
     }
 }
@@ -372,3 +405,7 @@ mod path_suggest;
 
 #[path = "tilde_home.rs"]
 mod tilde_home;
+
+#[cfg(not(feature = "confine"))]
+#[path = "confine_off_tests.rs"]
+mod confine_off_tests;

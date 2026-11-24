@@ -445,15 +445,14 @@ jobs:
           echo "features with confine off: $off"
           has_confine "$on" || { echo "::error::the probe cannot see confine when it is on"; exit 1; }
           if has_confine "$off"; then echo "::error::confine is on in the confine-off build"; exit 1; fi
-      # HOOK PARITY: CI-only; named in .githooks/pre-push. The justfile does not
-      # repeat it. #3160: the tests of what newt-core does without `confine`, in
-      # the confine-off gate's configuration. Each is named `confine_off` and is
-      # compiled only without `confine`, so no other job runs them; libtest selects
-      # them by that substring. A filter that selects nothing passes, so a renamed
-      # test would drop out silently; the last step of #3160 adds a count check.
+      # HOOK PARITY: CI-only; the exact selector is named in .githooks/pre-push.
+      # PIPELINE PARITY: the hook's CI-ONLY bullet mirrors this command; justfile
+      # does not repeat it. #3160: off-only refusal tests plus portable shared
+      # route, build classification, floor and recorder predicates. Every term
+      # has a measured nonzero match count; P15 adds the automated count guard.
       - name: test (newt-core, confine off)
         if: always()
-        run: cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off
+        run: cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off route_selection_tests build_shell::tests exec_floor_permits_ exec_floor_refuses_ shadow_records_iff
       # HOOK PARITY: CI-only; named in .githooks/pre-push. The justfile `check` recipe
       # mirrors the clippy and test lines (PIPELINE PARITY there); the `cargo tree` probe
       # after them is not repeated locally.

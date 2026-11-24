@@ -11,6 +11,7 @@ use super::*;
 /// bridle-policy wiring in `bridle_registry`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
     // Restricted-exec proofs must not inherit another test's temporary engine.
     let _env = super::disable_ocap_tests::env_lock().await;
@@ -58,6 +59,7 @@ async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
 /// denied", NOT "no network egress".)
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
     // Restricted-exec proofs must not inherit another test's temporary engine.
     let _env = super::disable_ocap_tests::env_lock().await;
@@ -112,6 +114,7 @@ async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
 /// entry, updated to match.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn run_command_route_fd_hygiene_is_cloexec_based_via_fdguard() {
     use std::os::fd::AsRawFd;
     if !crate::confined_exec::kernel_fs_fence_available() {

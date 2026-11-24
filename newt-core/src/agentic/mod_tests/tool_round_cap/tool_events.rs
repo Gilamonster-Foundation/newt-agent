@@ -450,7 +450,15 @@ async fn openai_funnel_records_the_execution_class() {
     .expect("the turn completes");
     assert_eq!(events.len(), 1, "{events:?}");
     assert!(!events[0].ok, "{events:?}");
-    assert_eq!(execution_class(&events[0]), "failed", "{events:?}");
+    assert_eq!(
+        execution_class(&events[0]),
+        if crate::confined_exec::BACKEND_COMPILED {
+            "failed"
+        } else {
+            "unavailable"
+        },
+        "{events:?}"
+    );
 }
 
 /// The Responses loop dispatches `function_call` items, so its funnel still
@@ -500,5 +508,13 @@ async fn responses_funnel_records_the_execution_class() {
     .expect("the turn completes");
     assert_eq!(events.len(), 1, "{events:?}");
     assert!(!events[0].ok, "{events:?}");
-    assert_eq!(execution_class(&events[0]), "failed", "{events:?}");
+    assert_eq!(
+        execution_class(&events[0]),
+        if crate::confined_exec::BACKEND_COMPILED {
+            "failed"
+        } else {
+            "unavailable"
+        },
+        "{events:?}"
+    );
 }

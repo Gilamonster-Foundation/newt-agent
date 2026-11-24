@@ -85,6 +85,7 @@ use newt_policy::caveats::{Caveats, Scope};
 mod executor;
 #[cfg(not(feature = "confine"))]
 mod executor_off;
+#[cfg(feature = "confine")]
 mod sandbox_policy;
 
 #[cfg(feature = "confine")]
@@ -97,6 +98,7 @@ pub use executor_off::{
     cgroup_subtree_kill_available, kernel_fs_fence_available, net_guard_available,
     ConstrainedExecutor,
 };
+#[cfg(feature = "confine")]
 pub(crate) use sandbox_policy::runtime_sandbox_policy;
 
 /// The trust class of the code being executed — the axis that decides how hard
@@ -244,6 +246,7 @@ impl ExecRequest {
         self
     }
 
+    #[cfg(feature = "confine")]
     pub(crate) fn build_held_read_roots(&self) -> Vec<crate::sandbox_seam::HeldReadRoot> {
         self.held_read_roots.clone()
     }
@@ -315,6 +318,7 @@ impl ExecRequest {
 
     /// Acquire this request's private scratch only after admission. The guards
     /// keep the same cleanup lifetime for native argv and confined shell runs.
+    #[cfg(feature = "confine")]
     pub(crate) fn prepare_scratch(&self) -> std::io::Result<Vec<ScratchDir>> {
         self.scratch_dirs
             .iter()
@@ -685,6 +689,7 @@ fn operator_build_scratch_root(workspace: &Path, base: Option<PathBuf>) -> Optio
 /// and refuses if the path already exists (so a pre-planted directory or
 /// symlink is never followed or reused); `Drop` removes exactly that directory,
 /// then the `tmp` and `target` parents only if they are left empty.
+#[cfg(any(test, feature = "confine"))]
 pub(crate) struct ScratchDir {
     path: PathBuf,
     /// `target/` did not exist before this run created it.
@@ -692,6 +697,7 @@ pub(crate) struct ScratchDir {
     managed: Option<crate::scratch::ManagedRun>,
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl ScratchDir {
     fn create(path: &Path) -> std::io::Result<Self> {
         if let Some(managed) = crate::scratch::acquire_build_run(path)? {
@@ -736,6 +742,7 @@ impl ScratchDir {
     }
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         if self.managed.is_some() {

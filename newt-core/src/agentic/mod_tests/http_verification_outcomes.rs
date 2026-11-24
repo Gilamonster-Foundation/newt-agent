@@ -256,6 +256,7 @@ fn repair_ordinals(run: &Run) -> std::collections::BTreeSet<String> {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn workspace_discovery_does_not_make_unrequested_checks_mandatory() {
     for (wire, smart) in [
         ("openai", false),
@@ -323,6 +324,7 @@ async fn workspace_discovery_does_not_make_unrequested_checks_mandatory() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn a_failing_check_is_repaired_to_the_allowance_then_exhausts() {
     for (wire, smart) in [
         ("openai", false),
@@ -410,6 +412,7 @@ async fn with_the_policy_off_a_failing_attempt_still_satisfies_the_gate() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn a_fresh_passing_check_completes_without_a_nudge() {
     for (wire, smart) in [("openai", false), ("anthropic", false), ("responses", true)] {
         let run = run(wire, smart, true, PASSING_CHECK).await;
@@ -450,6 +453,7 @@ async fn a_fresh_passing_check_completes_without_a_nudge() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn a_pass_goes_stale_on_a_write_but_not_on_a_read_only_command() {
     let read_only = run_script(
         "openai",
@@ -497,6 +501,7 @@ async fn a_pass_goes_stale_on_a_write_but_not_on_a_read_only_command() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
     // The check reports that it is running: `sh` opens the FIFO for writing,
     // which blocks until this test opens it for reading, so the read returning
@@ -551,6 +556,7 @@ async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
 /// it must not short-circuit the re-run: the turn completes on the new pass.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn an_identical_rerun_after_a_fix_is_not_blocked_by_the_repeat_guard() {
     const CHECK: &str = "sh -c 'test -f fixed'";
     for (wire, smart) in [
@@ -583,6 +589,7 @@ async fn an_identical_rerun_after_a_fix_is_not_blocked_by_the_repeat_guard() {
 /// Responses without SmartHarness, receipt mode `off`) keeps `round_cap`.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+#[cfg(feature = "confine")]
 async fn a_failure_at_the_round_limit_ends_repair_exhausted_not_round_cap() {
     let repair = [
         Step::Run(FAILING_CHECK),
@@ -728,6 +735,7 @@ pub(super) async fn every_verification_case_ends_within_its_allowance() {
         /// The class the check recorded at the last decision.
         status: Option<CheckStatus>,
     }
+    #[cfg(feature = "confine")]
     let no_exec = Caveats {
         exec: newt_policy::caveats::Scope::none(),
         ..Caveats::top()
@@ -744,6 +752,7 @@ pub(super) async fn every_verification_case_ends_within_its_allowance() {
             decisions: &["verification_incomplete"],
             status: Some(CheckStatus::Unexecuted),
         },
+        #[cfg(feature = "confine")]
         Case {
             name: "denied",
             check: PASSING_CHECK,
@@ -777,6 +786,7 @@ pub(super) async fn every_verification_case_ends_within_its_allowance() {
             decisions: EXHAUSTED,
             status: Some(CheckStatus::TimedOut),
         },
+        #[cfg(feature = "confine")]
         Case {
             name: "failed with substantial output",
             check: LOUD_FAILURE,
@@ -930,7 +940,19 @@ async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget
     )
     .await;
     assert_eq!(crate::initiative::installed_no_progress().stop_after, 2);
-    assert_eq!(run.reason, "repair_exhausted");
+    assert!(
+        !run.at_cap,
+        "the isolated fixture must finish before its round cap"
+    );
+    let confined = crate::confined_exec::BACKEND_COMPILED;
+    assert_eq!(
+        run.reason,
+        if confined {
+            "repair_exhausted"
+        } else {
+            "verification_incomplete"
+        }
+    );
     let signals = run
         .signals
         .iter()
@@ -946,7 +968,11 @@ async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget
             .iter()
             .map(|(decision, _)| *decision)
             .collect::<Vec<_>>(),
-        ["nudge", "nudge", "nudge", "repair_exhausted"]
+        if confined {
+            vec!["nudge", "nudge", "nudge", "repair_exhausted"]
+        } else {
+            vec!["verification_incomplete"]
+        }
     );
     assert_eq!(
         signals
@@ -957,7 +983,11 @@ async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget
             .iter()
             .map(|check| check.status)
             .collect::<Vec<_>>(),
-        [CheckStatus::Failed]
+        [if confined {
+            CheckStatus::Failed
+        } else {
+            CheckStatus::Unavailable
+        }]
     );
     let histories = run
         .bodies
@@ -969,6 +999,6 @@ async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget
         .enumerate()
         .filter(|(i, history)| *i == 0 || histories[i - 1] != **history)
         .count();
-    assert_eq!(rounds, 5);
+    assert_eq!(rounds, if confined { 5 } else { 2 });
     assert!(rounds <= VERIFY_REPAIR_ALLOWANCE + 2);
 }

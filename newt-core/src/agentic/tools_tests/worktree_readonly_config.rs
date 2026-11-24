@@ -1,5 +1,7 @@
 //! PR #2827: a config-selected verifier is a write-capable descendant, even
 //! for oneline log. Real Git grounds the admission grammar's read-only claim.
+#![cfg(feature = "confine")]
+
 use super::super::*;
 use crate::agentic::tools::{
     disable_ocap_tests::{env_lock, EnvVar},
