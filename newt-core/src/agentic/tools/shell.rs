@@ -787,6 +787,7 @@ pub(super) enum ShellRoute {
 
 /// Keep command-specific clamps in this decision, rather than inferring the
 /// shell from the session's OCAP switch alone. A broker always needs Brush.
+/// Backend absence never grants a bypass: the Bridled route then refuses.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_shell_route(
     bypass_enabled: bool,
@@ -1485,8 +1486,8 @@ pub(super) async fn exec_confined_command_with_broker(
     // consulted. #307 FLOOR: a named-permission-preset clamp WINS over the
     // bypass — the unconfined host path is taken ONLY if the floor permits this
     // command's leading token; else it falls through to the confined shell,
-    // which enforces the already-clamped `caveats`. `None` keeps the bypass
-    // bit-for-bit.
+    // which enforces the already-clamped `caveats`, or refuses when the backend
+    // is absent. `None` keeps the bypass bit-for-bit.
     let discover = || {
         (
             crate::config::windows_cmd_enabled(),

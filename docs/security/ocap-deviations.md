@@ -1265,10 +1265,17 @@ resolved in a later release:
   commit broker, and no preflight refusal, data-loss confirmation or
   network-read prompt in `run_command`. With OCAP on, the existing no-broker
   refusal still stops a `git commit` that the lexical check or the shell
-  inspector names, and every other command takes the shell route; with OCAP
-  off and no preset floor that forbids them, they run on the host, as in any
-  build. No released build turns `confine` off: every crate that depends on
-  newt-core takes its default features.
+  inspector names. Commands that reach the shell boundary with OCAP on are
+  refused with `ExecOutcome::Unavailable`: no user command and no backend,
+  no permission prompt or grant, no scratch allocation. The specialized
+  build-shell path is also compiled only with `confine`. Earlier routed
+  built-ins and native operations retain their own boundaries. With OCAP
+  off, the existing broker, lease and exec-floor checks still decide whether
+  the host route may run; otherwise the same shell refusal applies.
+  Full-access alone does not authorize host execution. The shell's documented
+  advisory fallback in builds with `confine` is unchanged. Dependencies remain
+  non-optional at this step, so this is not a bridle-free binary. Repository
+  consumers still take newt-core's default features.
 
 ### Native commit cancellation: lease shutdown is not tree completion (#2686)
 

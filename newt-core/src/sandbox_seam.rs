@@ -14,10 +14,10 @@
 //! The two `From` impls are the only conversions that know bridle, and they are compiled only
 //! with `confine`. Without it `SandboxRoots::runtime` has no policy to read and is empty.
 //!
-//! [`HeldReadRoot`] and [`CommandBroker`] are bridle's own types, named from here by the
-//! executor's request and the build's Git reads (their held read roots) and by the confined
-//! shell's entry point (its broker). Only bridle's fence reads a held root, and only bridle's
-//! shell calls a broker.
+//! With `confine`, [`HeldReadRoot`] and [`CommandBroker`] are bridle's own types, named
+//! here by executor requests, build Git reads and the confined shell entry point. Without
+//! it, no held root can be constructed and the broker has no methods: no backend consumes
+//! either value.
 
 /// A read root the caller holds as a descriptor, which the executor's Landlock fence anchors
 /// on. Bridle's type: its one constructor checks the descriptor against the path.
