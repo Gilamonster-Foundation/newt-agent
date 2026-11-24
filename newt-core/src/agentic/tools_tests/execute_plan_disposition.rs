@@ -370,7 +370,11 @@ async fn inferred_style_enforces_caveats_and_preserves_permission_requests() {
         )
         .await;
         assert!(
-            exec.contains("capability denied:"),
+            exec.contains(if crate::confined_exec::BACKEND_COMPILED {
+                "capability denied:"
+            } else {
+                "this build has no confined shell"
+            }),
             "{disposition:?}: {exec}"
         );
         assert!(!ws.path().join("denied.txt").exists());

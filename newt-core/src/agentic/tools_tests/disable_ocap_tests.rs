@@ -123,6 +123,7 @@ async fn confined_shell_env_timezone_respects_operator_allowlist() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[ignore = "real confined child and grandchild; run serially in integration tier"]
+#[cfg(feature = "confine")]
 async fn confined_shell_parent_timezone_reaches_child_and_grandchild() {
     let _lock = env_lock().await;
     let _pt = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH");
@@ -312,6 +313,7 @@ fn shadow_records_iff_the_run_is_unconfined() {
 /// is the "when the real shell returns" case the prior stub-build note
 /// anticipated; the "unavailable in this build" stub error is retired.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn flag_off_run_command_keeps_the_confined_dispatch_verbatim() {
     let _l = env_lock().await;
     let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
@@ -509,6 +511,7 @@ fn exec_floor_refuses_every_metacharacter_form() {
 /// dispatch, which (env-seam real shell) DENIES it. A deliberately
 /// restricted triage mode is NOT un-clamped by `--yolo`.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn floor_blocks_disable_ocap_for_a_denied_exec() {
     let _l = env_lock().await;
     let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
@@ -574,6 +577,7 @@ async fn floor_allows_disable_ocap_for_an_in_floor_exec() {
 /// must not smuggle `rm` past an `echo` grant. It falls to the confined
 /// shell (env-seam real shell ⇒ denied), which gates each spawn.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn floor_refuses_bypass_for_a_compound_command() {
     let _l = env_lock().await;
     let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
@@ -1151,6 +1155,7 @@ fn the_confined_pack_follows_the_session_grants() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "real macOS kernel sandbox; run serially in integration tier"]
+#[cfg(feature = "confine")]
 async fn a_confined_tail_survives_an_unpinned_pack_and_runs_a_pinned_one() {
     use std::os::unix::fs::PermissionsExt;
     let _lock = env_lock().await;
@@ -1376,7 +1381,9 @@ async fn yolo_keeps_the_tool_name_corrective_guard() {
 
 /// Even when a legacy Git collaborator is installed, native shell commands
 /// must not dispatch through its narrower operation interface.
+#[cfg(any(windows, feature = "confine"))]
 struct UnexpectedEmbeddedGit;
+#[cfg(any(windows, feature = "confine"))]
 impl crate::agentic::GitTool for UnexpectedEmbeddedGit {
     fn dispatch(
         &self,
@@ -1389,6 +1396,7 @@ impl crate::agentic::GitTool for UnexpectedEmbeddedGit {
     }
 }
 
+#[cfg(any(windows, feature = "confine"))]
 async fn run_command_with_legacy_git(
     command: &str,
     ws: &std::path::Path,
@@ -1420,6 +1428,7 @@ async fn run_command_with_legacy_git(
 }
 
 #[cfg(target_os = "windows")]
+#[cfg(feature = "confine")]
 async fn run_command_with_legacy_git_and_gate(
     command: &str,
     ws: &std::path::Path,
@@ -1599,6 +1608,7 @@ async fn routed_cat_goes_through_the_fs_floor_not_a_bypass() {
 /// status observes an untracked file through the exec gate with scoped reads,
 /// no write grant, and explicitly granted network/exec authority.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn native_git_status_requires_exec_and_reads_the_actual_repository() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
@@ -1675,6 +1685,7 @@ async fn windows_disable_ocap_keeps_native_git_available() {
 #[cfg(windows)]
 #[tokio::test]
 #[ignore = "weekly/release real-resource tier; requires Windows AppContainer"]
+#[cfg(feature = "confine")]
 async fn run_command_windows_global_git_config_stays_ignored() {
     let _lock = env_lock().await;
     let _route = EnvVar::unset("NEWT_NO_ROUTE");
@@ -1768,6 +1779,7 @@ async fn routed_rm_dispatches_through_delete_file() {
 /// Windows, this grounds the exec gate with a real AppContainer child and
 /// verifies that its temporary index lock does not break later host Git.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn state_modifying_git_add_is_not_routed() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
@@ -1819,6 +1831,7 @@ async fn state_modifying_git_add_is_not_routed() {
 /// Windows that retry must run native Git under AppContainer and stage the file.
 #[cfg(target_os = "windows")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn native_git_exec_grant_retry_stages_under_appcontainer() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
@@ -1926,7 +1939,11 @@ async fn no_route_bypasses_routing_but_keeps_l3() {
     // …and the command did NOT run unconfined: it took the confined shell
     // (env-seam real shell ⇒ denied — the L3 boundary held).
     assert!(
-        out.contains("capability denied"),
+        out.contains(if crate::confined_exec::BACKEND_COMPILED {
+            "capability denied"
+        } else {
+            "this build has no confined shell"
+        }),
         "the L3 confined dispatch must still gate the command; got: {out}"
     );
 }
@@ -2875,6 +2892,7 @@ async fn confined_python3_runs_on_macos() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn confined_git_ignores_ambient_config_and_carries_the_agent_identity() {
     let _l = env_lock().await;
     let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");

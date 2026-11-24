@@ -4,6 +4,7 @@
 use super::*;
 #[cfg(feature = "confine")]
 use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
+#[cfg(feature = "confine")]
 use crate::launch_authority::{self, LaunchAuthority};
 
 #[cfg(feature = "confine")]
@@ -13,8 +14,10 @@ const COMPLETED: &str = "first call completed: durable payload";
 
 /// Match production startup on the current-thread test runtime: authority
 /// stays frozen while unrelated environment-driven tests exercise their flags.
+#[cfg(feature = "confine")]
 struct ConfinedLaunch;
 
+#[cfg(feature = "confine")]
 impl ConfinedLaunch {
     fn new() -> Self {
         launch_authority::freeze(LaunchAuthority::CONFINED);
@@ -23,6 +26,7 @@ impl ConfinedLaunch {
     }
 }
 
+#[cfg(feature = "confine")]
 impl Drop for ConfinedLaunch {
     fn drop(&mut self) {
         launch_authority::reset_for_test();
@@ -1168,8 +1172,10 @@ async fn a_stop_right_after_an_idless_reask_round_still_files_as_no_progress() {
 /// own `Caveats::top()` so the arming write actually lands, in addition to
 /// asserting the workspace-change/turn-completion behavior these fixtures
 /// exist to pin.
+#[cfg(feature = "confine")]
 struct AllowEverything(Caveats);
 
+#[cfg(feature = "confine")]
 impl newt_policy::PermissionGate for AllowEverything {
     fn ask_dependency_fetch(
         &mut self,
@@ -1201,12 +1207,14 @@ impl newt_policy::PermissionGate for AllowEverything {
 /// into the resolved workspace cwd for a plain `>` redirect (#2618 review),
 /// so a bare relative filename lands in the test binary's actual process cwd
 /// (the crate root) instead of the tempdir.
+#[cfg(feature = "confine")]
 struct RunCommandWrites {
     n: std::sync::atomic::AtomicUsize,
     rounds: usize,
     workspace: std::path::PathBuf,
 }
 
+#[cfg(feature = "confine")]
 impl wiremock::Respond for RunCommandWrites {
     fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
         let n = self.n.fetch_add(1, Ordering::SeqCst);
@@ -1308,6 +1316,7 @@ async fn progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change() 
 /// the 12th tripped `stop_after: 12` even though every round wrote a new file.
 #[tokio::test]
 #[serial_test::serial]
+#[cfg(feature = "confine")]
 async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
     let _launch = ConfinedLaunch::new();
     let _settings = crate::test_guard::GlobalSettingsGuard::acquire();

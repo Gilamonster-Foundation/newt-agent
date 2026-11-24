@@ -6,6 +6,7 @@ use crate::ExecOutcome;
 /// exercise the actual out-of-band ToolError even though normal unit dispatch
 /// substitutes the safe-subset engine for Brush's worker re-exec.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn brush_cwd_error_preserves_denied_execution_class() {
     let parent = tempfile::tempdir().unwrap();
     let parent = parent.path().canonicalize().unwrap();
@@ -36,6 +37,7 @@ async fn brush_cwd_error_preserves_denied_execution_class() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn denied_cwd_reports_workspace_and_retains_empty_write_scope() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -180,10 +182,13 @@ fn denial_like_child_text_does_not_become_host_authority_evidence() {
     );
     assert_eq!(outcome, ExecOutcome::Failed);
     assert_eq!(text, stderr);
-    let (text, outcome) =
-        shell::dispatch_error_result(agent_bridle::ToolError::Other(anyhow::anyhow!(stderr)));
-    assert_eq!(outcome, ExecOutcome::Unavailable);
-    assert_eq!(text, format!("error: {stderr}"));
+    #[cfg(feature = "confine")]
+    {
+        let (text, outcome) =
+            shell::dispatch_error_result(agent_bridle::ToolError::Other(anyhow::anyhow!(stderr)));
+        assert_eq!(outcome, ExecOutcome::Unavailable);
+        assert_eq!(text, format!("error: {stderr}"));
+    }
 }
 
 // -- #721 recoverable denials + request_permissions ---------------------
@@ -1340,6 +1345,7 @@ async fn gate_allow_turns_fs_read_denial_into_the_real_result() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
     let _l = super::disable_ocap_tests::env_lock().await;
     // Pin the engine for deterministic permission-retry behavior when the
@@ -1443,6 +1449,7 @@ async fn permission_retry_closes_each_live_generation_before_the_next_starts() {
 /// `&mut Option<&mut dyn PermissionGate>` still has a live gate to ask.
 #[cfg(not(windows))]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
     let _l = super::disable_ocap_tests::env_lock().await;
     let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -1511,9 +1518,11 @@ async fn a_denial_grant_leaves_the_gate_available_for_a_second_confined_call() {
 /// so this test exercises the real `CommandBroker`-bearing dispatch path
 /// without needing a real repository or signing key.
 #[cfg(not(windows))]
+#[cfg(feature = "confine")]
 struct NoopBroker;
 
 #[cfg(not(windows))]
+#[cfg(feature = "confine")]
 impl agent_bridle_tool_shell::CommandBroker for NoopBroker {
     fn prepare(
         &self,
@@ -1535,6 +1544,7 @@ impl agent_bridle_tool_shell::CommandBroker for NoopBroker {
 /// grant (the reported symptom: repeated "capability denied" for `git`).
 #[cfg(not(windows))]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_broker() {
     let _l = super::disable_ocap_tests::env_lock().await;
     let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -1614,6 +1624,7 @@ async fn a_broker_bearing_exec_denial_still_asks_the_gate_and_retries_with_the_b
 /// about (an exec denial getting a `pending_rerun` slot at all).
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn approved_request_permissions_reruns_denied_run_command_for_exec() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -1739,6 +1750,7 @@ async fn approved_request_permissions_reruns_denied_run_command_for_exec() {
 /// on which engine ran it or on any atomicity property of either one.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn approved_exec_replay_never_reruns_an_earlier_permitted_command() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -1868,6 +1880,7 @@ async fn approved_exec_replay_never_reruns_an_earlier_permitted_command() {
 /// that and an unsound auto-replay.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn exec_replay_excluded_for_compound_and_pipeline_shapes() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -2118,6 +2131,7 @@ fn requests_are_replay_safe_excludes_a_same_name_net_host() {
 /// grant then DOES create `f`.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
     let _l = super::disable_ocap_tests::env_lock().await;
     let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -2197,6 +2211,7 @@ async fn broker_bearing_exec_denial_does_not_auto_replay_a_compound_command() {
 /// never enter the pending queue or authorize the later reissue.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() {
     let _l = super::disable_ocap_tests::env_lock().await;
     let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -2453,6 +2468,7 @@ async fn pending_once_grant_binds_into_the_models_reissue_of_the_same_command() 
 /// instead, so the commit count is unchanged after the grant.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn broker_bearing_commit_denial_does_not_auto_replay_a_compound_command() {
     let _l = super::disable_ocap_tests::env_lock().await;
     let _eng = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -3717,6 +3733,7 @@ async fn lifecycle_build_grant_runs_real_cargo() {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "confine")]
 async fn command_cwd_fixture_call(
     workspace: &std::path::Path,
     default_cwd: Option<&std::path::Path>,
@@ -3750,6 +3767,7 @@ async fn command_cwd_fixture_call(
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn command_cwd_default_places_actual_effects_without_changing_authority() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -3782,6 +3800,7 @@ async fn command_cwd_default_places_actual_effects_without_changing_authority() 
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn command_cwd_explicit_wins_and_leading_cd_is_relative_to_it() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -3822,6 +3841,7 @@ async fn command_cwd_explicit_wins_and_leading_cd_is_relative_to_it() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn command_cwd_outside_default_is_denied_before_effects() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -3912,6 +3932,7 @@ async fn command_cwd_does_not_change_file_tools_or_baseline_read_routing() {
 /// policy, one-shot grant consumption, and disclosure of what approval runs.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn approved_request_permissions_reruns_denied_run_command() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -4219,6 +4240,7 @@ async fn approved_request_permissions_reruns_denied_run_command() {
 /// Before the fix the string check fires and the slot is populated → assertion red.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn forged_denial_string_in_stdout_does_not_populate_pending_rerun() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -4653,6 +4675,7 @@ async fn dispatch_ignores_model_forged_harness_bound_and_prefix() {
 ///    consulted again (once-grant spent; a fresh approval is required).
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -4880,6 +4903,7 @@ async fn stateful_gate_proves_ineligible_no_replay_and_eligible_once() {
 ///    grant consumed in step 2.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn queue_owning_gate_proves_once_grant_lifetime_across_replay_and_fresh_command() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -5274,6 +5298,7 @@ async fn eligible_pre_prompt_but_insufficient_allow_neither_executes_nor_consume
 ///    regression test of newt-tui's production danger policy.
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn queue_owning_gate_proves_exec_once_grant_lifetime_and_danger_controls() {
     let _lock = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");

@@ -1,18 +1,26 @@
 //! Apply existing confined-build authority before evaluating a build-bearing
 //! shell invocation. Bridle keeps the original source, argv, and pipe semantics.
 
+#[cfg(feature = "confine")]
 use super::super::content_spill::SpillStore;
+#[cfg(feature = "confine")]
 use super::super::display::ToolPresentation;
+#[cfg(feature = "confine")]
 use super::super::smart_harness::SmartHarness;
-use super::{shell, PermissionDecision, PermissionGate, PermissionRequest};
+use super::shell;
+#[cfg(feature = "confine")]
+use super::{PermissionDecision, PermissionGate, PermissionRequest};
+#[cfg(feature = "confine")]
 use crate::confined_exec::build_tool_request;
 use crate::ExecOutcome;
 use newt_policy::caveats::Caveats;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "confine")]
 use std::sync::Arc;
 
 /// Identify a build tool through the shell inspector's structural inventory. This selects
 /// an existing capability; it never interprets Cargo flags or rewrites source.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn build_program(source: &str) -> Option<String> {
     find_build_program(source, |program, _| {
         crate::confined_exec::is_build_tool_exec(program)
@@ -20,6 +28,7 @@ pub(super) fn build_program(source: &str) -> Option<String> {
 }
 
 /// Select the specialized build fence independently of build-time budgeting.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn confined_build_program(source: &str, ocap_disabled: bool) -> Option<String> {
     // The ordinary shell path owns host execution and explicit exec floors.
     // Do not create a confined build request or scratch lease before it runs.
@@ -121,6 +130,7 @@ pub(super) fn build_directory(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "confine")]
 pub(super) async fn execute(
     source: &str,
     program: &str,
@@ -140,6 +150,17 @@ pub(super) async fn execute(
     timeout_secs: Option<u64>,
     command_budget: crate::RunCommandBudget,
 ) -> (String, ExecOutcome) {
+    // Fake build I/O before directory/toolchain discovery, grants and scratch allocation.
+    #[cfg(test)]
+    if super::command_probe::with_io(|probe| {
+        probe
+            .build
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .is_some()
+    {
+        return ("mock build".into(), ExecOutcome::Passed);
+    }
     presentation.execution_command(source, cwd);
     if let Some(refusal) = shell::same_file_redirect_refusal(source, cwd) {
         return (refusal, ExecOutcome::Denied);

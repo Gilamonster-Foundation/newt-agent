@@ -1,9 +1,11 @@
 pub(in crate::agentic::tools) use super::super::git_fixture::hermetic_git;
 // Only the Linux real-kernel-fence tests consume these.
 #[cfg(target_os = "linux")]
+#[cfg(feature = "confine")]
 pub(in crate::agentic::tools) use super::super::git_fixture::hermetic_git_env;
 
 #[cfg(target_os = "linux")]
+#[cfg(feature = "confine")]
 const FIXTURE_GIT: &str = "/usr/bin/git";
 
 /// The real-kernel-fence tests in this file need Landlock AND the
@@ -12,6 +14,7 @@ const FIXTURE_GIT: &str = "/usr/bin/git";
 /// to one that measured nothing — print an explicit line so a skip is
 /// visible in test output instead (#2686 review round 2).
 #[cfg(target_os = "linux")]
+#[cfg(feature = "confine")]
 fn skip_without_real_kernel_fence() -> bool {
     let available = crate::confined_exec::kernel_fs_fence_available()
         && std::path::Path::new(FIXTURE_GIT).exists();
@@ -46,6 +49,7 @@ fn real_git(dir: &std::path::Path, args: &[&str]) {
 /// succeed where a bare file-level rule could not.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_branch() {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -134,6 +138,7 @@ async fn confined_shell_git_add_succeeds_in_a_linked_worktree_on_a_non_default_b
 /// `GIT_CONFIG_NOSYSTEM=1` means git never opens the system config.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() {
     if skip_without_real_kernel_fence() {
         return;
@@ -153,6 +158,7 @@ async fn confined_shell_git_worktree_add_succeeds_under_a_git_only_exec_grant() 
 /// [`hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture`],
 /// so the isolation claim is made about exactly the fixture that runs.
 #[cfg(target_os = "linux")]
+#[cfg(feature = "confine")]
 async fn worktree_add_under_git_only_exec_grant(root: &std::path::Path) {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -215,6 +221,7 @@ async fn worktree_add_under_git_only_exec_grant(root: &std::path::Path) {
 /// that one child, never on this process: a process-global `set_var` races
 /// every other test in the binary.
 #[cfg(target_os = "linux")]
+#[cfg(feature = "confine")]
 const HOSTILE_ENV_SUBPROCESS_ROOT: &str = "NEWT_2630_HOSTILE_ENV_SUBPROCESS_ROOT";
 
 /// PR #2670 fix-first, P1: the fixture's unconfined `git init`/`add`/`commit`
@@ -244,6 +251,7 @@ const HOSTILE_ENV_SUBPROCESS_ROOT: &str = "NEWT_2630_HOSTILE_ENV_SUBPROCESS_ROOT
 /// disposable fixture, never an operator repository.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture() {
     // Re-entry: the same test, running as the dedicated hostile subprocess.
     if let Ok(root) = std::env::var(HOSTILE_ENV_SUBPROCESS_ROOT) {
@@ -360,6 +368,7 @@ async fn hostile_inherited_git_env_cannot_redirect_the_worktree_add_fixture() {
 /// same confined dispatch.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_default_branch() {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -476,6 +485,7 @@ async fn confined_shell_git_commit_succeeds_in_a_linked_worktree_on_a_non_defaul
 /// never granted to a confined child at all.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn confined_shell_cannot_redirect_into_a_sibling_or_default_branch_ref_or_reflog() {
     let _env = super::disable_ocap_tests::env_lock().await;
     let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
@@ -573,6 +583,7 @@ async fn confined_shell_cannot_redirect_into_a_sibling_or_default_branch_ref_or_
 /// cannot reach them either, so it can't regress silently later.
 #[cfg(target_os = "linux")]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn confined_shell_commit_cannot_reach_config_packed_refs_common_head_or_a_foreign_worktree_admin_dir(
 ) {
     let _env = super::disable_ocap_tests::env_lock().await;

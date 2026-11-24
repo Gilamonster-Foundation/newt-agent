@@ -25,10 +25,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 mod build;
-pub(crate) use build::{
-    acquire_run as acquire_build_run, managed_partition as managed_build_partition,
-    validate_grant as validate_build_grant, ManagedRun,
-};
+pub(crate) use build::managed_partition as managed_build_partition;
+#[cfg(feature = "confine")]
+pub(crate) use build::validate_grant as validate_build_grant;
+#[cfg(any(test, feature = "confine"))]
+pub(crate) use build::{acquire_run as acquire_build_run, ManagedRun};
 
 /// The operator override, or the stable private managed base proposed to the
 /// Build permission gate. Resolving it creates no filesystem entries.

@@ -1,13 +1,17 @@
 //! #2733 review regressions through the actual adoption dispatch boundary.
 use super::*;
-use crate::worktree_adoption::{
-    tests::{fixture, link},
-    WorktreeSession,
-};
+use crate::worktree_adoption::tests::fixture;
+#[cfg(any(unix, feature = "confine"))]
+use crate::worktree_adoption::tests::link;
+#[cfg(any(unix, feature = "confine"))]
+use crate::worktree_adoption::WorktreeSession;
+#[cfg(any(unix, feature = "confine"))]
 use crate::Scope;
 
 #[derive(Default)]
+#[cfg(any(unix, feature = "confine"))]
 struct BuildGate(Vec<(Caveats, String)>);
+#[cfg(any(unix, feature = "confine"))]
 impl PermissionGate for BuildGate {
     fn ask_dependency_fetch(
         &mut self,
@@ -34,6 +38,7 @@ impl PermissionGate for BuildGate {
     }
 }
 
+#[cfg(any(unix, feature = "confine"))]
 pub(super) async fn dispatch(
     args: serde_json::Value,
     original: &Path,
@@ -145,6 +150,7 @@ async fn worktree_adoption_round2_git_clean_preserves_sentinel() {
 /// #2733 P2: actual guarded dispatch must reach build admission for sibling
 /// AND nested adopted roots, while original-checkout builds never reach it.
 /// The recording gate stops before spawning, inspecting the real build fence.
+#[cfg(feature = "confine")]
 async fn adopted_build_dispatch(source: &str) {
     for nested in [false, true] {
         let (temp, policy, _) = fixture(nested);
@@ -209,6 +215,7 @@ async fn worktree_adoption_round2_argv_build_uses_adopted_root() {
 
 /// #2733 P2: compound Cargo source must retain the adopted root in build_shell.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn worktree_adoption_round2_shell_build_uses_adopted_root() {
     adopted_build_dispatch("cargo check; echo done").await;
 }
@@ -254,8 +261,17 @@ async fn worktree_adoption_dispatch_isolates_and_restores_bypass() {
         Some(&mut gate),
     )
     .await;
-    assert_eq!(outcome, Some(crate::ExecOutcome::Denied), "{text}");
-    assert_eq!(gate.0.len(), 1, "{text}");
+    let confined = crate::confined_exec::BACKEND_COMPILED;
+    assert_eq!(
+        outcome,
+        Some(if confined {
+            crate::ExecOutcome::Denied
+        } else {
+            crate::ExecOutcome::Unavailable
+        }),
+        "{text}"
+    );
+    assert_eq!(gate.0.len(), usize::from(confined), "{text}");
     assert!(crate::launch_authority::current().ocap_disabled());
 }
 

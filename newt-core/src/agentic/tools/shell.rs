@@ -3,18 +3,27 @@
 
 use super::super::content_spill::{self, SpillStore};
 use super::super::display::ToolPresentation;
+#[cfg(any(test, feature = "confine"))]
+use super::denial_recovery_hint;
 use super::live_output::{LiveOutputRelay, LiveOutputSession};
 use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
 use super::{
-    denial_context, denial_recovery_hint, full_access_requested, ocap_disabled,
-    permission_granted_result, requests_are_replay_safe, resolve_tool_alias, AliasOutcome,
+    denial_context, full_access_requested, ocap_disabled, resolve_tool_alias, AliasOutcome,
 };
+#[cfg(feature = "confine")]
+use super::{permission_granted_result, requests_are_replay_safe};
 use crate::ExecOutcome;
-use newt_policy::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+#[cfg(feature = "confine")]
+use newt_policy::permissions::PermissionDecision;
+use newt_policy::permissions::{DenialKind, PermissionGate, PermissionRequest};
 
 pub fn venv_cmd_prefix() -> Option<String> {
+    #[cfg(test)]
+    if super::command_probe::with_io(|_| ()).is_some() {
+        return venv_prefix(None, None, None);
+    }
     let venv = std::env::var("NEWT_VENV")
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
         .ok();
@@ -725,11 +734,16 @@ fn check_pipeline_redirects(tokens: &[RedirectToken], cmd: &str, cwd: &str) -> O
         })
 }
 
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn confined_dispatch_args(
     cmd: &str,
     cwd: &str,
     caveats: &newt_policy::caveats::Caveats,
 ) -> serde_json::Value {
+    #[cfg(test)]
+    if super::command_probe::with_io(|_| ()).is_some() {
+        return serde_json::json!({"cmd": cmd, "cwd": cwd, "env": {}});
+    }
     confined_dispatch_args_with(
         cmd,
         cwd,
@@ -739,6 +753,7 @@ pub(super) fn confined_dispatch_args(
 
 /// The carried pack, but only while this session's exec grants name it: an unpinned pack
 /// ahead of the host's `PATH` would shadow a tool the kernel lets run with one it refuses.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn confined_tools(
     pack: Option<std::path::PathBuf>,
     caveats: &newt_policy::caveats::Caveats,
@@ -747,6 +762,7 @@ pub(super) fn confined_tools(
 }
 
 /// [`confined_dispatch_args`] with the carried pack decided by the caller.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn confined_dispatch_args_with(
     cmd: &str,
     cwd: &str,
@@ -765,6 +781,7 @@ pub(super) enum ShellRoute {
     Cmd,
     AmbientBrush,
     BashSh,
+    /// Confined execution, or Unavailable when the backend is not compiled.
     Bridled(crate::ShellEngine),
 }
 
@@ -927,6 +944,7 @@ pub(super) fn shell_engine() -> crate::ShellEngine {
 /// path finally inheriting the same complete egress floor as the
 /// `ConstrainedExecutor` callers. Fail-closed: if the seccomp floor cannot be
 /// installed, the spawn is refused rather than run with a weaker floor.
+#[cfg(feature = "confine")]
 fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
     agent_bridle::SandboxPolicy {
         child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
@@ -941,6 +959,7 @@ fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
 /// the selected one, so `[shell] engine = "host"` (or `--full-access`) routes
 /// `run_command` to the full-grammar, kernel-jailed sandbox-host engine instead
 /// of the safe subset.
+#[cfg(feature = "confine")]
 fn bridle_registry(
     engine: crate::ShellEngine,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
@@ -1111,6 +1130,7 @@ pub(super) fn exec_floor_permits(
 /// arms so both honor **identical** exec caveats; the central presenter owns
 /// the tool-call and completed-result block.
 #[cfg(all(test, any(not(windows), feature = "windows-appcontainer")))]
+#[cfg(feature = "confine")]
 pub(super) async fn dispatch_bridled_shell(
     args: serde_json::Value,
     caveats: &newt_policy::caveats::Caveats,
@@ -1132,6 +1152,7 @@ pub(super) async fn dispatch_bridled_shell(
 /// A prepared build keeps the native build executor's strength floor while
 /// the same shell engine evaluates the original source and pipelines once.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "confine")]
 pub(super) async fn dispatch_bridled_build_shell(
     args: serde_json::Value,
     caveats: &newt_policy::caveats::Caveats,
@@ -1155,6 +1176,7 @@ pub(super) async fn dispatch_bridled_build_shell(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "confine")]
 async fn dispatch_bridled_shell_with_floor(
     mut args: serde_json::Value,
     caveats: &newt_policy::caveats::Caveats,
@@ -1165,6 +1187,12 @@ async fn dispatch_bridled_shell_with_floor(
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     command_budget: crate::RunCommandBudget,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
+    #[cfg(test)]
+    if let Some(envelope) =
+        super::command_probe::with_io(|probe| super::command_probe::Probe::ran(&probe.confined))
+    {
+        return Ok(envelope);
+    }
     let mut live = LiveOutputSession::start(sink);
     // NOTE (cross-platform review, `unconfined-fallback-on-missing-backend`):
     // run_command dispatches at the DEFAULT (Advisory) strength floor. On a
@@ -1258,6 +1286,7 @@ async fn dispatch_bridled_shell_with_floor(
 /// the one denial shape a #2628 rerun is allowed to bind to (round1 finding
 /// 3). Any other `Denied` result (a broker-bearing runtime refusal, a build
 /// fence, a compound command that partially ran) must never enter that slot.
+#[cfg(feature = "confine")]
 pub(super) const UNGRANTED_FS_AUTHORITY_DENIAL: &str =
     "capability denied: declared filesystem authority was not granted for this command";
 
@@ -1371,10 +1400,12 @@ pub(super) async fn exec_confined_command(
 }
 
 /// Broker-bearing native commands use Brush's runtime external-command hook.
+/// Without `confine`, `exec_bridled` refuses before command execution, permission
+/// prompts/grants or scratch allocation; the existing host-route checks still apply.
 ///
 /// #2689: a structured exec denial takes the operator to the SAME interactive
 /// `permission_gate.ask_with_caveats` prompt as any other exec denial. The
-/// retry below replays THIS SAME call — with `command_broker` still
+/// retry in `exec_bridled` replays THIS SAME call — with `command_broker` still
 /// attached, so the attribution/signing policy applies to the replay exactly
 /// as it would have to the original attempt — ONLY when
 /// `requests_are_replay_safe` (reused from `tools.rs`, #2691 round 3) proves
@@ -1456,15 +1487,28 @@ pub(super) async fn exec_confined_command_with_broker(
     // command's leading token; else it falls through to the confined shell,
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
+    let discover = || {
+        (
+            crate::config::windows_cmd_enabled(),
+            crate::ambient_brush::installed(),
+            shell_engine(),
+        )
+    };
+    #[cfg(test)]
+    let (windows_cmd, runner_available, engine) =
+        super::command_probe::with_io(|_| (false, true, crate::ShellEngine::SafeSubset))
+            .unwrap_or_else(discover);
+    #[cfg(not(test))]
+    let (windows_cmd, runner_available, engine) = discover();
     let route = select_shell_route(
         ocap_disabled(),
         command_broker.is_some(),
         execution_lease.is_some(),
         exec_floor_permits(exec_floor, cmd),
         cfg!(windows),
-        crate::config::windows_cmd_enabled(),
-        crate::ambient_brush::installed(),
-        shell_engine(),
+        windows_cmd,
+        runner_available,
+        engine,
     );
     let host_bypass = !matches!(route, ShellRoute::Bridled(_));
 
@@ -1475,8 +1519,23 @@ pub(super) async fn exec_confined_command_with_broker(
     // otherwise learn nothing). A genuinely confined session is not recorded —
     // its leash is real. No-op unless recording is armed (NEWT_FLIGHT_RECORDER).
     // `newt ocap propose` folds the capture into reviewable policy candidates.
-    if shadow_records(host_bypass, full_access_requested()) {
-        crate::flight_recorder::log_unconfined(cmd);
+    if shadow_records(
+        host_bypass,
+        crate::confined_exec::BACKEND_COMPILED && full_access_requested(),
+    ) {
+        let record = || crate::flight_recorder::log_unconfined(cmd);
+        #[cfg(test)]
+        if super::command_probe::with_io(|probe| {
+            probe
+                .exec_records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .is_none()
+        {
+            record();
+        }
+        #[cfg(not(test))]
+        record();
     }
 
     if host_bypass {
@@ -1553,6 +1612,39 @@ pub(super) async fn exec_confined_command_with_broker(
     .await
 }
 
+#[cfg(not(feature = "confine"))]
+#[allow(clippy::too_many_arguments)]
+async fn exec_bridled(
+    _cmd: &str,
+    _cwd: &str,
+    _workspace: &str,
+    _color: bool,
+    _tool_output_lines: usize,
+    _caveats: &newt_policy::caveats::Caveats,
+    _filesystem_requests: &[PermissionRequest],
+    _permission_gate: &mut Option<&mut dyn PermissionGate>,
+    _tool_offload: bool,
+    _spill_store: Option<&dyn SpillStore>,
+    _live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
+    _presentation: &mut dyn ToolPresentation,
+    _command_broker: Option<std::sync::Arc<dyn crate::sandbox_seam::CommandBroker>>,
+    _execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
+    _pre_exec_missing: &mut Option<Vec<PermissionRequest>>,
+    _retry_authorized: Option<&std::sync::OnceLock<()>>,
+    _timeout_secs: Option<u64>,
+    _adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
+    _command_budget: crate::RunCommandBudget,
+) -> (String, ExecOutcome) {
+    // At the shell boundary: no user command and no backend, no permission prompt
+    // or grant, no scratch allocation. Earlier routed built-ins and native operations
+    // retain their own boundaries.
+    (
+        "error: this build has no confined shell; this invocation cannot run on the host route. No command ran.".into(),
+        ExecOutcome::Unavailable,
+    )
+}
+
+#[cfg(feature = "confine")]
 #[allow(clippy::too_many_arguments)]
 async fn exec_bridled(
     cmd: &str,
@@ -1883,6 +1975,7 @@ async fn exec_bridled(
 
 /// Preserve the dispatch error alongside the execution class returned to the
 /// tool-event funnel. Both initial dispatch and the existing grant retry use it.
+#[cfg(feature = "confine")]
 pub(super) fn dispatch_error_result(error: agent_bridle::ToolError) -> (String, ExecOutcome) {
     let outcome = if matches!(error, agent_bridle::ToolError::Denied { .. }) {
         ExecOutcome::Denied
@@ -1931,6 +2024,7 @@ pub(super) fn envelope_outcome(envelope: &serde_json::Value) -> ExecOutcome {
 /// The confined lane's result for an envelope no grant widened: each rendering
 /// is paired with the class of the branch that chose it, so the class and the
 /// text the model reads cannot disagree.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn confined_result(
     cmd: &str,
     envelope: &serde_json::Value,
@@ -2019,6 +2113,7 @@ pub(super) fn command_budget_seconds(configured: Option<&str>, requested: Option
 }
 
 /// The selected wall must also be the safe-subset engine's default, not only its ceiling.
+#[cfg(feature = "confine")]
 pub(super) fn shell_limits(wall: std::time::Duration) -> agent_bridle::LimitsPolicy {
     let default = agent_bridle::LimitsPolicy::default();
     agent_bridle::LimitsPolicy {
@@ -2176,6 +2271,12 @@ pub(super) async fn host_shell_dispatch(
     timeout_secs: Option<u64>,
     command_budget: crate::RunCommandBudget,
 ) -> std::io::Result<serde_json::Value> {
+    #[cfg(test)]
+    if let Some(envelope) =
+        super::command_probe::with_io(|probe| super::command_probe::Probe::ran(&probe.host))
+    {
+        return Ok(envelope);
+    }
     let wall = command_wall(cmd, timeout_secs, command_budget);
     let run = if timeout_secs.is_none() && wall != LIFECYCLE_BUILD_TIMEOUT {
         host_shell_output(route, cmd, cwd, live, command_budget).await?
@@ -2884,6 +2985,7 @@ pub(super) fn envelope_denied(envelope: &serde_json::Value) -> bool {
 /// Build a human-readable denial message from the envelope's structured
 /// `denials: [{ kind, target, reason }]` list, joining each entry's `reason`.
 /// Falls back to a generic message when the list is missing or empty.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
     let reasons: Vec<String> = envelope
         .get("denials")
@@ -2924,6 +3026,7 @@ pub(super) fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
 ///
 /// The #263 prompt path still falls back here on deny (and on a second denial
 /// after a re-execution).
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn denied_run_command_result(envelope: &serde_json::Value, _color: bool) -> String {
     let recovery = denial_recovery_hints(envelope)
         .map(|hints| hints.join(" "))
@@ -2939,6 +3042,7 @@ pub(super) fn denied_run_command_result(envelope: &serde_json::Value, _color: bo
 
 /// #2759: use only trusted denial metadata, never output or a generic Denied
 /// outcome. An actual blocked write outranks any exec misses in the same batch.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn worktree_denial_notice(
     adopted: Option<&crate::worktree_adoption::AdoptedWorktree>,
     envelope: &serde_json::Value,
@@ -2992,6 +3096,7 @@ pub(super) fn worktree_denial_notice(
 /// (the touch/mkdir loops of #2631). The axis is read from the LEASH's own
 /// reason ([`open_denial_axis`]); the target brush hands the interceptor is
 /// already the absolute path. Neither comes from the child's output (#2633).
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<String>> {
     let denials = envelope
         .get("denials")?
@@ -3046,6 +3151,7 @@ pub(super) fn denial_recovery_hints(envelope: &serde_json::Value) -> Option<Vec<
 /// reservations, the fail-closed no-caveats default, a cancelled run) names
 /// no axis and stays ungrantable. If bridle ever exposes the axis as a field,
 /// read that and delete this.
+#[cfg(any(test, feature = "confine"))]
 fn open_denial_axis(reason: &str) -> Option<&'static str> {
     let reason = reason.strip_prefix("denied: ").unwrap_or(reason);
     let reason = reason.trim_end_matches('.');
@@ -3094,6 +3200,7 @@ fn open_denial_axis(reason: &str) -> Option<&'static str> {
 /// probe would be answering about the fence rather than about the host; newt's
 /// own process is never Landlocked, so it can resolve the real host PATH and
 /// separate "installed, but not reachable from in here" from "not installed".
+#[cfg(any(test, feature = "confine"))]
 pub(crate) fn absent_binary_refusal(
     envelope: &serde_json::Value,
     exec: &newt_policy::caveats::Scope<String>,
@@ -3125,6 +3232,7 @@ pub(crate) fn absent_binary_refusal(
 /// [`run_command_result_is_denial`]'s grant-gap classification), but its
 /// resolved path is never interpolated into either one. Only a trusted,
 /// invocation-bound refusal (the leash's `denials`) may name a target.
+#[cfg(any(test, feature = "confine"))]
 fn absent_program_note(
     envelope: &serde_json::Value,
     exec: &newt_policy::caveats::Scope<String>,
@@ -3177,6 +3285,7 @@ pub(crate) const NOT_ON_HOST_MARKER: &str = "not installed on this host";
 /// flag or a non-empty `denials` array. Every "is this an absence / an
 /// unstructured failure?" classifier runs this first, so none of them can
 /// relabel a refusal the interceptor actually made.
+#[cfg(any(test, feature = "confine"))]
 fn structured_denials_present(envelope: &serde_json::Value) -> bool {
     envelope_denied(envelope)
         || envelope
@@ -3210,6 +3319,7 @@ fn structured_denials_present(envelope: &serde_json::Value) -> bool {
 /// own (`Failed`), not `Denied`. The one thing that mints a target is the
 /// leash's structured `denials`, which [`denied_run_command_result`] renders
 /// before this is reached.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn unstructured_exit_126_note(envelope: &serde_json::Value) -> Option<&'static str> {
     (envelope
         .get("exit_code")
@@ -3225,6 +3335,7 @@ pub(super) fn unstructured_exit_126_note(envelope: &serde_json::Value) -> Option
 /// (`permission denied`), and never the name of the grant tool, so
 /// `run_command_result_is_denial` grounds a denial claim only on what the
 /// CHILD printed and no consumer can read a grant request out of this note.
+#[cfg(any(test, feature = "confine"))]
 pub(crate) const UNSTRUCTURED_EXIT_126_NOTE: &str = "\n(exit 126: the shell found a command but \
     could not execute it. No structured denial was recorded, so whether the sandbox refused it is \
     unknown, and so are the path and the axis it would have refused on; a missing execute bit or \
@@ -3247,6 +3358,7 @@ pub(crate) const UNSTRUCTURED_EXIT_126_NOTE: &str = "\n(exit 126: the shell foun
 /// (#2629 round 2): there the name would have chosen a grant TARGET, and a
 /// target comes only from the leash's structured `denials`, never from text
 /// the child controls.
+#[cfg(any(test, feature = "confine"))]
 fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'a str> {
     envelope
         .get("stderr")
@@ -3353,6 +3465,7 @@ pub(super) fn leading_program(cmd: &str) -> Option<&str> {
 /// would let `read_file` read `$CARGO_HOME/credentials.toml` for the rest of
 /// the session; widening only this one dispatch's caveats lets the SPAWNED
 /// cargo process resolve its own toolchain and nothing else gains the read.
+#[cfg(any(test, feature = "confine"))]
 fn dispatch_caveats_for_command(
     cmd: &str,
     caveats: &newt_policy::caveats::Caveats,
@@ -3385,6 +3498,7 @@ fn dispatch_caveats_for_command(
 
 /// The exec grants in force, for the refusal's second line. Naming what IS
 /// granted turns "no" into a question the operator can answer in one line.
+#[cfg(any(test, feature = "confine"))]
 fn granted_host_binaries(exec: &newt_policy::caveats::Scope<String>) -> String {
     match exec {
         newt_policy::caveats::Scope::All => "(unrestricted)".to_string(),
@@ -3656,12 +3770,14 @@ fn pr_next_step_hint(url: &str) -> String {
 /// detect it by the stable markers agent-bridle's `Refusal::Display` emits, so
 /// these fall through to the plain denial (which already names the --yolo
 /// escape) with no grant menu.
+#[cfg(any(test, feature = "confine"))]
 fn is_structural_refusal(reason: &str) -> bool {
     reason.contains("refused by design:")
         || reason.contains("dynamic construct the confined shell")
         || reason.contains("not yet supported by the confined shell")
 }
 
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {
     let denials = envelope.get("denials")?.as_array()?;
     if denials.is_empty() {
@@ -3706,6 +3822,7 @@ pub(super) fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<P
 /// Returns `Some` only when EVERY denial is a `net` kind with a non-empty host
 /// target — the case a grant is meaningful (add the host to the net allow-list).
 /// A mixed or non-net batch returns `None` and keeps the standard denial.
+#[cfg(any(test, feature = "confine"))]
 pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {
     let denials = envelope.get("denials")?.as_array()?;
     if denials.is_empty() {
@@ -3733,6 +3850,7 @@ pub(super) fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<Pe
 }
 
 #[cfg(test)]
+#[cfg(feature = "confine")]
 mod bridle_registry_tests {
     use super::*;
 
@@ -4119,5 +4237,37 @@ mod carried_tools_path_tests {
             carried_tools_dir_beside(&shared.join("newt"), real_path, Path::is_dir),
             Some(std::fs::canonicalize(keg.join("tools")).unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+mod route_selection_tests {
+    use super::{select_shell_route, ShellRoute};
+
+    #[test]
+    fn bridled_is_selected_exactly_when_the_host_route_is_not_permitted() {
+        for bypass in [false, true] {
+            for broker in [false, true] {
+                for lease in [false, true] {
+                    for floor in [false, true] {
+                        let route = select_shell_route(
+                            bypass,
+                            broker,
+                            lease,
+                            floor,
+                            false,
+                            false,
+                            true,
+                            crate::ShellEngine::SafeSubset,
+                        );
+                        assert_eq!(
+                            matches!(route, ShellRoute::Bridled(_)),
+                            !bypass || broker || lease || !floor,
+                            "bypass={bypass}, broker={broker}, lease={lease}, floor={floor}",
+                        );
+                    }
+                }
+            }
+        }
     }
 }

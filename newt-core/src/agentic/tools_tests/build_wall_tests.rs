@@ -94,6 +94,7 @@ fn a_timed_out_build_command_names_the_build_wall_in_its_result() {
 /// `default_timeout_secs`. Raising only `max_timeout_secs` left a build
 /// command on the SafeSubset engine killed at 60s.
 #[test]
+#[cfg(feature = "confine")]
 fn the_wall_is_the_default_timeout_not_just_the_ceiling() {
     let _env = crate::process_env::lock();
     let build = super::shell::shell_limits(build_wall());
@@ -259,6 +260,7 @@ fn command_budget_2747_catalog_and_dispatch_agree() {
         assert!(description.contains(&format!("killed after {seconds} seconds")));
         let wall = super::shell::command_wall("echo ready", None, budget);
         assert_eq!(wall.as_secs(), seconds);
+        #[cfg(feature = "confine")]
         assert_eq!(
             super::shell::shell_limits(wall).default_timeout_secs,
             seconds

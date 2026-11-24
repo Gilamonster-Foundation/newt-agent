@@ -2356,7 +2356,11 @@ async fn anthropic_funnel_records_the_execution_class() {
     assert!(!events[0].ok, "{events:?}");
     assert_eq!(
         serde_json::to_value(&events[0]).unwrap()["execution"],
-        "failed",
+        if crate::confined_exec::BACKEND_COMPILED {
+            "failed"
+        } else {
+            "unavailable"
+        },
         "{events:?}"
     );
 }

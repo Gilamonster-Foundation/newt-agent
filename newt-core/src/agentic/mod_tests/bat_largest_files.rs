@@ -538,6 +538,7 @@ async fn rust_followup_answers_with_source_filtered_markdown_table() {
 /// actual authority denial reaches the model, and asking the human stays
 /// available. A different phrasing of the task cannot grant exec authority.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn line_count_question_wc_denied_then_escalates_cleanly() {
     let ws = simulated_line_workspace();
     let (reply, hallucinations, end_reason, wire) = run_scenario_for(
@@ -591,6 +592,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
 /// the human (#1259) instead of being trapped into penalized narration. The
 /// footer still renders clean (#1261).
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn largest_files_question_pipeline_denied_then_escalates_cleanly() {
     let ws = simulated_workspace();
     let (reply, hallucinations, end_reason, wire) = run_scenario(

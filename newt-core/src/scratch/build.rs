@@ -4,8 +4,11 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::OnceLock;
+#[cfg(any(test, feature = "confine"))]
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
+#[cfg(any(test, feature = "confine"))]
 fn refused(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
@@ -20,6 +23,7 @@ fn outside_git(path: &Path) -> bool {
 /// no filesystem effects, and subsequent session grants name the same base.
 struct Plan {
     path: PathBuf,
+    #[cfg(any(test, feature = "confine"))]
     shared: Arc<LeaseState>,
     // Keep mappings after lease cleanup: remembered session grants must still
     // name the same partition. Full identities are never truncated or hashed again.
@@ -27,6 +31,7 @@ struct Plan {
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "confine"))]
 struct LeaseState {
     // `cleaning` covers the interval between the last strong reference going
     // away and Base::drop finishing cleanup; a new run waits for that cleanup.
@@ -38,6 +43,7 @@ struct LeaseState {
 }
 
 #[derive(Default)]
+#[cfg(any(test, feature = "confine"))]
 struct Lease {
     base: Weak<Base>,
     cleaning: bool,
@@ -48,6 +54,7 @@ struct Lease {
 /// An owned base which cleanup could not remove. Both identities stay held so
 /// a later build can safely reuse this exact directory without treating an
 /// arbitrary pre-existing path as ours.
+#[cfg(any(test, feature = "confine"))]
 struct RetainedBase {
     directory: Directory,
     parent: Directory,
@@ -57,6 +64,7 @@ impl Plan {
     fn new(parent: PathBuf) -> Self {
         Self {
             path: parent.join(format!("newt-{}", uuid::Uuid::new_v4().simple())),
+            #[cfg(any(test, feature = "confine"))]
             shared: Arc::default(),
             workspaces: parking_lot::Mutex::default(),
         }
@@ -75,6 +83,7 @@ impl Plan {
         self.path.join(format!("w{ordinal:x}"))
     }
 
+    #[cfg(any(test, feature = "confine"))]
     fn acquire(&self) -> io::Result<Arc<Base>> {
         let mut live = self
             .shared
@@ -190,6 +199,7 @@ pub(crate) fn managed_partition(
     (base == plan.path).then(|| plan.partition(identity))
 }
 
+#[cfg(any(test, feature = "confine"))]
 struct Base {
     directory: Option<Directory>,
     parent: Option<Directory>,
@@ -197,12 +207,14 @@ struct Base {
     operations: Mutex<()>,
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl Base {
     fn directory(&self) -> &Directory {
         self.directory.as_ref().unwrap()
     }
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl Drop for Base {
     fn drop(&mut self) {
         let Ok(mut live) = self.shared.live.lock() else {
@@ -260,6 +272,7 @@ impl Drop for Base {
 /// already-used same-file Windows handle. Windows handles deny delete-sharing
 /// for every ancestor except the known owned base, whose own held handle
 /// retains that protection while descendants share its DELETE access.
+#[cfg(any(test, feature = "confine"))]
 struct Directory {
     path: PathBuf,
     #[cfg(unix)]
@@ -273,6 +286,7 @@ struct Directory {
     delete_owner: Option<PathBuf>,
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl Directory {
     fn acquire(path: &Path) -> io::Result<Self> {
         Self::open(path, false, None)
@@ -555,12 +569,14 @@ fn take_forced_remove_child_failure() -> bool {
 }
 
 /// Keeps all owned parents alive until the existing execution lease ends.
+#[cfg(any(test, feature = "confine"))]
 pub(crate) struct ManagedRun {
     run: Option<Directory>,
     partition: Option<Directory>,
     base: Arc<Base>,
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl ManagedRun {
     fn create(plan: &Plan, path: &Path) -> io::Result<Self> {
         let base = plan.acquire()?;
@@ -588,6 +604,7 @@ impl ManagedRun {
     }
 }
 
+#[cfg(any(test, feature = "confine"))]
 impl Drop for ManagedRun {
     fn drop(&mut self) {
         let Ok(_operations) = self.base.operations.lock() else {
@@ -608,6 +625,7 @@ impl Drop for ManagedRun {
     }
 }
 
+#[cfg(any(test, feature = "confine"))]
 pub(crate) fn acquire_run(path: &Path) -> io::Result<Option<ManagedRun>> {
     if path.parent().and_then(Path::parent) == Some(plan().path.as_path()) {
         ManagedRun::create(plan(), path).map(Some)
@@ -616,6 +634,7 @@ pub(crate) fn acquire_run(path: &Path) -> io::Result<Option<ManagedRun>> {
     }
 }
 
+#[cfg(any(test, feature = "confine"))]
 pub(crate) fn validate_grant(
     path: &Path,
     writes: &newt_policy::caveats::Scope<String>,

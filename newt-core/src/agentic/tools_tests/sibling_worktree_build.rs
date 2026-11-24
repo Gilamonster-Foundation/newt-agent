@@ -2,11 +2,16 @@
 //! Real temporary directories ground canonical/symlink containment; a recording
 //! gate stops before external execution, inspecting the actual build request.
 use super::*;
-use newt_policy::caveats::{Caveats, Scope};
+use newt_policy::caveats::Caveats;
+#[cfg(feature = "confine")]
+use newt_policy::caveats::Scope;
+#[cfg(feature = "confine")]
 use std::path::Path;
 
 #[derive(Default)]
+#[cfg(feature = "confine")]
 struct BuildGate(Vec<(Caveats, String)>);
+#[cfg(feature = "confine")]
 impl PermissionGate for BuildGate {
     fn ask_dependency_fetch(
         &mut self,
@@ -32,6 +37,7 @@ impl PermissionGate for BuildGate {
     }
 }
 
+#[cfg(feature = "confine")]
 async fn build(
     shell_route: bool,
     workspace: &Path,
@@ -85,6 +91,7 @@ async fn build(
     }
 }
 
+#[cfg(feature = "confine")]
 fn grants(root: &Path) -> Caveats {
     let mut caveats = Caveats::top();
     caveats.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
@@ -94,6 +101,7 @@ fn grants(root: &Path) -> Caveats {
 
 /// #2723: a sibling's grant must reach Build admission with the sibling fence,
 /// including when cwd is a nested crate; the launch checkout must not be writable.
+#[cfg(feature = "confine")]
 async fn approved_sibling_build(shell_route: bool) {
     let temp = tempfile::tempdir().unwrap();
     let launch = temp.path().join("main");
@@ -132,6 +140,7 @@ async fn approved_sibling_argv_build_uses_its_own_fence() {
 
 /// #2723: build-bearing shell commands must use the same granted sibling fence.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn approved_sibling_shell_build_uses_its_own_fence() {
     approved_sibling_build(true).await;
 }
@@ -225,6 +234,7 @@ async fn relative_grant_does_not_authorize_a_sibling_build() {
 
 /// #2729: host-scoped session authority must narrow before Build admission on
 /// both routes, without modifying the session or bypassing a denied Build gate.
+#[cfg(feature = "confine")]
 async fn host_scoped_build_child_narrows_network(shell_route: bool) {
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().canonicalize().unwrap();
@@ -248,6 +258,7 @@ async fn host_scoped_build_children_narrow_network_argv() {
 
 /// #2729: build-bearing shell commands use the same network narrowing.
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn host_scoped_build_children_narrow_network_shell() {
     host_scoped_build_child_narrows_network(true).await;
 }

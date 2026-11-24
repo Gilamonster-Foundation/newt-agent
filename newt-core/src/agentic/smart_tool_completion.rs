@@ -350,6 +350,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
+    #[cfg(feature = "confine")]
     async fn native_failed_execution_retains_typed_failure_in_frame() {
         use crate::agentic::prompt_intake::PromptDisposition;
         use crate::agentic::tools::{execute_tool_with_collaborators, ToolCollaborators};

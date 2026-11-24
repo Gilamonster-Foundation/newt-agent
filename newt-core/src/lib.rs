@@ -193,10 +193,11 @@ pub fn maybe_dispatch() -> Option<i32> {
     #[cfg(target_os = "macos")]
     newt_policy::fs_aliases::initialize();
     #[cfg(feature = "confine")]
-    let dispatched = native_git_broker::maybe_dispatch();
+    {
+        native_git_broker::maybe_dispatch().or_else(agent_bridle::maybe_dispatch)
+    }
     #[cfg(not(feature = "confine"))]
-    let dispatched: Option<i32> = None;
-    dispatched.or_else(agent_bridle::maybe_dispatch)
+    None
 }
 
 /// What a `harness = false` test binary whose real body runs only under

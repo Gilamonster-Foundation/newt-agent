@@ -429,6 +429,7 @@ async fn run_tool_captured_with_context_and_live(
 
 #[cfg(not(windows))]
 #[tokio::test]
+#[cfg(feature = "confine")]
 async fn live_shell_observation_does_not_change_headless_completion_bytes() {
     let _lock = super::super::disable_ocap_tests::env_lock().await;
     let _ocap = super::super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
