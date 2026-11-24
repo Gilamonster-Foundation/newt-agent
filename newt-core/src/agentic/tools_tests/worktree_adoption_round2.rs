@@ -87,6 +87,7 @@ fn worktree_adoption_round2_git_clean_operands_are_not_creation() {
 /// the legitimate display wrapper must still create and adopt the worktree.
 #[cfg(unix)]
 // macOS production counterpart lives in the harness=false native contract.
+#[cfg(feature = "confine")]
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
 #[ignore = "requires native kernel confinement and git"]
@@ -200,6 +201,7 @@ async fn adopted_build_dispatch(source: &str) {
 }
 
 /// #2733: the ordinary Cargo command also passes through lifecycle routing.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn worktree_adoption_round2_argv_build_uses_adopted_root() {
     adopted_build_dispatch("cargo check").await;
@@ -214,6 +216,7 @@ async fn worktree_adoption_round2_shell_build_uses_adopted_root() {
 /// #2733 libtest regression: a sibling's temporary bypass must not change
 /// these confined build fixtures. Enter the fixtures while that override is
 /// active to reproduce the offending order without timing or parallelism.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 async fn worktree_adoption_build_fixture_isolates_and_restores_bypass() {
@@ -258,6 +261,7 @@ async fn worktree_adoption_dispatch_isolates_and_restores_bypass() {
 
 /// #2733 P2: ground the recording-gate tests in actual confined Cargo builds
 /// in sibling and nested adopted directories; original builds remain denied.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires native kernel confinement, cargo and rustc"]

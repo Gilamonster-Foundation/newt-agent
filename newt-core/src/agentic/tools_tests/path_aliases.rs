@@ -1,8 +1,10 @@
 use super::*;
+#[cfg(feature = "confine")]
 use crate::{Caveats, Scope};
 
 /// macOS /tmp is a host alias, not the per-child disposable TMPDIR. Ground
 /// permission matching in actual adoption, file dispatch, and confined writes.
+#[cfg(feature = "confine")]
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "native Seatbelt and Git persistence proof"]
@@ -143,9 +145,9 @@ async fn mac_tmp_alias_dispatch_and_adoption_persist() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 struct NullPresentation;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 impl ToolPresentation for NullPresentation {
     fn preview(&mut self, _: &str, _: usize) {}
     fn document(&mut self, _: &str) {}

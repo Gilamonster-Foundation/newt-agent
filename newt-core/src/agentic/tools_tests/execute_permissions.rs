@@ -3552,6 +3552,92 @@ async fn gate_allow_without_real_coverage_is_still_denied() {
     );
 }
 
+/// The build helper refuses before its execution line, directory lookup, or Build grant.
+/// The dispatcher's earlier tool-call line is outside this helper's contract.
+#[cfg(not(feature = "confine"))]
+#[tokio::test]
+async fn confine_off_lifecycle_build_refuses_before_asking() {
+    let workspace = "/p11b-absent-workspace";
+    let base = Caveats {
+        exec: Scope::none(),
+        ..Caveats::top()
+    };
+    let mut gate = MockGate::new(true, &base);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
+    let (text, outcome) = run_confined_build_lane(
+        workspace,
+        std::path::Path::new(workspace),
+        "cargo",
+        vec!["check".into()],
+        "cargo check",
+        None,
+        &base,
+        &mut Some(&mut gate),
+        20,
+        false,
+        false,
+        None,
+        None,
+        None,
+        shell::LIFECYCLE_BUILD_TIMEOUT,
+        &mut display,
+    )
+    .await;
+    assert_eq!(
+        text,
+        format!(
+            "error: {}",
+            crate::confined_exec::ExecRefused::ConfinementUnenforceable(
+                crate::confined_exec::CONFINE_OFF_REASON.into()
+            )
+        )
+    );
+    assert_eq!(outcome, ExecOutcome::Unavailable);
+    assert!(gate.asks.is_empty());
+    assert!(gate.full_access.is_empty());
+    assert!(display.into_inner().is_empty());
+}
+
+/// The feature refusal precedes AST validation, file access, and permission requests.
+/// Use the inner seam so terminal discovery and the tool-call clock are not involved.
+#[cfg(not(feature = "confine"))]
+#[tokio::test]
+async fn confine_off_move_from_refuses_at_dispatch() {
+    let base = Caveats {
+        exec: Scope::none(),
+        ..Caveats::top()
+    };
+    let mut gate = MockGate::new(true, &base);
+    let mut display = ToolDisplay::new(Vec::<u8>::new(), false, 80, 20, false);
+    let result = execute_tool_inner(
+        &mut display,
+        "write_file",
+        &serde_json::json!({"path":"child.rs", "content":"", "move_from":{
+            "path":"lib.rs", "items":["helper"]
+        }}),
+        "/p11b-absent-workspace",
+        false,
+        20,
+        &base,
+        &mut NoMcp,
+        ToolCollaborators {
+            permission_gate: Some(&mut gate as &mut dyn PermissionGate),
+            ..Default::default()
+        },
+        false,
+        PromptDisposition::Act,
+    )
+    .await;
+    assert_eq!(
+        result,
+        "error: move_from requires a build with the confine feature; nothing changed"
+    );
+    assert!(gate.asks.is_empty());
+    assert!(gate.full_access.is_empty());
+    assert!(display.into_inner().is_empty());
+}
+
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn declined_or_incomplete_lifecycle_build_launches_nothing() {
     let ws = tempfile::tempdir().unwrap();

@@ -1,5 +1,6 @@
 //! Completion publication occurs before presentation can discard the return.
 use super::*;
+#[cfg(feature = "confine")]
 use crate::agentic::anthropic_loop_tests::FixtureMcpPermission;
 use crate::agentic::smart_harness::SmartHarness;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ impl McpTools for BreakCheckpoint {
     }
 }
 
+#[cfg(feature = "confine")]
 async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W) {
     let workspace = tempfile::tempdir().unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -67,6 +69,7 @@ async fn failed_return<W: std::io::Write + Send>(writer: W) -> (anyhow::Error, W
 /// Grounds the failure-reporting contract with a real obstructed checkpoint:
 /// both a captured display and an output-discarding host retain the return and
 /// original storage error, without calling it an observed tool failure.
+#[cfg(feature = "confine")]
 #[tokio::test]
 #[serial_test::serial]
 async fn persistence_failure_preserves_result_with_captured_or_discarded_display() {

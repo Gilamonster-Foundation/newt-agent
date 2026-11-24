@@ -89,6 +89,7 @@ struct Run {
     bodies: Vec<String>,
     /// The behavior signals the turn recorded for the solve trace.
     signals: Vec<observability::BehaviorSignal>,
+    events: Vec<crate::ToolEvent>,
     /// The loop reported that the turn ended at its round cap.
     at_cap: bool,
 }
@@ -200,6 +201,8 @@ async fn run_turn(turn: Turn<'_>) -> Run {
     context.verify_outcomes = outcomes;
     let mut obs = observability::SolveObservation::default();
     context.solve_obs = Some(&mut obs);
+    let mut events = Vec::new();
+    context.tool_events = Some(&mut events);
     context.smart_harness = smart.then_some(&harness);
     context.kind = match wire {
         "ollama" => BackendKind::Ollama,
@@ -228,6 +231,7 @@ async fn run_turn(turn: Turn<'_>) -> Run {
         reason: serde_json::to_value(reason).unwrap(),
         bodies,
         signals: obs.behavior_signals,
+        events,
         at_cap,
     }
 }
@@ -622,6 +626,8 @@ async fn a_failure_at_the_round_limit_ends_repair_exhausted_not_round_cap() {
 /// manifest at the round limit. The cap exit must see that check and end
 /// `repair_exhausted`, not `round_cap`. The task names no check, so only the
 /// workspace scan can find it.
+/// Without confinement Cargo is unavailable, so the cap must not score a failure
+/// for a check that never ran; its tool event records Unavailable.
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
@@ -633,7 +639,27 @@ async fn a_check_created_after_the_first_scan_decides_the_cap_exit() {
     ];
     for (wire, smart) in [("openai", false), ("anthropic", true)] {
         let run = run_script(wire, smart, true, "", &script, None, 3).await;
-        assert_eq!(run.reason, "repair_exhausted", "{wire} smart={smart}");
+        assert_eq!(
+            run.events
+                .last()
+                .expect("the Cargo call was observed")
+                .execution,
+            Some(if cfg!(feature = "confine") {
+                crate::ExecOutcome::Failed
+            } else {
+                crate::ExecOutcome::Unavailable
+            }),
+            "{wire} smart={smart}"
+        );
+        assert_eq!(
+            run.reason,
+            if cfg!(feature = "confine") {
+                "repair_exhausted"
+            } else {
+                "round_cap"
+            },
+            "{wire} smart={smart}"
+        );
         // The cap exit's trace names the check the scan found after the write,
         // and the failed run it decided on.
         let checks: Vec<_> = run
@@ -650,14 +676,15 @@ async fn a_check_created_after_the_first_scan_decides_the_cap_exit() {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            checks,
-            [vec![(
+        let expected = if cfg!(feature = "confine") {
+            vec![vec![(
                 "`cargo test`".to_string(),
-                crate::agentic::self_verify::CheckStatus::Failed
-            )]],
-            "{wire} smart={smart}"
-        );
+                crate::agentic::self_verify::CheckStatus::Failed,
+            )]]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(checks, expected, "{wire} smart={smart}");
     }
 }
 

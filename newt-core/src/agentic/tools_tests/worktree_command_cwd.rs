@@ -204,6 +204,7 @@ async fn shell_task_cwd_2780_lifecycle_default() {
 /// #2780/#2784: builds use the task directory in both modes. Confined/direct
 /// builds require build approval; an explicit exec floor keeps even an
 /// OCAP-disabled shell from running. A recording denial prevents any child run.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn shell_task_cwd_2780_build_routes_keep_authority() {
     #[derive(Default)]

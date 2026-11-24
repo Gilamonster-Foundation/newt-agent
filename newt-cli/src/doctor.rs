@@ -193,6 +193,9 @@ pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
             "NOT available → a restricted fs grant is refused when its kernel floor cannot be met"
         }
     );
+    if let Some(line) = confinement_build_line(newt_core::confined_exec::BACKEND_COMPILED) {
+        println!("  {line}");
+    }
     println!(
         "  agent-bridle attenuates your full ambient authority into structural OCAP grants; \
          --full-access temporarily lifts them."
@@ -654,6 +657,12 @@ pub fn sign_ocap() -> anyhow::Result<i32> {
     Ok(if refused.is_empty() { 0 } else { 2 })
 }
 
+fn confinement_build_line(backend_compiled: bool) -> Option<&'static str> {
+    (!backend_compiled).then_some(
+        "confinement: NOT compiled into this build (cargo feature `confine` is off) - confined build/test/verify lanes refuse",
+    )
+}
+
 fn brush_engine_description(worker_available: bool) -> &'static str {
     if worker_available {
         "    · brush       — carried bash-in-Rust worker with static command/file policies; descendant confinement requires the native backend"
@@ -666,6 +675,15 @@ fn brush_engine_description(worker_available: bool) -> &'static str {
 mod tests {
     use super::*;
     use newt_core::ocap::{Guarantee, RuntimeEvidence, LINUX_CEILING, MACOS_CEILING};
+
+    #[test]
+    fn confinement_build_line_names_the_feature_only_when_compiled_out() {
+        assert_eq!(confinement_build_line(true), None);
+        assert_eq!(
+            confinement_build_line(false),
+            Some("confinement: NOT compiled into this build (cargo feature `confine` is off) - confined build/test/verify lanes refuse")
+        );
+    }
 
     /// #2929 review: `doctor` parsed a project's `.newt/backends/` drop-ins and
     /// probed them with the operator's credentials when config resolution

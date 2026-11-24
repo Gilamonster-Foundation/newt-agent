@@ -124,6 +124,7 @@ async fn approved_sibling_build(shell_route: bool) {
 }
 
 /// #2723: argv builds must admit the granted sibling, preserving Build approval.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn approved_sibling_argv_build_uses_its_own_fence() {
     approved_sibling_build(false).await;
@@ -136,6 +137,7 @@ async fn approved_sibling_shell_build_uses_its_own_fence() {
 }
 
 /// #2723: missing sibling authority must not be promoted to a Build approval.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn unapproved_sibling_build_is_refused_with_grant_guidance() {
     let temp = tempfile::tempdir().unwrap();
@@ -155,6 +157,7 @@ async fn unapproved_sibling_build_is_refused_with_grant_guidance() {
 
 /// #2723: canonical cwd escaping a granted sibling via a symlink is denied
 /// before Build admission, just as an escape from the launch root was denied.
+#[cfg(feature = "confine")]
 #[cfg(unix)]
 #[tokio::test]
 async fn sibling_build_symlink_escape_is_refused_by_both_routes() {
@@ -177,6 +180,7 @@ async fn sibling_build_symlink_escape_is_refused_by_both_routes() {
 
 /// #2723: full filesystem authority also admits a sibling, but the build
 /// request itself remains calibrated to that cwd, not the filesystem root.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn full_access_sibling_build_keeps_a_narrow_fence() {
     let launch = tempfile::tempdir().unwrap();
@@ -199,6 +203,7 @@ async fn full_access_sibling_build_keeps_a_narrow_fence() {
 
 /// #2723: a relative grant must not acquire a different meaning from the
 /// harness process cwd when choosing an absolute build fence.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn relative_grant_does_not_authorize_a_sibling_build() {
     let launch = tempfile::tempdir().unwrap();
@@ -235,6 +240,7 @@ async fn host_scoped_build_child_narrows_network(shell_route: bool) {
 }
 
 /// #2729: argv builds narrow host authority before admission.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn host_scoped_build_children_narrow_network_argv() {
     host_scoped_build_child_narrows_network(false).await;
@@ -248,6 +254,7 @@ async fn host_scoped_build_children_narrow_network_shell() {
 
 /// #2773: a missing cwd is an execution precondition failure, not missing
 /// authority. Real directories ground both build routes without spawning Cargo.
+#[cfg(feature = "confine")]
 #[tokio::test]
 async fn missing_cwd_2773_build_routes() {
     let root = tempfile::tempdir().unwrap();
