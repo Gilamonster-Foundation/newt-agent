@@ -36,9 +36,8 @@
 //! 5 of headroom. When a crate shrinks, lower its row. When a crate grows past
 //! its row, that is a finding to report, not a number to raise.
 
-// The count is for one Linux triple, so one Linux host is enough to hold it.
-// Off Linux this file is empty rather than fetching a foreign platform's
-// manifests.
+// Run on Linux: counts use one pinned Linux triple; bridle presence/absence
+// resolves Linux, Windows and macOS target configurations without compiling them.
 #![cfg(target_os = "linux")]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,10 +114,10 @@ fn cargo(args: &[&str]) -> String {
 /// colours the ` (*)` marker, so it is not stripped and the count comes back as
 /// the double count (`newt-core` 694, not 523).
 fn closure(package: &str) -> BTreeSet<String> {
-    closure_with(package, &[])
+    closure_with(package, &[], TARGET)
 }
 
-fn closure_with(package: &str, args: &[&str]) -> BTreeSet<String> {
+fn closure_with(package: &str, args: &[&str], target: &str) -> BTreeSet<String> {
     let mut command = vec![
         "tree",
         "--color",
@@ -130,7 +129,7 @@ fn closure_with(package: &str, args: &[&str]) -> BTreeSet<String> {
         "--prefix",
         "none",
         "--target",
-        TARGET,
+        target,
     ];
     command.extend_from_slice(args);
     parse_tree(package, &cargo(&command))
@@ -190,8 +189,11 @@ fn measure_rows(
 /// Measure each package AND feature selection once; neither core row hides the other.
 fn actuals() -> &'static BTreeMap<Selection, usize> {
     static ACTUALS: OnceLock<BTreeMap<Selection, usize>> = OnceLock::new();
-    ACTUALS
-        .get_or_init(|| measure_rows(rows(), |(package, args)| closure_with(package, args).len()))
+    ACTUALS.get_or_init(|| {
+        measure_rows(rows(), |(package, args)| {
+            closure_with(package, args, TARGET).len()
+        })
+    })
 }
 
 #[test]
@@ -277,6 +279,20 @@ const BRIDLE_CRATES: [&str; 5] = [
     "agent-bridle-fdguard",
     "agent-bridle-tool-shell",
     "agent-bridle-tool-web",
+];
+/// Measured with default normal/build trees on 2026-11-24: fdguard is Unix-only.
+const BRIDLE_TARGETS: &[(&str, &[&str])] = &[
+    (TARGET, &BRIDLE_CRATES),
+    (
+        "x86_64-pc-windows-msvc",
+        &[
+            "agent-bridle",
+            "agent-bridle-core",
+            "agent-bridle-tool-shell",
+            "agent-bridle-tool-web",
+        ],
+    ),
+    ("aarch64-apple-darwin", &BRIDLE_CRATES),
 ];
 const DIRECT_BRIDLE: [&str; 3] = [
     "agent-bridle",
@@ -377,18 +393,21 @@ fn bridle_manifest(meta: &serde_json::Value) -> Result<(), String> {
     }
 }
 
-/// Cargo-backed integration evidence, over both isolated feature selections.
+/// Grounds the literal tree/name checks in Cargo output for both off selections
+/// on each target configuration. Resolution on Linux is not native compilation.
 #[test]
 fn the_confine_off_closure_names_no_bridle_crate() {
     let mut leaks = Vec::new();
-    for args in [
-        &["--no-default-features"][..],
-        &["--no-default-features", "--features", "markdown"],
-    ] {
-        let tree = closure_with("newt-core", args);
-        let found = bridle_names(&tree);
-        if !found.is_empty() {
-            leaks.push(format!("{args:?}: {found:?}"));
+    for &(target, _) in BRIDLE_TARGETS {
+        for args in [
+            &["--no-default-features"][..],
+            &["--no-default-features", "--features", "markdown"],
+        ] {
+            let tree = closure_with("newt-core", args, target);
+            let found = bridle_names(&tree);
+            if !found.is_empty() {
+                leaks.push(format!("{target} {args:?}: {found:?}"));
+            }
         }
     }
     assert!(
@@ -398,11 +417,17 @@ fn the_confine_off_closure_names_no_bridle_crate() {
     );
 }
 
-/// Positive integration control: the same walker sees every exact default name.
+/// Positive integration control: the same walker sees each target's measured set.
 #[test]
 fn the_default_closure_names_every_bridle_crate() {
-    let tree = closure("newt-core");
-    assert_eq!(bridle_names(&tree), BTreeSet::from(BRIDLE_CRATES));
+    for &(target, expected) in BRIDLE_TARGETS {
+        let tree = closure_with("newt-core", &[], target);
+        assert_eq!(
+            bridle_names(&tree),
+            expected.iter().copied().collect(),
+            "{target}"
+        );
+    }
 }
 
 /// Cargo metadata integration evidence covers normal/dev/build and target rows.

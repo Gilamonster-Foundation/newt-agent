@@ -4,9 +4,9 @@
 //! later steps of that epic move every use of agent-bridle behind. Two lint runs of
 //! newt-core alone keep it honest, each with one default feature off: the lean gate
 //! (`markdown` off, `confine` kept) and the confine-off gate (`confine` off, the
-//! rest kept). They are written down in four places: the `lean-build` job of
+//! rest kept). They are written down in the `lean-build` job of
 //! `.github/workflows/ci.yml`, the `check` recipe of the `justfile`, the `windows`
-//! job (the confine-off gate again, for the `cfg(windows)` arms) and the
+//! and `macos` jobs (the confine-off gate for their platform arms) and the
 //! `# CI-ONLY` header of `.githooks/pre-push`.
 //!
 //! The failures this guards against are quiet. Cargo features are additive, so a
@@ -16,7 +16,7 @@
 //! gate at once, so a red step no longer names its cause.
 //!
 //! As in `msrv_pipeline_parity_ratchet.rs`, no command is pinned as a string: the
-//! commands are extracted and compared, CI to justfile, Windows job to lean job,
+//! commands are extracted and compared, CI to justfile, native jobs to lean job,
 //! hook to lean job, and the default feature list is read from the manifest.
 //! Change every site the same way and this stays green; change one and it fails.
 //!
@@ -37,7 +37,7 @@ const MANIFEST: &str = include_str!("../Cargo.toml");
 
 /// One job block of `ci.yml`, from its key at two-space indent to the next job key.
 ///
-/// Scoped, not grepped whole-file: two jobs lint newt-core alone, and an unscoped
+/// Scoped, not grepped whole-file: several jobs lint newt-core alone, and an unscoped
 /// search would keep passing on one job's line after the other's was deleted.
 fn ci_job(key: &str) -> &'static str {
     let Some(at) = CI.find(&format!("\n  {key}:\n")) else {
@@ -192,16 +192,16 @@ fn gate_problems(lean_job: &str, recipe: &str, manifest: &str) -> Vec<String> {
     problems
 }
 
-/// The `windows` job must run the lean job's confine-off gate, and no other gate.
-fn windows_leg_problems(lean_job: &str, windows_job: &str) -> Vec<String> {
+/// Each native job must run the lean job's confine-off gate, and no other gate.
+fn native_leg_problems(lean_job: &str, native_job: &str) -> Vec<String> {
     let confine_off = gates_with_confine(lean_job, false);
-    let windows = gates(windows_job);
-    if !confine_off.is_empty() && windows == confine_off {
+    let native = gates(native_job);
+    if !confine_off.is_empty() && native == confine_off {
         return Vec::new();
     }
     vec![format!(
-        "ci.yml's windows job must run the lean-build job's confine-off gate and no \
-         other newt-core gate.\n  lean-build : {confine_off:?}\n  windows    : {windows:?}"
+        "ci.yml's native job must run the lean-build job's confine-off gate and no \
+         other newt-core gate.\n  lean-build : {confine_off:?}\n  native     : {native:?}"
     )]
 }
 
@@ -339,6 +339,7 @@ fn the_ratchet_reads_the_real_files() {
     for (what, block) in [
         ("ci.yml lean-build job", ci_job("lean-build")),
         ("ci.yml windows job", ci_job("windows")),
+        ("ci.yml macos job", ci_job("macos")),
         ("justfile `[unix] check` recipe", check_recipe()),
     ] {
         assert!(
@@ -368,14 +369,16 @@ fn the_confine_off_gates_are_the_same_in_ci_and_the_justfile_and_turn_one_axis_o
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// **The Windows job runs the confine-off gate the lean job runs.**
+/// **The Windows and macOS jobs run the confine-off gate the lean job runs.**
 ///
-/// The Linux gate compiles no `cfg(windows)` arm, so a use of agent-bridle left
-/// ungated there would first show on a Windows host.
+/// The Linux gate does not compile those platform arms, so an ungated reference
+/// there needs the corresponding native lint step.
 #[test]
-fn the_windows_job_runs_the_same_confine_off_gate() {
-    let problems = windows_leg_problems(ci_job("lean-build"), ci_job("windows"));
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
+fn the_native_jobs_run_the_same_confine_off_gate() {
+    for job in ["windows", "macos"] {
+        let problems = native_leg_problems(ci_job("lean-build"), ci_job(job));
+        assert!(problems.is_empty(), "{job}: {}", problems.join("\n"));
+    }
 }
 
 /// **A default build keeps `confine`, and only the named features turn it on.**
@@ -471,11 +474,15 @@ fn the_checks_reject_what_they_exist_to_catch() {
         "red control passed: `default` grew a feature and no gate changed"
     );
 
-    let windows = mutated(ci_job("windows"), off, &off.replace(" --all-targets", ""));
-    assert!(
-        !windows_leg_problems(job, &windows).is_empty(),
-        "red control passed: the windows job runs a different command"
-    );
+    for key in ["windows", "macos"] {
+        for replacement in [off.replace(" --all-targets", ""), String::new()] {
+            let native = mutated(ci_job(key), off, &replacement);
+            assert!(
+                !native_leg_problems(job, &native).is_empty(),
+                "red control passed: the {key} job has a different or missing command"
+            );
+        }
+    }
 
     for (from, to) in [
         ("\"markdown\", \"confine\"]", "\"markdown\"]"),
