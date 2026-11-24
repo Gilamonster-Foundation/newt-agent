@@ -2843,7 +2843,7 @@ async fn confine_off_a_quoted_commit_is_refused_before_the_shell_route() {
 /// Grounds exact-target prompt tests in a real Seatbelt process-exec rule.
 /// A harmless test executable is reached through temporary non-system symlinks;
 /// granting one must launch it without granting its same-named sibling.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 async fn exact_executable_grants_launch_only_the_approved_non_system_binary() {
     let _lock = super::disable_ocap_tests::env_lock().await;
@@ -3080,7 +3080,7 @@ async fn native_once_filesystem_rejects_the_whole_invalid_declaration_before_pro
 
 /// Grounds complete-declaration admission with a real workspace side effect
 /// that must not occur when either grant decision drops a declared path.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 async fn native_once_filesystem_incomplete_decisions_never_start_the_child() {
     use newt_policy::caveats::Scope;
@@ -3136,7 +3136,7 @@ async fn native_once_filesystem_incomplete_decisions_never_start_the_child() {
 
 /// Grounds declared one-shot policy with a real Seatbelt child that must read
 /// one external file and write another, without granting their parent directory.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 async fn native_once_filesystem_declarations_reach_only_the_admitted_child() {
     let _lock = super::disable_ocap_tests::env_lock().await;
@@ -3234,7 +3234,7 @@ async fn native_once_filesystem_declarations_reach_only_the_admitted_child() {
 /// Grounds the live-policy seam and exact session-grant tests in a real native
 /// child's Seatbelt file read. The baseline stays unchanged across calls: only
 /// the gate remembers approval, and the sibling remains outside its scope.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 async fn live_permission_refresh_reaches_native_child_in_the_same_turn() {
     use crate::agentic::RepeatCallGuard;

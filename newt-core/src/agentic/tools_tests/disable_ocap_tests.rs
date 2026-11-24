@@ -2861,7 +2861,7 @@ async fn lifecycle_run_of_non_build_tool_does_not_request_build_authority() {
 /// failed with `You can set the path to the Xcode folder using
 /// /usr/bin/xcode-select -switch`. Library tests run the safe-subset engine
 /// (see `bridle_registry`), so this covers the exec fence, not brush's lookup.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 #[serial_test::serial]
 async fn confined_python3_runs_on_macos() {

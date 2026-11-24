@@ -130,7 +130,7 @@ impl PermissionGate for WidenAll {
 
 /// Grounds declaration preflight with a real workspace canary: a request to
 /// expose private frame storage must not consult the operator or start a child.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "confine"))]
 #[tokio::test]
 #[serial_test::serial]
 async fn native_once_filesystem_frame_preflight_precedes_consumption_and_spawn() {
