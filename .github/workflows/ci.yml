@@ -419,7 +419,7 @@ jobs:
       # crate that takes newt-core's defaults, turns `confine` back on and the step
       # passes on a build that is not confine-off.
       # newt-core/tests/confine_gate_parity_ratchet.rs holds both steps equal to
-      # the justfile's lines, and the Windows job's copy and the hook's account
+      # the justfile's lines, and the native jobs' copies and the hook's account
       # equal to this one.
       - name: clippy (newt-core, confine off)
         if: always()
@@ -948,7 +948,7 @@ jobs:
     # only here. Tests that fail only on macOS (Seatbelt admission, temp paths
     # under the `/var` symlink, tools missing from `/bin`) reached main twice
     # with every other check green (#2806, #3098); this job is the per-PR run
-    # that catches them. It mirrors the `windows` job's two commands.
+    # that catches them. The workspace commands mirror the `windows` job.
     timeout-minutes: 90
     env:
       CARGO_INCREMENTAL: 0
@@ -973,3 +973,10 @@ jobs:
       - name: cargo test
         if: always()
         run: cargo test --workspace --no-fail-fast --features newt-data/kernel,newt-interaction/schema
+      # HOOK PARITY: CI-only; named in .githooks/pre-push. PIPELINE PARITY:
+      # mirror the Windows/lean confine-off gate (#3160), so macOS-only arms
+      # compile without the backend too. The parity ratchet holds it equal.
+      # Last with `if: always()`: neither hides nor skips an earlier proof.
+      - name: clippy (newt-core, confine off)
+        if: always()
+        run: cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings

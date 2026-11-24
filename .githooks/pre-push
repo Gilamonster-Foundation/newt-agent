@@ -167,7 +167,7 @@
 #   - `just cov-ci` (coverage floor, cargo-llvm-cov instrumented whole-workspace)
 #   - the `--no-default-features` lean build/test config (issue #416, #1409, #1828)
 #   - the confine-off newt-core gate (#3160), ci.yml lean job and again in its
-#     Windows job: newt-core alone, every default feature but `confine`:
+#     Windows and macOS jobs: newt-core alone, every default feature but `confine`:
 #     `cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings`
 #     and, in the lean job, the probe that cargo really resolved `confine` off.
 #     The lean newt-core gate of the bullet above now names `confine` and keeps
@@ -175,7 +175,7 @@
 #     both clippy lines on Unix; this hook builds default features only. A push
 #     that touches a file the pin reads does run the pin here, as an ordinary
 #     newt-core test: newt-core/tests/confine_gate_parity_ratchet.rs holds the
-#     two gates, the Windows copy and the command quoted in this bullet equal.
+#     two gates, the native copies and the command quoted in this bullet equal.
 #   - the confine-off newt-core tests (#3160), ci.yml lean job: off-only refusals
 #     plus portable route, build classification, floor and recorder predicates.
 #     HOOK PARITY / PIPELINE PARITY: ci.yml and Unix justfile `check` run the

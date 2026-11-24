@@ -62,16 +62,33 @@ request core defaults until downstream threading changes that.
 |---|---|
 | Default core | Linux all-target Clippy and default library suite; native platform CI |
 | `--no-default-features --features confine` | Markdown-off all-target Clippy |
-| `--no-default-features --features markdown` | Core alone: Linux all-target Clippy, guarded refusal/route tests, feature probe, and Windows off Clippy; native macOS evidence supplied separately |
-| `--no-default-features` | Independent normal/build closure absence assertion |
+| `--no-default-features --features markdown` | Core alone: native all-target Clippy on Linux, Windows and macOS; guarded refusal/route tests and feature probe on Linux |
+| `--no-default-features` | Independent normal/build closure absence assertion for each target configuration below |
 
 The existing `closure_ledger` integration target invokes Cargo for both absence
-selections, an exact five-name default positive control, and metadata covering
+selections and a measured default positive control on each target below. The
+Linux and macOS controls name five bridle crates; Windows names four because
+`agent-bridle-fdguard` is Unix-only. The ledger also inspects metadata covering
 every direct normal/dev/build/target declaration and renamed local key. Its
 literal sample test is hermetic; the Cargo-backed tests are integration
 evidence. Counts are cached by package **and feature selection**. The ordinary
 ledger target runs in CI and the hook; its off closure checks do not depend on
 the test executable itself having confine off.
+
+The closure is **resolved for three target configurations on a Linux runner**
+with `cargo tree --target <triple> -e normal,build`; this does not compile for
+those targets or require their Rust standard libraries. Both bare off and
+markdown-only off are checked. The package-count ceilings remain Linux-only.
+Native lint and test steps select `--no-default-features --features markdown`:
+
+| Target configuration | Off closure resolution | Native off lint in CI | Native off tests in CI |
+|---|---|---|---|
+| `x86_64-unknown-linux-gnu` | Linux ledger | Linux `lean-build` job | Guarded refusal/route selection |
+| `x86_64-pc-windows-msvc` | Linux ledger | `windows` job | None |
+| `aarch64-apple-darwin` | Linux ledger | `macos` job | None |
+
+The native lint steps establish compilation independently of closure
+resolution. Only Linux runs native off tests in CI.
 
 The off library guard checks listing success, subtracts ignored matches and
 requires at least 18 `confine_off` tests on the Linux/Unix selection measured
@@ -136,8 +153,7 @@ No resolved reqwest, libc, tokio, serde, serde_json, sha2,
 content-addressable or agent-mesh-protocol feature is lost. In particular,
 libc `extra_traits` remains. These dependency/source observations are not a
 TLS, ANSI-rendering or cryptographic runtime experiment. The feature matrix
-and library runs check the selected callers; native macOS remains separate
-evidence.
+and library runs check the selected callers.
 
 The workspace's three bridle patches remain necessary for Newt-specific APIs.
 Making dependencies optional does not repair published-crate compilation
