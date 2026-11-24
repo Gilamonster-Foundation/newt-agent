@@ -4,8 +4,8 @@
 //! stay, so the code outside this module that imports them compiles unchanged. Every call,
 //! whatever its origin, is refused as [`ExecRefused::ConfinementUnenforceable`] before a
 //! scratch directory or a process exists, and the three probes report no fence. This file
-//! names no agent-bridle crate, tests included: `tests/confine_boundary_ratchet.rs` holds
-//! it to that (#3160).
+//! has no bridle dependency available when compiled off: core-only all-target builds
+//! and `tests/closure_ledger.rs` check the dependency boundary (#3160).
 
 use super::{off_refusal, ConfinedOutput, ExecRefused, ExecRequest};
 

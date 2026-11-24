@@ -26,7 +26,7 @@
 //!    plus the validated `credential.*` lines ([`import_credentials`]).
 //! 3. **Confined copy** — `git -C <staging> fetch <workspace repo> <oid>` runs
 //!    under a kernel fence whose RETURNED sandbox kind is checked
-//!    ([`confined::confined_fetch`]); staging's alternates file is then removed and
+//!    (`confined::confined_fetch`); staging's alternates file is then removed and
 //!    `fsck --connectivity-only <oid>` proves the approved commit is
 //!    self-contained before any network step runs.
 //! 4. **Dial** — `push <url> <approved-oid>:refs/heads/<branch>` from staging;
@@ -559,7 +559,7 @@ impl HeldRoots {
     /// renamed away, or swapped for a symlink after binding refuses.
     ///
     /// On Linux the fence itself is then built from the handles
-    /// ([`HeldRoots::held_read_roots`]), so this check is defence in depth
+    /// (`HeldRoots::held_read_roots`), so this check is defence in depth
     /// there; on macOS the Seatbelt profile is path-only and this check is
     /// the admission guard (residual #8).
     ///

@@ -405,6 +405,7 @@ mod shell_engine_tests {
 
     /// #3160: the probe is bridle's own, copied so the engine choice needs no bridle crate;
     /// while bridle is a dependency the two must agree.
+    #[cfg(feature = "confine")]
     #[test]
     fn the_worker_transport_probe_is_the_one_bridle_reports() {
         assert_eq!(

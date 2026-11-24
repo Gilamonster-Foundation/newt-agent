@@ -8,7 +8,7 @@ name: CI
 # `--workspace` on ALL), plus scripts/spawn_inventory.py and `just docs-check`.
 # This CI workflow is the authoritative FULL gate: coverage (cov-ci), MSRV,
 # security audit, the `--no-default-features` lean config, the `confine`-off
-# newt-core gate and tests (#3160), the whole npm
+# newt-core gate and guarded tests (#3160; also in Unix `just check`), the whole npm
 # installer matrix (the hook runs no npm check on any OS), the
 # eval/harness/PTY/mcp-import-real real-resource lanes, the real-`newt`-
 # session / real-PTY integration binaries the hook's nextest filter excludes
@@ -445,14 +445,29 @@ jobs:
           echo "features with confine off: $off"
           has_confine "$on" || { echo "::error::the probe cannot see confine when it is on"; exit 1; }
           if has_confine "$off"; then echo "::error::confine is on in the confine-off build"; exit 1; fi
-      # HOOK PARITY: CI-only; the exact selector is named in .githooks/pre-push.
-      # PIPELINE PARITY: the hook's CI-ONLY bullet mirrors this command; justfile
-      # does not repeat it. #3160: off-only refusal tests plus portable shared
-      # route, build classification, floor and recorder predicates. Every term
-      # has a measured nonzero match count; P15 adds the automated count guard.
+      # HOOK PARITY: this off selector is CI-only relative to .githooks/pre-push.
+      # PIPELINE PARITY: Unix justfile `check` mirrors this guard and selection;
+      # the hook's CI-ONLY bullet names both. P12 baseline: 18 nonignored off-only
+      # tests. Other OR filters cannot conceal an empty off-only selection.
       - name: test (newt-core, confine off)
         if: always()
-        run: cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off route_selection_tests build_shell::tests exec_floor_permits_ exec_floor_refuses_ shadow_records_iff
+        run: |
+          confine_off_tests() {
+            cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off route_selection_tests build_shell::tests exec_floor_permits_ exec_floor_refuses_ shadow_records_iff "$@"
+          }
+          confine_off_gate() {
+            local listed ignored count ignored_count
+            listed=$(confine_off_tests --list) || return 1
+            ignored=$(confine_off_tests --list --ignored) || return 1
+            count=$(printf '%s\n' "$listed" | awk '/confine_off.*: test$/ { n++ } END { print n+0 }')
+            ignored_count=$(printf '%s\n' "$ignored" | awk '/confine_off.*: test$/ { n++ } END { print n+0 }')
+            if [ "$((count - ignored_count))" -lt 18 ]; then
+              echo "confine-off guard: need at least 18 nonignored off-only tests; listed $count, ignored $ignored_count" >&2
+              return 1
+            fi
+            confine_off_tests
+          }
+          confine_off_gate
       # HOOK PARITY: CI-only; named in .githooks/pre-push. The justfile `check` recipe
       # mirrors the clippy and test lines (PIPELINE PARITY there); the `cargo tree` probe
       # after them is not repeated locally.

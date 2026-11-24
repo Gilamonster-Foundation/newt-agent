@@ -416,30 +416,25 @@ pub(crate) fn validate_tool_call_batch(
 ///
 /// Scope: `run_command` only.
 ///
-/// **The stub-shell caveat this paragraph used to carry is no longer true, and
-/// its own removal condition has been met.** It said stub-shell builds were the
-/// only crates.io-publishable configuration and that agent-bridle's `shell`
-/// tool failed closed on every command there. Measured on 2026-09-08:
+/// Historical observation (2026-09-08):
 /// `cargo tree -p newt-core --no-default-features -i agent-bridle-tool-shell
-/// -e features` reports the `brush` and `carried-coreutils` features enabled,
-/// from the unconditional dependency edge in `newt-core/Cargo.toml`; no newt
-/// feature disables the shell backend, there is no `[patch]` section in the
-/// workspace, and `brush-ocap-*` resolve from crates.io in `Cargo.lock`. The
-/// publishable configuration and the real-shell configuration are the same
-/// configuration. `web_fetch` is NOT bypassed, and never was affected by the
-/// caveat above either way — `crate::web_fetch` is the real leash-enforcing
-/// implementation (a copy of agent-bridle-tool-web's, #3160), so
-/// it does not fail closed. The fs tools keep the
-/// newt-native workspace fence untouched: yolo is unconfined exec, fenced fs
-/// — never a global authority-off switch.
+/// -e features` then reported `brush` and `carried-coreutils` through an
+/// unconditional dependency. At that time no feature disabled the backend,
+/// the workspace had no `[patch]`, and the published and real-shell configurations
+/// coincided. That observation retired the earlier stub-shell caveat; it is not
+/// a statement about today's feature graph or published-crate buildability.
 ///
-/// The removal condition recorded here — "when agent-bridle's real confined
-/// shell becomes the default everywhere" — has been met, by published
-/// `brush-ocap-*` crates rather than by an upstream brush merge
-/// (reubeno/brush#1184 remains open). Whether the `--disable-ocap` escape
-/// hatch itself should now be removed or demoted to a debug flag is a separate
-/// question about the bypass, not about shell availability, and is not decided
-/// here.
+/// Since #3160, `confine` controls the compiled backend. With it off, core's
+/// selected normal/build closure has no bridle crate, and commands reaching the
+/// confined shell route return Unavailable. This does not assert the runtime
+/// bypass: host admission still requires it, no broker/lease, and a permitting
+/// execution floor. Full access alone is insufficient. See
+/// `docs/decisions/confine_feature.md`. Workspace bridle patches still provide
+/// Newt-specific APIs; this feature does not repair the published-crate defect.
+///
+/// `web_fetch` is not bypassed: `crate::web_fetch` is the owned leash-enforcing
+/// implementation. File tools keep the newt-native workspace fence. Removing
+/// or demoting the runtime bypass remains a separate decision.
 pub fn ocap_disabled() -> bool {
     // Reads the process's FROZEN `LaunchAuthority` (resolved once from
     // `NEWT_DISABLE_OCAP` near startup), never the live env — so a switch that

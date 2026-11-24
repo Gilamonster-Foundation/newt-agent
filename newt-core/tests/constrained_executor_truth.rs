@@ -113,7 +113,7 @@ fn verifier_agrees_with_the_spawn_inventory_gate() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "confine"))]
 mod real_resource {
     use newt_core::confined_exec::{
         workspace_confined_caveats, ConstrainedExecutor, ExecOrigin, ExecRefused, ExecRequest,

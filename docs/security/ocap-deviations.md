@@ -67,6 +67,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 |---|---|---|---|
 | `governed-push-macos-net-unrestricted` | confined fetch uses net=none on every platform | 🟠 ACTIVE (macos) | (macOS-only: the vendored agent-bridle 0.8.0-rc.6 admits net=none and reports net Kernel for an unprivileged spawn with audited (piped/null) stdio, but the confined fetch has not adopted it and still uses net=Scope::All; fs is enforced via fd-based O_NOFOLLOW walk, exec not yet separately confined in copy; copy-side exec follow-up: #2661; net follow-up: #2662) |
 | `governed-push-macos-copy-fence-path-bound` | the confined copy's read fence anchors on the held root objects | 🟠 ACTIVE (macos) | (macOS-only, residual #8: Seatbelt admits paths, so a root swapped between the identity check and the profile may be read by the confined fetch; what is pushed is fixed by oid. Linux anchors on the held descriptors) |
+| `confine-off-build` | compiled backend available for confinement | 🟠 ACTIVE (explicit optional build) | confined executor and shell routes unavailable; host bypass remains explicitly authorized |
 | `b1-os-isolation` | OS isolation + egress proxy | 🟡 GATED | live credentials, untrusted-remote voices (UNREACHABLE) |
 | `local-deputy-egress` | no indirect egress via a host AF_UNIX / Windows named-pipe deputy | 🟠 ACTIVE (linux/windows) / 🟢 DENIED (macos) | (a confinement limitation on run_command/build/crew — not a gated capability) |
 | `mach-xpc-ambient-deputy` | no indirect authority via an ambient host Mach/XPC service (macOS) | 🟡 NARROWED (macos: deny-all/direct-denied net closed) / 🟠 ACTIVE (macos: loopback/host-grant net) | (a Seatbelt confinement limitation on run_command/build/crew — not a gated capability) |
@@ -90,6 +91,37 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `posture-report-honesty` | every security-posture surface is DERIVED from the same `verify_*` invariants the gates enforce, never independent prose | 🟢 closed | (a posture surface that asserts a claim the verifiers don't back — a report/enforcement drift) |
 | `platform-capability-ceiling` | an unsupported/unverified platform reports each guarantee as `unsupported` and REFUSES operations needing it — never a Linux-equivalent OCAP claim | 🟢 closed | (a non-Linux build silently claiming a kernel-backed guarantee it cannot provide) |
 | `dependency-fetch-egress` | a networked child's host allow-list is kernel-enforced | 🟠 ACTIVE (operator-gated) | the build lane's `cargo fetch --locked` without the operator's `net` grant for the crates.io hosts |
+
+### confine-off-build
+- **Invariant (ideal):** operations requiring confinement have a compiled backend
+  and report only enforcement they can deliver.
+- **Practical caveat (now):** `newt-core` can be built without its default-on
+  `confine` feature. Its selected normal/build closure then contains no bridle
+  crate. This does not assert the runtime OCAP bypass (R1).
+- **Residual:** a deliberately selected optional build posture provides no
+  confined executor or shell backend. Explicit OCAP-off host execution is
+  unconfined; full access or selecting Host alone does not authorize it. Core's
+  catalog can still advertise operations it will refuse. Default backend
+  advisory residuals and the MCP crates' separate feature contracts remain.
+- **Disabled while open:** every `ConstrainedExecutor` call and command reaching
+  the confined shell route refuses; executor-backed builds and `move_from`
+  cannot execute. Governed Git brokers and all their preflights are absent.
+  OCAP-on commits retain the no-broker refusal; other shell commands refuse at
+  the boundary. Earlier built-ins/native routes retain their own checks.
+- **Compensating controls:** an explicit launch-time bypass, no broker/lease,
+  and a permitting exec floor are still required for the host route. The
+  executor verifier reports Absent, its probes are false, and core's owned
+  web/file/policy/descriptor operations retain their independent checks.
+- **Closure criterion:** this remains active while optional backend absence is
+  supported; enable `confine` to restore the backend, whose runtime guarantees
+  and residuals must still be evaluated independently.
+- **Ratchet guard:** `newt-core/tests/closure_ledger.rs` (two absence selections,
+  default positive control, all direct metadata rows), the core `confine_off`
+  tests and their nonignored count guard, `constrained_executor_truth.rs`, and
+  `confine_gate_parity_ratchet.rs`. See
+  [the feature decision](../decisions/confine_feature.md).
+- **Status:** OPEN — deliberate optional posture, not a closed kernel guarantee;
+  owner: confinement maintainers; review-by: any feature or shell-route change.
 
 ### b1-os-isolation
 - **Invariant (ideal):** uid-namespace + Landlock fs + seccomp + default-deny netns + an
@@ -883,7 +915,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   feature (#3160) compiles no executor: every `ConstrainedExecutor` call is refused with
   `ExecRefused::ConfinementUnenforceable` before a scratch directory or a process exists, the
   fence probes report no fence, and this verifier reports `Absent`, naming the feature (the
-  `confine_off` tests in `newt-core`).
+  `confine_off` tests in `newt-core`); see [confine-off-build](#confine-off-build).
 - **Status:** CLOSED (migration + confinement + #8 env-isolation) — inventory gate (step-4.1),
   fail-closed executor + kernel-backed adversarial proof (step-4.2), build_check (step-4.3), crew +
   calibrated read fence (step-4.4), roadmap verify + newt-tui reclassify (step-4.5), yolo reclassify +
@@ -1273,9 +1305,10 @@ resolved in a later release:
   off, the existing broker, lease and exec-floor checks still decide whether
   the host route may run; otherwise the same shell refusal applies.
   Full-access alone does not authorize host execution. The shell's documented
-  advisory fallback in builds with `confine` is unchanged. Dependencies remain
-  non-optional at this step, so this is not a bridle-free binary. Repository
-  consumers still take newt-core's default features.
+  advisory fallback in builds with `confine` is unchanged. The selected core
+  closure now contains no bridle crate with `confine` off; repository consumers
+  still take core defaults, so this is not a bridle-free binary. See
+  [confine-off-build](#confine-off-build).
 
 ### Native commit cancellation: lease shutdown is not tree completion (#2686)
 

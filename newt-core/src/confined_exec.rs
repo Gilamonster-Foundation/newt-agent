@@ -52,7 +52,7 @@
 //! documented, permanent residual (agent-bridle `exec-behavior-bound` /
 //! ADR 0011 D7), not a bug — so an `AgentInfluenced` spawn with a restricted
 //! `exec` scope refuses unconditionally on Linux, for every caller, forever.
-//! [`NativeGitBroker`](crate::native_git_broker) hit exactly this: its own
+//! `NativeGitBroker` hit exactly this: its own
 //! host-side re-dispatch of `git` (`exec: Scope::only(["git"])`) always
 //! refused, so a governed commit could never land in a default-permission
 //! session (#2693).
@@ -119,10 +119,10 @@ pub enum ExecOrigin {
     /// A fixed-program, policy-mediated re-dispatch issued by a HOST-SIDE
     /// broker that already bounds which program/argv may run — not a raw
     /// model `run_command` (see the module doc's "per-axis exception").
-    /// Minted under [`agent_bridle::EnforcementFloor::CONFINED`]: `fs`/`net`
+    /// Minted under `agent_bridle::EnforcementFloor::CONFINED`: `fs`/`net`
     /// still require `Kernel` (fail-closed, #10 unchanged), `exec` accepts
     /// the `Interceptor` tier Landlock actually provides. Currently used only
-    /// by [`crate::native_git_broker::NativeGitBroker`]'s own `git`
+    /// by `crate::native_git_broker::NativeGitBroker`'s own `git`
     /// re-dispatch.
     BrokerMediated,
 }
@@ -253,7 +253,7 @@ impl ExecRequest {
 
     /// Give the run a private scratch `dir`: created just before spawning
     /// (owner-only, refused if anything already exists there, symlink
-    /// included) and removed when the run ends. See [`ScratchDir`].
+    /// included) and removed when the run ends. See `ScratchDir`.
     #[must_use]
     pub fn scratch_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.scratch_dirs.push(dir.into());
@@ -590,7 +590,7 @@ pub(crate) fn developer_tool_directory() -> Option<PathBuf> {
 /// A `Caveats` fence for an attacker-influenced subprocess confined to
 /// `workspace`: it may read and write **only** beneath the workspace root, run
 /// any program (an interpreter's *identity* is admitted; its behavior is bounded
-/// by the fs/net axes — see [`agent_bridle::AxisEnforcement::Kernel`]'s doc), and reach **no**
+/// by the fs/net axes — see `agent_bridle::AxisEnforcement::Kernel`'s doc), and reach **no**
 /// network (empty `net` → kernel deny-all). Built axis-by-axis so a headless
 /// dispatch path never even mentions `Caveats::top()` (the `#94` no-top-leak
 /// guard).

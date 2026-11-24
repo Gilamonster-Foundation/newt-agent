@@ -178,8 +178,12 @@
 #     two gates, the Windows copy and the command quoted in this bullet equal.
 #   - the confine-off newt-core tests (#3160), ci.yml lean job: off-only refusals
 #     plus portable route, build classification, floor and recorder predicates.
-#     HOOK PARITY / PIPELINE PARITY: this CI-ONLY selector mirrors ci.yml exactly;
-#     justfile does not repeat it (the existing core clippy gates remain there).
+#     HOOK PARITY / PIPELINE PARITY: ci.yml and Unix justfile `check` run the
+#     same selector with a successful-listing guard requiring at least 18
+#     nonignored off-only tests. Other OR filters cannot satisfy that floor.
+#     The hook keeps default builds. Its ordinary closure_ledger integration
+#     target also checks both off dependency selections, metadata and the
+#     feature-specific ceiling; that target is not CI-only.
 #     `cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off route_selection_tests build_shell::tests exec_floor_permits_ exec_floor_refuses_ shadow_records_iff`
 #   - the confine-off newt-mcp-server gate (#3160), ci.yml lean job: that crate alone, no
 #     default features (its one default feature is `confine`): `cargo clippy -p
