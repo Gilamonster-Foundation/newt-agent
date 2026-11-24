@@ -106,9 +106,9 @@ the previously unified decoding and bundled/native trust-root feature set;
 the trust-root consequence is inferred from reqwest's feature table, not a TLS
 experiment. The default/off feature-tree difference is recorded below.
 
-The normalized `cargo tree -e features --prefix none` difference has 428
-lines. Removed packages and their activation edges belong to bridle's shell,
-carried coreutils, OS sandbox and P-256 verifier stacks. Several names have
+In the normalized `cargo tree -e features --prefix none` difference between
+the two selections, the removed packages and their activation edges belong to
+bridle's shell, carried coreutils, OS sandbox and P-256 verifier stacks. Several names have
 multiple versions: `nix` 0.31.3, `signature` 3.0.0, `serde_spanned` 0.6.9 and
 `toml_edit` 0.22.27 disappear while their other versions remain. Their lost
 activation edges do not mean the surviving versions lost those features.
