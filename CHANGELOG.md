@@ -11,6 +11,12 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ### Changed
 
+- `newt-core`'s three agent-bridle dependencies are optional behind its default-on
+  `confine` feature (#3160). Core's selected normal/build closure contains no bridle
+  crate with the feature off. External `default-features = false` consumers must
+  enable `confine` explicitly to retain the backend. Repository consumers still
+  take core defaults; this does not make a bridle-free `newt` binary.
+
 - `newt-mcp-client` has a `confine` feature, on by default (#3160). Without it the crate names
   no agent-bridle crate: stdio servers are spawned advisory (environment scrubbed, inherited
   descriptors denied on Unix, no OS sandbox, `SandboxKind::None`, refused for a

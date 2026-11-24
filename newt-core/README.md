@@ -13,6 +13,10 @@ session and memory types, MCP server
 resolution and metrics used across the workspace. The capability caveat
 extensions moved to `newt-policy` (#3160).
 
+The `confine` feature enables the confinement backend and is on by default.
+Consumers disabling defaults must request `features = ["confine"]` to retain it.
+See the [feature decision](../docs/decisions/confine_feature.md) for behavior and scope.
+
 Turn metrics distinguish an answer from a question awaiting the operator and
 from incomplete narration. `TurnEndReason::AwaitingOperator` serializes as
 `awaiting_operator`; both narration exits report incomplete work. These are

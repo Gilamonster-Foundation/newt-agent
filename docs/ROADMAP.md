@@ -2217,6 +2217,16 @@ them as a list, not a ranking.
   reference only: ten alias names rewrite to `run_command`, so gating it out of
   `ALL_TOOL_NAMES` would strand them on a name `is_hallucination` then rejects.
 
+  **Addendum, 2026-11-24 UTC (#3160):** the observation above is historical.
+  Core now has a default-on `confine` feature; selecting core alone without it
+  removes every bridle crate from its normal/build closure and makes the confined
+  shell route unavailable. This does not assert the runtime OCAP bypass; host
+  admission still requires explicit bypass and the existing route/floor checks.
+  Repository consumers retain core defaults. Catalog/alias and steering-text
+  follow-up is separate; this addendum does not reopen 27.3 or claim the existing
+  workspace patches are publishable. See
+  [the feature decision](decisions/confine_feature.md).
+
 - **27.4 is COMPLETE, and separately its TEXT is STALE — the two are different
   defects and must not be merged into one sentence.** *(derived — read from
   `git show` / `git log -S` output; traced by the 27.4 lane and re-verified

@@ -258,6 +258,26 @@ check:
     # crate that takes newt-core's defaults, turns `confine` back on. The probe
     # that follows that step in CI is not repeated here.
     cargo clippy -p newt-core --no-default-features --features markdown --all-targets -- -D warnings || rc=1
+    # PIPELINE PARITY: mirrors ci.yml's "test (newt-core, confine off)" guard
+    # and filters. HOOK PARITY: .githooks/pre-push names this off-only selection
+    # as CI-only relative to its default builds. Keep listing errors fatal to
+    # this check and preserve the recipe's aggregate failure status.
+    confine_off_tests() {
+      cargo test -p newt-core --no-default-features --features markdown --lib -- confine_off route_selection_tests build_shell::tests exec_floor_permits_ exec_floor_refuses_ shadow_records_iff "$@"
+    }
+    confine_off_gate() {
+      local listed ignored count ignored_count
+      listed=$(confine_off_tests --list) || return 1
+      ignored=$(confine_off_tests --list --ignored) || return 1
+      count=$(printf '%s\n' "$listed" | awk '/confine_off.*: test$/ { n++ } END { print n+0 }')
+      ignored_count=$(printf '%s\n' "$ignored" | awk '/confine_off.*: test$/ { n++ } END { print n+0 }')
+      if [ "$((count - ignored_count))" -lt 18 ]; then
+        echo "confine-off guard: need at least 18 nonignored off-only tests; listed $count, ignored $ignored_count" >&2
+        return 1
+      fi
+      confine_off_tests
+    }
+    confine_off_gate || rc=1
     # PIPELINE PARITY: mirrors the "clippy (newt-mcp-server, confine off)" and "test
     # (newt-mcp-server, confine off)" steps in ci.yml's lean job (#3160). `-p
     # newt-mcp-server` alone: features are additive, so a second package that takes the
