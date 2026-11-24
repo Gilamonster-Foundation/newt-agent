@@ -232,6 +232,22 @@ fn extras() -> Vec<String> {
     let body = "literal $(touch never) `touch neither` 'unmatched\n";
     inputs.push(format!("cat <<'EOF'\n{body}EOF\n"));
     inputs.push("echo $(touch '/tmp/newt-inspect-marker')".to_string());
+    // One input per construct the inspector refuses, so the parity corpus reaches
+    // every refusal arm in `shell_inspect::collect_pipeline_nodes` and the guard
+    // test below can pin each arm to its corpus coverage.
+    for source in [
+        "if true; then echo a; fi",
+        "while false; do echo a; done",
+        "until true; do echo a; done",
+        "case a in b) echo b;; esac",
+        "( echo a )",
+        "{ echo a; }",
+        "[[ -n x ]]",
+        "for f in a b; do echo \"$f\"; done > out.txt",
+        "f() { echo a; }",
+    ] {
+        inputs.push(source.to_string());
+    }
     inputs
 }
 
@@ -277,4 +293,55 @@ fn the_copy_inspects_every_input_as_bridle_does() {
         "accepted {accepted}, refused {refused} of {}",
         inputs.len()
     );
+}
+
+/// Every refusal arm in `shell_inspect::collect_pipeline_nodes` must have at
+/// least one corpus input (over `CORPUS` plus `extras()`) on which both
+/// inspectors refuse with the identical error text. This is a drift guard in
+/// two directions: removing an input drops its arm's coverage, and bridle's
+/// inspector beginning to represent a construct (e.g. an `if`) leaves that arm
+/// with no refusing input even though the copy is still byte-identical.
+#[test]
+fn every_refusal_arm_has_a_corpus_input() {
+    // (construct refused, the exact error message its arm produces)
+    const REFUSALS: &[(&str, &str)] = &[
+        (
+            "redirections on a for loop",
+            "redirections on a for loop are not yet represented by the stable inspection projection",
+        ),
+        (
+            "extended test `[[ ]]`",
+            "extended test commands are not yet represented by the stable inspection projection",
+        ),
+        (
+            "compound command (if/while/until/case/subshell/brace group)",
+            "compound shell commands are not yet represented by the stable inspection projection",
+        ),
+        (
+            "shell function definition",
+            "shell function definitions are not yet represented by the stable inspection projection",
+        ),
+    ];
+
+    let inputs: Vec<String> = CORPUS
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(extras())
+        .collect();
+
+    for (construct, message) in REFUSALS {
+        let covered = inputs.iter().any(|input| {
+            matches!(
+                ours::inspect_shell(input),
+                Err(ref error) if error.message() == *message
+            ) && matches!(
+                agent_bridle::inspect_shell(input),
+                Err(ref error) if error.message() == *message
+            )
+        });
+        assert!(
+            covered,
+            "refusal arm for {construct:?} (`{message}`) has no corpus input"
+        );
+    }
 }
