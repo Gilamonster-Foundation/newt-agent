@@ -21,8 +21,8 @@
 //! Google's public DNS when the system configuration cannot be read; a bracketed IPv6
 //! literal reaches the resolver as a name, so it is refused; the 30 s limit is per request,
 //! up to 11 of them; a resolver is built per call. `DESIGN §7`, `AB-007` and `#270` are
-//! agent-bridle's. `web_fetch_parity_tests` holds this module equal to bridle's while bridle
-//! is a dependency.
+//! agent-bridle's. With `confine` enabled, `web_fetch_parity_tests` compares selected
+//! predicates and fetch behavior with bridle's; it does not compare file contents.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};

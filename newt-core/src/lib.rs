@@ -102,7 +102,7 @@ pub mod notes_scan;
 pub mod nudger;
 pub mod ocap;
 pub mod ocap_policy;
-#[cfg(test)]
+#[cfg(all(test, feature = "confine"))]
 mod ocap_policy_parity_tests;
 #[cfg(test)]
 mod ocap_policy_tests;
@@ -153,7 +153,7 @@ pub mod settings;
 pub mod settings_receipt;
 pub mod shell_env;
 pub mod shell_inspect;
-#[cfg(test)]
+#[cfg(all(test, feature = "confine"))]
 mod shell_inspect_parity_tests;
 pub mod ssh_caveats;
 pub mod stack;
@@ -176,7 +176,7 @@ pub mod tty;
 pub mod tuning;
 pub mod verify_gate;
 pub mod web_fetch;
-#[cfg(test)]
+#[cfg(all(test, feature = "confine"))]
 mod web_fetch_parity_tests;
 pub mod where_is;
 mod wire_framing;

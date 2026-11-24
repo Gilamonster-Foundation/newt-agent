@@ -47,16 +47,64 @@ categories = ["api-bindings", "text-processing"]
 name = "brush_build_pipeline"
 path = "tests/brush_build_pipeline.rs"
 harness = false
+required-features = ["confine"]
 
 [[test]]
 name = "native_git_broker_pipeline"
 path = "tests/native_git_broker_pipeline.rs"
 harness = false
+required-features = ["confine"]
 
 [[test]]
 name = "macos_exec_basenames"
 path = "tests/macos_exec_basenames.rs"
 harness = false
+required-features = ["confine"]
+
+[[test]]
+name = "af_unix_deputy"
+path = "tests/af_unix_deputy.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "build_network_macos"
+path = "tests/build_network_macos.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "confined_exec_landlock"
+path = "tests/confined_exec_landlock.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "confined_exec_lifetime"
+path = "tests/confined_exec_lifetime.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "linked_worktree_build_git"
+path = "tests/linked_worktree_build_git.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "net_guard_descendant_lifetime"
+path = "tests/net_guard_descendant_lifetime.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "net_guard_executor"
+path = "tests/net_guard_executor.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "net_guard_fd_hygiene"
+path = "tests/net_guard_fd_hygiene.rs"
+required-features = ["confine"]
+
+[[test]]
+name = "ocap_default_fence_repro_1016"
+path = "tests/ocap_default_fence_repro_1016.rs"
+required-features = ["confine"]
 
 [dependencies]
 agent-toolchain = { workspace = true, features = ["embedded-git"] }
@@ -138,7 +186,9 @@ newt-router.workspace = true
 newt-skills.workspace = true
 # `gzip`: `web_fetch` decodes gzip as agent-bridle-tool-web's client does, and that
 # decides whether a body's declared length is refused or its stream is cut (#3160).
-reqwest = { workspace = true, features = ["gzip"] }
+# `charset` and `rustls-tls` preserve decoding and bundled roots currently unified
+# through tool-web; core owns these requirements independently of that dependency.
+reqwest = { workspace = true, features = ["gzip", "charset", "rustls-tls"] }
 # Already in reqwest's dependency graph; bounded HTTP/1.1 over the gh socket.
 httparse = "1.10.1"
 tokio.workspace = true
@@ -158,9 +208,12 @@ tokio.workspace = true
 # 0.7.17 exports the brush engine's seeded PATH and the caller's `env` seam to
 # spawned children (before it a confined child's whole environment was
 # PWD/SHLVL/_, so a build could not find `cc`, and the seam — HOME, TMPDIR, the
-# passthrough list — never arrived). No `[patch]`: this is the published crate.
+# passthrough list — never arrived). The workspace currently patches bridle
+# crates for Newt-specific APIs; these version declarations do not remove those patches.
 agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"] }
-# Only `web_fetch_parity_tests` uses it: the tool `web_fetch` is copied from (#3160).
+# Only `web_fetch_parity_tests` names tool-web in source (#3160). Its reqwest
+# `rustls-tls`, `charset` and `gzip` features also unify into core; core now
+# declares them explicitly above so they survive the later optional-dependency flip.
 agent-bridle-tool-web = "0.8.0-rc.7"
 agent-bridle-tool-shell = { version = "0.8.0-rc.7", features = ["brush"] }
 # The descriptor guard, newt's own copy of agent-bridle-fdguard (#3160).
@@ -357,3 +410,4 @@ workspace = true
 name = "shell_discovery"
 path = "tests/shell_discovery.rs"
 harness = false
+required-features = ["confine"]

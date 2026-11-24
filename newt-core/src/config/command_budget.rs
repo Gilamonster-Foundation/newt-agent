@@ -48,6 +48,7 @@ mod tests {
 
     /// #3160: the constant is bridle's own default, copied so the default needs no bridle
     /// crate; while bridle is a dependency the two must agree.
+    #[cfg(feature = "confine")]
     #[test]
     fn the_default_wall_is_the_one_bridle_carries() {
         assert_eq!(

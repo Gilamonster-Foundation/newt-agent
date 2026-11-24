@@ -179,6 +179,7 @@ mod tests {
 
     /// #3160: the shim is bridle's own, copied so the host route needs no bridle crate;
     /// while bridle is a dependency the two must agree, byte for byte.
+    #[cfg(feature = "confine")]
     #[test]
     fn the_which_shim_is_the_one_bridle_supplies() {
         for command in ["which cargo", "echo 'a b' | wc -c", ""] {

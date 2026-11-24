@@ -223,6 +223,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "confine"))]
 #[path = "step_up_parity_tests.rs"]
 mod parity_tests;

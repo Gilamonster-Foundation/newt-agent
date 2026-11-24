@@ -7,8 +7,8 @@
 //! three comment lines whose dotted ranges are respelled in the short form the code below
 //! uses, because the pre-push network-leak guard refuses the dotted form. `DESIGN §7`,
 //! `AB-007` and `#270` are agent-bridle's; `Gate` and `ToolContext` are its names for what
-//! `admit` and `check_net` do in the parent module. `web_fetch_parity_tests` holds this
-//! file equal to bridle's while bridle is a dependency.
+//! `admit` and `check_net` do in the parent module. With `confine` enabled,
+//! `web_fetch_parity_tests` compares these predicates with bridle's, not file contents.
 //!
 //! Everything here is **pure** — no network, no DNS, no `Gate`. That is
 //! deliberate: the SSRF-defeating logic is the load-bearing security surface, so
