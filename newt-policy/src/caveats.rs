@@ -175,6 +175,21 @@ fn comparable_spelling(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
 
+/// Whether an existing grant covers `path`, comparing platform aliases in the
+/// same spelling. Like [`permits_path`], this is lexical, not symlink resolution.
+/// Use when omitting redundant filesystem roots from a proposed grant.
+pub fn covers_path(scope: &Scope<String>, path: &str) -> bool {
+    let roots = match scope {
+        Scope::All => return true,
+        Scope::Only(roots) => Scope::only(
+            roots
+                .iter()
+                .map(|root| comparable_spelling(root).into_owned()),
+        ),
+    };
+    permits_path(&roots, &comparable_spelling(path))
+}
+
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
 /// `NEWT_WRITE_PATHS` and the `--net` hosts, widening `fs_read` by what `discover`
 /// returns for the workspace's own git metadata. The session entry point every
@@ -226,13 +241,13 @@ pub fn apply_cli_fs_grants_with(
     let granted = Scope::only(
         std::iter::once(workspace)
             .chain(read.iter().chain(&write).map(String::as_str))
-            .map(|root| comparable_spelling(root).into_owned()),
+            .map(str::to_owned),
     );
     read.extend(
         own_git
             .read
             .into_iter()
-            .filter(|dir| !permits_path(&granted, &comparable_spelling(dir))),
+            .filter(|dir| !covers_path(&granted, dir)),
     );
 
     lock_fs_to_workspace(caveats, workspace, &read, &write);

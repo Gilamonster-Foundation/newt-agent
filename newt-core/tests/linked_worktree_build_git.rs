@@ -12,6 +12,34 @@ use newt_policy::caveats::{permits_path, Scope};
 mod fixture_support;
 use fixture_support::{fixture, git};
 
+/// Grounds the mocked `build_git_reads_skip_covered_roots` regression in real
+/// Git discovery and the workspace guard used before the Build prompt.
+#[test]
+fn build_git_reads_pass_workspace_protection_in_both_checkout_layouts() {
+    let (_fixture, repo, linked) = fixture();
+    let protection = newt_core::workspace_protection::WorkspaceProtection::new(
+        &[repo.parent().unwrap().join("operator-policy")],
+        &[],
+    )
+    .unwrap();
+    for root in [&repo, &linked] {
+        own_gitdir_grants(root);
+        let request = build_tool_request(root, root, "cargo", ["check"], &Scope::none());
+        protection.validate_caveats(request.caveats()).unwrap();
+        protection
+            .validate_request(newt_policy::DenialKind::Build, root.to_str().unwrap())
+            .unwrap();
+        assert!(permits_path(
+            &request.caveats().fs_read,
+            &repo.join(".git").to_string_lossy(),
+        ));
+        // Spawn admission requires exact fs_read membership for every held
+        // descriptor; covered metadata must lose its extra descriptor too.
+        let output = confined(root, "git", &["rev-parse", "HEAD"]);
+        assert!(output.success, "{output:?}");
+    }
+}
+
 fn confined(root: &Path, program: &str, args: &[&str]) -> newt_core::confined_exec::ConfinedOutput {
     let request = build_tool_request(root, root, program, args.iter().copied(), &Scope::All)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

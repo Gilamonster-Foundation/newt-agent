@@ -237,11 +237,29 @@ impl ExecRequest {
     /// Add validated build metadata reads together with their held objects.
     /// Plain caveats alone cannot carry descriptor-bound authority.
     #[must_use]
-    pub fn with_build_git_reads(mut self, workspace: &Path) -> Self {
+    pub fn with_build_git_reads(self, workspace: &Path) -> Self {
         let (paths, held) = crate::git_hardening::build_reads::build_git_reads(workspace);
+        self.with_build_git_reads_from(paths, held)
+    }
+
+    fn with_build_git_reads_from(
+        mut self,
+        mut paths: Vec<String>,
+        held: Vec<crate::sandbox_seam::HeldReadRoot>,
+    ) -> Self {
+        // Compare against the original grant so external common/admin roots
+        // retain both descriptors, regardless of discovery order.
+        paths.retain(|path| !newt_policy::caveats::covers_path(&self.caveats.fs_read, path));
         if let Scope::Only(reads) = &mut self.caveats.fs_read {
+            // Held roots require exact fs_read membership at spawn admission.
+            #[cfg(feature = "confine")]
+            self.held_read_roots.extend(
+                held.into_iter()
+                    .filter(|root| paths.iter().any(|path| path == root.provenance())),
+            );
+            #[cfg(not(feature = "confine"))]
+            let _ = held;
             reads.extend(paths);
-            self.held_read_roots.extend(held);
         }
         self
     }
@@ -1273,6 +1291,74 @@ mod tests {
         assert_eq!(request.args, baseline.args);
         let denied = dependency_fetch_request(ws, ws, &Scope::none());
         assert_eq!(denied.caveats.net, Scope::none());
+    }
+
+    #[test]
+    fn build_git_reads_skip_covered_roots() {
+        let workspace = Path::new("/ws");
+        for (reads, git_dirs, expected) in [
+            (
+                Scope::only(["/ws".into()]),
+                vec!["/ws/.git", "/ws/.git"],
+                vec!["/ws"],
+            ),
+            (
+                Scope::only(["/ws".into()]),
+                vec!["/repo/.git", "/repo/.git/worktrees/ws"],
+                vec!["/repo/.git", "/repo/.git/worktrees/ws", "/ws"],
+            ),
+            (
+                Scope::only(["/repo".into(), "/ws".into()]),
+                vec!["/repo/.git", "/repo/.git/worktrees/ws"],
+                vec!["/repo", "/ws"],
+            ),
+            (
+                Scope::only(["/ws".into()]),
+                vec!["/ws-other/.git"],
+                vec!["/ws", "/ws-other/.git"],
+            ),
+            (Scope::none(), vec!["/repo/.git"], vec!["/repo/.git"]),
+            #[cfg(target_os = "macos")]
+            (
+                Scope::only(["/var/ws".into()]),
+                vec!["/private/var/ws/.git"],
+                vec!["/var/ws"],
+            ),
+            #[cfg(windows)]
+            (
+                Scope::only([r"\\?\C:\ws".into()]),
+                vec!["C:/ws/.git"],
+                vec![r"\\?\C:\ws"],
+            ),
+        ] {
+            let mut caveats = workspace_confined_caveats(workspace);
+            caveats.fs_read = reads;
+            let request = ExecRequest::new(
+                ExecOrigin::AgentInfluenced,
+                "cargo",
+                ["check"],
+                workspace,
+                caveats.clone(),
+            )
+            .with_build_git_reads_from(
+                git_dirs.into_iter().map(str::to_owned).collect(),
+                Vec::new(),
+            );
+            caveats.fs_read = Scope::only(expected.into_iter().map(str::to_owned));
+            assert_eq!(
+                request.caveats, caveats,
+                "only uncovered Git reads are added"
+            );
+        }
+        let request = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            "cargo",
+            ["check"],
+            workspace,
+            Caveats::top(),
+        )
+        .with_build_git_reads_from(vec!["/ws/.git".into()], Vec::new());
+        assert_eq!(request.caveats, Caveats::top());
     }
 
     #[test]
