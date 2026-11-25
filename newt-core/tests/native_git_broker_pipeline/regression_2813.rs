@@ -65,7 +65,7 @@ async fn nested_creation_without_session_is_refused() {
     let command = format!("cd '{}' && git worktree add -b agentic-refactor-wt agentic-refactor-wt HEAD 2>&1 | tail -5", main.display());
     let out = dispatch(&main, &command, &caveats, false).await;
     assert!(
-        out.contains("capability denied") && out.contains("standalone literal command"),
+        out.contains("capability denied") && out.contains("no worktree session is available"),
         "creation bypassed admission: {out}"
     );
     assert!(!main.join("agentic-refactor-wt").exists());

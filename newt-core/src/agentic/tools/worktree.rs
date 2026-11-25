@@ -470,6 +470,31 @@ pub(super) async fn execute(
 ) -> String {
     let bypass = ocap_disabled();
     let session = collab.worktree_session;
+    let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
+    // Resolve redundant or unavailable creation from session state before
+    // probing paths or permissions. No part of this command batch needs to run.
+    if !bypass
+        && name == "run_command"
+        && (session.is_none() || policy.is_some())
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(possible_creation)
+    {
+        if let Some(invocation) = collab.invocation {
+            invocation.host();
+        }
+        if let Some(policy) = &policy {
+            return format!(
+                "Task worktree already bound: {}. Commands already run there by default. No command was run.",
+                task_path_literal(&policy.worktree)
+            );
+        }
+        if let Some(slot) = collab.execution {
+            let _ = slot.set(crate::ExecOutcome::Denied);
+        }
+        return "capability denied: no worktree session is available to bind a task worktree; no command was run".into();
+    }
     // #2771: choose the file-tool base once, before both the adoption fence
     // and native dispatch. This changes path resolution, never authority.
     // Shell calls (including routed file reads) retain their explicit cwd.
@@ -495,7 +520,6 @@ pub(super) async fn execute(
         .unwrap_or(workspace);
     let objective = collab.prompt_context.map(|context| context.active_text());
     let command_directory = collab.command_directory;
-    let policy = session.and_then(crate::worktree_adoption::WorktreeSession::snapshot);
     let mut collab = collab;
     // Project the approved workspace switch before refreshing current ceilings.
     // Native file tools must see the same limits as the shell; never re-project
@@ -552,30 +576,17 @@ pub(super) async fn execute(
             )
         })
     });
-    // #2813: no adoption slot is not permission to run creation ungoverned.
-    // A second worktree cannot replace the session's already-bound task either.
-    let unavailable_creation = !bypass
-        && name == "run_command"
-        && (session.is_none() || policy.is_some())
-        && normalized
-            .get("command")
-            .and_then(|v| v.as_str())
-            .is_some_and(possible_creation);
-    let admission = if unavailable_creation {
-        Err(())
-    } else {
-        session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
-            creation_admission(
-                bypass,
-                name,
-                &normalized,
-                workspace,
-                caveats,
-                shell::shell_engine(),
-                git_identity::resolve,
-            )
-        })
-    };
+    let admission = session.filter(|_| policy.is_none()).map_or(Ok(None), |_| {
+        creation_admission(
+            bypass,
+            name,
+            &normalized,
+            workspace,
+            caveats,
+            shell::shell_engine(),
+            git_identity::resolve,
+        )
+    });
     let Ok(candidate) = admission else {
         if let Some(invocation) = collab.invocation {
             invocation.host();

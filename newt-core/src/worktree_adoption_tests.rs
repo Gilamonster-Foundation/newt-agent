@@ -1,5 +1,18 @@
 use super::*;
 
+pub(crate) fn policy_fixture(original: PathBuf, worktree: PathBuf) -> AdoptedWorktree {
+    let common = original.join(".git");
+    AdoptedWorktree {
+        original,
+        worktree,
+        task_branch: Some("task".into()),
+        admin: common.join("worktrees/task"),
+        common,
+        protected_branch: Some("main".into()),
+        relocate_workspace_access: false,
+    }
+}
+
 pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("main");
@@ -20,15 +33,10 @@ pub(crate) fn fixture(nested: bool) -> (tempfile::TempDir, AdoptedWorktree, Path
         std::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    let policy = AdoptedWorktree {
-        original: original.canonicalize().unwrap(),
-        worktree: worktree.canonicalize().unwrap(),
-        task_branch: Some("task".into()),
-        common: common.canonicalize().unwrap(),
-        admin: admin.canonicalize().unwrap(),
-        protected_branch: Some("main".into()),
-        relocate_workspace_access: false,
-    };
+    let policy = policy_fixture(
+        original.canonicalize().unwrap(),
+        worktree.canonicalize().unwrap(),
+    );
     (temp, policy, unrelated.canonicalize().unwrap())
 }
 
