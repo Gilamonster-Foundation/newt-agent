@@ -4,6 +4,7 @@
 use std::io;
 #[cfg(feature = "rich-tui")]
 use std::io::IsTerminal as _;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -845,12 +846,31 @@ mod build_grant_tests;
 #[path = "permissions_tests/workspace_protection.rs"]
 mod workspace_protection_tests;
 
+/// The existing protection checks, injectable without filesystem access.
+pub(crate) trait PermissionProtection: Send + Sync {
+    fn validate_caveats(&self, caveats: &newt_core::Caveats) -> anyhow::Result<()>;
+    fn validate_request(&self, kind: newt_policy::DenialKind, target: &str) -> anyhow::Result<()>;
+}
+
+impl PermissionProtection for newt_core::workspace_protection::WorkspaceProtection {
+    fn validate_caveats(&self, caveats: &newt_core::Caveats) -> anyhow::Result<()> {
+        self.validate_caveats(caveats)
+    }
+
+    fn validate_request(&self, kind: newt_policy::DenialKind, target: &str) -> anyhow::Result<()> {
+        self.validate_request(kind, target)
+    }
+}
+
 /// Session decisions remain separate from the never-widened operating key.
 #[derive(Default)]
 pub(crate) struct PermissionPromptState {
     /// Immutable operator resources excluded from all permission expansions.
-    pub(crate) protection:
-        Option<std::sync::Arc<newt_core::workspace_protection::WorkspaceProtection>>,
+    pub(crate) protection: Option<std::sync::Arc<dyn PermissionProtection>>,
+    #[cfg(test)]
+    decision_time: Option<&'static str>,
+    #[cfg(test)]
+    notices: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     pub(crate) prompt_default: Option<PromptChoice>,
     /// Trusted configured terminal MCP default; None uses the shipped choice.
     pub(crate) mcp_net_prompt_default: Option<PromptChoice>,
@@ -874,6 +894,7 @@ pub(crate) struct PermissionPromptState {
     /// One-shot grants carried from `request_permissions` to its retry.
     pending_once_grants: std::collections::BTreeSet<(newt_policy::DenialKind, String)>,
     pub(crate) decisions: Vec<newt_policy::PermissionRecord>,
+    refusal_cause: Option<&'static str>,
     /// Durable approve/deny policy, read-only during the session.
     pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
 }
@@ -1339,15 +1360,31 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     /// appended to the durable log. A log-write failure is reported but
     /// never blocks the decision — the record is a review artifact, not a
     /// gate.
-    fn record(&mut self, req: &newt_policy::PermissionRequest, decision: &str, scope: &str) {
-        let rec = newt_policy::PermissionRecord::new(
-            &self.conversation_id,
-            &req.tool,
-            req.kind,
-            &req.target,
-            decision,
-            scope,
-        );
+    fn record(
+        &mut self,
+        req: Option<&newt_policy::PermissionRequest>,
+        decision: &str,
+        scope: &str,
+        reason: Option<&str>,
+    ) {
+        #[cfg(test)]
+        let ts_claim = self
+            .state
+            .decision_time
+            .map(str::to_owned)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        #[cfg(not(test))]
+        let ts_claim = chrono::Utc::now().to_rfc3339();
+        let rec = newt_policy::PermissionRecord {
+            ts_claim,
+            conversation_id: self.conversation_id.clone(),
+            tool: req.map_or("permission_gate", |r| r.tool.as_str()).into(),
+            kind: req.map_or("", |r| r.kind.as_str()).into(),
+            target: req.map_or("", |r| r.target.as_str()).into(),
+            decision: decision.into(),
+            scope: scope.into(),
+            reason: reason.map(str::to_owned),
+        };
         if let Some(path) = self.log_path.as_deref() {
             if let Err(e) = newt_core::permission_journal::append_record(path, rec.clone()) {
                 print_newt(
@@ -1843,7 +1880,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         )
     }
 
-    /// Record an authorizer refusal, keeping the operator-facing message
+    /// Describe an authorizer refusal, keeping the operator-facing message
     /// the fixed-enum code produced for the cases that have one.
     ///
     /// The DECISION is now `validate_response`'s — a high-danger session
@@ -1852,13 +1889,12 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
     /// operator still gets the same sentence, and the audit record still
     /// carries the same specific reason, because a refusal that reads as
     /// a generic deny is a worse refusal.
-    fn note_refusal(
-        &mut self,
-        w: Option<&PromptWindow>,
-        req: &newt_policy::PermissionRequest,
+    fn authorization_refusal<'r>(
+        &self,
+        req: &'r newt_policy::PermissionRequest,
         decoded: PromptChoice,
         refusal: &newt_interaction::Refusal,
-    ) {
+    ) -> PermissionRefusal<'r> {
         let high = self.danger.classify(req.kind, &req.target) == danger::DangerTier::High;
         let (scope, message) = match decoded {
             PromptChoice::AllowSession if high => (
@@ -1878,18 +1914,22 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             ),
             _ => ("unauthorized", None),
         };
-        // INERT-CODE-RATCHET: F18 WIRE: permission refusal detail is promised to audit but explicitly discarded.
-        let _ = refusal;
-        self.record(req, "deny", scope);
-        if let Some(message) = message {
-            self.notice(w, &message);
-        }
+        PermissionRefusal::new(
+            Some(req),
+            scope,
+            message.unwrap_or_else(|| format!("{refusal:?}")),
+        )
     }
 
     /// Direct prompts keep the arbiter until their notices are written. A
     /// surface-owned prompt has already closed; stdout is captured by that
     /// owner and committed to the transcript after its modal is removed.
     fn notice(&self, window: Option<&PromptWindow>, message: &str) {
+        #[cfg(test)]
+        if let Some(notices) = &self.state.notices {
+            notices.lock().unwrap().push(message.to_string());
+            return;
+        }
         match window {
             Some(window) => {
                 window
@@ -1980,6 +2020,9 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
 impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::PermissionGate
     for PromptPermissionGate<'_, F>
 {
+    fn take_refusal_cause(&mut self) -> Option<&'static str> {
+        self.state.refusal_cause.take()
+    }
     fn refresh_caveats(
         &mut self,
         baseline: &newt_core::Caveats,
@@ -2001,7 +2044,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::
         &mut self,
         requests: &[newt_policy::PermissionRequest],
     ) -> newt_policy::PermissionDecision {
-        self.ask_scoped(&self.base.clone(), requests, false, true)
+        self.ask_recorded(&self.base.clone(), requests, false, true)
     }
 
     fn consume_pending_once(&mut self, kind: newt_policy::DenialKind, target: &str) {
@@ -2096,7 +2139,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::
         baseline: &newt_core::Caveats,
         requests: &[newt_policy::PermissionRequest],
     ) -> newt_policy::PermissionDecision {
-        self.ask_scoped(baseline, requests, false, false)
+        self.ask_recorded(baseline, requests, false, false)
     }
 
     fn ask_dependency_fetch(
@@ -2104,7 +2147,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::
         prepared: &newt_core::Caveats,
         request: &newt_policy::PermissionRequest,
     ) -> newt_policy::PermissionDecision {
-        self.ask_scoped(prepared, std::slice::from_ref(request), true, false)
+        self.ask_recorded(prepared, std::slice::from_ref(request), true, false)
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
@@ -2182,26 +2225,81 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::
     }
 }
 
+/// A scoped refusal always identifies its cause and operator-only detail.
+/// The public gate decision is formed only after this evidence is recorded.
+struct PermissionRefusal<'r> {
+    request: Option<&'r newt_policy::PermissionRequest>,
+    cause: &'static str,
+    reason: String,
+}
+
+impl<'r> PermissionRefusal<'r> {
+    fn new(
+        request: Option<&'r newt_policy::PermissionRequest>,
+        cause: &'static str,
+        reason: impl ToString,
+    ) -> Self {
+        Self {
+            request,
+            cause,
+            reason: reason.to_string(),
+        }
+    }
+}
+
 impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermissionGate<'_, F> {
-    /// `preapproved` (#2995, `--full-access`) skips only the prompt: every
-    /// veto above it still runs, and the allow is recorded after they pass.
-    fn ask_scoped(
+    fn ask_recorded(
         &mut self,
         baseline: &newt_core::Caveats,
         requests: &[newt_policy::PermissionRequest],
         operation_only: bool,
         preapproved: bool,
     ) -> newt_policy::PermissionDecision {
-        use newt_policy::PermissionDecision::{Allow, Deny};
+        self.state.refusal_cause = None;
+        match self.ask_scoped(baseline, requests, operation_only, preapproved) {
+            Ok(ControlFlow::Continue(allowed)) => newt_policy::PermissionDecision::Allow(allowed),
+            // Back/Exit cancel the interaction without making a permission decision.
+            Ok(ControlFlow::Break(())) => newt_policy::PermissionDecision::Deny,
+            Err(refusal) => {
+                self.record(
+                    refusal.request,
+                    "deny",
+                    refusal.cause,
+                    Some(&refusal.reason),
+                );
+                self.notice(
+                    None,
+                    &format!("permission refused ({}): {}", refusal.cause, refusal.reason),
+                );
+                self.state.refusal_cause = Some(refusal.cause);
+                newt_policy::PermissionDecision::Deny
+            }
+        }
+    }
+
+    /// `preapproved` (#2995, `--full-access`) skips only the prompt: every
+    /// veto above it still runs, and the allow is recorded after they pass.
+    fn ask_scoped<'r>(
+        &mut self,
+        baseline: &newt_core::Caveats,
+        requests: &'r [newt_policy::PermissionRequest],
+        operation_only: bool,
+        preapproved: bool,
+    ) -> Result<ControlFlow<(), newt_core::Caveats>, PermissionRefusal<'r>> {
+        let first = requests.first();
         if operation_only
             && (requests.len() != 1
                 || !requests[0].operation_egress()
                 || baseline.net != newt_core::Scope::All)
         {
-            return Deny;
+            return Err(PermissionRefusal::new(first, "invalid-operation-request", "dependency fetch requires one operation egress request and unrestricted prepared egress"));
         }
         if requests.is_empty() {
-            return Deny;
+            return Err(PermissionRefusal::new(
+                first,
+                "empty-request",
+                "no permission request was supplied",
+            ));
         }
         if let Some(protection) = &self.state.protection {
             // Preflight the whole batch before consuming pending grants,
@@ -2211,16 +2309,23 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                 .iter()
                 .map(|request| (request.kind, request.target.clone()))
                 .collect::<Vec<_>>();
-            if protection.validate_caveats(baseline).is_err()
-                || requests.iter().any(|request| {
-                    protection
-                        .validate_request(request.kind, &request.target)
-                        .is_err()
-                })
-                || self.policy_with_grants(baseline, &proposed).is_err()
-            {
-                return Deny;
+            protection.validate_caveats(baseline).map_err(|e| {
+                PermissionRefusal::new(first, "workspace-protection", format!("{e:#}"))
+            })?;
+            for request in requests {
+                protection
+                    .validate_request(request.kind, &request.target)
+                    .map_err(|e| {
+                        PermissionRefusal::new(
+                            Some(request),
+                            "workspace-protection",
+                            format!("{e:#}"),
+                        )
+                    })?;
             }
+            self.policy_with_grants(baseline, &proposed).map_err(|e| {
+                PermissionRefusal::new(first, "workspace-protection", format!("{e:#}"))
+            })?;
         }
         // A prepared build request carries its exact projected fence. Check
         // that fence before prompting as well as the named Build capability;
@@ -2237,7 +2342,20 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     .delegation
                     .is_some_and(|delegation| !baseline.leq(delegation.caveats())))
         {
-            return Deny;
+            let cause = if self
+                .preset_clamp
+                .as_ref()
+                .is_some_and(|ceiling| !baseline.leq(ceiling))
+            {
+                "preset-ceiling"
+            } else {
+                "delegated-ceiling"
+            };
+            return Err(PermissionRefusal::new(
+                first,
+                cause,
+                "prepared operation exceeds the authority ceiling",
+            ));
         }
         // A filesystem manifest must not consume lawful pending siblings
         // before discovering that another target cannot survive the preset.
@@ -2248,18 +2366,22 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             )
         });
         if let Some(clamp) = &self.preset_clamp {
-            if filesystem_batch
-                && requests.iter().any(|request| {
-                    matches!(
+            if let Some(request) = requests.iter().find(|request| {
+                filesystem_batch
+                    && matches!(
                         request.kind,
                         newt_policy::DenialKind::FsRead
                             | newt_policy::DenialKind::FsWrite
                             | newt_policy::DenialKind::Exec
                             | newt_policy::DenialKind::Net
-                    ) && !ceiling_permits(clamp, request.kind, &request.target)
-                })
-            {
-                return Deny;
+                    )
+                    && !ceiling_permits(clamp, request.kind, &request.target)
+            }) {
+                return Err(PermissionRefusal::new(
+                    Some(request),
+                    "preset-ceiling",
+                    "filesystem request exceeds the permission preset",
+                ));
             }
         }
         // A delegated session's inherited ceiling is preflighted over the WHOLE
@@ -2272,34 +2394,39 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         // request that cannot be granted.
         if let Some(d) = self.delegation {
             let ceiling = d.caveats();
-            if requests
+            if let Some(request) = requests
                 .iter()
-                .any(|r| !ceiling_permits(ceiling, r.kind, &r.target))
+                .find(|r| !ceiling_permits(ceiling, r.kind, &r.target))
             {
-                for r in requests {
-                    self.record(r, "deny", "delegated-ceiling");
-                }
-                return Deny;
+                return Err(PermissionRefusal::new(
+                    Some(request),
+                    "delegated-ceiling",
+                    "request exceeds inherited delegated authority",
+                ));
             }
         }
         // Previously recorded session, permanent, and OCAP denials short-circuit.
-        if requests
+        if let Some(request) = requests
             .iter()
-            .any(|r| self.state.denied(r.kind, &r.target))
+            .find(|r| self.state.denied(r.kind, &r.target))
         {
-            return Deny;
+            return Err(PermissionRefusal::new(
+                Some(request),
+                "prior-denial",
+                "a session, permanent, or OCAP denial already refuses this request",
+            ));
         }
         if preapproved {
-            let Ok(minted) = self.mint(baseline, &[]) else {
-                return Deny;
-            };
+            let minted = self
+                .mint(baseline, &[])
+                .map_err(|e| PermissionRefusal::new(first, "authority-mint", format!("{e:#}")))?;
             for req in requests {
-                self.record(req, "allow", "session-full-access");
+                self.record(Some(req), "allow", "session-full-access", None);
                 self.state
                     .session_grants
                     .insert((req.kind, req.target.clone()));
             }
-            return Allow(minted);
+            return Ok(ControlFlow::Continue(minted));
         }
         let mut once_grants: Vec<(newt_policy::DenialKind, String)> = Vec::new();
         // dec1-build-grant round 2: a request covered by the Build-grant
@@ -2321,15 +2448,21 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     .as_ref()
                     .is_some_and(|floor| !ceiling_permits(floor, req.kind, &req.target))
             {
-                self.record(req, "deny", "preset-floor-build");
-                return Deny;
+                return Err(PermissionRefusal::new(
+                    Some(req),
+                    "preset-floor-build",
+                    "the permission preset does not allow builds",
+                ));
             }
             // GitWrite is non-axis, so enforce the readonly preset before minting.
             if req.kind == newt_policy::DenialKind::GitWrite {
                 if let Some(clamp) = &self.preset_clamp {
                     if !newt_core::git_caveats::GitCaveats::from_session(clamp).permits_commit() {
-                        self.record(req, "deny", "preset-floor-git-readonly");
-                        return Deny;
+                        return Err(PermissionRefusal::new(
+                            Some(req),
+                            "preset-floor-git-readonly",
+                            "the permission preset only allows Git reads",
+                        ));
                     }
                 }
             }
@@ -2382,9 +2515,13 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                             std::path::Path::new(workspace),
                         );
                         fence.net = baseline.net.clone();
-                        if self.state.validate_caveats(&fence).is_err() {
-                            return Deny;
-                        }
+                        self.state.validate_caveats(&fence).map_err(|e| {
+                            PermissionRefusal::new(
+                                Some(req),
+                                "workspace-protection",
+                                format!("{e:#}"),
+                            )
+                        })?;
                         build_covered_clamp = Some(match build_covered_clamp.take() {
                             Some(existing) => existing.meet(&fence),
                             None => fence,
@@ -2400,7 +2537,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     .contains(&(req.kind, req.target.clone()))
                 && self.danger.classify(req.kind, &req.target) != danger::DangerTier::High
             {
-                self.record(req, "allow", "encrypted-permanent");
+                self.record(Some(req), "allow", "encrypted-permanent", None);
                 continue;
             }
             // Durable approval pre-answers only a low-danger request.
@@ -2412,7 +2549,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                 ) == Some(newt_core::ocap_store::Verdict::Approve)
                 && self.danger.classify(req.kind, &req.target) != danger::DangerTier::High
             {
-                self.record(req, "allow", "ocap-approve");
+                self.record(Some(req), "allow", "ocap-approve", None);
                 once_grants.push((req.kind, req.target.clone()));
                 continue;
             }
@@ -2426,13 +2563,13 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     .iter()
                     .any(|(kind, target)| *kind == req.kind && target == &req.target)
             {
-                self.record(req, "allow", "once");
+                self.record(Some(req), "allow", "once", None);
                 continue;
             }
             // Only the eventual operation consumes a request_permissions grant.
             if !operation_only && req.tool != "request_permissions" {
                 if let Some(key) = take_pending_once(&mut self.state.pending_once_grants, req) {
-                    self.record(req, "allow", "once");
+                    self.record(Some(req), "allow", "once", None);
                     once_grants.push(key);
                     continue;
                 }
@@ -2441,8 +2578,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
             // standing authority still works after the preflights above. Keep
             // this gate for `ask_question`, which is not an authorization.
             if !self.authorization_prompts_enabled {
-                self.record(req, "deny", "authorization-prompts-disabled");
-                return Deny;
+                return Err(PermissionRefusal::new(
+                    Some(req),
+                    "authorization-prompts-disabled",
+                    "authorization prompts are disabled for this session",
+                ));
             }
             // The session hands semantic authorization to its terminal owner,
             // just as `ask_question` does. Taking stdin on this worker would
@@ -2495,15 +2635,14 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     match self.authorize(&interaction.definition, Audience::Terminal, decoded) {
                         Ok(choice) => (choice, decision_scope(choice)),
                         Err(refusal) => {
-                            self.note_refusal(window.as_ref(), req, decoded, &refusal);
-                            return Deny;
+                            return Err(self.authorization_refusal(req, decoded, &refusal));
                         }
                     }
                 }
             };
             match choice {
                 PromptChoice::AllowOnce => {
-                    self.record(req, "allow", scope);
+                    self.record(Some(req), "allow", scope, None);
                     once_grants.push((req.kind, req.target.clone()));
                     // Carry proactive allow-once to the model's separate retry.
                     if req.tool == "request_permissions" {
@@ -2520,18 +2659,17 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High
                         && req.kind != newt_policy::DenialKind::Build
                     {
-                        self.record(req, "deny", "session-allow-refused-high-danger");
-                        self.notice(
-                            window.as_ref(),
-                            &format!(
+                        return Err(PermissionRefusal::new(
+                            Some(req),
+                            "session-allow-refused-high-danger",
+                            format!(
                                 "session allow refused for high-danger `{}` — \
                                  allow once per op or deny (step-up is the future path)",
                                 req.target
                             ),
-                        );
-                        return Deny;
+                        ));
                     }
-                    self.record(req, "allow", scope);
+                    self.record(Some(req), "allow", scope, None);
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
@@ -2547,28 +2685,29 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     // actually persist, not a raw string that hides it.
                     let danger_target = normalized_danger_target(req.kind, &req.target);
                     if self.danger.classify(req.kind, &danger_target) == danger::DangerTier::High {
-                        self.record(req, "deny", "permanent-allow-refused-high-danger");
-                        self.notice(
-                            window.as_ref(),
-                            &format!("permanent allow refused for high-danger `{danger_target}`"),
-                        );
-                        return Deny;
+                        return Err(PermissionRefusal::new(
+                            Some(req),
+                            "permanent-allow-refused-high-danger",
+                            format!("permanent allow refused for high-danger `{danger_target}`"),
+                        ));
                     }
                     let entry = match approve_entry_for(req.kind, &req.target) {
                         None => {
                             // Kinds outside the durable store's vocabulary
                             // (RemoteTool/GitWrite/Build) keep the prior
                             // session-only behavior.
-                            self.record(req, "allow", scope);
+                            self.record(Some(req), "allow", scope, None);
                             self.state
                                 .session_grants
                                 .insert((req.kind, req.target.clone()));
                             continue;
                         }
                         Some(Err(reason)) => {
-                            self.record(req, "deny", "permanent-allow-refused-relative-exec-path");
-                            self.notice(window.as_ref(), &reason);
-                            return Deny;
+                            return Err(PermissionRefusal::new(
+                                Some(req),
+                                "permanent-allow-refused-relative-exec-path",
+                                reason,
+                            ));
                         }
                         Some(Ok(entry)) => entry,
                     };
@@ -2682,24 +2821,29 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                             }
                         }
                     };
-                    self.record(req, "allow", persistent_scope);
+                    self.record(Some(req), "allow", persistent_scope, None);
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
                 }
                 PromptChoice::Deny => {
-                    self.record(req, "deny", scope);
-                    return Deny;
+                    return Err(PermissionRefusal::new(
+                        Some(req),
+                        scope,
+                        "permission was not approved",
+                    ));
                 }
                 PromptChoice::DenyAlways => {
-                    self.record(req, "deny", "session");
                     self.state
                         .session_denials
                         .insert((req.kind, req.target.clone()));
-                    return Deny;
+                    return Err(PermissionRefusal::new(
+                        Some(req),
+                        "session",
+                        "the operator denied this request for the session",
+                    ));
                 }
                 PromptChoice::DenyPermanent => {
-                    self.record(req, "deny", "permanent");
                     if let Some(path) = self.denials_path.as_deref() {
                         if let Err(e) = newt_policy::append_denial(path, req.kind, &req.target) {
                             print_newt(
@@ -2712,33 +2856,41 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
                     self.state
                         .persistent_denials
                         .insert((req.kind, req.target.clone()));
-                    return Deny;
+                    return Err(PermissionRefusal::new(
+                        Some(req),
+                        "permanent",
+                        "the operator permanently denied this request",
+                    ));
                 }
                 control @ (PromptChoice::Back | PromptChoice::Exit) => {
                     self.apply_control(control);
-                    return Deny;
+                    return Ok(ControlFlow::Break(()));
                 }
             }
         }
-        let Ok(minted) = self.mint(baseline, &once_grants) else {
-            return Deny;
-        };
+        let minted = self
+            .mint(baseline, &once_grants)
+            .map_err(|e| PermissionRefusal::new(first, "authority-mint", format!("{e:#}")))?;
         let allowed = match build_covered_clamp {
             Some(fence) => minted.meet(&fence),
             None => minted,
         };
-        if self.state.validate_caveats(&allowed).is_err() {
-            return Deny;
-        }
+        self.state
+            .validate_caveats(&allowed)
+            .map_err(|e| PermissionRefusal::new(first, "workspace-protection", format!("{e:#}")))?;
         if operation_only {
             // Recalled grants cannot add unrelated authority to the prepared
             // operation, and a clamp may not silently remove its needed fence.
             if !baseline.leq(&allowed) {
-                return Deny;
+                return Err(PermissionRefusal::new(
+                    first,
+                    "operation-ceiling",
+                    "minted authority cannot cover the prepared operation",
+                ));
             }
-            Allow(allowed.meet(baseline))
+            Ok(ControlFlow::Continue(allowed.meet(baseline)))
         } else {
-            Allow(allowed)
+            Ok(ControlFlow::Continue(allowed))
         }
     }
 }
@@ -2746,6 +2898,10 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
 #[cfg(test)]
 #[path = "permissions_tests/permission_prompt_tests.rs"]
 mod permission_prompt_tests;
+
+#[cfg(test)]
+#[path = "permissions_tests/refusal.rs"]
+mod refusal_tests;
 
 #[cfg(test)]
 #[path = "permissions_tests/session_promotion.rs"]

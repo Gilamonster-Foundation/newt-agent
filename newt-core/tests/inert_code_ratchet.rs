@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 33;
+const KNOWN_INERT_UNITS: usize = 32;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -586,18 +586,6 @@ const DEBT: &[Unit] = &[
                 "cost_usd: None",
                 "suppress unused warning until token usage is wired"
             ),
-        ]
-    ),
-    unit!(
-        "F18",
-        Wire,
-        "permission refusal detail is promised to audit but explicitly discarded.",
-        [
-            site(
-                "newt-tui/src/permissions.rs",
-                "refusal: &newt_interaction::Refusal"
-            ),
-            site("newt-tui/src/permissions.rs", "let _ = refusal"),
         ]
     ),
     unit!(
@@ -1315,7 +1303,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (23, 8, 2),
+        (22, 8, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(

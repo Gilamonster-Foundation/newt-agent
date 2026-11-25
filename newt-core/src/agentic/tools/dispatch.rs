@@ -449,10 +449,15 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     let execution = collab
         .execution
         .or_else(|| invocation.map(|call| call.execution_slot()));
-    let collab = ToolCollaborators {
+    let mut collab = ToolCollaborators {
         execution,
         ..collab
     };
+    let mut permission_gate = collab.permission_gate.take();
+    if let Some(gate) = permission_gate.as_mut() {
+        // A previous cancelled call must not annotate this call's result.
+        gate.take_refusal_cause();
+    }
     let spill = collab.spill_store;
     let result = {
         // #1727: the row under the header is never silent while the tool is
@@ -463,6 +468,9 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
         let spinner = ToolSpinner::start(&presentation_name, color);
         let collab = ToolCollaborators {
             live_tool_output: spinner.wrap(collab.live_tool_output),
+            permission_gate: permission_gate
+                .as_mut()
+                .map(|gate| &mut **gate as &mut dyn PermissionGate),
             ..collab
         };
         let execution = execute_tool_inner(
@@ -486,7 +494,20 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
         }
     };
     match result {
-        Some(result) => {
+        Some(mut result) => {
+            if let Some(cause) = permission_gate
+                .as_mut()
+                .and_then(|gate| gate.take_refusal_cause())
+            {
+                // A pre-prompt refusal is not an operator declining the form.
+                // Other tools may carry partial execution output; retain it.
+                if name == "request_permissions" {
+                    result.clear();
+                } else {
+                    result.push('\n');
+                }
+                result.push_str(&format!("Permission refused ({cause}); a retry or a permission request cannot override this refusal."));
+            }
             if let Some(invocation) = invocation {
                 if let Err(error) = invocation.observe(
                     &result,

@@ -2105,7 +2105,10 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             newt_policy::PermissionDecision::Deny
         ));
     }
-    assert!(fresh.decisions.is_empty());
+    assert_eq!(fresh.decisions.len(), 1);
+    assert_eq!(fresh.decisions[0].decision, "deny");
+    assert_eq!(fresh.decisions[0].scope, "prior-denial");
+    assert!(fresh.decisions[0].reason.is_some());
 }
 
 /// #2535/#2524 PR1: every durable-store kind (exec/fs/net) offers permanent
@@ -2492,12 +2495,16 @@ fn refresh_caveats_preserves_denials_and_filters_conflicting_cached_grants() {
         refreshed, base,
         "the broad recalled grant conflicts with a denial"
     );
+    assert_eq!(gate.state.decisions.len(), 2, "refresh records no decision");
     assert!(matches!(
         gate.ask(&[request]),
         newt_policy::PermissionDecision::Deny
     ));
     assert_eq!(prompts.get(), 2, "refresh cannot clear an operator refusal");
-    assert_eq!(gate.state.decisions.len(), 2);
+    assert_eq!(gate.state.decisions.len(), 3);
+    assert_eq!(gate.state.decisions[2].decision, "deny");
+    assert_eq!(gate.state.decisions[2].scope, "prior-denial");
+    assert!(gate.state.decisions[2].reason.is_some());
 }
 
 /// #2716: a loop's repeated resolved exec denials belong to one invocation,
@@ -3206,9 +3213,12 @@ fn deny_always_short_circuits_later_asks() {
     ));
     assert_eq!(prompts.get(), 1, "second ask auto-denied without a prompt");
     drop(gate);
-    assert_eq!(state.decisions.len(), 1);
+    assert_eq!(state.decisions.len(), 2);
     assert_eq!(state.decisions[0].decision, "deny");
     assert_eq!(state.decisions[0].scope, "session");
+    assert_eq!(state.decisions[1].decision, "deny");
+    assert_eq!(state.decisions[1].scope, "prior-denial");
+    assert!(state.decisions[1].reason.is_some());
 }
 
 #[test]

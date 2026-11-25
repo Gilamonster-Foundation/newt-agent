@@ -69,6 +69,62 @@ fn request(kind: DenialKind, target: &Path) -> PermissionRequest {
     }
 }
 
+/// Grounds `refusal_tests::pre_prompt_refusal_records_guard_reason_and_notifies_operator_once`:
+/// a real mutable build anchor produces the same refusal and the production
+/// append path persists its reason in a verifiable chain. Run single-threaded
+/// with the existing native permission test feature.
+#[cfg(feature = "native-permission-test")]
+#[test]
+fn real_build_refusal_writes_one_chained_record_and_one_notice() {
+    let fixture = Fixture::new();
+    let git = fixture.workspace.join(".git");
+    std::fs::create_dir(&git).unwrap();
+    let mut build = newt_core::confined_exec::build_tool_caveats(&fixture.workspace);
+    if let Scope::Only(reads) = &mut build.fs_read {
+        reads.insert(git.to_string_lossy().into_owned());
+    }
+    let reason = fixture
+        .guard
+        .validate_caveats(&build)
+        .unwrap_err()
+        .to_string();
+    assert!(reason.contains("model-writable ancestor"), "{reason}");
+    let log = fixture._temp.path().join("permission-log.jsonl");
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = fixture.state();
+    state.notices = Some(notices.clone());
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        build.clone(),
+        None,
+        Some(log.clone()),
+        vec![],
+        prompts.clone(),
+    );
+    assert!(matches!(
+        gate.ask_with_caveats(&build, &[request(DenialKind::Build, &fixture.workspace)]),
+        newt_policy::PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 0);
+    assert_eq!(gate.state.decisions.len(), 1);
+    let notices = notices.lock().unwrap();
+    assert_eq!(
+        *notices,
+        [format!(
+            "permission refused (workspace-protection): {reason}"
+        )]
+    );
+    let lines = newt_core::permission_journal::read_jsonl(&std::fs::read_to_string(&log).unwrap());
+    assert_eq!(lines.len(), 1);
+    let record = lines[0].node.payload();
+    assert_eq!(record.decision, "deny");
+    assert_eq!(record.scope, "workspace-protection");
+    assert_eq!(record.reason.as_deref(), Some(reason.as_str()));
+    let head = newt_core::permission_journal::read_head(&log).unwrap();
+    assert!(newt_core::permission_journal::verify_chain(&lines, Some(&head)).is_empty());
+}
+
 #[test]
 fn protected_batch_denies_before_prompt_consumption_or_persistence() {
     let fixture = Fixture::new();
