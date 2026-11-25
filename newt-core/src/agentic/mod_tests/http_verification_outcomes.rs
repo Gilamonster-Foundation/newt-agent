@@ -928,6 +928,7 @@ async fn verification_fixture_isolates_and_restores_a_foreign_no_progress_budget
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after: 2,
+            ..Default::default()
         },
         ..Default::default()
     });

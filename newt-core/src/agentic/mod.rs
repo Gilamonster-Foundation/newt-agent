@@ -1338,16 +1338,16 @@ mod retry_ledger_tests;
 /// `outcome`), so the frame stays consistent.
 macro_rules! no_progress_gate {
     (
-        $runtime:expr, $steer_allowed:expr, $messages:expr, $end_reason:expr,
+        $runtime:expr, $disposition:expr, $steer_allowed:expr, $messages:expr, $end_reason:expr,
         $solve_obs:expr, $usage:expr, $halluc:expr, $smart:expr, ($workspace:expr, $read:expr, $evidence:expr, $disclosure:expr, $claims:expr, $verification:expr), |$h:ident| $record:expr
     ) => {
-        match $runtime.no_progress_verdict($steer_allowed) {
+        match $runtime.no_progress_verdict($disposition, $steer_allowed) {
             NoProgress::Continue => {}
             NoProgress::Steer(text) => {
                 $messages.push(serde_json::json!({ "role": "user", "content": text }));
             }
             NoProgress::Stop => {
-                let notice = finalize_final_text(FinalReply::harness($runtime.no_progress_notice()), $workspace, $read, $evidence, $disclosure, $claims, $verification);
+                let notice = finalize_final_text(FinalReply::harness($runtime.no_progress_notice($disposition)), $workspace, $read, $evidence, $disclosure, $claims, $verification);
                 if let Some($h) = $smart {
                     $record;
                     $h.outcome(crate::TurnEndReason::NoProgress, &notice)?;
@@ -1941,6 +1941,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                prompt_disposition,
                 action_nudges,
                 messages,
                 end_reason,
@@ -4515,6 +4516,11 @@ struct WorkflowRuntimeState {
     /// `consecutive_read_only_rounds` on purpose: that counter RESETS whenever its
     /// nudge fires, so it cannot measure a whole stall.
     rounds_without_change: usize,
+    /// Counts every completed round, including early continues, but fresh
+    /// evidence and action-forcing nudges cannot reset this longer ceiling.
+    rounds_without_action_progress: usize,
+    /// A workspace change or newly verified check in the completed round.
+    round_action_progressed: bool,
     /// The one steer for this stall has been sent.
     no_progress_steered: bool,
     /// Fresh evidence, an observed workspace change, or a newly verified check
@@ -4588,12 +4594,14 @@ impl WorkflowRuntimeState {
                 args.remove("trim");
                 args.remove("echo_dropped");
             }
-            return content_addressable::canonical::to_canonical_dagcbor(&call)
+            let fresh = content_addressable::canonical::to_canonical_dagcbor(&call)
                 .ok()
                 .is_some_and(|bytes| {
                     self.verified_checks
                         .insert(content_addressable::ContentId::from_canonical_bytes(&bytes))
                 });
+            self.round_action_progressed |= fresh;
+            return fresh;
         }
         // Passing non-gate build phases do not prove new work. The tool's
         // recorded route, never a text/keyword guess, identifies these.
@@ -4626,14 +4634,26 @@ impl WorkflowRuntimeState {
     /// the very next statement would throw the operator's words away unread.
     fn note_operator_steering(&mut self) {
         self.round_progressed = true;
+        self.round_action_progressed = true;
     }
 
     /// U4b: called at the start of every round after the first. First it counts
     /// the round that just completed (idle unless it progressed), then decides.
-    /// Applies to read-only loops too; `0` disables that half of the brake.
+    /// The short brake applies to read-only loops too; the evidence-only
+    /// ceiling applies only to Act. `0` disables each threshold.
     /// The STOP is a cost bound and always applies; the STEER is advice, so the
     /// caller passes `steer_allowed = action_nudges`.
-    fn no_progress_verdict(&mut self, steer_allowed: bool) -> NoProgress {
+    fn no_progress_verdict(
+        &mut self,
+        disposition: PromptDisposition,
+        steer_allowed: bool,
+    ) -> NoProgress {
+        if std::mem::take(&mut self.round_action_progressed) {
+            self.rounds_without_action_progress = 0;
+        } else {
+            self.rounds_without_action_progress =
+                self.rounds_without_action_progress.saturating_add(1);
+        }
         if std::mem::take(&mut self.round_progressed) {
             self.rounds_without_change = 0;
             self.no_progress_steered = false;
@@ -4641,7 +4661,9 @@ impl WorkflowRuntimeState {
             self.rounds_without_change = self.rounds_without_change.saturating_add(1);
         }
         let (n, cfg) = (self.rounds_without_change, self.no_progress);
-        if cfg.stop_after > 0 && n >= cfg.stop_after {
+        if (cfg.stop_after > 0 && n >= cfg.stop_after)
+            || self.evidence_only_ceiling_reached(disposition)
+        {
             return NoProgress::Stop;
         }
         if steer_allowed && cfg.steer_after > 0 && n >= cfg.steer_after && !self.no_progress_steered
@@ -4656,16 +4678,33 @@ impl WorkflowRuntimeState {
         NoProgress::Continue
     }
 
+    fn evidence_only_ceiling_reached(&self, disposition: PromptDisposition) -> bool {
+        disposition == PromptDisposition::Act
+            && self.no_progress.evidence_only_stop_after > 0
+            && self.rounds_without_action_progress >= self.no_progress.evidence_only_stop_after
+    }
+
     /// The harness-written reply when the brake ends the turn.
-    fn no_progress_notice(&self) -> String {
+    fn no_progress_notice(&self, disposition: PromptDisposition) -> String {
+        let (rounds, missing) = if self.evidence_only_ceiling_reached(disposition) {
+            (
+                self.rounds_without_action_progress,
+                "workspace change or newly verified check",
+            )
+        } else {
+            (
+                self.rounds_without_change,
+                "new evidence, workspace change, or newly verified check",
+            )
+        };
         format!(
-            "Stopped: {} consecutive rounds produced no new evidence, workspace change, or \
-             newly verified check. Work done so far is left in the workspace.",
-            self.rounds_without_change
+            "Stopped: {rounds} consecutive rounds produced no {missing}. \
+             Work done so far is left in the workspace."
         )
     }
 
     fn record_round_outcome(&mut self, round_wrote: bool, round_progress: bool) {
+        self.round_action_progressed |= round_wrote;
         // Only concrete progress renews the round allowance. The gate also
         // counts rounds which continue before reaching this hook.
         if round_wrote || round_progress {
@@ -7296,6 +7335,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                prompt_disposition,
                 action_nudges,
                 messages,
                 end_reason,
@@ -10220,6 +10260,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                prompt_disposition,
                 action_nudges,
                 messages,
                 end_reason,
@@ -12911,6 +12952,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                prompt_disposition,
                 action_nudges,
                 input,
                 end_reason,

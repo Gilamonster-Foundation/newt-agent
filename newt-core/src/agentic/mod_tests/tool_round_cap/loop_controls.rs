@@ -587,6 +587,7 @@ async fn run_brake_loop(
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after: 2,
+            ..Default::default()
         },
         ..Default::default()
     });
