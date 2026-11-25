@@ -393,6 +393,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn issue_3256_quoted_final_lines_are_pending_actions() {
+        let classifier = NudgeClassifier::builtin();
+        let mut failures = Vec::new();
+        // Only the final lines were supplied, not the complete stored replies.
+        for (label, quote, newlines) in [
+            ("A", "Let me read the beginning of mod.rs to understand the module declarations:", 58),
+            ("B", "Let me check the refactor/large-files branch to see what's already been extracted:", 82),
+        ] {
+            for padding in [0, newlines] {
+                let text = format!("{}{quote}", "\n".repeat(padding));
+                let result = classifier.classify(&text);
+                println!("{label}, preceding newlines={padding}: {:?}, score={:.6}", result.class, result.score);
+                if !result.is_pending_action() {
+                    failures.push(format!("{label}, preceding newlines={padding}: {result:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn unfinished_summary_and_tool_promises_are_pending_actions() {
         let classifier = NudgeClassifier::builtin();
         for text in [

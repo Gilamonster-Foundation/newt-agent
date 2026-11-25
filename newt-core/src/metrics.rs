@@ -39,8 +39,7 @@ impl TokenUsage {
 /// narrate-then-stop acceptance was indistinguishable from a normal
 /// completion — even under `NEWT_DEBUG` (the 2026-07-08 ornith:35b
 /// forensics could not tell "cap exhausted" from "classifier missed" from
-/// disk). `None` on paths that do not report it (headless callers, the
-/// Responses-API loop).
+/// disk). `None` on callers that do not request it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnEndReason {
@@ -52,6 +51,9 @@ pub enum TurnEndReason {
     NarrationCapExhausted,
     /// Pending-action narration stopped on the final allowed round.
     NarrationFinalRound,
+    /// Pending-action narration ended without an eligible action rescue.
+    /// This says nothing about a rescue budget having been spent.
+    NarrationUnrescued,
     /// The tool-round cap ended the turn via the tools-disabled summary.
     RoundCap,
     /// The operator-configured whole-run inference-call allowance
@@ -203,10 +205,13 @@ impl TurnMetrics {
         // cap) says so instead of silently looking finished.
         match self.end_reason {
             Some(TurnEndReason::NarrationCapExhausted) => {
-                format!("{base} · ⚠ incomplete: ended on narration (rescue budget spent)")
+                format!("{base} · ⚠ incomplete: ended on narration (rescue budget spent) — model stopped before acting")
             }
             Some(TurnEndReason::NarrationFinalRound) => {
-                format!("{base} · ⚠ incomplete: ended on narration (final round)")
+                format!("{base} · ⚠ incomplete: ended on narration (final round) — model stopped before acting")
+            }
+            Some(TurnEndReason::NarrationUnrescued) => {
+                format!("{base} · ⚠ incomplete: model stopped before acting (no action rescue)")
             }
             Some(TurnEndReason::AwaitingOperator) => format!("{base} · awaiting operator"),
             Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
@@ -548,7 +553,22 @@ mod tests {
         ] {
             m.end_reason = Some(reason);
             assert!(m.display_line().contains("incomplete"));
+            assert!(m.display_line().contains("model stopped before acting"));
         }
+    }
+
+    #[test]
+    fn issue_3256_unrescued_narration_round_trips_without_claiming_a_spent_budget() {
+        let reason: TurnEndReason = serde_json::from_str("\"narration_unrescued\"").unwrap();
+        let mut m = metrics(100, 10, 5, None);
+        m.end_reason = Some(reason);
+        let line = m.display_line();
+        assert!(line.contains("incomplete") && line.contains("model stopped before acting"));
+        assert!(!line.contains("rescue budget spent"));
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["end_reason"],
+            "narration_unrescued"
+        );
     }
 
     #[test]

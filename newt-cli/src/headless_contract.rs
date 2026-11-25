@@ -159,6 +159,7 @@ pub fn terminal(
             | TurnEndReason::AwaitingOperator
             | TurnEndReason::NarrationCapExhausted
             | TurnEndReason::NarrationFinalRound
+            | TurnEndReason::NarrationUnrescued
             | TurnEndReason::RepairExhausted
             | TurnEndReason::VerificationIncomplete
             | TurnEndReason::PrepareOnly),
@@ -224,7 +225,8 @@ pub fn outcome_label(t: Terminal) -> &'static str {
             TurnEndReason::Empty
             | TurnEndReason::AwaitingOperator
             | TurnEndReason::NarrationCapExhausted
-            | TurnEndReason::NarrationFinalRound,
+            | TurnEndReason::NarrationFinalRound
+            | TurnEndReason::NarrationUnrescued,
         ) => "model_error",
         // The remaining variants cannot construct `StoppedShort`; listed so a
         // new one fails to compile rather than inheriting a bucket.
@@ -1021,6 +1023,8 @@ mod tests {
         TurnEndReason::VerificationIncomplete,
         TurnEndReason::RunAllowance,
         TurnEndReason::NoProgress,
+        TurnEndReason::PrepareOnly,
+        TurnEndReason::NarrationUnrescued,
     ];
 
     fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
@@ -1084,6 +1088,7 @@ mod tests {
             TurnEndReason::RunAllowance => 10,
             TurnEndReason::NoProgress => 11,
             TurnEndReason::PrepareOnly => 12,
+            TurnEndReason::NarrationUnrescued => 13,
         }
     }
 
@@ -1227,6 +1232,17 @@ mod tests {
             Terminal::Completed
         );
         assert_eq!(outcome_label(Terminal::Completed), "completed");
+    }
+
+    #[test]
+    fn issue_3256_unrescued_narration_is_an_incomplete_model_attempt() {
+        let reason: TurnEndReason = serde_json::from_str("\"narration_unrescued\"").unwrap();
+        for smart_harness in [false, true] {
+            let actual = terminal(true, None, Some(reason), smart_harness);
+            assert_eq!(actual, Terminal::StoppedShort(reason));
+            assert_eq!(status_label(actual), "incomplete");
+            assert_eq!(outcome_label(actual), "model_error");
+        }
     }
 
     #[test]
