@@ -141,8 +141,8 @@ pub(super) enum WireValidationError {
     /// A tool is not in the flattened Responses shape (missing name / non-object
     /// parameters / still Chat-shaped).
     MalformedTool,
-    /// A strict-shaped tool schema (`parameters.additionalProperties == false`)
-    /// lost its `strict: true` marker, silently downgrading validation.
+    /// A built-in tool's closed schema (`parameters.additionalProperties == false`)
+    /// lacks its `strict: true` marker, silently downgrading validation.
     StrictSchemaLoss,
     /// A content handle in `input` does not parse as a canonical `SpillCid`.
     MalformedCidMarker { kind: &'static str },
@@ -393,19 +393,16 @@ fn validate_tools(body: &Value, policy: &ResponsesWirePolicy) -> Result<(), Wire
     for tool in tools {
         // Flattened Responses shape: `{type:function, name, parameters, …}`; a
         // residual `function` key means it was never flattened.
-        let name_ok = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|n| !n.is_empty());
-        if !name_ok || tool.get("function").is_some() || !tool["parameters"].is_object() {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+        if name.is_empty() || tool.get("function").is_some() || !tool["parameters"].is_object() {
             return Err(WireValidationError::MalformedTool);
         }
-        // A schema that forbids additional properties is only ENFORCED as strict
-        // when `strict: true` rides at the tool's top level; without it the
-        // provider treats the schema as advisory — a silent strictness loss.
+        // Newt's closed schemas require strict mode. MCP names are namespaced,
+        // outside the built-in registry, and a remote schema may forbid extra
+        // properties without ever claiming strictness (e.g. optional fields).
         let strict_shaped = tool["parameters"]["additionalProperties"] == Value::Bool(false);
         let is_strict = tool.get("strict") == Some(&Value::Bool(true));
-        if strict_shaped && !is_strict {
+        if super::tools::known_builtin_tool_name(name) && strict_shaped && !is_strict {
             return Err(WireValidationError::StrictSchemaLoss);
         }
     }
@@ -677,6 +674,23 @@ mod tests {
             "name": "write_file",
             "parameters": {"type": "object", "additionalProperties": false},
         }]);
+        assert_eq!(
+            validate_responses_request(&body, &base_policy()).unwrap_err(),
+            WireValidationError::StrictSchemaLoss
+        );
+    }
+
+    #[test]
+    fn operating_mode_catalog_without_strict_is_still_rejected() {
+        let mut body = good_body();
+        let mut definition = super::super::select_operating_mode_tool_definition();
+        definition["function"]
+            .as_object_mut()
+            .unwrap()
+            .remove("strict");
+        body["tools"] = serde_json::json!(super::super::tools_to_responses(&serde_json::json!([
+            definition
+        ])));
         assert_eq!(
             validate_responses_request(&body, &base_policy()).unwrap_err(),
             WireValidationError::StrictSchemaLoss
