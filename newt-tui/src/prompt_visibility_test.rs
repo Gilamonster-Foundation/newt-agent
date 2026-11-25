@@ -317,6 +317,8 @@ fn mcp_net_prompt_enter_confirms_configured_default_on_a_real_terminal() {
     }
 }
 
+/// Grounds the mocked modal redraw and arbiter suspension tests: the real
+/// terminal keeps the question and answer visible while the spinner is parked.
 #[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
@@ -356,11 +358,15 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     let prompt_start = screen
         .find('⊘')
         .unwrap_or_else(|| panic!("question missing; screen={screen:?}"));
-    let echo_rel = screen[prompt_start..]
-        .find("d\r\n")
-        .or_else(|| screen[prompt_start..].find("d\n"))
+    // Match the answer at its input glyph, not the final `d` in a status row
+    // such as "elapsed". Strip zero-width accents before locating that row.
+    let prompt_output = strip_ansi(&screen[prompt_start..]);
+    let echo_rel = prompt_output
+        .find(&format!("{MODAL_INPUT_GLYPH}d\r\n"))
+        .or_else(|| prompt_output.find(&format!("{MODAL_INPUT_GLYPH}d\n")))
+        .map(|offset| offset + MODAL_INPUT_GLYPH.len())
         .unwrap_or_else(|| panic!("keystroke not echoed; screen={screen:?}"));
-    let window = &screen[prompt_start..prompt_start + echo_rel];
+    let window = &prompt_output[..echo_rel];
 
     // C0a (#1856): the expectation is re-derived from the production
     // renderer, so this real-PTY grounding tracks `plain::render` rather
@@ -376,6 +382,10 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     assert!(
         window_lf.contains(expected_prompt.trim_end()),
         "question not fully visible\nscreen={screen:?}"
+    );
+    assert!(
+        window_lf.contains("waiting for operator") && window_lf.contains("s elapsed"),
+        "operator wait status missing before input\nscreen={screen:?}"
     );
 
     let intruders: Vec<char> = window

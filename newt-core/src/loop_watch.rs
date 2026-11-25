@@ -231,6 +231,7 @@ mod loop_watch_tests {
             args_digest: digest.to_string(),
             ok,
             duration_ms: Some(ms),
+            operator_wait_ms: None,
             execution: None,
             from_cache: false,
         }

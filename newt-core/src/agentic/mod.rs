@@ -3623,7 +3623,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             let before_change =
                 progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
             ledger_note_write(write_ledger, name, &args, workspace);
-            let tool_t0 = std::time::Instant::now();
+            let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
@@ -8965,7 +8965,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             let before_change =
                 progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
             ledger_note_write(write_ledger, name, &args, workspace);
-            let tool_t0 = std::time::Instant::now();
+            let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
@@ -11798,7 +11798,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let before_change =
                 progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
             ledger_note_write(write_ledger, name, &args, workspace);
-            let tool_t0 = std::time::Instant::now();
+            let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();
@@ -13783,7 +13783,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let before_change =
                 progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
             ledger_note_write(write_ledger, name, &args, workspace);
-            let tool_t0 = std::time::Instant::now();
+            let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
             let retry_authorized = std::sync::OnceLock::new();
             let routed_to = std::sync::OnceLock::new();

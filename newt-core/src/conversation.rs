@@ -42,11 +42,18 @@ pub struct ToolEvent {
     /// tool results are plain strings, so this mirrors the `error:` /
     /// `capability denied:` / `unknown tool` prefixes `execute_tool` emits.
     pub ok: bool,
-    /// Wall-clock duration of the tool call in milliseconds. A display
+    /// Tool-call duration excluding measured operator wait, in milliseconds.
+    /// Legacy events without `operator_wait_ms` include that wait. A display
     /// claim only (§6): never an ordering key — order within the turn is
     /// the events array position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Time waiting for an operator decision, separate from `duration_ms`.
+    /// `None` means unmeasured (including legacy events), not zero. The chain
+    /// hashes stored event bytes, so this additive field needs no turn-encoding
+    /// version bump and never changes the bytes or identity of existing rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_wait_ms: Option<u64>,
     /// #2315: what a shell call (`run_command` / `lifecycle`) observably did,
     /// classified where its envelope is produced. `None` for every other call
     /// and for calls refused before reaching the shell. Additive: absent from
@@ -94,6 +101,7 @@ impl ToolEvent {
             args_digest,
             ok,
             duration_ms,
+            operator_wait_ms: None,
             execution: None,
             from_cache: false,
         }
