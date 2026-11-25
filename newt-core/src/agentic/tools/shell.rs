@@ -1167,7 +1167,9 @@ pub(super) async fn dispatch_bridled_build_shell(
         args,
         caveats,
         sink,
-        Some(agent_bridle::AxisEnforcement::Kernel),
+        Some(agent_bridle::EnforcementFloor::from_scalar(
+            agent_bridle::AxisEnforcement::Kernel,
+        )),
         Some(execution_lease),
         command_broker,
         held_read_roots,
@@ -1178,11 +1180,11 @@ pub(super) async fn dispatch_bridled_build_shell(
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "confine")]
-async fn dispatch_bridled_shell_with_floor(
+pub(super) async fn dispatch_bridled_shell_with_floor(
     mut args: serde_json::Value,
     caveats: &newt_policy::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
-    strength_floor: Option<agent_bridle::AxisEnforcement>,
+    strength_floor: Option<agent_bridle::EnforcementFloor>,
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
@@ -1258,7 +1260,7 @@ async fn dispatch_bridled_shell_with_floor(
     let result = match strength_floor {
         Some(floor) => {
             registry
-                .dispatch_with_strength_floor("shell", args, &grant, floor)
+                .dispatch_with_enforcement_floor("shell", args, &grant, floor)
                 .await
         }
         None => registry.dispatch("shell", args, &grant).await,

@@ -4803,7 +4803,8 @@ async fn execute_authorized_tool(
                     caveats,
                     &mut permission_gate,
                     governed_pr,
-                ));
+                    shell::command_wall(cmd, args.get("timeout_secs").and_then(serde_json::Value::as_u64), command_budget),
+                ).await);
             }
             #[cfg(feature = "confine")]
             if governed_git && git_words::needs_pr_create_broker(cmd) {
