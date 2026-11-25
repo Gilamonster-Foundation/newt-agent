@@ -1,6 +1,86 @@
 use super::*;
 use crate::agentic::NoMcp;
 
+#[test]
+fn delayed_operator_decision_records_the_actual_permission_tool_result() {
+    use crate::agentic::attribution::{record_completed_tool_event, ToolTimer};
+    use crate::markup::extension::Stopwatch;
+    use crate::Caveats;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+
+    struct Clock(AtomicU64);
+    impl Stopwatch for Clock {
+        fn read_nanos(&self) -> u128 {
+            u128::from(self.0.load(Ordering::Relaxed)) * 1_000_000
+        }
+    }
+    struct Gate {
+        clock: Arc<Clock>,
+        allow: bool,
+    }
+    impl PermissionGate for Gate {
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            assert_eq!(requests[0].tool, "request_permissions");
+            assert_eq!(requests[0].target, "stat");
+            crate::lifecycle::emit(crate::lifecycle::LifecycleEvent::Blocked);
+            self.clock.0.store(10_002, Ordering::Relaxed);
+            crate::lifecycle::emit(crate::lifecycle::LifecycleEvent::Unblocked);
+            if self.allow {
+                PermissionDecision::Allow(Caveats::top())
+            } else {
+                PermissionDecision::Deny
+            }
+        }
+        fn ask_dependency_fetch(
+            &mut self,
+            _: &Caveats,
+            _: &PermissionRequest,
+        ) -> PermissionDecision {
+            panic!("this tool requests exec permission, not a dependency fetch")
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            panic!("this tool requests exec permission, not free text")
+        }
+    }
+    for allow in [true, false] {
+        let clock = Arc::new(Clock(AtomicU64::new(0)));
+        let timer = ToolTimer::with_clock(clock.clone());
+        clock.0.store(2, Ordering::Relaxed);
+        let mut gate = Gate {
+            clock: clock.clone(),
+            allow,
+        };
+        let args = serde_json::json!({"capability":"exec", "target":"stat"});
+        let (granted, replay, result) = execute_request_permissions(
+            &Caveats::default(),
+            &args,
+            Some(&mut gate),
+            false,
+            20,
+            "/workspace",
+            None,
+        );
+        assert_eq!(granted.is_some(), allow, "{result}");
+        assert!(replay.is_none());
+        clock.0.store(10_007, Ordering::Relaxed);
+        let mut events = Vec::new();
+        record_completed_tool_event(
+            &mut Some(&mut events),
+            "request_permissions",
+            &args,
+            allow,
+            None,
+            timer,
+        );
+        assert_eq!(events[0].duration_ms, Some(7));
+        assert_eq!(events[0].operator_wait_ms, Some(10_000));
+        assert_eq!(events[0].ok, allow);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RecordingLiveOutput {
     pub(in crate::agentic::tools) events: std::sync::Mutex<Vec<String>>,

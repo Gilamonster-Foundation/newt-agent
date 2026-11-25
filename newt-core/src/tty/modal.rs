@@ -80,14 +80,27 @@ pub fn read_prompt_window_line(
         // Keep normal newline translation while delivering permanent notices;
         // the prompt's raw editor begins only once those lines are complete.
         let _guard = take_modal_ownership(window)?;
-        window.ask(&render(prompt, "", true, accent)?)?;
         let mut value = String::new();
+        let mut first = true;
+        let mut previous = String::new();
         loop {
+            let status = super::Terminal::operator_wait_line().unwrap_or_default();
+            let fitted = super::fit_line(&status, super::term_cols().saturating_sub(1));
+            let status = format!("{}{}{}", fitted.head, fitted.fade, fitted.ellipsis);
+            let shown = echo.display(&value);
+            let frame = render_waiting(prompt, &shown, first, accent, &status)?;
+            if first || frame != previous {
+                window.ask(&frame)?;
+                previous = frame;
+                first = false;
+            }
+            if !event::poll(Duration::from_millis(250))? {
+                continue;
+            }
             let key = match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => key,
                 Event::Paste(text) => {
                     value.extend(text.chars().filter(|ch| !ch.is_control()));
-                    window.ask(&render(prompt, &echo.display(&value), false, accent)?)?;
                     continue;
                 }
                 _ => continue,
@@ -99,14 +112,12 @@ pub fn read_prompt_window_line(
                 KeyCode::Enter => break PromptLine::Line(value),
                 KeyCode::Backspace => {
                     value.pop();
-                    window.ask(&render(prompt, &echo.display(&value), false, accent)?)?;
                 }
                 KeyCode::Char(ch)
                     if !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     value.push(ch);
-                    window.ask(&render(prompt, &echo.display(&value), false, accent)?)?;
                 }
                 _ => {}
             }
@@ -230,6 +241,49 @@ fn render(prompt: &str, value: &str, first: bool, accent: bool) -> io::Result<St
     }
     write!(out, "{value}")?;
     String::from_utf8(out).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Repaint the prompt's own status and answer rows, never through a suspended
+/// spinner. The answer (including secret masking) survives every clock tick.
+fn render_waiting(
+    prompt: &str,
+    value: &str,
+    first: bool,
+    accent: bool,
+    status: &str,
+) -> io::Result<String> {
+    if status.is_empty() {
+        return render(prompt, value, first, accent);
+    }
+    if first {
+        let (body, answer) = prompt.rsplit_once('\n').unwrap_or(("", prompt));
+        return render(&format!("{body}\n{status}\n{answer}"), value, true, accent);
+    }
+    let mut out = Vec::new();
+    crossterm::queue!(out, crossterm::cursor::MoveUp(1))?;
+    out.extend_from_slice(render(status, "", false, false)?.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(render(prompt, value, false, accent)?.as_bytes());
+    Ok(String::from_utf8(out).expect("terminal commands and text are UTF-8"))
+}
+
+#[test]
+fn operator_wait_redraw_preserves_the_answer_and_reports_elapsed() {
+    let rendered = render_waiting(
+        "Allow?\n❯ ",
+        "yes",
+        false,
+        false,
+        "waiting for operator — 10s elapsed",
+    )
+    .unwrap();
+    assert!(rendered.contains("waiting for operator — 10s elapsed"));
+    assert!(rendered.contains("❯ yes"));
+    assert!(!rendered.contains("still working"));
+    assert!(
+        !rendered.contains("Allow?"),
+        "only the status and answer rows redraw"
+    );
 }
 
 /// Draw the final input row. The semantic prompt remains plain text; only the

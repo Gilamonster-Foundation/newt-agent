@@ -11,6 +11,84 @@ use super::GitTool;
 use super::NoteNudge;
 use super::NoteSink;
 use crate::agentic::{compress, smart_harness, tools};
+use crate::markup::extension::{Monotonic, Stopwatch};
+use std::sync::{Arc, Mutex};
+
+/// Per-call timing over the existing prompt lifecycle. Session filtering keeps
+/// another tab's prompt out of this call; nesting counts overlapping windows once.
+pub(super) struct ToolTimer {
+    clock: Arc<dyn Stopwatch + Send + Sync>,
+    started: u128,
+    // Open windows, first opening, completed wait (all times in nanoseconds).
+    wait: Arc<Mutex<(usize, u128, u128)>>,
+    _subscription: crate::lifecycle::Subscription,
+}
+
+impl ToolTimer {
+    pub(super) fn start() -> Self {
+        Self::with_clock(Arc::new(Monotonic::default()))
+    }
+
+    pub(super) fn with_clock(clock: Arc<dyn Stopwatch + Send + Sync>) -> Self {
+        let started = clock.read_nanos();
+        let wait = Arc::new(Mutex::new((0, 0, 0)));
+        let state = wait.clone();
+        let watch = clock.clone();
+        let session = crate::lifecycle::active_session();
+        let thread = std::thread::current().id();
+        let subscription = crate::lifecycle::subscribe(move |envelope| {
+            if envelope.session_id != session
+                || (session.is_none() && std::thread::current().id() != thread)
+            {
+                return;
+            }
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (depth, opening, total) = &mut *state;
+            match envelope.event {
+                crate::lifecycle::LifecycleEvent::Blocked => {
+                    if *depth == 0 {
+                        *opening = watch.read_nanos();
+                    }
+                    *depth += 1;
+                }
+                crate::lifecycle::LifecycleEvent::Unblocked if *depth > 0 => {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        *total += watch.read_nanos().saturating_sub(*opening);
+                    }
+                }
+                _ => {}
+            }
+        });
+        Self {
+            clock,
+            started,
+            wait,
+            _subscription: subscription,
+        }
+    }
+
+    fn finish(self) -> (Option<u64>, Option<u64>) {
+        let now = self.clock.read_nanos();
+        let (depth, opening, total) = *self
+            .wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waiting = total
+            + if depth > 0 {
+                now.saturating_sub(opening)
+            } else {
+                0
+            };
+        let execution = now.saturating_sub(self.started).saturating_sub(waiting);
+        (
+            u64::try_from(execution / 1_000_000).ok(),
+            u64::try_from(waiting / 1_000_000).ok(),
+        )
+    }
+}
 
 /// Record organic save_note use after repeat rejection and before dispatch.
 /// Reset even if the subsequent attempt fails or is cancelled; retain the
@@ -59,17 +137,14 @@ pub(super) fn record_completed_tool_event(
     // #2315: required, so no funnel can record a shell call without deciding
     // what its execution slot holds.
     execution: Option<crate::ExecOutcome>,
-    tool_t0: std::time::Instant,
+    timer: ToolTimer,
 ) {
     if let Some(rec) = tool_events.as_deref_mut() {
+        let (duration_ms, operator_wait_ms) = timer.finish();
         rec.push(crate::ToolEvent {
             execution,
-            ..crate::ToolEvent::from_call(
-                name,
-                args,
-                ok,
-                u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-            )
+            operator_wait_ms,
+            ..crate::ToolEvent::from_call(name, args, ok, duration_ms)
         });
     }
 }
@@ -254,5 +329,92 @@ impl Drop for AttributionEpoch<'_> {
             // it must never clear credit speculatively during preparation.
             self.consume_confirmed();
         }
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use crate::lifecycle::{emit, LifecycleEvent};
+    use crate::markup::extension::Stopwatch;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+
+    #[derive(Default)]
+    struct Clock(AtomicU64);
+
+    impl Stopwatch for Clock {
+        fn read_nanos(&self) -> u128 {
+            u128::from(self.0.load(Ordering::Relaxed)) * 1_000_000
+        }
+    }
+
+    #[test]
+    fn delayed_operator_decision_is_separate_from_tool_execution() {
+        let clock = Arc::new(Clock::default());
+        let timer = ToolTimer::with_clock(clock.clone());
+        clock.0.store(2, Ordering::Relaxed);
+        emit(LifecycleEvent::Blocked);
+        clock.0.store(10_002, Ordering::Relaxed);
+        emit(LifecycleEvent::Unblocked);
+        clock.0.store(10_007, Ordering::Relaxed);
+        let mut events = Vec::new();
+        record_completed_tool_event(
+            &mut Some(&mut events),
+            "run_command",
+            &serde_json::json!({}),
+            false,
+            Some(crate::ExecOutcome::Failed),
+            timer,
+        );
+        assert_eq!(events[0].duration_ms, Some(7));
+        assert_eq!(events[0].operator_wait_ms, Some(10_000));
+        assert_eq!(events[0].execution, Some(crate::ExecOutcome::Failed));
+    }
+
+    #[test]
+    fn unprompted_call_records_zero_operator_wait() {
+        let clock = Arc::new(Clock::default());
+        let timer = ToolTimer::with_clock(clock.clone());
+        clock.0.store(7, Ordering::Relaxed);
+        assert_eq!(timer.finish(), (Some(7), Some(0)));
+    }
+
+    #[test]
+    fn repeated_and_nested_prompts_count_only_this_sessions_wait() {
+        let session = crate::lifecycle::SessionId::from_issued("timing-nested");
+        let _scope = crate::lifecycle::scoped_active_session(&session);
+        let clock = Arc::new(Clock::default());
+        let timer = ToolTimer::with_clock(clock.clone());
+        crate::lifecycle::emit_for(
+            Some("another-session".into()),
+            crate::lifecycle::LifecycleEvent::Blocked,
+        );
+        clock.0.store(5, Ordering::Relaxed);
+        emit(LifecycleEvent::Blocked);
+        clock.0.store(10, Ordering::Relaxed);
+        emit(LifecycleEvent::Blocked);
+        clock.0.store(15, Ordering::Relaxed);
+        emit(LifecycleEvent::Unblocked);
+        clock.0.store(20, Ordering::Relaxed);
+        emit(LifecycleEvent::Unblocked);
+        clock.0.store(25, Ordering::Relaxed);
+        emit(LifecycleEvent::Blocked);
+        clock.0.store(35, Ordering::Relaxed);
+        emit(LifecycleEvent::Unblocked);
+        clock.0.store(40, Ordering::Relaxed);
+        assert_eq!(timer.finish(), (Some(15), Some(25)));
+    }
+
+    #[test]
+    fn recording_during_an_open_prompt_includes_the_wait_so_far() {
+        let clock = Arc::new(Clock::default());
+        let timer = ToolTimer::with_clock(clock.clone());
+        clock.0.store(2, Ordering::Relaxed);
+        emit(LifecycleEvent::Blocked);
+        clock.0.store(12, Ordering::Relaxed);
+        assert_eq!(timer.finish(), (Some(2), Some(10)));
     }
 }

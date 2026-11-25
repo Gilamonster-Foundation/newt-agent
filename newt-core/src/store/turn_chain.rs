@@ -903,6 +903,56 @@ impl ConversationStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn operator_wait_is_round_tripped_and_committed_by_the_existing_encoding() {
+        let legacy = r#"{"tool":"run_command","args_digest":"command b3:abc","ok":false,"duration_ms":10007}"#;
+        let mut event: crate::ToolEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(event.operator_wait_ms, None);
+        assert_eq!(serde_json::to_string(&event).unwrap(), legacy);
+        let old = TurnRow {
+            conversation_id: "c".into(),
+            writer_fingerprint: "w".into(),
+            seq: 1,
+            prev_hash: "p".into(),
+            user: "u".into(),
+            assistant: "a".into(),
+            events: format!("[{legacy}]"),
+            phantom_reaches: "[]".into(),
+            sources: "[]".into(),
+            tokens_in: None,
+            tokens_out: None,
+            ts_claim: 7,
+            encoding_version: TURN_ENCODING_VERSION_CURRENT,
+        };
+        let old_hash = old.content_hash().unwrap();
+        event.operator_wait_ms = Some(10_000);
+        event.duration_ms = Some(7);
+        let stored = serde_json::to_string(&vec![event.clone()]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<crate::ToolEvent>>(&stored).unwrap(),
+            vec![event]
+        );
+        let recorded = TurnRow {
+            events: stored,
+            ..clone_row(&old)
+        };
+        assert_ne!(recorded.content_hash().unwrap(), old_hash);
+        let edited = TurnRow {
+            events: recorded.events.replace("10000", "9999"),
+            ..clone_row(&recorded)
+        };
+        assert_ne!(
+            recorded.content_hash().unwrap(),
+            edited.content_hash().unwrap()
+        );
+        assert_ne!(recorded.content_id(), edited.content_id());
+        assert_eq!(
+            old.content_hash().unwrap(),
+            old_hash,
+            "old stored bytes remain untouched"
+        );
+    }
+
     fn clone_row(row: &TurnRow) -> TurnRow {
         TurnRow {
             conversation_id: row.conversation_id.clone(),

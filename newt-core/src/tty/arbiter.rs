@@ -34,6 +34,7 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::{execute, queue};
 
 use super::caps::LineCaps;
+use crate::markup::extension::{Monotonic, Stopwatch};
 
 /// Which stream an ephemeral writer paints on.
 ///
@@ -112,6 +113,7 @@ struct Inner {
     regions: Vec<(u64, Region)>,
     /// A `PromptWindow` is alive: every writer paints nothing.
     suspended: bool,
+    prompt_clock: Option<Arc<dyn Stopwatch + Send + Sync>>,
     next_id: u64,
     /// Stdin ownership — the other half of the terminal. `prompt_owner` is the
     /// thread currently blocked on a human; `watcher_reading` is the turn
@@ -126,6 +128,15 @@ struct Inner {
 }
 
 impl Inner {
+    fn operator_wait_line(&self) -> Option<String> {
+        self.prompt_clock.as_ref().map(|clock| {
+            format!(
+                "waiting for operator — {}s elapsed",
+                clock.read_nanos() / 1_000_000_000
+            )
+        })
+    }
+
     fn watcher_can_read(&self) -> bool {
         self.prompt_owner.is_none() && !self.watcher_reading && self.quiet_waiters == 0
     }
@@ -1111,6 +1122,12 @@ impl Terminal {
         Self::suspend_for_prompt_with_output(PromptOutput::Stdout, taker)
     }
 
+    /// The live prompt's status, read by its own renderer while other writers
+    /// are suspended. The arbiter owns the clock as well as the prompt lifetime.
+    pub fn operator_wait_line() -> Option<String> {
+        lock().operator_wait_line()
+    }
+
     /// [`Terminal::suspend_for_prompt`] with an explicit terminal output.
     ///
     /// The process may have redirected fd 1 into an internal capture while
@@ -1151,6 +1168,9 @@ impl Terminal {
         //    first, a ticker that wakes mid-erase paints nothing back.
         let live: Vec<Arc<dyn Ephemeral>> = {
             let mut state = lock();
+            if !state.suspended {
+                state.prompt_clock = Some(Arc::new(Monotonic::default()));
+            }
             state.suspended = true;
             live_ephemerals(&mut state)
         };
@@ -1518,9 +1538,19 @@ impl Drop for PromptWindow {
         }
         // Clear the suspend flag BEFORE restoring, so a restore that repaints
         // is not silently swallowed.
-        lock().suspended = false;
-        for e in &self.resume {
-            e.restore();
+        let last = {
+            let mut state = lock();
+            let last = state.prompt_depth == 1;
+            if last {
+                state.suspended = false;
+                state.prompt_clock = None;
+            }
+            last
+        };
+        if last {
+            for e in &self.resume {
+                e.restore();
+            }
         }
         // Stdin last: the terminal mode goes back to whatever the turn watcher
         // had set up only after the screen is whole again.

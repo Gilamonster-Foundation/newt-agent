@@ -201,13 +201,14 @@ mod terminal {
         u16::try_from(body + 3 + usize::from(input.options.is_none())).unwrap_or(u16::MAX)
     }
 
-    fn draw(frame: &mut ratatui::Frame, input: &mut ModalInput) {
+    fn draw(frame: &mut ratatui::Frame, input: &mut ModalInput, waiting: Option<&str>) {
         if let Some(inspection) = &mut input.inspection {
             let body = crate::modal::frame(
                 frame,
                 frame.area(),
                 &crate::modal::Chrome {
                     title: "inspect pending request — no decision submitted",
+                    subtitle: waiting.map(str::to_owned),
                     ..Default::default()
                 },
             );
@@ -270,12 +271,14 @@ mod terminal {
                     "input required"
                 },
                 // A reader who cannot see the end should know there is one.
-                subtitle: overflows.then(|| {
-                    format!(
-                        "· lines {}–{} of {total}",
-                        top + 1,
-                        (top + visible).min(total)
-                    )
+                subtitle: waiting.map(str::to_owned).or_else(|| {
+                    overflows.then(|| {
+                        format!(
+                            "· lines {}–{} of {total}",
+                            top + 1,
+                            (top + visible).min(total)
+                        )
+                    })
                 }),
                 hint: Some(&hint),
             },
@@ -643,7 +646,8 @@ mod terminal {
                 .as_mut()
                 .ok_or_else(|| io::Error::other("the interaction frame has no viewport"))?;
             let input = &mut self.input;
-            terminal.draw(|f| draw(f, input))?;
+            let waiting = newt_core::tty::Terminal::operator_wait_line();
+            terminal.draw(|f| draw(f, input, waiting.as_deref()))?;
             let area = terminal.get_frame().area();
             if !event::poll(timeout)? {
                 return Ok(None);
@@ -720,6 +724,35 @@ mod terminal {
         fn modal_default_selection_never_grants_authority() {
             let view = initial_view(&interaction());
             assert_eq!(view.answer_for_selection().as_deref(), Some("deny"));
+        }
+
+        #[test]
+        fn operator_wait_status_replaces_working_for_the_open_prompt() {
+            let mut input = ModalInput::new(&interaction());
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            for waiting in [None, Some("waiting for operator — 125s elapsed"), None] {
+                terminal
+                    .draw(|frame| draw(frame, &mut input, waiting))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert_eq!(
+                    text.contains("waiting for operator — 125s elapsed"),
+                    waiting.is_some(),
+                    "{text}"
+                );
+                assert!(!text.contains("still working"));
+                assert!(
+                    text.contains("[d]eny"),
+                    "the decision remains usable: {text}"
+                );
+            }
         }
 
         #[test]
@@ -968,7 +1001,9 @@ mod terminal {
                 let mut all_visible = String::new();
                 let mut reached_end = false;
                 for _ in 0..512 {
-                    terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+                    terminal
+                        .draw(|frame| draw(frame, &mut input, None))
+                        .unwrap();
                     let buffer = terminal.backend().buffer();
                     let rows: Vec<String> = (0..height)
                         .map(|y| {
@@ -1057,7 +1092,9 @@ mod terminal {
             }
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut input, None))
+                .unwrap();
             let buffer = terminal.backend().buffer();
             (0..height)
                 .map(|y| {
@@ -1150,7 +1187,7 @@ mod terminal {
                     }
                     ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
                         .unwrap()
-                        .draw(|frame| draw(frame, &mut input))
+                        .draw(|frame| draw(frame, &mut input, None))
                         .unwrap();
                 }
             }
@@ -1166,7 +1203,9 @@ mod terminal {
             let mut input = ModalInput::new(&interaction);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 5)).unwrap();
-            terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut input, None))
+                .unwrap();
             let buffer = terminal.backend().buffer();
             // Inside the left border: row 1 is the question, row 2 the answer.
             let (question, chevron) = (buffer.cell((1, 1)).unwrap(), buffer.cell((1, 2)).unwrap());
@@ -1193,7 +1232,9 @@ mod terminal {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
                     .unwrap();
-            terminal.draw(|frame| draw(frame, &mut input)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut input, None))
+                .unwrap();
             let visible: String = terminal
                 .backend()
                 .buffer()

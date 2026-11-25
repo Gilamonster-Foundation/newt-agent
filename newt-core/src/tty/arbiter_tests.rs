@@ -1,3 +1,28 @@
+#[test]
+fn operator_wait_status_tracks_the_prompt_clock_and_clears_on_close() {
+    struct Clock(std::sync::atomic::AtomicU64);
+    impl crate::markup::extension::Stopwatch for Clock {
+        fn read_nanos(&self) -> u128 {
+            u128::from(self.0.load(Ordering::Relaxed)) * 1_000_000_000
+        }
+    }
+    let clock = Arc::new(Clock(std::sync::atomic::AtomicU64::new(0)));
+    let mut state = super::Inner::default();
+    assert_eq!(state.operator_wait_line(), None);
+    state.prompt_clock = Some(clock.clone());
+    assert_eq!(
+        state.operator_wait_line().as_deref(),
+        Some("waiting for operator — 0s elapsed")
+    );
+    clock.0.store(125, Ordering::Relaxed);
+    assert_eq!(
+        state.operator_wait_line().as_deref(),
+        Some("waiting for operator — 125s elapsed")
+    );
+    state.prompt_clock = None;
+    assert_eq!(state.operator_wait_line(), None);
+}
+
 /// **The policy (#1866)**, in the shape `progress_sink`'s
 /// `protocol_mode_vetoes_rendering_from_every_capability` uses, and for the
 /// same reason: `enter_protocol_mode` is documented as one-way, so a test

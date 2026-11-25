@@ -363,7 +363,9 @@ const CATEGORIES: &[Category] = &[
         },
         // The shared modal/prompt-window adapter — the common path every
         // other row is a duplicate BESIDE.
-        destinations: &[("newt-core/src/tty/modal.rs", 5)],
+        // The polling loop shares one redraw for input and the operator-wait
+        // clock; the other write is the piped prompt.
+        destinations: &[("newt-core/src/tty/modal.rs", 2)],
         baseline: &[
             // D1b-0 (#1892) split `setup.rs` into `setup/{mod,commit,tests}.rs`.
             // The row was REPOINTED, not lowered: all 23 sites moved intact to
