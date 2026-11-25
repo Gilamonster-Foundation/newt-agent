@@ -1069,6 +1069,7 @@ async fn brake_under_smart_harness(
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after,
+            ..Default::default()
         },
         ..Default::default()
     });
@@ -1324,6 +1325,7 @@ async fn run_command_shell_writes_do_not_trip_the_no_progress_brake() {
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after: 12,
+            ..Default::default()
         },
         ..Default::default()
     });

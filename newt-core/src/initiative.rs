@@ -172,12 +172,15 @@ impl InitiativeRounds {
 /// evidence, an observed workspace change, or a newly verified check. Applies
 /// before and after writes. `steer_after` injects one optional steer and
 /// `stop_after` ends the turn (`TurnEndReason::NoProgress`), even when action
-/// nudges are disabled. `0` disables the corresponding half. Defaults: 8 / 12.
+/// nudges are disabled. `evidence_only_stop_after` additionally bounds Act
+/// rounds without a workspace change or newly verified check, even when they
+/// find fresh evidence. `0` disables each threshold. Defaults: 8 / 12 / 48.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NoProgressRounds {
     pub steer_after: usize,
     pub stop_after: usize,
+    pub evidence_only_stop_after: usize,
 }
 
 impl Default for NoProgressRounds {
@@ -185,6 +188,7 @@ impl Default for NoProgressRounds {
         Self {
             steer_after: 8,
             stop_after: 12,
+            evidence_only_stop_after: 48,
         }
     }
 }
@@ -344,7 +348,7 @@ pub fn initiative_config() -> Option<InitiativeConfig> {
     INITIATIVE_CONFIG.lock().ok().and_then(|s| s.clone())
 }
 
-/// The installed `[initiative.no_progress]` thresholds, or the built-in 8/12.
+/// The installed `[initiative.no_progress]` thresholds, or the built-in defaults.
 #[must_use]
 pub fn installed_no_progress() -> NoProgressRounds {
     INITIATIVE_CONFIG
@@ -465,6 +469,27 @@ pub fn restore_runtime_state(snapshot: InitiativeRuntimeSnapshot) {
 mod tests {
     use super::*;
     use crate::test_guard::GlobalSettingsGuard;
+
+    #[test]
+    fn evidence_only_ceiling_config_defaults_overrides_and_disables() {
+        let _guard = GlobalSettingsGuard::acquire();
+        for (text, expected) in [
+            ("", 48),
+            ("[no_progress]\nstop_after = 20", 48),
+            ("[no_progress]\nevidence_only_stop_after = 24", 24),
+            ("[no_progress]\nevidence_only_stop_after = 0", 0),
+        ] {
+            let config: InitiativeConfig = toml::from_str(text).unwrap();
+            assert_eq!(config.no_progress.evidence_only_stop_after, expected);
+            let encoded = toml::to_string(&config).unwrap();
+            assert_eq!(
+                toml::from_str::<InitiativeConfig>(&encoded).unwrap(),
+                config
+            );
+            set_initiative_config(config);
+            assert_eq!(installed_no_progress().evidence_only_stop_after, expected);
+        }
+    }
 
     fn cfg(default: Option<Initiative>, fams: &[(&str, Initiative)]) -> InitiativeConfig {
         InitiativeConfig {

@@ -21,6 +21,17 @@ Turn metrics distinguish an answer from a question awaiting the operator and
 from incomplete narration. `TurnEndReason::AwaitingOperator` serializes as
 `awaiting_operator`; both narration exits report incomplete work. These are
 control outcomes, not evidence that a claimed external action succeeded.
+
+The no-progress brake is configured in `[initiative.no_progress]`. `steer_after`
+(default 8) and `stop_after` (12) count rounds without fresh evidence, an observed
+workspace change, or a newly verified check. `evidence_only_stop_after` (48)
+also stops `act` turns after that many consecutive rounds without a workspace
+change or newly verified check, even if reads keep returning fresh bytes.
+Research, explain, and plan turns are exempt from this additional ceiling.
+Each threshold accepts `0` to disable it. Operator steering restarts both
+counters; context summarization does not. A stop ends the turn as `no_progress`
+with a harness-written notice and leaves existing workspace changes in place.
+
 Pending-action matching keeps whole-reply similarity for paraphrases and boosts
 prototype recall only when its configured opening phrase occurs in the reply.
 This reduces false narration warnings from shared nouns in completed reports.

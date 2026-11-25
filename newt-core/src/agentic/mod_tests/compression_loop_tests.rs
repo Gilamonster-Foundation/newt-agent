@@ -979,6 +979,7 @@ async fn run_long_haul(
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after: 0,
+            evidence_only_stop_after: 0,
         },
         ..Default::default()
     });
@@ -1159,6 +1160,7 @@ async fn compaction_release_forces_a_real_read_not_a_cache_hit() {
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after: 0,
+            evidence_only_stop_after: 0,
         },
         ..Default::default()
     });
@@ -1816,6 +1818,7 @@ async fn compaction_2799_releases_skill_reuse_in_real_loop() {
         no_progress: crate::initiative::NoProgressRounds {
             steer_after: 0,
             stop_after: 0,
+            evidence_only_stop_after: 0,
         },
         ..Default::default()
     });

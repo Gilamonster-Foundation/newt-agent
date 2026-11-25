@@ -1346,6 +1346,7 @@ fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeSt
         no_progress: crate::initiative::NoProgressRounds {
             steer_after,
             stop_after,
+            evidence_only_stop_after: 0,
         },
         ..Default::default()
     }
@@ -1353,11 +1354,227 @@ fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeSt
 
 /// The verdict at one round start, as a word.
 fn gate(state: &mut WorkflowRuntimeState, steer_allowed: bool) -> &'static str {
-    match state.no_progress_verdict(steer_allowed) {
+    match state.no_progress_verdict(PromptDisposition::Act, steer_allowed) {
         NoProgress::Continue => "continue",
         NoProgress::Steer(_) => "steer",
         NoProgress::Stop => "stop",
     }
+}
+
+/// #3255: distinct read results must not fund an unbounded implementation turn.
+#[test]
+fn evidence_only_progress_stops_at_a_bounded_round() {
+    let mut state = WorkflowRuntimeState::default();
+    for round in 1..=48 {
+        let progress = state.record_observation(
+            "read_file",
+            &serde_json::json!({"path": "source.rs", "offset": round}),
+            &format!("source page {round}"),
+            true,
+            None,
+            None,
+        );
+        assert!(progress);
+        state.record_round_outcome(false, progress);
+        assert_eq!(
+            gate(&mut state, false),
+            if round == 48 { "stop" } else { "continue" },
+            "fresh evidence at round {round}"
+        );
+    }
+}
+
+/// #3255 aggregate replay: the measured counts, with a synthetic interleaving
+/// and synthetic outputs (the original ledger and its disposition are absent).
+/// All tool observations are injected; no tool, filesystem, or clock is used.
+#[test]
+fn evidence_only_progress_replay_ends_no_progress_with_harness_notice() {
+    let mut state = WorkflowRuntimeState::default();
+    let mut end = None;
+    let mut observation = SolveObservation::default();
+    let mut completed = 0;
+    let mut run = || -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+        let mut messages = Vec::<serde_json::Value>::new();
+        let mut end_reason = Some(&mut end);
+        let mut solve_obs = Some(&mut observation);
+        let read_scope = crate::Scope::none();
+        let claims = claim_check::TurnClaims::capture(".", &read_scope, None);
+        for round in 0..221 {
+            // A permutation spreads 204 calls and 17 non-tool rounds across
+            // the turn instead of inventing a long contiguous idle block.
+            let index = (round * 37) % 221;
+            let (name, args, output, ok) = match index {
+                0..120 => (
+                    "run_command",
+                    serde_json::json!({"command": format!("probe {}", if index < 32 { index % 8 } else { index })}),
+                    format!("probe output {index}"),
+                    true,
+                ),
+                120..136 => (
+                    "run_command",
+                    serde_json::json!({"command": format!("refused probe {}", if index < 126 { 0 } else { index })}),
+                    "permission denied".into(),
+                    false,
+                ),
+                136..168 => (
+                    "prompt_read",
+                    serde_json::json!({"view": "full"}),
+                    "the same approved objective".into(),
+                    true,
+                ),
+                168..197 => (
+                    "read_file",
+                    serde_json::json!({"path": "source.rs", "offset": if index < 175 { 0 } else { index }}),
+                    format!("source span {}", if index < 175 { 0 } else { index }),
+                    true,
+                ),
+                197..204 => (
+                    "update_plan",
+                    serde_json::json!({"step": index % 5}),
+                    "plan receipt".into(),
+                    index < 202,
+                ),
+                _ => ("", serde_json::json!({}), String::new(), true),
+            };
+            let progress = state.record_observation(name, &args, &output, ok, None, None);
+            state.record_round_outcome(false, progress);
+            completed += 1;
+            no_progress_gate!(
+                state,
+                PromptDisposition::Act,
+                false,
+                messages,
+                end_reason,
+                solve_obs,
+                None,
+                0,
+                None::<&smart_harness::SmartHarness>,
+                (
+                    ".",
+                    &read_scope,
+                    &capability_check::Evidence::default(),
+                    None,
+                    &claims,
+                    &self_verify::VerificationLedger::default()
+                ),
+                |harness| harness.record_messages(&messages)?
+            );
+        }
+        Ok(("completed".into(), false, None, 0))
+    };
+    let (text, _, _, _) = run().unwrap();
+    assert_eq!(end, Some(crate::TurnEndReason::NoProgress));
+    assert_eq!(completed, 48);
+    assert!(observation.harness_reply);
+    assert!(text.contains("Stopped: 48 consecutive rounds"), "{text}");
+    assert!(text.contains("Work done so far is left in the workspace."));
+    assert_eq!(model_reply_for_history(&text), "");
+}
+
+#[test]
+fn evidence_only_progress_ceiling_exempts_non_act_and_zero_disables_it() {
+    for disposition in [
+        PromptDisposition::Explain,
+        PromptDisposition::Research,
+        PromptDisposition::Plan,
+        PromptDisposition::Ask,
+        PromptDisposition::Act,
+    ] {
+        let mut state = WorkflowRuntimeState::default();
+        if disposition == PromptDisposition::Act {
+            state.no_progress.evidence_only_stop_after = 0;
+        }
+        for _ in 0..221 {
+            state.record_round_outcome(false, true);
+            assert!(matches!(
+                state.no_progress_verdict(disposition, false),
+                NoProgress::Continue
+            ));
+        }
+        // The old short brake still bounds repeated/idle observations.
+        for _ in 1..12 {
+            assert!(matches!(
+                state.no_progress_verdict(disposition, false),
+                NoProgress::Continue
+            ));
+        }
+        assert!(matches!(
+            state.no_progress_verdict(disposition, false),
+            NoProgress::Stop
+        ));
+    }
+}
+
+#[test]
+fn evidence_only_progress_ceiling_resets_on_writes_checks_and_operator_steering() {
+    for reset in ["write", "check", "steering"] {
+        let mut state = no_progress_state(0, 0);
+        state.no_progress.evidence_only_stop_after = 3;
+        for _ in 0..2 {
+            assert_eq!(gate(&mut state, false), "continue");
+        }
+        match reset {
+            "write" => {
+                let snapshot = |value| {
+                    Some(ProgressSnapshot::Tree(
+                        content_addressable::ContentId::from_canonical_bytes(&[value]),
+                    ))
+                };
+                let wrote = state.record_workspace_change(snapshot(1), snapshot(2));
+                assert!(wrote);
+                state.record_round_outcome(wrote, false);
+            }
+            "check" => {
+                let fresh = state.record_observation(
+                    "lifecycle",
+                    &serde_json::json!({"phase": "test"}),
+                    "passed",
+                    true,
+                    Some(crate::ExecOutcome::Passed),
+                    None,
+                );
+                assert!(fresh);
+                state.record_round_outcome(false, fresh);
+            }
+            _ => state.note_operator_steering(),
+        }
+        assert_eq!(gate(&mut state, false), "continue", "{reset}");
+        // Early-continue rounds count even without record_round_outcome.
+        for _ in 0..2 {
+            assert_eq!(gate(&mut state, false), "continue", "{reset}");
+        }
+        assert_eq!(gate(&mut state, false), "stop", "{reset}");
+    }
+}
+
+#[test]
+fn evidence_only_progress_ceiling_ignores_duplicate_checks_and_action_nudges() {
+    let mut state = no_progress_state(0, 0);
+    state.no_progress.evidence_only_stop_after = 3;
+    for round in 0..=3 {
+        let fresh = state.record_observation(
+            "lifecycle",
+            &serde_json::json!({"phase": "check"}),
+            &format!("passed in {round} seconds"),
+            true,
+            Some(crate::ExecOutcome::Passed),
+            None,
+        );
+        assert_eq!(fresh, round == 0);
+        state.record_round_outcome(false, fresh);
+        // Force the existing nudge to fire without depending on global config.
+        state.consecutive_read_only_rounds = usize::MAX;
+        assert!(state
+            .action_forcing_nudge(None, None, None, &tools::ExposureSettings::default())
+            .is_some());
+        assert_eq!(
+            gate(&mut state, false),
+            if round == 3 { "stop" } else { "continue" }
+        );
+    }
+    let notice = state.no_progress_notice(PromptDisposition::Act);
+    assert!(notice.contains("no workspace change or newly verified check"));
+    assert!(!notice.contains("no new evidence"));
 }
 
 #[test]
@@ -1368,16 +1585,18 @@ fn a_write_then_idle_rounds_are_steered_once_then_stopped() {
     state.record_round_outcome(false, false);
     assert_eq!(gate(&mut state, true), "continue"); // 1 idle round
     state.record_round_outcome(false, false);
-    let NoProgress::Steer(text) = state.no_progress_verdict(true) else {
+    let NoProgress::Steer(text) = state.no_progress_verdict(PromptDisposition::Act, true) else {
         panic!("2 idle rounds must steer");
     };
     assert!(text.contains("2 rounds produced no new evidence"), "{text}");
     state.record_round_outcome(false, false);
     assert_eq!(gate(&mut state, true), "stop"); // 3 idle rounds; the steer was sent once
     assert!(
-        state.no_progress_notice().contains("3 consecutive rounds"),
+        state
+            .no_progress_notice(PromptDisposition::Act)
+            .contains("3 consecutive rounds"),
         "{}",
-        state.no_progress_notice()
+        state.no_progress_notice(PromptDisposition::Act)
     );
 }
 
