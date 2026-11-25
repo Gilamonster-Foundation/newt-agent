@@ -312,10 +312,14 @@ fn scoped_read_only_git_catalog_survives_the_responses_strict_gate() {
         ),
         (
             "non-Act disposition",
-            crate::agentic::git_tool::read_only_definition(),
+            tools::filter_tools_for_disposition(
+                serde_json::json!([crate::agentic::git_tool::git_tool_definition()]),
+                PromptDisposition::Plan,
+            )[0]
+            .clone(),
         ),
     ] {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": "test-model",
             "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
             "instructions": "be terse",
@@ -359,6 +363,13 @@ fn scoped_read_only_git_catalog_survives_the_responses_strict_gate() {
             properties["scope"]["enum"],
             serde_json::json!(["local", "remote", "all", null]),
             "{path}"
+        );
+        // Removing Newt's marker must still be caught on both catalog paths.
+        body["tools"][0].as_object_mut().unwrap().remove("strict");
+        assert_eq!(
+            responses_wire_validation::validate_responses_request(&body, &policy).unwrap_err(),
+            responses_wire_validation::WireValidationError::StrictSchemaLoss,
+            "{path}: a built-in must not receive the remote-schema exemption"
         );
     }
 }
