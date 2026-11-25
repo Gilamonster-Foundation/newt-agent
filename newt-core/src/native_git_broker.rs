@@ -26,7 +26,9 @@ mod common_view;
 const BROKER_FD: i32 = 198;
 const FD_ENV: &str = "NEWT_NATIVE_GIT_BROKER_FD";
 const HOOKS_ENV: &str = "NEWT_NATIVE_GIT_ORIGINAL_HOOKS";
+const PUSH_INPUT_ENV: &str = "NEWT_NATIVE_GIT_PUSH_INPUT";
 const HOOK_NAMES: &[&str] = &[
+    "pre-push",
     "pre-commit",
     "prepare-commit-msg",
     "commit-msg",
@@ -42,17 +44,32 @@ fn denied(error: impl std::fmt::Display) -> ToolError {
 
 /// One shell invocation's owned policy and immutable mechanism resources.
 /// No repository is opened, and no session authority changes, on construction.
+#[derive(Clone)]
 pub(crate) struct NativeGitBroker {
-    policy: Arc<dyn CommitPolicy>,
-    helper_dir: tempfile::TempDir,
+    purpose: Purpose,
+    helper_dir: Arc<tempfile::TempDir>,
     executable: PathBuf,
     git: PathBuf,
     native_image: PathBuf,
 }
 
+#[derive(Clone)]
+enum Purpose {
+    Commit(Arc<dyn CommitPolicy>),
+    PrePush { branch: String, oid: String },
+}
+
 impl NativeGitBroker {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn new(policy: Arc<dyn CommitPolicy>) -> Result<Arc<Self>, String> {
+        Self::create(Purpose::Commit(policy))
+    }
+
+    pub(crate) fn pre_push(branch: String, oid: String) -> Result<Arc<Self>, String> {
+        Self::create(Purpose::PrePush { branch, oid })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn create(purpose: Purpose) -> Result<Arc<Self>, String> {
         let executable = std::env::current_exe()
             .and_then(|path| path.canonicalize())
             .map_err(|error| error.to_string())?;
@@ -83,8 +100,8 @@ impl NativeGitBroker {
                 .map_err(|error| error.to_string())?;
         }
         Ok(Arc::new(Self {
-            policy,
-            helper_dir,
+            purpose,
+            helper_dir: Arc::new(helper_dir),
             executable,
             git,
             native_image,
@@ -92,9 +109,37 @@ impl NativeGitBroker {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(crate) fn new(_policy: Arc<dyn CommitPolicy>) -> Result<Arc<Self>, String> {
+    fn create(_purpose: Purpose) -> Result<Arc<Self>, String> {
         Err("authenticated native Git helper transport is unavailable on this platform".into())
     }
+}
+
+// The pre-push helper only chains repository code inside the fence. It has no
+// signing, ref-publication, or other host callback authority.
+impl BrokerSession for NativeGitBroker {
+    fn on_spawn(&self, process: &BrokerProcess, control: &BrokerControl) -> ToolResult<()> {
+        control.check()?;
+        if process.executable != self.git && process.executable != self.native_image {
+            return Err(denied("native Git spawn image changed"));
+        }
+        Ok(())
+    }
+
+    fn request(&self, _: &BrokerPeer, _: &[u8], _: &BrokerControl) -> ToolResult<Vec<u8>> {
+        Err(denied("pre-push has no host callbacks"))
+    }
+}
+
+fn pre_push_input(branch: &str, oid: &str, remote_oid: Option<&str>) -> Result<String, String> {
+    crate::git_staging::validate_branch_name(branch)?;
+    let zero = "0".repeat(oid.len());
+    let remote_oid = remote_oid.unwrap_or(&zero);
+    if !valid_oid(oid) || !valid_oid(remote_oid) || oid.len() != remote_oid.len() {
+        return Err("invalid pre-push object identifier".into());
+    }
+    Ok(format!(
+        "refs/heads/{branch} {oid} refs/heads/{branch} {remote_oid}\n"
+    ))
 }
 
 /// Apple's system Git is a locator stub that only forwards to the selected
@@ -123,7 +168,7 @@ fn native_git_image(program: &Path) -> Result<PathBuf, String> {
 
 /// Inspect only Git's expanded global-option boundary. Git itself still parses
 /// every commit option and pathspec; no shell source is rewritten or replayed.
-fn commit_position(args: &[OsString]) -> Option<usize> {
+fn operation_position(args: &[OsString]) -> Option<usize> {
     let mut position = 0;
     while let Some(arg) = args.get(position) {
         let arg = arg.to_str()?;
@@ -132,7 +177,7 @@ fn commit_position(args: &[OsString]) -> Option<usize> {
                 position += 2;
             }
             arg if arg.starts_with('-') => position += 1,
-            "commit" => return Some(position),
+            "commit" | "hook" => return Some(position),
             _ => return None,
         }
     }
@@ -294,9 +339,20 @@ impl CommandBroker for NativeGitBroker {
         context: &ToolContext,
         control: &BrokerControl,
     ) -> ToolResult<Option<PreparedBrokerCommand>> {
-        let Some(position) = commit_position(&command.args) else {
+        let Some(position) = operation_position(&command.args) else {
             return Ok(None);
         };
+        let pre_push = matches!(self.purpose, Purpose::PrePush { .. });
+        if !pre_push && command.args[position] != "commit" {
+            return Ok(None);
+        }
+        if pre_push
+            && (command.args.len() != position + 6
+                || command.args[position..position + 4]
+                    != ["hook", "run", "pre-push", "--"].map(OsString::from))
+        {
+            return Err(denied("unexpected pre-push hook invocation"));
+        }
         let program = command.program.canonicalize().map_err(denied)?;
         if program != self.git && program != self.native_image {
             if command
@@ -315,10 +371,14 @@ impl CommandBroker for NativeGitBroker {
             return Ok(None);
         }
         control.check()?;
-        let policy = self
-            .policy
-            .snapshot_for_commit()
-            .unwrap_or_else(|| self.policy.clone());
+        let policy = match &self.purpose {
+            Purpose::Commit(policy) => Some(
+                policy
+                    .snapshot_for_commit()
+                    .unwrap_or_else(|| policy.clone()),
+            ),
+            Purpose::PrePush { .. } => None,
+        };
         if context
             .check_exec(&command.program.to_string_lossy())
             .is_err()
@@ -368,6 +428,38 @@ impl CommandBroker for NativeGitBroker {
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             control,
         )?);
+        if let Purpose::PrePush { branch, oid } = &self.purpose {
+            let remote = command.args[position + 4].to_string_lossy();
+            let remote_oid = probe.optional_text(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/{remote}/{branch}"),
+                ],
+                control,
+            )?;
+            let input = pre_push_input(branch, oid, remote_oid.as_deref()).map_err(denied)?;
+            let hooks = original_hooks(command, position, &common, &probe, control, true)?;
+            let mut args = command.args[..position].to_vec();
+            let mut hooks_path = OsString::from("core.hooksPath=");
+            hooks_path.push(self.helper_dir.path());
+            args.extend([OsString::from("-c"), hooks_path]);
+            args.extend_from_slice(&command.args[position..]);
+            return Ok(Some(PreparedBrokerCommand {
+                args: Some(args),
+                env: vec![
+                    (FD_ENV.into(), BROKER_FD.to_string().into()),
+                    (HOOKS_ENV.into(), hooks.into_os_string()),
+                    (PUSH_INPUT_ENV.into(), input.into()),
+                ],
+                target_fd: BROKER_FD,
+                expected_process_image: (program != self.native_image)
+                    .then(|| self.native_image.clone()),
+                session: Arc::new(self.clone()),
+            }));
+        }
+        let policy = policy.expect("commit purpose has a policy snapshot");
         context.check_path_write(&git_dir)?;
         context.check_path_write(&common.join("objects"))?;
         let reference = probe
@@ -391,7 +483,7 @@ impl CommandBroker for NativeGitBroker {
         // Resolve existing hook behavior before injecting our own final config.
         // The ordinary shell hardening may deliberately disable hooks; preserve
         // that choice, as well as an explicit caller-provided hooksPath.
-        let original_hooks = original_hooks(command, position, &git_dir, &probe, control)?;
+        let original_hooks = original_hooks(command, position, &git_dir, &probe, control, false)?;
         let common_view = if reference == "HEAD" && git_dir != common {
             Some(common_view::create(
                 &git_dir,
@@ -504,6 +596,7 @@ fn original_hooks(
     git_dir: &Path,
     probe: &RepositoryProbe,
     control: &BrokerControl,
+    repository_config: bool,
 ) -> ToolResult<PathBuf> {
     // `git config --get` is a native read with the original selectors and
     // environment. Unlike other probes it must observe the original hooksPath.
@@ -512,7 +605,15 @@ fn original_hooks(
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    args.extend(["config".into(), "--get".into(), "core.hooksPath".into()]);
+    args.push("config".into());
+    if repository_config {
+        // Ordinary shell hardening disables hooks via command-scope config.
+        // The push broker explicitly chains the repository's own hook instead.
+        args.extend(["--null".into(), "--show-scope".into(), "--get-all".into()]);
+    } else {
+        args.push("--get".into());
+    }
+    args.push("core.hooksPath".into());
     plain.prefix.clear();
     // A config query does not execute hooks. It still runs inside the fence.
     let mut request = crate::confined_exec::ExecRequest::new(
@@ -535,16 +636,31 @@ fn original_hooks(
     let result = crate::confined_exec::ConstrainedExecutor::run(&request).map_err(denied)?;
     control.check()?;
     if result.success {
+        let text = String::from_utf8(result.stdout).map_err(denied)?;
         // Git resolves relative hooksPath in its hook working directory, not
         // the caller's cwd. The helper inherits that exact native directory.
-        Ok(PathBuf::from(
-            String::from_utf8(result.stdout).map_err(denied)?.trim_end(),
-        ))
+        if repository_config {
+            Ok(repository_hooks(&text).map_or_else(|| git_dir.join("hooks"), PathBuf::from))
+        } else {
+            Ok(PathBuf::from(text.trim_end()))
+        }
     } else if result.code == Some(1) {
         Ok(git_dir.join("hooks"))
     } else {
         Err(denied(String::from_utf8_lossy(&result.stderr)))
     }
+}
+
+fn repository_hooks(config: &str) -> Option<&str> {
+    config
+        .split_terminator('\0')
+        .collect::<Vec<_>>()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|pair| matches!(pair[0], "local" | "worktree"))
+        .map(|pair| pair[1])
+        .next_back()
 }
 
 struct SessionState {
@@ -842,14 +958,20 @@ fn run_helper(
     }
     let mut client = agent_bridle_tool_shell::BrokerClient::from_delegated_fd(fd)
         .map_err(|error| error.to_string())?;
-    let mut input = Vec::new();
+    let mut input = if name == "pre-push" {
+        std::env::var(PUSH_INPUT_ENV)
+            .map_err(|_| "pre-push helper has no approved input")?
+            .into_bytes()
+    } else {
+        Vec::new()
+    };
     // Message hooks receive no stdin contract. Do not drain a pipeline's input
     // merely to finalize the on-disk message file passed by native Git.
     let reads_stdin = matches!(
         role,
         Some(HelperRole::ReferenceTransaction | HelperRole::Sign)
-    ) || name == "post-rewrite";
-    if reads_stdin {
+    ) || matches!(name, "post-rewrite" | "pre-push");
+    if reads_stdin && name != "pre-push" {
         std::io::stdin()
             .take(MAX_COMMIT_BYTES as u64 + 1)
             .read_to_end(&mut input)
@@ -861,9 +983,25 @@ fn run_helper(
     if !matches!(role, Some(HelperRole::Sign)) {
         if let Some(original) = std::env::var_os(HOOKS_ENV) {
             let hook = PathBuf::from(original).join(name);
-            if hook.is_file() {
+            let executable = if name == "pre-push" {
+                match std::fs::metadata(&hook) {
+                    Ok(metadata) => {
+                        use std::os::unix::fs::PermissionsExt;
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.to_string()),
+                }
+            } else {
+                hook.is_file()
+            };
+            if executable {
                 let mut command = std::process::Command::new(&hook);
-                command.args(args).env_remove(FD_ENV).env_remove(HOOKS_ENV);
+                command
+                    .args(args)
+                    .env_remove(FD_ENV)
+                    .env_remove(HOOKS_ENV)
+                    .env_remove(PUSH_INPUT_ENV);
                 if reads_stdin {
                     command.stdin(std::process::Stdio::piped());
                 }
@@ -880,9 +1018,11 @@ fn run_helper(
                             return Err(format!("original {name} hook refused"));
                         }
                     }
-                    // Git ignores non-executable hook files rather than
-                    // changing a previously successful native commit to fail.
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                    // Non-executable hooks were skipped above. An executable
+                    // hook denied by the fence must refuse, never be skipped.
+                    Err(error)
+                        if name != "pre-push"
+                            && error.kind() == std::io::ErrorKind::PermissionDenied => {}
                     Err(error) => return Err(error.to_string()),
                 }
             }
@@ -915,6 +1055,46 @@ mod tests {
     use super::forward_original_hook_input;
     use std::io::Read;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn pre_push_3258_uses_the_original_hook_chain() {
+        assert!(
+            super::HOOK_NAMES.contains(&"pre-push"),
+            "governed pushes must dispatch the repository's pre-push hook"
+        );
+    }
+
+    #[test]
+    fn pre_push_3258_input_pins_local_and_tracking_oids() {
+        for width in [40, 64] {
+            let oid = "a".repeat(width);
+            for remote in [None, Some("b".repeat(width))] {
+                let expected = remote.clone().unwrap_or_else(|| "0".repeat(width));
+                assert_eq!(
+                    super::pre_push_input("task", &oid, remote.as_deref()).unwrap(),
+                    format!("refs/heads/task {oid} refs/heads/task {expected}\n")
+                );
+            }
+        }
+        assert!(super::pre_push_input("task\ninjected", &"a".repeat(40), None).is_err());
+        assert!(super::pre_push_input("task", "not-an-oid", None).is_err());
+        assert!(super::pre_push_input("task", &"a".repeat(40), Some(&"b".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn pre_push_3258_resolves_repository_hook_precedence() {
+        assert_eq!(super::repository_hooks("command\0/dev/null\0"), None);
+        assert_eq!(
+            super::repository_hooks("local\0.githooks\0command\0/dev/null\0"),
+            Some(".githooks")
+        );
+        assert_eq!(
+            super::repository_hooks(
+                "local\0.githooks\0worktree\0custom hooks\0command\0/dev/null\0"
+            ),
+            Some("custom hooks")
+        );
+    }
 
     #[test]
     fn original_hook_closing_stdin_does_not_refuse_successful_hook() {

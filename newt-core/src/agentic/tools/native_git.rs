@@ -343,24 +343,26 @@ fn parse_governed_push(argv: &[String]) -> Result<GovernedPush, String> {
 }
 
 /// issue-1188 #2641 design round 4: execute a governed `git push` through the
-/// staging-repo broker (`crate::git_staging`), entirely host-side (never
-/// through the confined shell — see the call site's comment in `tools.rs`).
+/// staging-repo broker (`crate::git_staging`). The repository's pre-push hook
+/// runs in the confined shell before any host-side staging or publication.
 /// `cwd` is the resolved directory the model's `run_command` targeted (after
 /// any folded leading `cd`).
 ///
 /// F6: raw child output and refusal details can contain operator config and
-/// are dropped. #2719 adds only harness-authored syntax/permission guidance
+/// are dropped, except for the confined repository hook's failure diagnostics.
+/// #2719 adds only harness-authored syntax/permission guidance
 /// to the fixed outcome and interprets validated presentation wrappers in
 /// process. No model-supplied shell is executed by this host-side broker.
 ///
 /// [`Unavailable`]: crate::git_staging::Unavailable
 /// [`Outcome`]: crate::git_staging::Outcome
-pub(super) fn execute_governed_push(
+pub(super) async fn execute_governed_push(
     source: &str,
     cwd: &Path,
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
     observed: Option<&std::sync::OnceLock<crate::git_staging::Outcome>>,
+    wall: std::time::Duration,
 ) -> String {
     if let Err(unavailable) = broker_available(caveats) {
         return format!("{unavailable}. {PUSH_RETRY}");
@@ -376,15 +378,93 @@ pub(super) fn execute_governed_push(
     }
     // The read roots are bound ONCE, before planning, and the same held
     // handles serve planning reads and the confined copy's admission.
-    let result = (|| {
+    let planned = (|| {
         let held = crate::git_staging::HeldRoots::bind(&caveats.fs_read)?;
         let plan = plan_governed_push(source, cwd, caveats, gate, &held)?;
-        run_staged_push(&plan, caveats, &held)
+        held.verify_identities()?;
+        Ok::<_, crate::git_staging::Refusal>((held, plan))
     })();
+    let (held, plan) = match planned {
+        Ok(planned) => planned,
+        Err(error) => return render_governed_result(&command, Err(error), PUSH_RETRY),
+    };
+    let result = match after_pre_push(run_pre_push(&plan, cwd, caveats, wall).await, || {
+        run_staged_push(&plan, caveats, &held)
+    }) {
+        Ok(result) => result,
+        Err(reason) => {
+            return command.render(
+                format!(
+                    "{}: pre-push hook refused; no push was staged. {reason}",
+                    crate::git_staging::Outcome::Failed {
+                        category: crate::git_staging::FailureCategory::RefusedByHarness,
+                    }
+                ),
+                false,
+            )
+        }
+    };
     if let (Some(slot), Ok(outcome)) = (observed, &result) {
         let _ = slot.set(outcome.clone());
     }
     render_governed_result(&command, result, PUSH_RETRY)
+}
+
+async fn run_pre_push(
+    plan: &GovernedPushPlan,
+    cwd: &Path,
+    caveats: &Caveats,
+    wall: std::time::Duration,
+) -> agent_bridle::ToolResult<serde_json::Value> {
+    use super::shell;
+    let broker =
+        crate::native_git_broker::NativeGitBroker::pre_push(plan.branch.clone(), plan.oid.clone())
+            .map_err(agent_bridle::ToolError::denied)?;
+    // Reuse the commit lane's attenuation: immutable helpers cannot coexist
+    // with ambient writes. No filesystem or executable grant is added here.
+    let mut confined = crate::git_hardening::commit_invocation_caveats(caveats, cwd)
+        .map_err(agent_bridle::ToolError::denied)?;
+    confined.net = crate::Scope::none();
+    let cmd = format!(
+        "git hook run pre-push -- {} {}",
+        crate::mcp::shell_quote_arg(&plan.remote),
+        crate::mcp::shell_quote_arg(&plan.url)
+    );
+    let mut args = shell::confined_dispatch_args(&cmd, &cwd.to_string_lossy(), &confined);
+    args["timeout_secs"] = wall.as_secs().into();
+    shell::dispatch_bridled_shell_with_floor(
+        args,
+        &confined,
+        None,
+        Some(agent_bridle::EnforcementFloor::CONFINED),
+        None,
+        Some(broker),
+        Vec::new(),
+        Default::default(),
+    )
+    .await
+}
+
+/// Keep staging unreachable for every hook failure, including missing confinement
+/// or timeout. The callback is the existing staging implementation (mocked in units).
+fn after_pre_push<T>(
+    hook: agent_bridle::ToolResult<serde_json::Value>,
+    stage: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let envelope = hook.map_err(|error| error.to_string())?;
+    let outcome = super::shell::envelope_outcome(&envelope);
+    if outcome != crate::ExecOutcome::Passed {
+        let output =
+            super::shell::shell_envelope_output(&envelope, usize::MAX, false, false, None, None);
+        return Err(match outcome {
+            crate::ExecOutcome::TimedOut => {
+                format!("configured command deadline expired. {output}")
+            }
+            crate::ExecOutcome::Denied => format!("confined execution denied. {output}"),
+            _ => output,
+        });
+    }
+    Ok(stage())
 }
 
 /// Only harness-authored reasons cross the fixed-form boundary; raw config
@@ -1255,6 +1335,35 @@ mod tests {
     };
     use super::*;
     use crate::agentic::{NoMcp, PromptDisposition};
+
+    #[test]
+    fn pre_push_3258_refusal_never_stages_or_dials() {
+        for hook in [
+            Err(agent_bridle::ToolError::denied("kernel fence unavailable")),
+            Ok(
+                serde_json::json!({"exit_code": 1, "stdout": "format failed", "stderr": "hook diagnostic"}),
+            ),
+            Ok(serde_json::json!({"exit_code": 0, "timed_out": true})),
+            Ok(serde_json::json!({"exit_code": 0, "denied": true})),
+            Ok(serde_json::json!({})),
+        ] {
+            let result = after_pre_push(hook, || panic!("refused hook reached staging"));
+            assert!(result.is_err());
+        }
+        let refused = after_pre_push(
+            Ok(serde_json::json!({
+                "exit_code": 1, "stdout": "format failed", "stderr": "hook diagnostic"
+            })),
+            || (),
+        )
+        .unwrap_err();
+        assert!(refused.contains("format failed"), "{refused}");
+        assert!(refused.contains("hook diagnostic"), "{refused}");
+        assert_eq!(
+            after_pre_push(Ok(serde_json::json!({"exit_code": 0})), || "staged").unwrap(),
+            "staged"
+        );
+    }
 
     /// Answers the one-operation egress prompt and records what it was shown.
     #[derive(Default)]
@@ -2467,6 +2576,27 @@ mod governed_push_tests {
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
+
+    fn execute_governed_push(
+        source: &str,
+        cwd: &Path,
+        caveats: &Caveats,
+        gate: &mut Option<&mut dyn PermissionGate>,
+        observed: Option<&std::sync::OnceLock<crate::git_staging::Outcome>>,
+    ) -> String {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::execute_governed_push(
+                source,
+                cwd,
+                caveats,
+                gate,
+                observed,
+                std::time::Duration::from_secs(crate::RunCommandBudget::DEFAULT_SECS),
+            ))
+    }
 
     /// A write root nothing in these fixtures lives under, so every trust
     /// check sees real (not model-writable) paths.

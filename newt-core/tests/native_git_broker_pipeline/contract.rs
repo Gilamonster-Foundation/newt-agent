@@ -5,6 +5,8 @@
 mod chat;
 #[path = "contract_diagnostics.rs"]
 mod diagnostics;
+#[path = "pre_push.rs"]
+mod pre_push;
 #[path = "contract_removal.rs"]
 mod removal;
 #[path = "contract_siblings.rs"]
@@ -16,8 +18,10 @@ use newt_policy::{PermissionDecision, PermissionGate, PermissionRequest};
 use std::path::{Path, PathBuf};
 
 pub fn run() {
+    use std::os::unix::fs::PermissionsExt;
     diagnostics::regression();
     let home = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     // Set environment before starting any worker/runtime; never use operator config.
     for key in [
         "GIT_DIR",
@@ -58,6 +62,7 @@ pub fn run() {
     );
     let bin = home.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::os::unix::fs::symlink("/usr/bin/true", bin.join("gh")).unwrap();
     let paths = format!("{}:/usr/bin:/bin", bin.display());
     newt_core::process_env::set_var("NEWT_EXEC_PATHS", &paths);
@@ -71,7 +76,9 @@ pub fn run() {
         .build()
         .unwrap()
         .block_on(async {
-            if std::env::args().any(|arg| arg == "--publication") {
+            if std::env::args().any(|arg| arg == "--pre-push") {
+                pre_push::run().await;
+            } else if std::env::args().any(|arg| arg == "--publication") {
                 governed_publication().await;
             } else {
                 detached_branch_wrappers().await;

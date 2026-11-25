@@ -135,7 +135,16 @@ fn main() {
         return;
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    native::run();
+    {
+        native::run();
+        // Keep the push fixture's environment isolated from the commit fixtures,
+        // and run it in the same scheduled/release real-resource tier.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--confined-contract", "--pre-push"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "confined pre-push regression failed");
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     panic!("the native Git broker's hook round-trip is unverified outside Linux/macOS");
 }
