@@ -8,3 +8,4 @@ that live elsewhere are indexed here too.
 - **[Truncation honesty](../testing/results/context-baseline-f0f4f6e.md)** — silent context truncation yields *silently wrong* answers; every fix moves the failure, it doesn't always remove it.
 - **[Coder-driving sweet spots](./2026-05-31-newt-coder-driving-sweet-spots.md)** — where small local models are and aren't reliable at agentic coding.
 - **[Hermes learnings](../design/context-memory-hermes-learnings.md)** — take the algorithms, refuse the architecture.
+- **[MCP init timeout vs. request timeout](./2026-10-28-mcp-init-timeout-vs-request-timeout.md)** — one knob (`request_timeout_secs`) drives both the `initialize` handshake and every tool call; a slow-to-start server needs a distinct startup timeout and a diagnostic (not opaque) init error.
