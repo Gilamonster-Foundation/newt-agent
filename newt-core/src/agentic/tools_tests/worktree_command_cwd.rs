@@ -13,6 +13,120 @@ impl ToolPresentation for Notices {
     fn override_result(&mut self, _: String) {}
 }
 
+/// #3254: replay redundant creation at the dispatch boundary with in-memory
+/// adoption state. No child, filesystem fixture, or presentation notice is needed.
+#[tokio::test]
+async fn worktree_creation_3254_bound_task_is_a_quiet_result() {
+    let _lock = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let original = PathBuf::from("original");
+    let policy = crate::worktree_adoption::tests::policy_fixture(
+        original.clone(),
+        PathBuf::from("task`[bound]"),
+    );
+    let session = WorktreeSession::default();
+    session.adopt(policy.clone());
+    for command in [
+        "git worktree add ../dir branch",
+        "git worktree add -b branch repo/dir 2>&1 || echo \"Trying alternative approach\"",
+        "git worktree add repo/dir branch",
+        "git worktree add --detach repo/dir branch 2>&1",
+        "git worktree add repo/dir branch 2>&1; echo \"exit: $?\"",
+        "git worktree add -b branch ../dir main",
+    ] {
+        let mut notices = Notices::default();
+        let outcome = std::sync::OnceLock::new();
+        let directory = std::sync::OnceLock::new();
+        let result = execute(
+            &mut notices,
+            "run_command",
+            &serde_json::json!({"command": command}),
+            original.to_str().unwrap(),
+            false,
+            40,
+            &Caveats {
+                fs_read: crate::Scope::none(),
+                fs_write: crate::Scope::none(),
+                exec: crate::Scope::none(),
+                ..Caveats::top()
+            },
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: Some(&session),
+                execution: Some(&outcome),
+                command_directory: Some(&directory),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert!(
+            result.contains(&super::task_path_literal(&policy.worktree)),
+            "{command}: {result}"
+        );
+        assert!(
+            result.contains("Commands already run there by default"),
+            "{result}"
+        );
+        assert!(result.contains("No command was run"), "{result}");
+        assert!(!result.contains("git worktree add"), "{result}");
+        assert!(!result.contains("capability denied"), "{result}");
+        assert_eq!(outcome.get(), None, "no execution to classify: {result}");
+        assert!(directory.get().is_none() && notices.0.is_empty());
+        assert_eq!(session.snapshot().unwrap().worktree, policy.worktree);
+    }
+}
+
+/// #3254: unavailable session state cannot be repaired by changing command
+/// syntax; an unverifiable batch in an available session still gets that advice.
+#[tokio::test]
+async fn worktree_creation_3254_unavailable_and_unverifiable_are_distinct() {
+    let _lock = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let session = WorktreeSession::default();
+    for active in [None, Some(&session)] {
+        let mut notices = Notices::default();
+        let outcome = std::sync::OnceLock::new();
+        let directory = std::sync::OnceLock::new();
+        let result = execute(
+            &mut notices,
+            "run_command",
+            &serde_json::json!({"command": "git worktree add -b task ../task && touch source.rs"}),
+            "original",
+            false,
+            40,
+            &Caveats::top(),
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: active,
+                execution: Some(&outcome),
+                command_directory: Some(&directory),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert!(result.contains("capability denied"), "{result}");
+        assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied));
+        assert!(directory.get().is_none() && notices.0.is_empty());
+        if active.is_none() {
+            assert!(
+                result.contains("no worktree session is available"),
+                "{result}"
+            );
+            assert!(!result.contains("git worktree add"), "{result}");
+        } else {
+            assert!(
+                result.contains("cannot verify this worktree creation"),
+                "{result}"
+            );
+            assert!(result.contains("standalone literal command"), "{result}");
+        }
+    }
+}
+
 fn fixture() -> (tempfile::TempDir, AdoptedWorktree) {
     let (temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
     crate::worktree_adoption::tests::link(&policy);

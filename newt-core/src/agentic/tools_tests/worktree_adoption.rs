@@ -447,12 +447,19 @@ async fn worktree_creation_2813_requires_an_available_adoption_session() {
             PromptDisposition::Act,
         )
         .await;
-        assert!(
-            text.contains("standalone literal command")
-                && text.contains("git worktree add -b <new-branch> <path> [<start>]"),
-            "creation fell through admission: {text}"
-        );
-        assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied));
+        if active.is_some() {
+            assert!(
+                text.contains(&task_path_literal(&policy.worktree)),
+                "{text}"
+            );
+            assert!(text.contains("No command was run"), "{text}");
+            assert!(!text.contains("capability denied"), "{text}");
+            assert_eq!(outcome.get(), None);
+        } else {
+            assert!(text.contains("no worktree session is available"), "{text}");
+            assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied));
+        }
+        assert!(!text.contains("git worktree add"), "{text}");
         assert!(!root.join("agentic-refactor-wt").exists());
     }
 }
