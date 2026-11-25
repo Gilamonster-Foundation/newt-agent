@@ -7,6 +7,7 @@ nudge = "You described what you were about to do but did not call any tool, so n
 matchers = [
   "Now I have everything I need. Let me make both edits now.",
   "Let me edit the file.",
+  "Let me read the beginning of the module to understand the declarations:",
   "Let me summarize the current state and what could be improved.",
   "Let me check the current working directory and available git operations.",
   "Let me keep editing now.",

@@ -2933,7 +2933,6 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let out = readonly_completion_handoff(
                     &probe_content,
                     &mut end_reason,
-                    more_rounds,
                     workspace,
                     &caveats.fs_read,
                     &capability_evidence,
@@ -3102,32 +3101,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
                         }
-                        // Every rescue gate passed on this content: it is
-                        // about to be accepted as the final answer. Record
-                        // WHY — before this, a narration acceptance was
-                        // indistinguishable from a normal completion, even
-                        // under NEWT_DEBUG (2026-07-08 ornith:35b forensics).
-                        //
-                        // #1261: the reason MIRRORS the rescue gate above —
-                        // including its `action_turn` guard. On a turn where
-                        // the rescue can never arm (non-Act disposition forces
-                        // `action_nudges = false`, or the prompt does not
-                        // invite action), prose is this turn's LEGITIMATE
-                        // ending: reporting "rescue budget spent" there blamed
-                        // the model for a harness decision — the budget was
-                        // untouched and no cap value could have changed
-                        // anything (the diagnosed ornith:35b Explain turn).
-                        let accepted_reason = if nudge_classification.is_pending_action()
-                            && action_turn
-                        {
-                            if !workflow_runtime.has_next_round(round, current_tool_round_limit, workflow_grace_rounds) {
-                                crate::TurnEndReason::NarrationFinalRound
-                            } else {
-                                crate::TurnEndReason::NarrationCapExhausted
-                            }
-                        } else {
-                            crate::TurnEndReason::Completed
-                        };
+                        let accepted_reason = accepted_reply_end_reason(
+                            Some(&nudge_classification),
+                            action_turn,
+                            workflow_runtime.has_next_round(round, current_tool_round_limit, workflow_grace_rounds),
+                        );
                         if debug && accepted_reason != crate::TurnEndReason::Completed {
                             print_debug(
                                 &format!(
@@ -5370,6 +5348,23 @@ fn looks_like_intent_to_act(content: &str) -> bool {
     crate::NudgeClassifier::builtin().is_pending_action(content)
 }
 
+/// Recording an unfinished reply does not authorize another inference. #1261's
+/// action-pressure guard still owns rescue eligibility; #3256 records narration
+/// even when that guard prevents a rescue. `None` denotes an empty reply.
+fn accepted_reply_end_reason(
+    classification: Option<&crate::classifiers::NudgeClassification>,
+    action_rescue: bool,
+    more_rounds: bool,
+) -> crate::TurnEndReason {
+    match classification {
+        None => crate::TurnEndReason::Empty,
+        Some(c) if !c.is_pending_action() => crate::TurnEndReason::Completed,
+        Some(_) if !action_rescue => crate::TurnEndReason::NarrationUnrescued,
+        Some(_) if !more_rounds => crate::TurnEndReason::NarrationFinalRound,
+        Some(_) => crate::TurnEndReason::NarrationCapExhausted,
+    }
+}
+
 /// Completing an evidence question is independent of permission to mutate.
 /// Reuse the classifier's bare-evidence-promise refinement. Findings, blockers,
 /// and future plans can themselves be the requested read-only deliverable.
@@ -5421,7 +5416,6 @@ fn retry_readonly_completion(
 fn readonly_completion_handoff(
     content: &str,
     end_reason: &mut Option<&mut Option<crate::TurnEndReason>>,
-    more_rounds: bool,
     workspace: &str,
     read_scope: &crate::Scope<String>,
     capability_evidence: &capability_check::Evidence,
@@ -5430,11 +5424,7 @@ fn readonly_completion_handoff(
     verification: &self_verify::VerificationLedger,
 ) -> String {
     if let Some(slot) = end_reason {
-        **slot = Some(if more_rounds {
-            crate::TurnEndReason::NarrationCapExhausted
-        } else {
-            crate::TurnEndReason::NarrationFinalRound
-        });
+        **slot = Some(crate::TurnEndReason::NarrationUnrescued);
     }
     finalize_final_text(
         FinalReply::from(content.to_owned()).with_notice(
@@ -8373,7 +8363,6 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 let out = readonly_completion_handoff(
                     &content,
                     &mut end_reason,
-                    more_rounds,
                     workspace,
                     &caveats.fs_read,
                     &capability_evidence,
@@ -8635,30 +8624,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     round_est_raw,
                 );
             }
-            // Acceptance forensics (mirrors the Ollama macro): record WHY
-            // this no-tool reply ends the turn. #1261: includes the gate's
-            // `action_turn` guard — where the rescue can never arm (non-Act
-            // turn / non-action-inviting prompt), prose is the legitimate
-            // ending, never a "budget spent" anomaly.
-            let accepted_reason = if content.is_empty() {
-                crate::TurnEndReason::Empty
-            } else if nudge_classification
-                .as_ref()
-                .is_some_and(|c| c.is_pending_action())
-                && action_turn
-            {
-                if !workflow_runtime.has_next_round(
+            let accepted_reason = accepted_reply_end_reason(
+                nudge_classification.as_ref(),
+                action_turn,
+                workflow_runtime.has_next_round(
                     round,
                     current_tool_round_limit,
                     workflow_grace_rounds,
-                ) {
-                    crate::TurnEndReason::NarrationFinalRound
-                } else {
-                    crate::TurnEndReason::NarrationCapExhausted
-                }
-            } else {
-                crate::TurnEndReason::Completed
-            };
+                ),
+            );
             let accepted_reason = verification_stop.unwrap_or(accepted_reason);
             if debug && accepted_reason != crate::TurnEndReason::Completed {
                 print_debug(
@@ -11263,7 +11237,6 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 let out = readonly_completion_handoff(
                     &content,
                     &mut end_reason,
-                    more_rounds,
                     workspace,
                     &caveats.fs_read,
                     &capability_evidence,
@@ -11512,26 +11485,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     round_est_raw,
                 );
             }
-            // Acceptance forensics — mirrors the OpenAI path.
-            let accepted_reason = if content.is_empty() {
-                crate::TurnEndReason::Empty
-            } else if nudge_classification
-                .as_ref()
-                .is_some_and(|c| c.is_pending_action())
-                && action_turn
-            {
-                if !workflow_runtime.has_next_round(
+            let accepted_reason = accepted_reply_end_reason(
+                nudge_classification.as_ref(),
+                action_turn,
+                workflow_runtime.has_next_round(
                     round,
                     current_tool_round_limit,
                     workflow_grace_rounds,
-                ) {
-                    crate::TurnEndReason::NarrationFinalRound
-                } else {
-                    crate::TurnEndReason::NarrationCapExhausted
-                }
-            } else {
-                crate::TurnEndReason::Completed
-            };
+                ),
+            );
             let accepted_reason = verification_stop.unwrap_or(accepted_reason);
             if debug && accepted_reason != crate::TurnEndReason::Completed {
                 print_debug(
@@ -13523,7 +13485,6 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 let out = readonly_completion_handoff(
                     &text,
                     &mut end_reason,
-                    more_rounds,
                     workspace,
                     &caveats.fs_read,
                     &capability_evidence,
@@ -13565,6 +13526,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
             // The decoder guarantees affirmative output here (text or calls); with
             // no calls, `text` is non-empty — return it as the turn's answer.
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(accepted_reply_end_reason(
+                    Some(&nudge_classifier.classify(&text)),
+                    false, // Responses has no action rescue.
+                    workflow_runtime.has_next_round(
+                        round,
+                        current_tool_round_limit,
+                        workflow_grace_rounds,
+                    ),
+                ));
+            }
             // #1964: this normal (non-cap) finish gets the same claim check
             // + disclosure gate as a cap-exit summary.
             let text = finalize_final_text(

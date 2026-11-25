@@ -1,6 +1,89 @@
 use super::*;
 
 #[tokio::test]
+async fn issue_3256_pending_replies_have_honest_end_reasons_on_every_transport() {
+    let _settings = default_loop_settings();
+    let mut failures = Vec::new();
+    for wire in ["ollama", "openai", "anthropic", "responses"] {
+        for (quote, newlines) in [
+            ("Let me read the beginning of mod.rs to understand the module declarations:", 58),
+            ("Let me check the refactor/large-files branch to see what's already been extracted:", 82),
+        ] {
+            for padding in [0, newlines] {
+                // Only the quoted final line is known; do not invent its prefix.
+                let text = format!("{}{quote}", "\n".repeat(padding));
+                let response = match wire {
+                    "ollama" => serde_json::json!({"message": {"role": "assistant", "content": text}, "done": true}),
+                    "anthropic" => serde_json::json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model", "stop_reason": "end_turn", "content": [{"type": "text", "text": text}]}),
+                    "responses" => serde_json::json!({"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]}),
+                    _ => serde_json::json!({"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}),
+                };
+                for (disposition, action_nudges, task, rounds, expected, requests) in [
+                    (PromptDisposition::Act, true, "continue?", 8, "narration_unrescued", 1),
+                    (PromptDisposition::Act, false, "do the thing", 8, "narration_unrescued", 1),
+                    (PromptDisposition::Plan, true, "do the thing", 8, "narration_unrescued", 1),
+                    (PromptDisposition::Explain, false, "continue?", 1, "narration_unrescued", 1),
+                    (PromptDisposition::Research, false, "continue?", 1, "narration_unrescued", 1),
+                    (PromptDisposition::Act, true, "do the thing", 8, "narration_cap_exhausted", 2),
+                    (PromptDisposition::Act, true, "do the thing", 1, "narration_final_round", 1),
+                ] {
+                    // Responses has no action rescue; recording must not add one.
+                    let (expected, requests) = if wire == "responses" {
+                        ("narration_unrescued", 1)
+                    } else {
+                        (expected, requests)
+                    };
+                    let server = MockServer::start().await;
+                    let json_reply = ResponseTemplate::new(200).set_body_json(&response);
+                    let stream_reply = crate::agentic::anthropic_loop_tests::sse_text_reply(&[&text], 10, 5);
+                    Mock::given(method("POST"))
+                        .respond_with(move |request: &Request| {
+                            if wire == "anthropic" && body_json(request)["stream"] == true {
+                                stream_reply.clone()
+                            } else {
+                                json_reply.clone()
+                            }
+                        })
+                        .mount(&server).await;
+                    let messages = vec![MemMessage::user(task)];
+                    let caveats = Caveats::top();
+                    let uri = server.uri();
+                    let mut reason = None;
+                    let mut c = ctx(&uri, &messages, &caveats);
+                    c.kind = match wire {
+                        "ollama" => BackendKind::Ollama,
+                        "anthropic" => BackendKind::Anthropic,
+                        _ => BackendKind::Openai,
+                    };
+                    c.task = task;
+                    c.prompt_disposition = disposition;
+                    c.action_nudges = action_nudges;
+                    c.max_tool_rounds = rounds;
+                    c.end_reason = Some(&mut reason);
+                    let (reply, _, _, _) = if wire == "responses" {
+                        openai_responses_complete(c, &mut NoMcp).await
+                    } else {
+                        chat_complete(c, &mut NoMcp).await
+                    }.expect("scripted final reply");
+                    assert_eq!(model_explanation(&reply).trim(), quote, "{wire}");
+                    let actual_requests = server.received_requests().await.unwrap().len();
+                    let line = crate::TurnMetrics { end_reason: reason, ..Default::default() }.display_line();
+                    if serde_json::to_value(reason).unwrap() != expected
+                        || actual_requests != requests
+                        || !line.contains("model stopped before acting")
+                        || (expected == "narration_unrescued" && line.contains("rescue budget spent"))
+                    {
+                        failures.push(format!("{wire}, {disposition:?}, action_nudges={action_nudges}, newlines={padding}: {reason:?}, requests={actual_requests}, expected={expected}/{requests}"));
+                    }
+                }
+            }
+        }
+        println!("{wire}: replayed both quoted final lines, plain and padded, across seven rescue-policy cases");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
 async fn rendered_report_ack_avoids_repetition_and_allows_followup_tools() {
     use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
     let ledger = SessionStepLedger::default();
@@ -526,7 +609,6 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
     let reply = readonly_completion_handoff(
         &candidate,
         &mut None,
-        false,
         workspace.path().to_str().unwrap(),
         &crate::Scope::All,
         &capability_check::Evidence::default(),
