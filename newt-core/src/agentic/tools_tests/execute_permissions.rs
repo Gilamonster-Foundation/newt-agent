@@ -2,6 +2,81 @@ use super::*;
 use crate::agentic::ReadScope;
 use crate::ExecOutcome;
 
+#[tokio::test]
+async fn pre_prompt_refusal_cause_reaches_model_and_does_not_leak_to_next_call() {
+    struct Gate(bool);
+    impl PermissionGate for Gate {
+        fn take_refusal_cause(&mut self) -> Option<&'static str> {
+            std::mem::take(&mut self.0).then_some("workspace-protection")
+        }
+        fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+            self.0 = true;
+            PermissionDecision::Deny
+        }
+        fn ask_dependency_fetch(
+            &mut self,
+            _: &Caveats,
+            _: &PermissionRequest,
+        ) -> PermissionDecision {
+            unreachable!("this test requests an exec permission")
+        }
+        fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+            HumanQuestionOutcome::Unavailable
+        }
+    }
+    let mut gate = Gate(false);
+    let mut display = ToolDisplay::new(Vec::new(), false, 80, 20, false);
+    for (tool, args) in [
+        (
+            "request_permissions",
+            serde_json::json!({"capability": "exec", "target": "cargo"}),
+        ),
+        (
+            "request_user_input",
+            serde_json::json!({"question": "Proceed?"}),
+        ),
+    ] {
+        if tool == "request_user_input" {
+            // Simulate evidence left by a cancelled previous invocation.
+            gate.0 = true;
+        }
+        let result = dispatch::execute_tool_with_display_cancellable(
+            &mut display,
+            tool,
+            &args,
+            "workspace",
+            false,
+            20,
+            &Caveats::top(),
+            &mut NoMcp,
+            ToolCollaborators {
+                permission_gate: Some(&mut gate),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if tool == "request_permissions" {
+            assert!(result.contains("workspace-protection"), "{result}");
+            assert!(!result.contains("operator declined"), "{result}");
+            assert!(
+                result.contains("retry or a permission request cannot override"),
+                "{result}"
+            );
+        } else {
+            assert!(
+                !result.contains("workspace-protection"),
+                "stale refusal: {result}"
+            );
+        }
+    }
+    assert_eq!(gate.take_refusal_cause(), None);
+}
+
 /// Brush rejects this cwd before starting its worker, so the unit harness can
 /// exercise the actual out-of-band ToolError even though normal unit dispatch
 /// substitutes the safe-subset engine for Brush's worker re-exec.

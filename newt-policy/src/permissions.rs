@@ -370,6 +370,13 @@ pub struct ChoiceSpec {
 }
 
 pub trait PermissionGate {
+    /// Consume the cause class of a refusal during the current tool call.
+    /// Only static, model-safe labels belong here; operator paths and error
+    /// details stay in the permission journal and operator notice.
+    fn take_refusal_cause(&mut self) -> Option<&'static str> {
+        None
+    }
+
     /// Read current standing authority without prompting or consuming an
     /// allow-once grant. Apply approved grants to the caller's baseline without
     /// restoring unrelated authority from a broader base. Implementations must
@@ -610,8 +617,12 @@ pub struct PermissionRecord {
     pub target: String,
     /// `allow` or `deny`.
     pub decision: String,
-    /// `once` (this call only) or `session` (until the session ends).
+    /// Grant/denial scope, or the cause class of a gate refusal.
     pub scope: String,
+    /// Full operator-only refusal detail. Omission preserves the canonical
+    /// bytes and content IDs of records written before reasons were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl PermissionRecord {
@@ -633,6 +644,7 @@ impl PermissionRecord {
             target: target.to_string(),
             decision: decision.to_string(),
             scope: scope.to_string(),
+            reason: None,
         }
     }
 }

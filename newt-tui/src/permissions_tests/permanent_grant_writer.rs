@@ -247,7 +247,10 @@ fn full_access_preapproval_still_honours_delegation_and_stored_denials() {
         state.session_grants.is_empty(),
         "delegated: no session allow"
     );
-    assert!(state.decisions.iter().all(|d| d.decision == "deny"));
+    assert_eq!(state.decisions.len(), 1);
+    assert_eq!(state.decisions[0].decision, "deny");
+    assert_eq!(state.decisions[0].scope, "delegated-ceiling");
+    assert!(state.decisions[0].reason.is_some());
 
     let mut state = PermissionPromptState::default();
     state
@@ -257,7 +260,10 @@ fn full_access_preapproval_still_honours_delegation_and_stored_denials() {
         .ask_full_access(std::slice::from_ref(&request));
     assert!(matches!(decision, newt_policy::PermissionDecision::Deny));
     assert!(state.session_grants.is_empty(), "denied: no session allow");
-    assert!(state.decisions.is_empty());
+    assert_eq!(state.decisions.len(), 1);
+    assert_eq!(state.decisions[0].decision, "deny");
+    assert_eq!(state.decisions[0].scope, "prior-denial");
+    assert!(state.decisions[0].reason.is_some());
 }
 
 /// A delegated session never establishes its own root: the grant stays

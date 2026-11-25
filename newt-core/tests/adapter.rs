@@ -105,8 +105,10 @@ mod b0a {
     /// `{MODAL_CONTROL_HINT}`, so a naive brace count closes the function
     /// early and the guard starts reading the next one's body.
     pub(super) fn function_body(lines: &[String], name: &str) -> Option<String> {
-        let anchor = format!("fn {name}(");
-        let start = lines.iter().position(|line| line.contains(&anchor))?;
+        let anchors = [format!("fn {name}("), format!("fn {name}<")];
+        let start = lines
+            .iter()
+            .position(|line| anchors.iter().any(|anchor| line.contains(anchor)))?;
         let mut depth = 0i32;
         let mut opened = false;
         let mut body = String::new();
@@ -162,13 +164,18 @@ mod b0a {
         // semantic prompt path; pin both forwarding edges independently.
         Link {
             caller: "ask_with_caveats",
-            needle: "self.ask_scoped(",
-            why: "ordinary permissions must reach the shared scoped implementation",
+            needle: "self.ask_recorded(",
+            why: "ordinary permissions must reach the shared recording boundary",
         },
         Link {
             caller: "ask_dependency_fetch",
+            needle: "self.ask_recorded(",
+            why: "operation-only fetch permissions must reach the same recording boundary",
+        },
+        Link {
+            caller: "ask_recorded",
             needle: "self.ask_scoped(",
-            why: "operation-only fetch permissions must reach the same implementation",
+            why: "recording must retain the scoped implementation's authorization path",
         },
         Link {
             caller: "ask_scoped",
@@ -319,13 +326,18 @@ mod b0a {
             &[
                 Link {
                     caller: "ask_with_caveats",
-                    needle: "self.ask_scoped(",
+                    needle: "self.ask_recorded(",
                     why: "the ordinary entry must reach shared authorization",
                 },
                 Link {
                     caller: "ask_dependency_fetch",
-                    needle: "self.ask_scoped(",
+                    needle: "self.ask_recorded(",
                     why: "the one-fetch entry must reach shared authorization",
+                },
+                Link {
+                    caller: "ask_recorded",
+                    needle: "self.ask_scoped(",
+                    why: "recording must reach shared authorization",
                 },
                 Link {
                     caller: "ask_scoped",
@@ -396,12 +408,15 @@ mod b0a {
             "    self.ask_with_caveats(&self.base.clone(), requests)",
             "}",
             "fn ask_with_caveats(&mut self, baseline: &C, requests: &[R]) -> Decision {",
-            "    self.ask_scoped(baseline, requests, false)",
+            "    self.ask_recorded(baseline, requests, false)",
             "}",
             "fn ask_dependency_fetch(&mut self, prepared: &C, request: &R) -> Decision {",
-            "    self.ask_scoped(prepared, std::slice::from_ref(request), true)",
+            "    self.ask_recorded(prepared, std::slice::from_ref(request), true)",
             "}",
-            "fn ask_scoped(&mut self, baseline: &C, requests: &[R], operation_only: bool) -> Decision {",
+            "fn ask_recorded(&mut self, baseline: &C, requests: &[R], operation_only: bool) -> Decision {",
+            "    self.ask_scoped(baseline, requests, operation_only)",
+            "}",
+            "fn ask_scoped<'r>(&mut self, baseline: &C, requests: &'r [R], operation_only: bool) -> Decision {",
             "    let q = Question {",
             "        markdown: format!(\"{} wants\", req.tool),",
             "        actions: vec![],",
