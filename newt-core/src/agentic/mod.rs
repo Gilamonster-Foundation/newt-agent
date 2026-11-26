@@ -3623,16 +3623,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_wrote = true;
             }
             record_organic_note_use(name, &note_sink, &mut note_nudge);
+            let workspace_change = std::sync::OnceLock::new();
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
-            let before_change = progress_workspace_state(
-                name,
-                &args,
-                workspace,
-                &caveats.fs_read,
-                worktree_session,
-            )
-            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -3742,6 +3735,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        workspace_change: Some(&workspace_change),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         report_capture: Some(&report_capture),
@@ -3773,12 +3767,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
-                    .await
-            } else {
-                None
-            };
+            let (before_change, after_change) = workspace_change.get().copied().unzip();
             round_modified_workspace |=
                 workflow_runtime.record_workspace_change(before_change, after_change);
             round_progress |= workflow_runtime.record_observation(
@@ -4414,7 +4403,7 @@ impl RepeatCallGuard {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ProgressSnapshot {
+pub(crate) enum ProgressSnapshot {
     File(content_addressable::ContentId),
     Tree(content_addressable::ContentId),
 }
@@ -8980,16 +8969,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 .map(|batch| batch.start(call_index, disclosure))
                 .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
+            let workspace_change = std::sync::OnceLock::new();
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
-            let before_change = progress_workspace_state(
-                name,
-                &args,
-                workspace,
-                &caveats.fs_read,
-                worktree_session,
-            )
-            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -9087,6 +9069,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        workspace_change: Some(&workspace_change),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         report_capture: Some(&report_capture),
@@ -9126,12 +9109,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
-                    .await
-            } else {
-                None
-            };
+            let (before_change, after_change) = workspace_change.get().copied().unzip();
             round_modified_workspace |=
                 workflow_runtime.record_workspace_change(before_change, after_change);
             round_progress |= workflow_runtime.record_observation(
@@ -11824,16 +11802,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 .map(|batch| batch.start(call_index, disclosure))
                 .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
+            let workspace_change = std::sync::OnceLock::new();
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs (mirrors the OpenAI path).
-            let before_change = progress_workspace_state(
-                name,
-                &args,
-                workspace,
-                &caveats.fs_read,
-                worktree_session,
-            )
-            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -11925,6 +11896,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        workspace_change: Some(&workspace_change),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         report_capture: Some(&report_capture),
@@ -11961,12 +11933,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             attribution_epoch.finish(&args, ok);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
-            let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
-                    .await
-            } else {
-                None
-            };
+            let (before_change, after_change) = workspace_change.get().copied().unzip();
             round_modified_workspace |=
                 workflow_runtime.record_workspace_change(before_change, after_change);
             round_progress |= workflow_runtime.record_observation(
@@ -13822,14 +13789,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 .map(|batch| batch.start(call_index, disclosure))
                 .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
-            let before_change = progress_workspace_state(
-                name,
-                &args,
-                workspace,
-                &caveats.fs_read,
-                worktree_session,
-            )
-            .await;
+            let workspace_change = std::sync::OnceLock::new();
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -13941,6 +13901,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         live_tool_output: live_tool_output.clone(),
                         completed_spill_renderer: completed_spill_renderer.clone(),
                         execution: Some(&execution),
+                        workspace_change: Some(&workspace_change),
                         retry_authorized: Some(&retry_authorized),
                         governed_pr: Some(&governed_pr),
                         report_capture: Some(&report_capture),
@@ -13975,12 +13936,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // (mirrors Ollama path).
             let ok = tools::tool_ok(&result, execution.get().copied());
             round_succeeded |= ok;
-            let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
-                    .await
-            } else {
-                None
-            };
+            let (before_change, after_change) = workspace_change.get().copied().unzip();
             round_modified_workspace |=
                 workflow_runtime.record_workspace_change(before_change, after_change);
             round_progress |= workflow_runtime.record_observation(

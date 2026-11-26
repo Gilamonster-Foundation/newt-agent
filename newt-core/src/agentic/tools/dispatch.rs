@@ -91,6 +91,9 @@ pub(crate) struct ToolCollaborators<'a, 'gate> {
     /// tool-event funnel. `None` when no funnel is listening.
     pub(crate) report_capture: Option<&'a std::sync::Mutex<super::super::observed_report::Capture>>,
     pub(crate) execution: Option<&'a std::sync::OnceLock<crate::ExecOutcome>>,
+    /// Comparable observations captured under the dispatcher's projected authority.
+    pub(crate) workspace_change:
+        Option<&'a std::sync::OnceLock<(agentic::ProgressSnapshot, agentic::ProgressSnapshot)>>,
     /// A host-approved deferred retry; independent of child output or exit status.
     pub(crate) retry_authorized: Option<&'a std::sync::OnceLock<()>>,
     /// #2741/#2769: only governed brokers supply typed publication outcomes.

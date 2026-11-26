@@ -115,6 +115,105 @@ fn adoption_progress_lifecycle_preserves_short_brake() {
     ));
 }
 
+/// #3290: ground the mocked 71-round replay in successful native edits with
+/// base read/write caveats confined to the original checkout.
+#[cfg(unix)]
+#[tokio::test]
+async fn projected_task_progress_edit() {
+    projected_task_progress("edit_file").await;
+}
+
+/// #3290: ground the same replay's tree snapshots in real confined sed writes.
+#[cfg(all(target_os = "linux", feature = "confine"))]
+#[tokio::test]
+async fn projected_task_progress_shell() {
+    projected_task_progress("run_command").await;
+}
+
+#[cfg(unix)]
+async fn projected_task_progress(name: &str) {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _lock = env_lock().await;
+    let _ocap = EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "brush");
+    let (_temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+    let original = policy.worktree.parent().unwrap().join("main");
+    let task = policy.worktree.clone();
+    let mut candidate = Creation::before(&original, &task, &Caveats::top()).unwrap();
+    candidate.prepare(&Caveats::top()).unwrap();
+    crate::worktree_adoption::tests::link(&policy);
+    let session = crate::worktree_adoption::WorktreeSession::default();
+    record_verified_creation(&session, candidate.verify().unwrap(), false);
+    let base = Caveats {
+        fs_read: crate::Scope::only([original.to_string_lossy().into_owned()]),
+        fs_write: crate::Scope::only([original.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    std::fs::write(task.join("probe.txt"), "before\n").unwrap();
+    let mut changes = Vec::new();
+    for (old, new) in [
+        ("before", "first"),
+        ("first", "second"),
+        ("second", "second"),
+    ] {
+        let args = if name == "edit_file" {
+            serde_json::json!({"path":"probe.txt", "old_string":old, "new_string":new})
+        } else {
+            serde_json::json!({"command":format!("sed -i 's/{old}/{new}/' probe.txt")})
+        };
+        let workspace_change = std::sync::OnceLock::new();
+        let outcome = std::sync::OnceLock::new();
+        let result = execute(
+            &mut Notices::default(),
+            name,
+            &args,
+            original.to_str().unwrap(),
+            false,
+            20,
+            &base,
+            &mut crate::agentic::NoMcp,
+            ToolCollaborators {
+                worktree_session: Some(&session),
+                execution: Some(&outcome),
+                workspace_change: Some(&workspace_change),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+        )
+        .await;
+        assert!(
+            crate::agentic::tools::tool_ok(&result, outcome.get().copied()),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(task.join("probe.txt")).unwrap(),
+            format!("{new}\n")
+        );
+        for scope in [&base.fs_read, &base.fs_write] {
+            assert!(!newt_policy::caveats::permits_path(
+                scope,
+                task.to_str().unwrap()
+            ));
+        }
+        let (before, after) = workspace_change.get().copied().unzip();
+        assert!(
+            before.is_some() && after.is_some(),
+            "{name}: missing snapshots"
+        );
+        if old == new {
+            assert!(
+                !crate::agentic::WorkflowRuntimeState::default()
+                    .record_workspace_change(before, after),
+                "a no-op is not progress"
+            );
+        } else {
+            changes.push((before, after));
+        }
+    }
+    crate::agentic::repeat_call_guard_tests::projected_task_progress_replay(&changes);
+}
+
 struct Approve {
     asked: bool,
 }

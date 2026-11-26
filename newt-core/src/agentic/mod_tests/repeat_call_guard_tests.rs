@@ -1555,6 +1555,57 @@ pub(in crate::agentic) fn task_worktree_progress_replay(
     assert_eq!(state.rounds_without_change, 1);
 }
 
+/// #3290: in-memory replay of adoption at 23 and edits at 30 and 42. Real
+/// dispatch tests supply the same replay with file/tree observations.
+#[test]
+fn projected_task_progress_replay_survives_attempt_71() {
+    let snapshot = |bytes: &[u8]| {
+        Some(ProgressSnapshot::File(
+            content_addressable::ContentId::from_canonical_bytes(bytes),
+        ))
+    };
+    projected_task_progress_replay(&[
+        (snapshot(b"before"), snapshot(b"first")),
+        (snapshot(b"first"), snapshot(b"second")),
+    ]);
+}
+
+pub(in crate::agentic) fn projected_task_progress_replay(
+    changes: &[(Option<ProgressSnapshot>, Option<ProgressSnapshot>)],
+) {
+    let session = crate::worktree_adoption::WorktreeSession::default();
+    let mut state = WorkflowRuntimeState::default();
+    let mut changes = changes.iter();
+    for round in 1..=71 {
+        if round == 23 {
+            session.adopt(crate::worktree_adoption::tests::policy_fixture(
+                "original".into(),
+                "task".into(),
+            ));
+        }
+        let wrote = if matches!(round, 30 | 42) {
+            let (before, after) = *changes.next().unwrap();
+            let wrote = state.record_workspace_change(before, after);
+            assert!(
+                wrote,
+                "round {round}: successful task edit must count as workspace change"
+            );
+            wrote
+        } else {
+            false
+        };
+        state.record_round_outcome(wrote, true);
+        assert!(
+            matches!(
+                state.no_progress_verdict(PromptDisposition::Act, false, Some(&session)),
+                NoProgress::Continue
+            ),
+            "round {round}"
+        );
+    }
+    assert_eq!(state.rounds_without_action_progress, 29);
+}
+
 #[test]
 fn evidence_only_progress_ceiling_resets_on_writes_checks_and_operator_steering() {
     for reset in ["write", "check", "steering"] {

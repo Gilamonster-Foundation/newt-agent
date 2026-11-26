@@ -3887,6 +3887,7 @@ async fn execute_authorized_tool(
         live_tool_output,
         completed_spill_renderer: _,
         execution,
+        workspace_change: _,
         report_capture,
         governed_pr,
         command_directory,
