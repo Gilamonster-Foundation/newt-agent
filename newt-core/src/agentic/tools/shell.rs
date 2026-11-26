@@ -285,14 +285,17 @@ pub(super) fn command_args_with_default_cwd<'a>(
     workspace: &str,
     default_cwd: Option<&std::path::Path>,
     session: Option<&crate::worktree_adoption::WorktreeSession>,
-) -> Result<std::borrow::Cow<'a, serde_json::Value>, &'static str> {
+) -> Result<std::borrow::Cow<'a, serde_json::Value>, String> {
     let Some(key) = command_cwd_key(name) else {
         return Ok(std::borrow::Cow::Borrowed(args));
     };
     if args.get(key).is_some() || !args.is_object() {
         return Ok(std::borrow::Cow::Borrowed(args));
     }
-    let task_root = session.and_then(|session| session.task_root(std::path::Path::new(workspace)));
+    let task_root = session
+        .map(|session| session.task_root(std::path::Path::new(workspace)))
+        .transpose()?
+        .flatten();
     // Without a task, preserve the existing lifecycle/build defaults.
     let is_shell = name == "run_command"
         || matches!(

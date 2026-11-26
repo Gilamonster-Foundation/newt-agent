@@ -356,7 +356,10 @@ async fn plan_release_preserves_worktree_adoption() {
                 PromptDisposition::Act,
             )
             .await;
-            assert_eq!(session.task_root(&root).as_deref(), Some(target.as_path()));
+            assert_eq!(
+                session.task_root(&root).unwrap().as_deref(),
+                Some(target.as_path())
+            );
             assert_eq!(
                 plan.is_plan_mode(),
                 phase != Phase::Approved,

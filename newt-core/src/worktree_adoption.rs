@@ -55,20 +55,37 @@ impl WorktreeSession {
             task_path_literal(path)
         ))
     }
-    /// Routing needs a reciprocal link to THIS repository, not just advisory
-    /// command success. This portable metadata check grants no file authority.
-    pub(crate) fn task_root(&self, workspace: &Path) -> Option<PathBuf> {
-        let path = self
-            .task_worktree
-            .lock()
-            .expect("worktree hint lock")
-            .as_ref()?
-            .0
-            .clone();
-        Self::bound_task_root(&path, workspace)
+    /// An adopted task (including detached HEAD) cannot fall back to the original
+    /// checkout. Advisory hints still require a reciprocal link to THIS repository.
+    /// This portable metadata check grants no file authority.
+    pub(crate) fn task_root(&self, workspace: &Path) -> Result<Option<PathBuf>, String> {
+        let adopted = self.snapshot();
+        let path = adopted
+            .as_ref()
+            .map(|policy| policy.worktree.clone())
+            .or_else(|| {
+                self.task_worktree
+                    .lock()
+                    .expect("worktree hint lock")
+                    .as_ref()
+                    .map(|(path, _)| path.clone())
+            });
+        let Some(path) = path else { return Ok(None) };
+        match Self::bound_task_root(&path, workspace) {
+            Some(root) => Ok(Some(root)),
+            None if adopted.is_some() => Err(format!(
+                "error: bound task worktree {} cannot be used: its directory or reciprocal Git metadata is missing or invalid for this repository; no command was run. Restore the worktree or ask the operator for /permissions worktree-lift.",
+                task_path_literal(&path)
+            )),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn bound_task_root(path: &Path, workspace: &Path) -> Option<PathBuf> {
+        #[cfg(test)]
+        if let Ok(root) = tests::TASK_ROOT.try_with(|root| root.borrow().clone()) {
+            return root;
+        }
         let root = path.canonicalize().ok()?;
         let gitfile = root.join(".git");
         if !std::fs::symlink_metadata(&gitfile).ok()?.is_file() {

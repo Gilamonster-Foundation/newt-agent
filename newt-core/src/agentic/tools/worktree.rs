@@ -495,7 +495,7 @@ pub(super) async fn execute(
         }
         if let Some(policy) = &policy {
             return format!(
-                "Task worktree already bound: {}. Commands already run there by default. No command was run.",
+                "Task worktree already bound: {}. Commands default there and stop if the binding is unavailable. No command was run.",
                 task_path_literal(&policy.worktree)
             );
         }
@@ -507,11 +507,24 @@ pub(super) async fn execute(
     // #2771: choose the file-tool base once, before both the adoption fence
     // and native dispatch. This changes path resolution, never authority.
     // Shell calls (including routed file reads) retain their explicit cwd.
-    let task_root = matches!(
+    let task_root = match matches!(
         name,
         "read_file" | "write_file" | "edit_file" | "delete_file" | "list_dir" | "find" | "grep"
     )
-    .then(|| crate::agentic::selected_target::root(workspace, session));
+    .then(|| crate::agentic::selected_target::root(workspace, session))
+    .transpose()
+    {
+        Ok(root) => root,
+        Err(error) => {
+            if let Some(invocation) = collab.invocation {
+                invocation.host();
+            }
+            if let Some(slot) = collab.execution {
+                let _ = slot.set(crate::ExecOutcome::Unavailable);
+            }
+            return error;
+        }
+    };
     // Absolute searches retain the original workspace-only boundary. Only
     // relative operands select the task's search root; no fence is widened.
     let absolute_search = matches!(name, "find" | "grep")
@@ -553,14 +566,24 @@ pub(super) async fn execute(
         None
     };
     let caveats = task_authority.as_ref().unwrap_or(caveats);
-    let mut normalized = shell::command_args_with_default_cwd(
+    let mut normalized = match shell::command_args_with_default_cwd(
         name,
         args,
         workspace,
         collab.default_command_cwd,
         collab.worktree_session,
-    )
-    .unwrap_or(std::borrow::Cow::Borrowed(args));
+    ) {
+        Ok(args) => args,
+        Err(error) => {
+            if let Some(invocation) = collab.invocation {
+                invocation.host();
+            }
+            if let Some(slot) = collab.execution {
+                let _ = slot.set(crate::ExecOutcome::Unavailable);
+            }
+            return error;
+        }
+    };
     // Announce only an implicit task default, never an explicit cwd/dir/cd.
     // Keep the path chosen for this call; the inner dispatcher receives the
     // same projected args, rather than independently choosing another root.
@@ -573,7 +596,7 @@ pub(super) async fn execute(
         {
             return None;
         }
-        let task = session?.task_root(Path::new(workspace))?;
+        let task = session?.task_root(Path::new(workspace)).ok()??;
         let child_path = dunce::simplified(&task);
         (normalized.get(key)?.as_str()? == child_path.to_str()?).then(|| {
             format!(

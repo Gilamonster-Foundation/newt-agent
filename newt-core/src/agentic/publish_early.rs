@@ -76,7 +76,7 @@ pub(crate) fn after_tool(
     ) {
         return None;
     }
-    let root = session.task_root(Path::new(workspace))?;
+    let root = session.task_root(Path::new(workspace)).ok()??;
     let admin = crate::workspace_key::discover_git_dir(&root)?;
     let head = read_fact(&admin.join("HEAD"), read)?;
     let branch = head.trim().strip_prefix("ref: refs/heads/")?;

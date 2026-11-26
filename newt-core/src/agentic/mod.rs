@@ -1855,14 +1855,17 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             false,
         );
         observed_facts.verbatim = exposure.verbatim_system;
-        observed_facts.planning = output_budget::guidance(
-            output_allowance,
-            step_ledger,
-            &selected_target::root(workspace, worktree_session),
-            &caveats.fs_read,
-            estimation,
-            &exposure,
-        );
+        observed_facts.planning = match selected_target::root(workspace, worktree_session) {
+            Ok(root) => output_budget::guidance(
+                output_allowance,
+                step_ledger,
+                &root,
+                &caveats.fs_read,
+                estimation,
+                &exposure,
+            ),
+            Err(error) => error,
+        };
         semantic_pins::refresh(
             &mut observed_facts,
             smart_harness,
@@ -4431,7 +4434,7 @@ async fn progress_workspace_state(
     {
         return None;
     }
-    let root = selected_target::root(workspace, worktree_session);
+    let root = selected_target::root(workspace, worktree_session).ok()?;
     let target = matches!(name, "write_file" | "edit_file" | "delete_file")
         .then(|| args.get("path").and_then(serde_json::Value::as_str))
         .flatten()
@@ -7249,18 +7252,21 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             false,
         );
         observed_facts.verbatim = exposure.verbatim_system;
-        observed_facts.planning = output_budget::guidance(
-            Some(generation_bounds::output_cap(
-                generation_policy.output_allowance,
-                None,
-                0,
-            )?),
-            step_ledger,
-            &selected_target::root(workspace, worktree_session),
-            &caveats.fs_read,
-            estimation,
-            &exposure,
-        );
+        observed_facts.planning = match selected_target::root(workspace, worktree_session) {
+            Ok(root) => output_budget::guidance(
+                Some(generation_bounds::output_cap(
+                    generation_policy.output_allowance,
+                    None,
+                    0,
+                )?),
+                step_ledger,
+                &root,
+                &caveats.fs_read,
+                estimation,
+                &exposure,
+            ),
+            Err(error) => error,
+        };
         semantic_pins::refresh(
             &mut observed_facts,
             smart_harness,
@@ -10172,14 +10178,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             false,
         );
         observed_facts.verbatim = exposure.verbatim_system;
-        observed_facts.planning = output_budget::guidance(
-            Some(max_tokens),
-            step_ledger,
-            &selected_target::root(workspace, worktree_session),
-            &caveats.fs_read,
-            estimation,
-            &exposure,
-        );
+        observed_facts.planning = match selected_target::root(workspace, worktree_session) {
+            Ok(root) => output_budget::guidance(
+                Some(max_tokens),
+                step_ledger,
+                &root,
+                &caveats.fs_read,
+                estimation,
+                &exposure,
+            ),
+            Err(error) => error,
+        };
         semantic_pins::refresh(
             &mut observed_facts,
             smart_harness,
@@ -12866,18 +12875,21 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             true,
         );
         observed_facts.verbatim = exposure.verbatim_system;
-        observed_facts.planning = output_budget::guidance(
-            Some(generation_bounds::output_cap(
-                generation_policy.output_allowance,
-                None,
-                0,
-            )?),
-            step_ledger,
-            &selected_target::root(workspace, worktree_session),
-            &caveats.fs_read,
-            estimation,
-            &exposure,
-        );
+        observed_facts.planning = match selected_target::root(workspace, worktree_session) {
+            Ok(root) => output_budget::guidance(
+                Some(generation_bounds::output_cap(
+                    generation_policy.output_allowance,
+                    None,
+                    0,
+                )?),
+                step_ledger,
+                &root,
+                &caveats.fs_read,
+                estimation,
+                &exposure,
+            ),
+            Err(error) => error,
+        };
         semantic_pins::refresh(
             &mut observed_facts,
             smart_harness,

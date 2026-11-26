@@ -187,7 +187,8 @@ async fn worktree_adoption_guards_file_dispatch_across_calls_and_lift() {
     let session = WorktreeSession::default();
     session.adopt(policy.clone());
     for name in ["write_file", "edit_file", "delete_file"] {
-        let args = serde_json::json!({"path":"source.rs", "content":"after", "old_string":"before", "new_string":"after"});
+        // Relative paths now select the adopted task even without a branch hint.
+        let args = serde_json::json!({"path":original.join("source.rs"), "content":"after", "old_string":"before", "new_string":"after"});
         let output = call(name, &args, &original, &session).await;
         assert!(
             output.contains("original checkout is read-only"),
@@ -201,7 +202,7 @@ async fn worktree_adoption_guards_file_dispatch_across_calls_and_lift() {
     }
     let read = call(
         "read_file",
-        &serde_json::json!({"path":"source.rs"}),
+        &serde_json::json!({"path":original.join("source.rs")}),
         &original,
         &session,
     )

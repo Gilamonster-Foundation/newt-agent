@@ -4053,7 +4053,7 @@ async fn execute_authorized_tool(
         worktree_session,
     ) {
         Ok(args) => args,
-        Err(error) => return host_return(error.to_owned()),
+        Err(error) => return host_return(executed((error, crate::ExecOutcome::Unavailable))),
     };
     let args = command_args.as_ref();
 
@@ -4293,7 +4293,13 @@ async fn execute_authorized_tool(
                             return "error: target revision requires prompt-artifact recording; previous selection retained".into();
                         }
                         if let Some(target) = &mut after.target {
-                            let root = super::selected_target::root(workspace, worktree_session);
+                            let root = match super::selected_target::root(workspace, worktree_session) {
+                                Ok(root) => root,
+                                Err(error) => {
+                                    ledger.restore(&before);
+                                    return host_return(error);
+                                }
+                            };
                             if let Err(error) = target.bind_baseline(super::selected_target::baseline(&root, &caveats.fs_read)) {
                                 ledger.restore(&before);
                                 return format!("error: {error}");
@@ -4779,7 +4785,10 @@ async fn execute_authorized_tool(
             #[cfg(not(test))]
             let cwd_result = check_cwd();
             if let Err((error, outcome)) = cwd_result {
-                let task_root = worktree_session.and_then(|session| session.task_root(std::path::Path::new(workspace)));
+                let task_root = match worktree_session.map(|session| session.task_root(std::path::Path::new(workspace))).transpose() {
+                    Ok(root) => root.flatten(),
+                    Err(task_error) => return host_return(executed((format!("{error}; {task_error}"), outcome))),
+                };
                 let previous = task_root.as_deref().or(default_command_cwd).unwrap_or_else(|| std::path::Path::new(workspace));
                 return host_return(executed((
                     format!("{error}; default working directory remains {}", crate::worktree_adoption::task_path_literal(previous)),
