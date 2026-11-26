@@ -871,6 +871,15 @@ pub fn trusted_gh_config_dir(ctx: &TrustContext) -> Result<Option<PathBuf>, Refu
 /// When no repository is found inside the read roots, a pointer file is
 /// malformed, or an administrative directory is outside read authority.
 pub fn discover_git_dirs(cwd: &Path, held: &HeldRoots) -> Result<(PathBuf, PathBuf), Refusal> {
+    discover_worktree(cwd, held).map(|(_, common, admin)| (common, admin))
+}
+
+/// The same held-root discovery, also retaining the worktree that owns `.git`.
+/// Hooks run there even when the push was requested from a subdirectory.
+pub(crate) fn discover_worktree(
+    cwd: &Path,
+    held: &HeldRoots,
+) -> Result<(PathBuf, PathBuf, PathBuf), Refusal> {
     let readable = |p: &Path| -> Result<PathBuf, Refusal> {
         let resolved = std::fs::canonicalize(p)
             .map_err(|e| format!("refused: '{}' cannot be resolved ({e})", p.display()))?;
@@ -925,7 +934,7 @@ pub fn discover_git_dirs(cwd: &Path, held: &HeldRoots) -> Result<(PathBuf, PathB
             Some(text) => readable(&git_dir.join(text.trim()))?,
             None => git_dir.clone(),
         };
-        return Ok((common_dir, git_dir));
+        return Ok((dir.to_path_buf(), common_dir, git_dir));
     }
     Err(
         "refused: no git repository found inside this session's read authority"

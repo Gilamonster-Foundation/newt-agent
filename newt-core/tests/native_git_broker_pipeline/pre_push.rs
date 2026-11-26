@@ -1,7 +1,10 @@
 //! Grounds the mocked pre-push contract and refusal tests with the real broker,
 //! Git hook, and kernel fence. Run through `--confined-contract --pre-push`.
 
-use super::{dispatch, fixture, real_git, real_git_output, Scope, WorktreeSession};
+use super::{
+    dispatch, dispatch_with_operator, fixture, real_git, real_git_output, Operator, Scope,
+    WorktreeSession,
+};
 use std::os::unix::fs::PermissionsExt;
 
 pub(super) async fn run() {
@@ -29,6 +32,100 @@ pub(super) async fn run() {
     let state = main.join("blocked-state");
     std::fs::write(&state, "not a directory").unwrap();
     newt_core::process_env::set_var("NEWT_CONFIG_DIR", state.to_str().unwrap());
+    // #3294 grounds the mocked Build admission and pre-push staging contract:
+    // a real build tool needs its toolchain read, target and private scratch.
+    let tools = tempfile::tempdir().unwrap();
+    let bin = tools.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let tool = bin.join("just");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\nexec /usr/bin/make --no-print-directory\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    newt_core::process_env::set_var("XDG_BIN_HOME", bin.to_str().unwrap());
+    std::fs::write(
+        main.join("Makefile"),
+        concat!(
+            "check:\n",
+            "\ttest -n \"$$TMPDIR\" && test -d \"$$TMPDIR\"\n",
+            "\ttest \"$$CARGO_TARGET_DIR\" = \"$$PWD/target\"\n",
+            "\tprintf scratch > \"$$TMPDIR/probe\"\n",
+            "\tmkdir -p \"$$CARGO_TARGET_DIR\"\n",
+            "\tprintf built > \"$$CARGO_TARGET_DIR/hook-built\"\n",
+            "\tprintf '%s' \"$$TMPDIR\" > hook-scratch\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nexec {}\n",
+            newt_core::mcp::shell_quote_arg(&tool.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut build = newt_core::confined_exec::build_tool_request(
+        &main,
+        &main,
+        "just",
+        ["check"],
+        &Scope::none(),
+    )
+    .caveats()
+    .clone();
+    build.net = caveats.net.clone();
+    let out = dispatch(&session, &main, &build, "git push origin task").await;
+    assert!(
+        out.contains("trusted staging checks failed"),
+        "build hook: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(main.join("target/hook-built")).unwrap(),
+        "built"
+    );
+    let scratch = std::fs::read_to_string(main.join("hook-scratch")).unwrap();
+    assert!(
+        !std::path::Path::new(&scratch).exists(),
+        "scratch lease leaked"
+    );
+    println!("GOVERNED_PRE_PUSH_BUILD_CONFIRMED");
+
+    // Missing or declined Build authority cannot execute even the hook's first tool.
+    std::fs::remove_file(main.join("target/hook-built")).unwrap();
+    let out = dispatch(&session, &main, &caveats, "git push").await;
+    assert!(
+        out.contains("requires explicit confined build authority"),
+        "{out}"
+    );
+    assert!(!main.join("target/hook-built").exists());
+    for allow in [false, true] {
+        let mut operator = Operator::new(allow);
+        let out =
+            dispatch_with_operator(&session, &main, &caveats, "git push", &mut operator).await;
+        assert_eq!(operator.asked, [main.to_string_lossy().into_owned()]);
+        assert_eq!(main.join("target/hook-built").exists(), allow, "{out}");
+        assert!(
+            out.contains(if allow {
+                "trusted staging checks failed"
+            } else {
+                "requires explicit confined build authority"
+            }),
+            "{out}"
+        );
+    }
+    if let Scope::Only(writes) = &mut caveats.fs_write {
+        writes.insert(main.to_string_lossy().into_owned());
+        writes.insert(
+            newt_core::confined_exec::build_scratch_root(&main)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    println!("GOVERNED_PRE_PUSH_BUILD_AUTHORITY_CONFIRMED");
+
     for tracked in [false, true] {
         if tracked {
             real_git(
@@ -95,6 +192,26 @@ pub(super) async fn run() {
     assert!(out.contains("pre-push"), "{out}");
     assert!(!marker.exists(), "hook escaped its filesystem fence");
 
+    // Even an ambient network grant for publication stays unavailable to hook code.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(main.join("network-probe.py"), format!(
+        "import socket\ntry:\n    socket.create_connection(('127.0.0.1', {}), timeout=1)\nexcept PermissionError:\n    pass\nelse:\n    raise AssertionError('hook acquired network')\n", listener.local_addr().unwrap().port()
+    )).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexec python3 network-probe.py\n").unwrap();
+    let mut network = caveats.clone();
+    network.net = Scope::All;
+    let out = dispatch(&session, &main, &network, "git push").await;
+    assert!(
+        out.contains("trusted staging checks failed"),
+        "network fence: {out}"
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    println!("GOVERNED_PRE_PUSH_NETWORK_DENIED_CONFIRMED");
+
     // A linked worktree's default hooks live in the common repository, while
     // the hook runs in that worktree's root even when invoked in a subdirectory.
     real_git(&main, &["config", "--unset", "core.hooksPath"]);
@@ -112,6 +229,16 @@ pub(super) async fn run() {
         &main,
         &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()],
     );
+    // Session bootstrap binds the external metadata reads used by every build.
+    newt_core::git_hardening::own_gitdir_grants(&linked);
+    if let Scope::Only(writes) = &mut caveats.fs_write {
+        writes.insert(linked.to_string_lossy().into_owned());
+        writes.insert(
+            newt_core::confined_exec::build_scratch_root(&linked)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     let sub = linked.join("sub");
     std::fs::create_dir(&sub).unwrap();
     let out = dispatch(&session, &sub, &caveats, "git push").await;
@@ -121,7 +248,23 @@ pub(super) async fn run() {
         "linked"
     );
 
-    // The ordinary per-call timeout owns the broker and all hook descendants.
+    // The common Git directory is readable to the hook, but cannot be mutated.
+    let config = main.join(".git/config");
+    let original = std::fs::read(&config).unwrap();
+    std::fs::write(
+        &common_hook,
+        format!(
+            "#!/bin/sh\nprintf poisoned > {}\n",
+            newt_core::mcp::shell_quote_arg(&config.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    let out = dispatch(&session, &sub, &caveats, "git push").await;
+    assert!(out.contains("pre-push hook refused"), "{out}");
+    assert_eq!(std::fs::read(&config).unwrap(), original);
+    println!("GOVERNED_PRE_PUSH_GIT_PROTECTION_CONFIRMED");
+
+    // An explicit per-call hang guard still owns the broker and hook descendants.
     std::fs::write(&common_hook, "#!/bin/sh\nexec sleep 30\n").unwrap();
     let out = newt_core::execute_tool(
         "run_command",
