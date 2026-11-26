@@ -133,9 +133,9 @@ fn namespace(uid: &[u8], gid: &[u8]) -> io::Result<()> {
     interface.ifr_name[0] = b'l' as libc::c_char;
     interface.ifr_name[1] = b'o' as libc::c_char;
     let result = (|| {
-        check(unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut interface) })?;
+        check(unsafe { libc::ioctl(fd, libc::SIOCGIFFLAGS as libc::Ioctl, &mut interface) })?;
         unsafe { interface.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short };
-        check(unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS, &interface) })
+        check(unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS as libc::Ioctl, &interface) })
     })();
     unsafe { libc::close(fd) };
     result
