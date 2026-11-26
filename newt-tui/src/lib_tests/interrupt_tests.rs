@@ -1,4 +1,7 @@
-use super::{is_ctrl_c, is_lone_esc, watch_for_interrupt_fd, SpillInput, TurnKey, TurnKeyDecoder};
+use super::{
+    is_ctrl_c, is_lone_esc, watch_for_interrupt_fd, watch_for_interrupt_input, SpillInput, TurnKey,
+    TurnKeyDecoder,
+};
 
 #[test]
 fn lone_esc_interrupts_but_sequences_and_chords_do_not() {
@@ -268,11 +271,28 @@ fn every_ctrl_c_press_is_counted_for_the_spinner() {
     newt_core::tty::set_interrupt_pending(false);
 }
 
-#[serial_test::serial(prompt_stdin, type_ahead)]
+#[serial_test::serial(prompt_stdin, interrupt_pending, type_ahead)]
 #[test]
 fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
+    let (up, toggled, cancelled) = run_fragmented_arrow(false);
+    assert_eq!(up, 1);
+    assert_eq!(toggled, 1);
+    assert!(!cancelled);
+}
+
+/// #3270: a delayed writer can let the escape grace expire before `[` arrives.
+/// Replay that former sleep-dependent failure without waiting on a real clock.
+#[serial_test::serial(prompt_stdin, interrupt_pending, type_ahead)]
+#[test]
+fn watcher_fragmented_arrow_after_escape_grace_cancels() {
+    let (up, toggled, cancelled) = run_fragmented_arrow(true);
+    assert_eq!(up, 0);
+    assert_eq!(toggled, 0);
+    assert!(cancelled);
+}
+
+fn run_fragmented_arrow(grace_expired: bool) -> (usize, usize, bool) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingSpill {
@@ -321,53 +341,47 @@ fn watcher_routes_a_fragmented_arrow_and_activation_without_cancelling() {
         }
     }
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let _ = crate::type_ahead::take();
+    newt_core::tty::set_interrupt_pending(false);
     let cancel = AtomicBool::new(false);
     let stop = AtomicBool::new(false);
     let spill = RecordingSpill::default();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            watch_for_interrupt_fd(
-                pipe[0],
-                &cancel,
-                &stop,
-                Some(&spill),
-                newt_core::EditMode::Nano,
-                false, // mode_nav: base keys (arrow + space) only
-                10,
-                100,
-            );
-        });
-        let write = |bytes: &[u8]| {
-            assert_eq!(
-                unsafe { libc::write(pipe[1], bytes.as_ptr().cast(), bytes.len()) },
-                bytes.len() as isize
-            );
-        };
-        write(&[0x1b]);
-        std::thread::sleep(Duration::from_millis(10));
-        write(b"[");
-        std::thread::sleep(Duration::from_millis(10));
-        write(b"A ");
-
-        let deadline = std::time::Instant::now() + newt_core::test_guard::HANG_GUARD;
-        while (spill.up.load(Ordering::Relaxed) == 0 || spill.toggled.load(Ordering::Relaxed) == 0)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        stop.store(true, Ordering::Relaxed);
-        write(b"x");
-    });
-    unsafe {
-        libc::close(pipe[0]);
-        libc::close(pipe[1]);
-    }
-
-    assert_eq!(spill.up.load(Ordering::Relaxed), 1);
-    assert_eq!(spill.toggled.load(Ordering::Relaxed), 1);
-    assert!(!cancel.load(Ordering::Relaxed));
+    // These are separate reads, even if the runner pauses between them. The
+    // grace result models whether the writer's next fragment arrived in time.
+    let mut polls = [(10, true), (100, !grace_expired)]
+        .into_iter()
+        .chain(grace_expired.then_some((10, true)))
+        .chain([(10, true)]);
+    let mut fragments = [b"\x1b".as_slice(), b"[", b"A "].into_iter().peekable();
+    watch_for_interrupt_input(
+        &cancel,
+        &stop,
+        Some(&spill),
+        TurnKeyDecoder::default(),
+        (10, 100),
+        |timeout| {
+            let (expected_timeout, ready) = polls.next().expect("unexpected poll");
+            assert_eq!(timeout, expected_timeout);
+            (i32::from(ready), if ready { libc::POLLIN } else { 0 })
+        },
+        |buf| {
+            let fragment = fragments.next().expect("unexpected read");
+            buf[..fragment.len()].copy_from_slice(fragment);
+            if fragments.peek().is_none() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            fragment.len() as isize
+        },
+    );
+    assert!(polls.next().is_none(), "all polls were consumed");
+    assert!(fragments.next().is_none(), "all three fragments were read");
+    let _ = crate::type_ahead::take();
+    newt_core::tty::set_interrupt_pending(false);
+    (
+        spill.up.load(Ordering::Relaxed),
+        spill.toggled.load(Ordering::Relaxed),
+        cancel.load(Ordering::Relaxed),
+    )
 }
 
 /// #1704: while the spill viewport is in explore mode (scrolled back off the

@@ -596,25 +596,56 @@ pub(crate) fn watch_for_interrupt_fd(
     poll_timeout_ms: libc::c_int,
     escape_grace_ms: libc::c_int,
 ) {
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-    let mut buf = [0u8; 64];
     // #1303 step 5 + FIX F: bind the decoder to the session's editor keybinding,
     // but activate the mode-aware nav keys ONLY when `mode_nav` (the mouse
     // opt-in) is on — the base keys (`↑`/`↓`/`Space`/`Enter`) work either way.
     // The lean build has no nav modes.
     #[cfg(feature = "live-spill")]
-    let mut decoder = if mode_nav {
+    let decoder = if mode_nav {
         TurnKeyDecoder::with_mode(mode)
     } else {
         TurnKeyDecoder::default()
     };
     #[cfg(not(feature = "live-spill"))]
-    let mut decoder = {
+    let decoder = {
         let _ = mode;
         let _ = mode_nav;
         TurnKeyDecoder::default()
     };
+    watch_for_interrupt_input(
+        cancel,
+        stop,
+        spill,
+        decoder,
+        (poll_timeout_ms, escape_grace_ms),
+        |timeout| {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let n = unsafe { libc::poll(&mut pfd, 1, timeout) };
+            (n, pfd.revents)
+        },
+        |buf| unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) },
+    );
+}
+
+/// The same watcher loop for native fd input and scripted poll/read results.
+/// Injecting poll outcomes lets tests control the escape grace without sleeps.
+#[cfg(unix)]
+fn watch_for_interrupt_input(
+    cancel: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
+    spill: Option<&dyn SpillInput>,
+    mut decoder: TurnKeyDecoder,
+    (poll_timeout_ms, escape_grace_ms): (libc::c_int, libc::c_int),
+    mut poll: impl FnMut(libc::c_int) -> (libc::c_int, libc::c_short),
+    mut read: impl FnMut(&mut [u8]) -> isize,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let mut buf = [0u8; 64];
     while !stop.load(Ordering::Relaxed) {
         if let Some(spill) = spill {
             spill.refresh_geometry();
@@ -623,16 +654,11 @@ pub(crate) fn watch_for_interrupt_fd(
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let n = unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms) };
-        if n <= 0 || pfd.revents & libc::POLLIN == 0 {
+        let (n, revents) = poll(poll_timeout_ms);
+        if n <= 0 || revents & libc::POLLIN == 0 {
             continue; // timeout or spurious — re-check `stop`
         }
-        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        let r = read(&mut buf);
         if r <= 0 {
             continue;
         }
@@ -642,12 +668,7 @@ pub(crate) fn watch_for_interrupt_fd(
             // Guard against a split escape sequence (Esc arriving in a separate
             // read from its `[A` tail under load): wait briefly for a
             // continuation. None arriving → a real Esc press.
-            let mut pfd2 = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let m = unsafe { libc::poll(&mut pfd2, 1, escape_grace_ms) };
+            let (m, _) = poll(escape_grace_ms);
             if m <= 0 {
                 // A real lone Esc press. #1704: if the spill viewport is in
                 // explore mode (scrolled back off the tail), the FIRST Esc
@@ -665,7 +686,7 @@ pub(crate) fn watch_for_interrupt_fd(
                 // Feed Esc and its continuation through one persistent decoder;
                 // `[A`/`[B` may themselves be split across later reads.
                 dispatch_turn_keys(&mut decoder, bytes, spill);
-                let r2 = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                let r2 = read(&mut buf);
                 if r2 > 0 {
                     dispatch_turn_keys(&mut decoder, &buf[..r2 as usize], spill);
                 }
