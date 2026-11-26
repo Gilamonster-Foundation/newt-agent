@@ -76,11 +76,14 @@ pub fn run() {
         .build()
         .unwrap()
         .block_on(async {
-            if std::env::args().any(|arg| arg == "--pre-push") {
+            if std::env::args().any(|arg| arg == "--creation-3273") {
+                approved_creation_from_read_only_workspace().await;
+            } else if std::env::args().any(|arg| arg == "--pre-push") {
                 pre_push::run().await;
             } else if std::env::args().any(|arg| arg == "--publication") {
                 governed_publication().await;
             } else {
+                approved_creation_from_read_only_workspace().await;
                 detached_branch_wrappers().await;
                 removal::run().await;
                 siblings::run().await;
@@ -286,9 +289,7 @@ async fn creation_and_security(wrapper: bool) {
     let missing = dispatch(&session, &main, &caveats, "git worktree add ../task absent").await;
     assert!(missing.contains("-b"), "missing branch guidance: {missing}");
     assert!(!task.join(".git").exists());
-    if task.exists() {
-        std::fs::remove_dir(&task).expect("failed creation leaves only an empty leaf");
-    }
+    assert!(!task.exists(), "failed creation left its empty destination");
     println!("PASS missing_branch_guidance");
     let discovery = dispatch(&session, &main, &caveats, "which git").await;
     assert!(discovery.contains("/usr/bin/git"), "discovery: {discovery}");
@@ -543,4 +544,148 @@ async fn detached_branch_wrappers() {
     );
     assert!(main.join(".git/logs/refs/heads/detached-task").is_file());
     println!("PASS detached_branch_wrapper_retry_and_broker");
+}
+
+/// #3273: grounds the creation admission/permission mocks in real Git locks,
+/// registration and kernel enforcement. Destination approval must not become
+/// a standing metadata grant, including when the operator chooses session scope.
+async fn approved_creation_from_read_only_workspace() {
+    let (_temp, main, task, mut caveats) = fixture();
+    caveats.fs_read = Scope::only([main.to_string_lossy().into_owned()]);
+    caveats.fs_write = Scope::none();
+    caveats.exec = Scope::only(["git".into(), "sh".into(), "cat".into()]);
+    std::fs::write(main.join("payload"), "tracked content\n").unwrap();
+    std::fs::write(main.join(".gitattributes"), "payload filter=boundary\n").unwrap();
+    real_git(&main, &["add", "payload", ".gitattributes"]);
+    real_git(&main, &["commit", "-qm", "checkout fixture"]);
+    let filter = format!(
+        "echo attempted > filter-ran; echo corrupt > '{}/.git/HEAD'; cat",
+        main.display()
+    );
+    real_git(&main, &["config", "filter.boundary.smudge", &filter]);
+    let head_bytes = std::fs::read(main.join(".git/HEAD")).unwrap();
+    let config_bytes = std::fs::read(main.join(".git/config")).unwrap();
+    let session = WorktreeSession::default();
+    let mut operator = Operator::new(true);
+    let before = real_git_output(&main, &["rev-parse", "HEAD"]);
+    let out = dispatch_with_operator(
+        &session,
+        &main,
+        &caveats,
+        "git worktree add -b task ../task",
+        &mut operator,
+    )
+    .await;
+    assert!(
+        out.contains("Adopted task worktree:"),
+        "approved creation: {out}"
+    );
+    assert!(
+        task.join(".git").is_file(),
+        "registered worktree missing: {out}"
+    );
+    assert!(real_git_output(&main, &["worktree", "list", "--porcelain"])
+        .contains(&format!("worktree {}", task.display())));
+    assert_eq!(real_git_output(&task, &["rev-parse", "HEAD"]), before);
+    assert_eq!(real_git_output(&main, &["rev-parse", "HEAD"]), before);
+    assert_eq!(
+        std::fs::read_to_string(task.join("payload")).unwrap(),
+        "tracked content\n"
+    );
+    assert!(
+        task.join("filter-ran").is_file(),
+        "filter must run under the checkout fence: {out}"
+    );
+    assert_eq!(std::fs::read(main.join(".git/HEAD")).unwrap(), head_bytes);
+    assert_eq!(
+        std::fs::read(main.join(".git/config")).unwrap(),
+        config_bytes
+    );
+    assert!(
+        operator.asked.iter().all(|path| !path.contains(".git")),
+        "metadata authority must never reach a session grant: {:?}",
+        operator.asked
+    );
+    for file in ["HEAD", "config", "objects/unauthorized"] {
+        let command = format!("echo corrupt > '{}/.git/{file}'", main.display());
+        let refused = dispatch(&session, &main, &caveats, &command).await;
+        assert!(
+            refused.contains("denied") || refused.contains("read-only"),
+            "{refused}"
+        );
+    }
+    assert_eq!(real_git_output(&main, &["rev-parse", "HEAD"]), before);
+    assert!(!main.join(".git/objects/unauthorized").exists());
+    println!("PASS approved_read_only_creation_registered_without_standing_metadata_grant");
+
+    let (_temp, main, task, mut caveats) = fixture();
+    caveats.fs_read = Scope::only([main.to_string_lossy().into_owned()]);
+    caveats.fs_write = Scope::none();
+    let session = WorktreeSession::default();
+    let mut refused_operator = Operator::new(false);
+    let denied = dispatch_with_operator(
+        &session,
+        &main,
+        &caveats,
+        "git worktree add -b task ../task",
+        &mut refused_operator,
+    )
+    .await;
+    assert!(denied.contains("not approved"), "{denied}");
+    assert!(!task.exists());
+    assert!(!main.join(".git/refs/heads/task").exists());
+    println!("PASS denied_creation_does_not_mutate");
+    let mut operator = Operator::new(true);
+    let failed = dispatch_with_operator(
+        &session,
+        &main,
+        &caveats,
+        "git worktree add -b task ../task missing-start",
+        &mut operator,
+    )
+    .await;
+    assert!(
+        !task.exists(),
+        "failed creation left its empty destination: {failed}"
+    );
+    assert!(!main.join(".git/refs/heads/task").exists());
+    println!("PASS failed_creation_removes_owned_empty_destination");
+    std::fs::create_dir(&task).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&task, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failed = dispatch_with_operator(
+        &session,
+        &main,
+        &caveats,
+        "git worktree add -b task ../task missing-start",
+        &mut operator,
+    )
+    .await;
+    assert!(
+        task.is_dir(),
+        "preexisting destination was removed: {failed}"
+    );
+    assert_eq!(std::fs::read_dir(&task).unwrap().count(), 0);
+    println!("PASS failed_creation_preserves_preexisting_destination");
+
+    real_git(
+        &main,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+    );
+    let refused = dispatch(&session, &main, &caveats, "git fetch origin main").await;
+    assert!(
+        refused.contains("git fetch") && refused.contains("read-only"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("Permission denied"),
+        "raw Git failure: {refused}"
+    );
+    assert!(!main.join(".git/FETCH_HEAD").exists());
+    println!("PASS read_only_fetch_refused_before_network_or_git_writes");
 }

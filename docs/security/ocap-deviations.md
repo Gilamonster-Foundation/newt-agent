@@ -77,7 +77,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
-| `native-git-broker-exec-floor` | `NativeGitBroker`'s own `git` re-dispatch exec axis is kernel-enforced | 🟡 BOUNDED | (narrowed to `ExecOrigin::BrokerMediated`'s two call sites; fs/net stay Kernel — #2693) |
+| `native-git-broker-exec-floor` | `NativeGitBroker`'s own `git` re-dispatch exec axis is kernel-enforced | 🟡 BOUNDED | (native Git broker operations only; fs/net stay Kernel — #2693, #3273) |
 | `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`; macOS `O_NOFOLLOW` fd walk) | 🟢 closed (Linux) / 🟡 partial (macOS) | (macOS: `find_root_contained` and the `newt-tools` applier stay lexical; other platforms: lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | every MCP call mediated at call time (witness-typed leash; authority = structural grant, never the tool name; no-persona ≠ unrestricted) | 🟢 closed | (credential broker → `b1`; per-call budget = follow-on) |
@@ -1126,7 +1126,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** every attacker/host-influenced confined spawn's `exec` axis is kernel-enforced
   (`AxisEnforcement::Kernel`) before it is trusted — never admitted at a weaker tier.
 - **Practical caveat (now):** `NativeGitBroker`'s own `git` re-dispatch (`RepositoryProbe::output`,
-  `original_hooks` — `newt-core/src/native_git_broker.rs`) mints its `ExecRequest` under
+  `original_hooks`, and approved task creation — `newt-core/src/native_git_broker.rs`) mints its `ExecRequest` under
   `confined_exec::ExecOrigin::BrokerMediated`, which raises the gate's floor via
   `agent_bridle::EnforcementFloor::CONFINED` instead of the scalar `AxisEnforcement::Kernel`:
   `fs_read`/`fs_write`/`net` still require `Kernel` (unchanged — a restricted fs/net axis the governing
@@ -1135,22 +1135,27 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   loader/interpreter trampoline is the same documented, permanent residual `exec-behavior-bound` above
   already names (agent-bridle ADR 0011 D7) — so the PRIOR scalar `ExecOrigin::AgentInfluenced` `Kernel`
   floor refused this dispatch UNCONDITIONALLY on every Linux host, making a governed commit through the
-  broker impossible in a default-permission session (#2693). `BrokerMediated` is minted ONLY at these two
-  call sites: a host-side, fixed-program (`git`), policy-mediated re-dispatch — never a raw model
+  broker impossible in a default-permission session (#2693). These are host-side,
+  fixed-program (`git`), policy-mediated operations — never a raw model
   `run_command`, which keeps the stricter `AgentInfluenced` scalar floor unchanged.
 - **Residual:** 🟡 — this is a relaxation of the exec enforcement requirement: the broker's
   `git` re-dispatch accepts Interceptor enforcement instead of Kernel. The loader/interpreter
   trampoline residual remains. The floor preserves the request's existing fs/net authority; it does
   not turn granted access into deny-all authority or make a trampolined process harmless.
 - **Disabled while open:** raw model `run_command` spawns retain the stricter `AgentInfluenced`
-  floor. The two broker probe sites accept the weaker exec tier so governed commits can proceed.
+  floor. Broker operations accept the weaker exec tier so governed commits and approved task creation can proceed.
 - **Compensating controls:** `EnforcementFloor::CONFINED` still demands `Kernel` for restricted
-  fs/net axes (fail-closed unchanged). The two current `BrokerMediated` call sites are inside
-  `NativeGitBroker`. The executable is host-selected and the appended probe operation is
+  fs/net axes (fail-closed unchanged). The `BrokerMediated` operations are inside the native Git
+  broker module. The executable is host-selected and the appended probe operation is
   host-constructed, but `RepositoryProbe` copies the command's global-option prefix, environment,
   and cwd; these inputs are not wholly host-controlled. The broker also checks message/signature/
   object policy. The attribution-only fixture proves its trailer policy reached the commit through
   the hook handshake; it does not establish general commit unforgeability or exercise signing.
+  Approved task creation (#3273) grants common Git-directory and exact destination writes only
+  to fixed `git worktree add --no-checkout -b` registration. Hooks are disabled. Checkout then
+  uses `read-tree --reset -u HEAD` with writes limited to the new destination and its registered
+  admin directory; repository filters never receive shared metadata writes. Neither fence is
+  stored in session authority. Unsupported creation forms require a standalone new-branch command.
 - **Closure criterion:** the SAME kernel-granularity exec fence `exec-behavior-bound` already names
   (Tier-2, `b1` / #57 — W^X + a micro-VM rootfs, or seccomp `execve` argument binding) that makes the
   loader trampoline unrepresentable, OR evidence that Landlock's `Execute` rule is a complete identity

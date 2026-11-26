@@ -1,11 +1,11 @@
-//! #2757: one private approved leaf, held identity, and no rollback deletion.
+//! One private approved leaf, held identity, and bounded empty-leaf cleanup.
 //!
 //! A concurrent writer to the parent running as the SAME uid is outside the
 //! threat model: it already holds the user's authority. An indistinguishable
 //! empty, same-owner, mode-0700 replacement gains that writer nothing. Binding
 //! refuses other owners, nonempty directories and modes other than 0700.
-//! Failure retains the directory; pathname checks cannot make unlink conditional
-//! on a held object, so this module never deletes a directory.
+//! Explicit failure cleanup removes only our still-empty, identity-checked leaf
+//! through the held parent. Drop retains it: cancellation is not proof of failure.
 use newt_fdguard::GrantedRoot;
 use rustix::fs::{fstat, mkdirat, openat, Mode, OFlags};
 use std::path::{Path, PathBuf};
@@ -147,6 +147,21 @@ impl Destination {
                 .object
                 .as_ref()
                 .is_some_and(|object| Self::empty(object) == Ok(true))
+    }
+
+    pub(super) fn remove_empty(&self) -> Result<(), String> {
+        if !self.left_empty() {
+            return Err("worktree destination is not our unchanged empty directory".into());
+        }
+        // No recursive deletion, and no symlink traversal. A concurrent content
+        // insertion makes rmdir fail; same-uid parent replacement remains the
+        // threat-model limitation documented above.
+        rustix::fs::unlinkat(
+            self.parent.as_fd(),
+            Path::new(self.path.file_name().expect("destination leaf")),
+            rustix::fs::AtFlags::REMOVEDIR,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 

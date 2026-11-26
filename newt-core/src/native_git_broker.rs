@@ -1,5 +1,6 @@
 //! Native Git retains its CLI, index, author selection, hooks, and streams.
-//! Only message policy, signing, and verified publication cross to the host.
+//! Message policy, signing, verified publication, and approved task creation
+//! cross to the host broker.
 //!
 //! All repository probes use the original invocation's confined executor. The
 //! helper directory is a read-only mechanism resource outside child writes.
@@ -37,6 +38,133 @@ const HOOK_NAMES: &[&str] = &[
     "post-rewrite",
     "reference-transaction",
 ];
+
+/// Register one approved task without lending shared metadata writes to a shell
+/// or checkout filters. Like commit publication, this is invocation authority,
+/// never a session grant. The caller admits only a standalone literal creation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) async fn create_worktree(
+    candidate: &crate::worktree_adoption::Creation,
+    git: &Path,
+    branch: &str,
+    start: &str,
+    authority: &crate::Caveats,
+) -> Result<crate::confined_exec::ConfinedOutput, String> {
+    use crate::confined_exec::{ConstrainedExecutor, ExecOrigin, ExecRequest};
+    use newt_policy::caveats::{permits_path, CaveatsExt};
+    crate::git_staging::validate_branch_name(branch)?;
+    if branch.starts_with('-') || start.starts_with('-') || !authority.permits_exec("git") {
+        return Err(
+            "worktree creation requires Git execution and literal branch/start operands".into(),
+        );
+    }
+    let (original, common) = candidate.repository();
+    let destination = candidate.destination();
+    candidate.ready()?;
+    let held =
+        crate::git_staging::HeldRoots::bind(&authority.fs_read).map_err(|e| e.to_string())?;
+    if crate::git_staging::discover_git_dirs(original, &held)
+        .map_err(|e| e.to_string())?
+        .0
+        != common
+        || ![&authority.fs_read, &authority.fs_write]
+            .iter()
+            .all(|scope| permits_path(scope, &destination.to_string_lossy()))
+    {
+        return Err("approved worktree destination or repository identity changed".into());
+    }
+    let git = native_git_image(git)?;
+    let identity = crate::AgentIdentity::resolve().unwrap_or_default();
+    let (name, email) = identity.sandbox_author();
+    let env = crate::git_hardening::sandbox_git_env((&name, &email), &identity.git.config);
+    let exec_twins = match &authority.exec {
+        crate::Scope::Only(exec) => crate::confined_exec::developer_exec_twins(exec.iter()),
+        crate::Scope::All => Vec::new(),
+    };
+    // Only fixed, hook-free registration receives common-dir writes. No files
+    // are checked out here, so repository smudge/process filters cannot run.
+    let mut output = ConstrainedExecutor::run_async(
+        ExecRequest::new(
+            ExecOrigin::BrokerMediated,
+            git.to_string_lossy(),
+            [
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                branch,
+                "--",
+                destination
+                    .to_str()
+                    .ok_or("non-UTF8 worktree destination")?,
+                start,
+            ],
+            original,
+            worktree_caveats(authority, [common, destination], &exec_twins),
+        )
+        .envs(env.clone())
+        .env("GIT_NO_LAZY_FETCH", "1"),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    if !output.success {
+        return Ok(output);
+    }
+    candidate.ready()?;
+    let (registered, admin) =
+        crate::git_staging::discover_git_dirs(destination, &held).map_err(|e| e.to_string())?;
+    if registered != common || admin.parent() != Some(common.join("worktrees").as_path()) {
+        return Err("created worktree does not belong to the approved repository".into());
+    }
+    // read-tree populates the new index and checkout without updating any ref.
+    // Repository filters run here under only the task/admin write fence.
+    let checkout = ConstrainedExecutor::run_async(
+        ExecRequest::new(
+            ExecOrigin::BrokerMediated,
+            git.to_string_lossy(),
+            ["read-tree", "--reset", "-u", "HEAD"],
+            destination,
+            worktree_caveats(authority, [destination, &admin], &exec_twins),
+        )
+        .envs(env)
+        .env("GIT_NO_LAZY_FETCH", "1"),
+    )
+    .await;
+    let checkout = match checkout {
+        Ok(checkout) => checkout,
+        Err(error) => {
+            output.success = false;
+            output.code = None;
+            output.stderr.extend(
+                format!("\nWorktree registered, but checkout could not run: {error}").bytes(),
+            );
+            return Ok(output);
+        }
+    };
+    output.stdout.extend(checkout.stdout);
+    output.stderr.extend(checkout.stderr);
+    output.success = checkout.success;
+    output.code = checkout.code;
+    output.timed_out |= checkout.timed_out;
+    Ok(output)
+}
+
+/// Both creation steps use the shell commit path's developer exec identities
+/// with their own write fence. Runtime reads come from the executor's policy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn worktree_caveats(
+    authority: &crate::Caveats,
+    writes: [&Path; 2],
+    exec_twins: &[String],
+) -> crate::Caveats {
+    let mut confined = authority.clone();
+    confined.net = crate::Scope::none();
+    confined.fs_write = crate::Scope::only(writes.map(|path| path.to_string_lossy().into_owned()));
+    if let crate::Scope::Only(exec) = &mut confined.exec {
+        exec.extend(exec_twins.iter().cloned());
+    }
+    confined
+}
 
 fn denied(error: impl std::fmt::Display) -> ToolError {
     ToolError::denied(format!("native Git commit: {error}"))
@@ -1055,6 +1183,46 @@ mod tests {
     use super::forward_original_hook_input;
     use std::io::Read;
     use std::process::{Command, Stdio};
+
+    /// Model the host-resolved Xcode twin without reading a real toolchain.
+    /// The native creation contract grounds this policy in Landlock/Seatbelt.
+    #[test]
+    fn worktree_creation_admits_developer_git_without_widening_writes() {
+        use crate::{Caveats, Scope};
+        use std::path::Path;
+
+        let authority = Caveats {
+            fs_read: Scope::only(["/repo".into(), "/task".into()]),
+            fs_write: Scope::only(["/task".into()]),
+            exec: Scope::only(["git".into(), "sh".into(), "cat".into()]),
+            ..Caveats::top()
+        };
+        let original = authority.clone();
+        let git = "/toolchain/usr/bin/git".to_owned();
+        for writes in [
+            ["/repo/.git", "/task"],
+            ["/task", "/repo/.git/worktrees/task"],
+        ] {
+            let confined = super::worktree_caveats(
+                &authority,
+                writes.map(Path::new),
+                std::slice::from_ref(&git),
+            );
+            assert_eq!(
+                confined.exec,
+                Scope::only(["git".into(), "sh".into(), "cat".into(), git.clone()]),
+                "both creation steps must admit the resolved developer Git image"
+            );
+            let expected = Caveats {
+                fs_write: Scope::only(writes.map(str::to_owned)),
+                net: Scope::none(),
+                exec: confined.exec.clone(),
+                ..original.clone()
+            };
+            assert_eq!(confined, expected);
+        }
+        assert_eq!(authority, original, "invocation grants must not escape");
+    }
 
     #[test]
     fn pre_push_3258_uses_the_original_hook_chain() {

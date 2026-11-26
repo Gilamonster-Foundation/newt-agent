@@ -3760,6 +3760,7 @@ async fn execute_tool_unadopted(
     mut collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
     disposition: PromptDisposition,
+    worktree_creation: Option<&crate::worktree_adoption::Creation>,
 ) -> String {
     let Some(invocation) = collab.invocation else {
         return execute_authorized_tool(
@@ -3774,6 +3775,7 @@ async fn execute_tool_unadopted(
             collab,
             tool_offload,
             disposition,
+            worktree_creation,
         )
         .await;
     };
@@ -3813,6 +3815,7 @@ async fn execute_tool_unadopted(
         },
         tool_offload,
         disposition,
+        worktree_creation,
     )
     .await;
     match gate.and_then(|gate| gate.refusal) {
@@ -3844,6 +3847,7 @@ async fn execute_authorized_tool(
     // the boundary that refuses fabricated tool names before MCP routing,
     // aliases, or permission widening can run.
     disposition: PromptDisposition,
+    worktree_creation: Option<&crate::worktree_adoption::Creation>,
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
@@ -4865,6 +4869,33 @@ async fn execute_authorized_tool(
                 Ok(requests) => requests,
                 Err(error) => return host_return(error),
             };
+            if let Some(candidate) = worktree_creation.filter(|candidate| {
+                !newt_policy::caveats::permits_path(&caveats.fs_write, &candidate.repository().1.to_string_lossy())
+            }) {
+                // The frame, disposition, and Git preflight checks above still govern
+                // this broker. The destination guard rechecks identity on this refresh.
+                let current = match permission_gate.as_deref_mut().map(|gate| gate.refresh_caveats(caveats)) {
+                    Some(PermissionDecision::Allow(current)) => current,
+                    Some(PermissionDecision::Deny) => return host_return(executed((
+                        "capability denied: current permissions refuse worktree creation".into(), crate::ExecOutcome::Denied,
+                    ))),
+                    None => caveats.clone(),
+                };
+                if filesystem_requests.iter().any(|request| !shell::permits_filesystem_request(&current, request)) {
+                    return host_return(executed(("capability denied: worktree creation requires the declared filesystem permissions".into(), crate::ExecOutcome::Denied)));
+                }
+                return host_return(executed(match worktree::prepare::broker_creation(candidate, cmd, &current).await {
+                    Ok(output) => {
+                        let envelope = serde_json::json!({"exit_code": output.code, "timed_out": output.timed_out, "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr)});
+                        let mut text = shell::shell_envelope_output(&envelope, tool_output_lines, color, tool_offload, spill_store, Some(presentation));
+                        if let Some(hint) = worktree::creation_failure_hint(cmd, &envelope) {
+                            text.push_str(hint);
+                        }
+                        (text, shell::envelope_outcome(&envelope))
+                    }
+                    Err(reason) => (format!("capability denied: {reason}"), crate::ExecOutcome::Denied),
+                }));
+            }
             if let Some(policy) = &adopted {
                 if let Some(result) = worktree::branch::execute(policy, cmd, std::path::Path::new(&run_cwd), caveats, &filesystem_requests) {
                     if let Some(invocation) = invocation { invocation.host(); }

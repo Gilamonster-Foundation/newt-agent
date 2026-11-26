@@ -11,7 +11,7 @@ mod detect;
 #[path = "worktree_git.rs"]
 mod git_identity;
 mod nudge;
-mod prepare;
+pub(super) mod prepare;
 
 /// Match the actual Git subcommand, never words appearing in path operands.
 fn worktree_add_args(words: &[String]) -> Option<&[String]> {
@@ -451,12 +451,12 @@ fn record_verified_creation(
     }
 }
 
-fn report_leftover(
+fn cleanup_creation(
     presentation: &mut dyn ToolPresentation,
     candidate: &Creation,
     mut result: String,
 ) -> String {
-    if let Some(notice) = candidate.leftover_notice() {
+    if let Some(notice) = candidate.cleanup_notice() {
         presentation.preview(&notice, 0);
         result.push_str(&format!("\n{notice}"));
     }
@@ -639,7 +639,7 @@ pub(super) async fn execute(
                 if let Some(slot) = collab.execution {
                     let _ = slot.set(crate::ExecOutcome::Denied);
                 }
-                return report_leftover(
+                return cleanup_creation(
                     presentation,
                     candidate,
                     format!("capability denied: {reason}"),
@@ -661,7 +661,7 @@ pub(super) async fn execute(
             if let Some(slot) = execution {
                 let _ = slot.set(crate::ExecOutcome::Denied);
             }
-            return report_leftover(
+            return cleanup_creation(
                 presentation,
                 candidate,
                 format!("capability denied: {reason}"),
@@ -721,6 +721,7 @@ pub(super) async fn execute(
             },
             tool_offload,
             disposition,
+            None,
         ))
         .await
     } else if let Some(candidate) = &candidate {
@@ -743,6 +744,7 @@ pub(super) async fn execute(
             },
             tool_offload,
             disposition,
+            Some(candidate),
         ))
         .await
     } else {
@@ -758,6 +760,7 @@ pub(super) async fn execute(
             collab,
             tool_offload,
             disposition,
+            None,
         ))
         .await
     };
@@ -816,7 +819,7 @@ pub(super) async fn execute(
         result.push_str(&format!("\n{UNARMED_NOTICE}"));
     }
     if let Some(candidate) = &candidate {
-        result = report_leftover(presentation, candidate, result);
+        result = cleanup_creation(presentation, candidate, result);
     }
     if let (Some(session), Some(candidate)) = (session, candidate) {
         if matches!(
