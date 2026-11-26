@@ -448,6 +448,7 @@ fn assert_task_handoff(
 
 /// #2771: native dispatch regression for relative file operands after confined
 /// creation. Grounds path routing in real files while retaining adoption fences.
+/// #3278: grounds the mocked progress replay in an actual task-worktree write.
 #[cfg(unix)]
 #[tokio::test]
 async fn relative_task_root_confined() {
@@ -455,6 +456,7 @@ async fn relative_task_root_confined() {
 }
 
 /// #2771: recorded ambient worktrees must also become the file-tool base.
+/// #3278: grounds the mocked progress replay for file and shell writes.
 #[tokio::test]
 async fn relative_task_root_ambient() {
     relative_task_root(true).await;
@@ -525,13 +527,52 @@ async fn relative_task_root(bypass: bool) {
     assert_eq!(session.snapshot().is_none(), bypass);
     let out = call("read_file", read()).await;
     assert!(out.contains("task marker"), "{out}");
-    let out = call(
+    let args = serde_json::json!({"path":"created.txt","content":"new task file\n"});
+    let before = crate::agentic::progress_workspace_state(
         "write_file",
-        serde_json::json!({"path":"created.txt","content":"new task file\n"}),
+        &args,
+        original.to_str().unwrap(),
+        &authority.fs_read,
+        Some(&session),
     )
     .await;
+    let out = call("write_file", args.clone()).await;
+    assert!(crate::agentic::tools::tool_ok(&out, None), "{out}");
     assert!(task.join("created.txt").is_file(), "{out}");
     assert!(!original.join("created.txt").exists());
+    let after = crate::agentic::progress_workspace_state(
+        "write_file",
+        &args,
+        original.to_str().unwrap(),
+        &authority.fs_read,
+        Some(&session),
+    )
+    .await;
+    if bypass {
+        let args = serde_json::json!({"command":"echo changed > shell.txt"});
+        let before = crate::agentic::progress_workspace_state(
+            "run_command",
+            &args,
+            original.to_str().unwrap(),
+            &authority.fs_read,
+            Some(&session),
+        )
+        .await;
+        let out = call("run_command", args.clone()).await;
+        assert!(crate::agentic::tools::tool_ok(&out, None), "{out}");
+        assert!(task.join("shell.txt").is_file(), "{out}");
+        assert!(!original.join("shell.txt").exists());
+        let after = crate::agentic::progress_workspace_state(
+            "run_command",
+            &args,
+            original.to_str().unwrap(),
+            &authority.fs_read,
+            Some(&session),
+        )
+        .await;
+        crate::agentic::repeat_call_guard_tests::task_worktree_progress_replay(before, after);
+    }
+    crate::agentic::repeat_call_guard_tests::task_worktree_progress_replay(before, after);
     let out = call("edit_file", serde_json::json!({"path":"probe.txt","old_string":"task marker","new_string":"edited task"})).await;
     assert_eq!(
         std::fs::read_to_string(task.join("probe.txt")).unwrap(),

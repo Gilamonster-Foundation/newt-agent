@@ -498,14 +498,11 @@ pub(super) async fn execute(
     // #2771: choose the file-tool base once, before both the adoption fence
     // and native dispatch. This changes path resolution, never authority.
     // Shell calls (including routed file reads) retain their explicit cwd.
-    let task_root = session.and_then(|session| {
-        matches!(
-            name,
-            "read_file" | "write_file" | "edit_file" | "delete_file" | "list_dir" | "find" | "grep"
-        )
-        .then(|| session.task_root(Path::new(workspace)))
-        .flatten()
-    });
+    let task_root = matches!(
+        name,
+        "read_file" | "write_file" | "edit_file" | "delete_file" | "list_dir" | "find" | "grep"
+    )
+    .then(|| crate::agentic::selected_target::root(workspace, session));
     // Absolute searches retain the original workspace-only boundary. Only
     // relative operands select the task's search root; no fence is widened.
     let absolute_search = matches!(name, "find" | "grep")

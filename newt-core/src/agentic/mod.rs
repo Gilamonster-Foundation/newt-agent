@@ -3620,8 +3620,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
-            let before_change =
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
+            let before_change = progress_workspace_state(
+                name,
+                &args,
+                workspace,
+                &caveats.fs_read,
+                worktree_session,
+            )
+            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -3763,7 +3769,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
             let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await
+                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
+                    .await
             } else {
                 None
             };
@@ -4415,6 +4422,7 @@ async fn progress_workspace_state(
     args: &serde_json::Value,
     workspace: &str,
     fs_read: &newt_policy::caveats::Scope<String>,
+    worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
 ) -> Option<ProgressSnapshot> {
     if !matches!(
         name,
@@ -4423,7 +4431,7 @@ async fn progress_workspace_state(
     {
         return None;
     }
-    let root = std::path::PathBuf::from(workspace);
+    let root = selected_target::root(workspace, worktree_session);
     let target = matches!(name, "write_file" | "edit_file" | "delete_file")
         .then(|| args.get("path").and_then(serde_json::Value::as_str))
         .flatten()
@@ -8962,8 +8970,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
-            let before_change =
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
+            let before_change = progress_workspace_state(
+                name,
+                &args,
+                workspace,
+                &caveats.fs_read,
+                worktree_session,
+            )
+            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -9101,7 +9115,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
             let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await
+                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
+                    .await
             } else {
                 None
             };
@@ -11795,8 +11810,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs (mirrors the OpenAI path).
-            let before_change =
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
+            let before_change = progress_workspace_state(
+                name,
+                &args,
+                workspace,
+                &caveats.fs_read,
+                worktree_session,
+            )
+            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -11925,7 +11946,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             capability_evidence.record(name, ok, execution.get().copied());
             let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await
+                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
+                    .await
             } else {
                 None
             };
@@ -13780,8 +13802,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 .map(|batch| batch.start(call_index, disclosure))
                 .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
-            let before_change =
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await;
+            let before_change = progress_workspace_state(
+                name,
+                &args,
+                workspace,
+                &caveats.fs_read,
+                worktree_session,
+            )
+            .await;
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = attribution::ToolTimer::start();
             let execution = std::sync::OnceLock::new();
@@ -13928,7 +13956,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             let ok = tools::tool_ok(&result, execution.get().copied());
             round_succeeded |= ok;
             let after_change = if before_change.is_some() {
-                progress_workspace_state(name, &args, workspace, &caveats.fs_read).await
+                progress_workspace_state(name, &args, workspace, &caveats.fs_read, worktree_session)
+                    .await
             } else {
                 None
             };
