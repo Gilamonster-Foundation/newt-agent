@@ -2,7 +2,7 @@
 name: regression-fix-cycle
 description: "Harden newt by running it on a real task until it completes unaided: run the task with the current build, turn every stall into a measured issue, fix the batch through lanes and reviewed PRs, rebuild from the new main, and run the same task again. Use when asked to make newt complete a task end to end (for example a progressive refactoring run from code to a PR merged on green), or to run a 'regression test and fix' loop."
 when_to_use: When the operator asks for a regression-test-and-fix cycle, for newt to be tested on itself, or to repeat a failed newt run after its bugs are fixed.
-version: 1.0.0
+version: 1.1.0
 license: Apache-2.0
 ---
 
@@ -77,6 +77,10 @@ Stop probing when new attempts repeat a known stall. In the first retest every
 - A red job on an unrelated PR is evidence. Read the log before rerunning. In
   the first cycle one was a stale lockfile that made every PR red, and two
   were flaky tests that earned their own issues.
+- **A flake seen twice goes into the batch.** The first cycles reran three
+  known flakes again and again to land fix PRs, a full CI round each time,
+  and the task's own "merge on green" would have met the same three.
+  Follow "Flaky tests" in `CLAUDE.md`: one rerun, then a p1 fix.
 - A PR closes its issue only when the issue's "Done when" is fully met.
   Anything that needs the rebuilt binary stays open for stage 4.
 
