@@ -3423,13 +3423,6 @@ pub(super) fn dispatch_caveats_for_git_shell(
     if write.is_empty() {
         return caveats.clone();
     }
-    let mut widened = caveats.clone();
-    widened.fs_write = match &widened.fs_write {
-        newt_policy::caveats::Scope::All => newt_policy::caveats::Scope::All,
-        newt_policy::caveats::Scope::Only(set) => {
-            newt_policy::caveats::Scope::only(set.iter().cloned().chain(write))
-        }
-    };
     // Real git ALWAYS tries to read the system config (`/etc/gitconfig`),
     // regardless of repo/branch — not just on a host that happens to have
     // one. Landlock's base read allowlist does not include it (CI caught
@@ -3439,15 +3432,17 @@ pub(super) fn dispatch_caveats_for_git_shell(
     // silently worked only because it has no such file). One extra,
     // non-secret, well-known system path, granted only on this ONE widened
     // dispatch, same as the write grant above.
-    widened.fs_read = match &widened.fs_read {
-        newt_policy::caveats::Scope::All => newt_policy::caveats::Scope::All,
-        newt_policy::caveats::Scope::Only(set) => newt_policy::caveats::Scope::only(
-            set.iter()
-                .cloned()
-                .chain(std::iter::once("/etc/gitconfig".to_string())),
-        ),
-    };
-    widened
+    // Reuse grant normalization: a main checkout already covers its .git
+    // and objects roots. Emitting them again fails stable-anchor validation.
+    let grants: Vec<_> = write
+        .into_iter()
+        .map(|path| (DenialKind::FsWrite, path))
+        .chain(std::iter::once((
+            DenialKind::FsRead,
+            "/etc/gitconfig".into(),
+        )))
+        .collect();
+    newt_policy::widen_caveats(caveats, &grants)
 }
 
 /// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
