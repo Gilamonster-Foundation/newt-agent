@@ -206,6 +206,68 @@ fn pre_prompt_refusal_records_guard_reason_and_notifies_operator_once() {
 }
 
 #[test]
+fn refresh_refusal_records_mint_reason_and_notifies_operator_once() {
+    use newt_core::Caveats;
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let mut state = PermissionPromptState {
+        protection: Some(Arc::new(RejectBaseline)),
+        decision_time: Some("2026-11-24T00:00:00Z"),
+        notices: Some(notices.clone()),
+        ..Default::default()
+    };
+    state
+        .pending_once_grants
+        .insert((DenialKind::Exec, "git".into()));
+    let pending = state.pending_once_grants.clone();
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        Caveats::top(),
+        None,
+        None,
+        vec![],
+        prompts.clone(),
+    );
+    assert!(matches!(
+        gate.refresh_caveats(&Caveats::top()),
+        PermissionDecision::Deny
+    ));
+    assert_eq!(prompts.get(), 0);
+    assert_eq!(gate.state.pending_once_grants, pending);
+    assert_eq!(
+        gate.state.decisions.len(),
+        1,
+        "refresh refusals must enter the existing decision log"
+    );
+    let record = &gate.state.decisions[0];
+    assert_eq!(record.tool, "permission_gate");
+    assert_eq!(record.decision, "deny");
+    assert_eq!(record.scope, "authority-mint");
+    assert_eq!(record.reason.as_deref(), Some(REASON));
+    assert_eq!(
+        *notices.lock().unwrap(),
+        [format!("permission refused (authority-mint): {REASON}")]
+    );
+    assert_eq!(gate.take_refusal_cause(), Some("authority-mint"));
+    assert_eq!(gate.take_refusal_cause(), None);
+
+    gate.state.protection = None;
+    gate.state.refusal_cause = Some("stale-refusal");
+    assert!(matches!(
+        gate.refresh_caveats(&Caveats::top()),
+        PermissionDecision::Allow(_)
+    ));
+    assert_eq!(gate.take_refusal_cause(), None);
+    assert_eq!(
+        gate.state.decisions.len(),
+        1,
+        "a successful refresh is silent"
+    );
+    assert_eq!(notices.lock().unwrap().len(), 1);
+    assert_eq!(gate.state.pending_once_grants, pending);
+}
+
+#[test]
 fn refusal_reason_is_addressed_without_readdressing_existing_permission_records() {
     use newt_core::{event_journal::Journal, permission_journal};
     let legacy = serde_json::json!({

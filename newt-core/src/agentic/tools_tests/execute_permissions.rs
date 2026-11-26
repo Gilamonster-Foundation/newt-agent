@@ -4,13 +4,17 @@ use crate::ExecOutcome;
 
 #[tokio::test]
 async fn pre_prompt_refusal_cause_reaches_model_and_does_not_leak_to_next_call() {
-    struct Gate(bool);
+    struct Gate(Option<&'static str>);
     impl PermissionGate for Gate {
         fn take_refusal_cause(&mut self) -> Option<&'static str> {
-            std::mem::take(&mut self.0).then_some("workspace-protection")
+            self.0.take()
         }
         fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
-            self.0 = true;
+            self.0 = Some("workspace-protection");
+            PermissionDecision::Deny
+        }
+        fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
+            self.0 = Some("authority-mint");
             PermissionDecision::Deny
         }
         fn ask_dependency_fetch(
@@ -24,13 +28,19 @@ async fn pre_prompt_refusal_cause_reaches_model_and_does_not_leak_to_next_call()
             HumanQuestionOutcome::Unavailable
         }
     }
-    let mut gate = Gate(false);
+    let probe = crate::agentic::tools::command_probe::Probe {
+        io_only: true,
+        ..Default::default()
+    };
+    let mut gate = Gate(None);
     let mut display = ToolDisplay::new(Vec::new(), false, 80, 20, false);
     for (tool, args) in [
         (
             "request_permissions",
             serde_json::json!({"capability": "exec", "target": "cargo"}),
         ),
+        #[cfg(feature = "confine")]
+        ("run_command", serde_json::json!({"command": "true"})),
         (
             "request_user_input",
             serde_json::json!({"question": "Proceed?"}),
@@ -38,7 +48,7 @@ async fn pre_prompt_refusal_cause_reaches_model_and_does_not_leak_to_next_call()
     ] {
         if tool == "request_user_input" {
             // Simulate evidence left by a cancelled previous invocation.
-            gate.0 = true;
+            gate.0 = Some("workspace-protection");
         }
         let result = dispatch::execute_tool_with_display_cancellable(
             &mut display,
@@ -50,6 +60,7 @@ async fn pre_prompt_refusal_cause_reaches_model_and_does_not_leak_to_next_call()
             &Caveats::top(),
             &mut NoMcp,
             ToolCollaborators {
+                command_probe: Some(&probe),
                 permission_gate: Some(&mut gate),
                 ..Default::default()
             },
@@ -60,8 +71,13 @@ async fn pre_prompt_refusal_cause_reaches_model_and_does_not_leak_to_next_call()
         .await
         .unwrap()
         .unwrap();
-        if tool == "request_permissions" {
-            assert!(result.contains("workspace-protection"), "{result}");
+        if tool != "request_user_input" {
+            let cause = if tool == "run_command" {
+                "authority-mint"
+            } else {
+                "workspace-protection"
+            };
+            assert!(result.contains(cause), "{result}");
             assert!(!result.contains("operator declined"), "{result}");
             assert!(
                 result.contains("retry or a permission request cannot override"),

@@ -823,6 +823,9 @@ fn frame_permission_gate_forwards_consume_pending_once() {
         fn consume_pending_once(&mut self, _kind: DenialKind, _target: &str) {
             self.0.set(true);
         }
+        fn take_refusal_cause(&mut self) -> Option<&'static str> {
+            self.0.replace(false).then_some("authority-mint")
+        }
     }
 
     let directory = tempfile::tempdir().unwrap();
@@ -836,6 +839,10 @@ fn frame_permission_gate_forwards_consume_pending_once() {
             inner: &mut spy,
             refusal: None,
         };
+        gate.consume_pending_once(DenialKind::FsWrite, "/ws/out.txt");
+        assert!(consumed.get());
+        assert_eq!(gate.take_refusal_cause(), Some("authority-mint"));
+        assert_eq!(gate.take_refusal_cause(), None);
         gate.consume_pending_once(DenialKind::FsWrite, "/ws/out.txt");
     }
     assert!(

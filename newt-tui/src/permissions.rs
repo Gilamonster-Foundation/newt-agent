@@ -2027,10 +2027,11 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::
         &mut self,
         baseline: &newt_core::Caveats,
     ) -> newt_policy::PermissionDecision {
-        self.mint(baseline, &[]).map_or(
-            newt_policy::PermissionDecision::Deny,
-            newt_policy::PermissionDecision::Allow,
-        )
+        let result = self
+            .mint(baseline, &[])
+            .map(ControlFlow::Continue)
+            .map_err(|e| PermissionRefusal::new(None, "authority-mint", format!("{e:#}")));
+        self.record_decision(result)
     }
 
     fn ask(
@@ -2225,7 +2226,7 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> newt_policy::
     }
 }
 
-/// A scoped refusal always identifies its cause and operator-only detail.
+/// A permission refusal always identifies its cause and operator-only detail.
 /// The public gate decision is formed only after this evidence is recorded.
 struct PermissionRefusal<'r> {
     request: Option<&'r newt_policy::PermissionRequest>,
@@ -2255,8 +2256,16 @@ impl<F: FnMut(&PromptWindow, &SurfaceInteraction) -> PromptChoice> PromptPermiss
         operation_only: bool,
         preapproved: bool,
     ) -> newt_policy::PermissionDecision {
+        let result = self.ask_scoped(baseline, requests, operation_only, preapproved);
+        self.record_decision(result)
+    }
+
+    fn record_decision(
+        &mut self,
+        result: Result<ControlFlow<(), newt_core::Caveats>, PermissionRefusal<'_>>,
+    ) -> newt_policy::PermissionDecision {
         self.state.refusal_cause = None;
-        match self.ask_scoped(baseline, requests, operation_only, preapproved) {
+        match result {
             Ok(ControlFlow::Continue(allowed)) => newt_policy::PermissionDecision::Allow(allowed),
             // Back/Exit cancel the interaction without making a permission decision.
             Ok(ControlFlow::Break(())) => newt_policy::PermissionDecision::Deny,

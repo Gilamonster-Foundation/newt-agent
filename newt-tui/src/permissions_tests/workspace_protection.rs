@@ -432,3 +432,102 @@ fn dead_covered_grants_do_not_add_unstable_nested_roots() {
         base
     );
 }
+
+/// Grounds `refusal_tests::refresh_refusal_records_mint_reason_and_notifies_operator_once`
+/// against real Git metadata and the production guard. A failed worktree add
+/// must leave both spellings of Git usable under workspace-scoped authority.
+/// Run explicitly with `native-permission-test`, single-threaded.
+#[cfg(all(unix, feature = "native-permission-test"))]
+#[tokio::test]
+async fn failed_worktree_creation_does_not_poison_git_refresh() {
+    use crate::disable_ocap_session_tests::EnvVar;
+    let _env = crate::test_env_guard::env_write_guard_async().await;
+    let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let _full = EnvVar::unset("NEWT_FULL_ACCESS");
+    assert!(newt_core::confined_exec::kernel_fs_fence_available());
+    let fixture = Fixture::new();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(&fixture.workspace)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(git(&["init", "-b", "main"]).status.success());
+    assert!(git(&["commit", "--allow-empty", "-m", "fixture"])
+        .status
+        .success());
+    newt_core::git_hardening::own_gitdir_grants(&fixture.workspace);
+    assert!(git(&["checkout", "-b", "refresh-fixture"]).status.success());
+    let base = fixture.caveats();
+    let destination = fixture._temp.path().join("destination");
+    let mut state = fixture.state();
+    let mut gate = scripted_gate(
+        &mut state,
+        base.clone(),
+        None,
+        None,
+        vec![PromptChoice::AllowOnce, PromptChoice::AllowOnce],
+        Rc::new(Cell::new(0)),
+    );
+    assert!(matches!(
+        gate.ask_with_caveats(
+            &base,
+            &[
+                request(DenialKind::FsRead, &destination),
+                request(DenialKind::FsWrite, &destination),
+            ]
+        ),
+        newt_policy::PermissionDecision::Allow(_)
+    ));
+    std::fs::create_dir(&destination).unwrap();
+    let failed = git(&[
+        "worktree",
+        "add",
+        "-b",
+        "refresh-fixture",
+        destination.to_str().unwrap(),
+    ]);
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("already exists"));
+    for program in ["git", "/usr/bin/git"] {
+        let out = newt_core::execute_tool(
+            "run_command",
+            &serde_json::json!({"command": format!("{program} status --short --branch")}),
+            fixture.workspace.to_str().unwrap(),
+            false,
+            20,
+            &base,
+            &mut newt_core::NoMcp,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut gate),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(out.contains("## refresh-fixture"), "{program}: {out}");
+    }
+    assert_eq!(
+        gate.state.decisions.len(),
+        2,
+        "only the destination approvals are recorded"
+    );
+}

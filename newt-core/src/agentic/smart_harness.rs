@@ -210,6 +210,10 @@ impl FramePermissionGate<'_> {
 }
 
 impl newt_policy::permissions::PermissionGate for FramePermissionGate<'_> {
+    fn take_refusal_cause(&mut self) -> Option<&'static str> {
+        self.inner.take_refusal_cause()
+    }
+
     fn refresh_caveats(
         &mut self,
         baseline: &newt_policy::caveats::Caveats,
