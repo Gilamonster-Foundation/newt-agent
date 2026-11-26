@@ -15,6 +15,12 @@ pub(super) fn resolve(caveats: &Caveats) -> Result<PathBuf, ()> {
     resolve_program(caveats, "git")
 }
 
+/// Bare Git is pinned at dispatch; an explicit program must name that same
+/// resolved executable. A matching basename alone cannot authorize execution.
+pub(super) fn matches(program: &str, git: &Path) -> bool {
+    program == "git" || (Path::new(program).is_absolute() && Path::new(program) == git)
+}
+
 fn resolve_program(caveats: &Caveats, name: &str) -> Result<PathBuf, ()> {
     // Use the same venv/exec-path/developer-tool selection as shell dispatch.
     // In particular macOS may select the real tool instead of /usr/bin's shim.
@@ -102,7 +108,7 @@ pub(super) fn pin(source: &str, git: &Path, caveats: &Caveats) -> Result<String,
             return Err(());
         }
         pinned.push_str(gap);
-        if command.program.as_deref() == Some("git") {
+        if command.program.as_deref().is_some_and(|p| matches(p, git)) {
             let words = command
                 .argv
                 .iter()

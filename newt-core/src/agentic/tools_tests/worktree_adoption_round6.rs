@@ -81,7 +81,14 @@ async fn worktree_adoption_round6_untrusted_host_git_refuses_dispatch() {
     let caveats = Caveats::top();
     assert!(git_identity::resolve(&caveats).is_err());
     let args = serde_json::json!({"command":"git worktree add ../fresh -b fresh; git branch --show-current"});
-    assert!(creation("run_command", &args, root.to_str().unwrap(), &caveats).is_some());
+    assert!(creation(
+        "run_command",
+        &args,
+        root.to_str().unwrap(),
+        &caveats,
+        Path::new("/fixture/git")
+    )
+    .is_some());
     let session = crate::worktree_adoption::WorktreeSession::default();
     std::fs::write(root.join("sentinel"), "unchanged").unwrap();
     let (text, outcome) =
@@ -105,6 +112,7 @@ fn worktree_2810_tail_shape_is_bounded_and_literal() {
             creation_batch_is_read_only_after_add(
                 &serde_json::json!({"command":format!("git worktree add -b task ../task 2>&1 | {tail} && git branch --show-current")}),
                 crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "{tail}"
         );
@@ -125,6 +133,7 @@ fn worktree_2810_tail_shape_is_bounded_and_literal() {
             !creation_batch_is_read_only_after_add(
                 &serde_json::json!({"command":format!("git worktree add -b task ../task 2>&1 | {tail}")}),
                 crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "{tail}"
         );
@@ -214,7 +223,8 @@ fn readonly_git_sibling_shapes() {
         assert!(
             creation_batch_is_read_only_after_add(
                 &serde_json::json!({"command":format!("git worktree add -b task ../task HEAD 2>&1 | tail -5 && {sibling}")}),
-                crate::ShellEngine::Brush
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "{sibling}"
         );
@@ -256,7 +266,8 @@ fn readonly_git_sibling_negatives() {
         assert!(
             !creation_batch_is_read_only_after_add(
                 &serde_json::json!({"command":format!("git worktree add -b task ../task && {sibling}")}),
-                crate::ShellEngine::Brush
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "{sibling}"
         );
@@ -303,7 +314,11 @@ fn readonly_git_redirect_boundary() {
     for redirect in ["< marker", "<&3", "1>&2", "2>&3", "> marker", "<<< text"] {
         let args = serde_json::json!({"command":format!("git worktree add -b task ../task {redirect} && git branch --show-current")});
         assert!(
-            !creation_batch_is_read_only_after_add(&args, crate::ShellEngine::Brush),
+            !creation_batch_is_read_only_after_add(
+                &args,
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
+            ),
             "{redirect}"
         );
     }
