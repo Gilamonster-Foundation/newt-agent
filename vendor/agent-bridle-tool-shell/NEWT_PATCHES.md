@@ -10,6 +10,13 @@ temporary dependency override, not a second shell implementation.
 
 Integration changes:
 
+- #3220: name the broker RPC socket and operation in I/O failures, including
+  macOS `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` lookups, and distinguish the
+  delegation channel from the per-request socket. Injected disconnect and
+  truncated-frame tests keep these failures fatal; a complete frame followed
+  by EOF remains valid. This diagnoses the intermittent native-commit failure;
+  its underlying close race still needs native macOS evidence.
+
 - #3093: expose the existing static word parser through a source-bound
   single-argument helper. Broker arguments such as `owner/r` and `done` are
   data, not standalone executable commands; expansion/globs/control syntax
