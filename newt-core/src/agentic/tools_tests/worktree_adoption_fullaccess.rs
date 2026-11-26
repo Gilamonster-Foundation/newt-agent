@@ -1,4 +1,5 @@
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 
 /// #3274: verified adoption at the evidence-only ceiling earns one reset.
 /// Inject the existing policy fixture; no filesystem or subprocess is needed.
@@ -136,11 +137,11 @@ async fn projected_task_progress(name: &str) {
     let _lock = env_lock().await;
     let _ocap = EnvVar::set("NEWT_DISABLE_OCAP", "0");
     let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "brush");
-    let (_temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
+    let (temp, policy, _) = crate::worktree_adoption::tests::fixture(false);
     let original = policy.worktree.parent().unwrap().join("main");
     let task = policy.worktree.clone();
-    let mut candidate = Creation::before(&original, &task, &Caveats::top()).unwrap();
-    candidate.prepare(&Caveats::top()).unwrap();
+    let mut candidate = Creation::before(&original, &task, &read_caveats(&[temp.path()])).unwrap();
+    candidate.prepare(&read_caveats(&[temp.path()])).unwrap();
     crate::worktree_adoption::tests::link(&policy);
     let session = crate::worktree_adoption::WorktreeSession::default();
     record_verified_creation(&session, candidate.verify().unwrap(), false);
@@ -699,7 +700,7 @@ async fn relative_task_root(bypass: bool) {
             original.to_string_lossy().into_owned(),
             task.to_string_lossy().into_owned(),
         ]),
-        ..Caveats::top()
+        ..read_caveats(&[temp.path()])
     };
     struct Quiet;
     impl ToolPresentation for Quiet {

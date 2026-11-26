@@ -1,5 +1,6 @@
 //! #2759: ground creation admission and denial classification in real dispatch.
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 use crate::agentic::tools::tests::git_shell_grant::hermetic_git;
 use crate::{worktree_adoption::WorktreeSession, ExecOutcome, Scope};
 
@@ -28,7 +29,7 @@ fn repo() -> (tempfile::TempDir, PathBuf, Caveats) {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let mut c = Caveats::top();
+    let mut c = read_caveats(&[temp.path()]);
     c.net = Scope::none();
     c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     (temp, original, c)

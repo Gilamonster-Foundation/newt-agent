@@ -1,5 +1,6 @@
 //! #2733 review regressions through the actual adoption dispatch boundary.
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 use crate::worktree_adoption::tests::fixture;
 #[cfg(any(unix, feature = "confine"))]
 use crate::worktree_adoption::tests::link;
@@ -161,7 +162,7 @@ async fn adopted_build_dispatch(source: &str) {
         std::fs::create_dir(&crate_dir).unwrap();
         let session = WorktreeSession::default();
         session.adopt(policy.clone());
-        let mut c = Caveats::top();
+        let mut c = read_caveats(&[temp.path()]);
         c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
         c.exec = Scope::none(); // Require explicit Build admission.
         for cwd in [&policy.worktree, &crate_dir] {
@@ -250,7 +251,7 @@ async fn worktree_adoption_dispatch_isolates_and_restores_bypass() {
     link(&policy);
     let session = WorktreeSession::default();
     session.adopt(policy.clone());
-    let mut c = Caveats::top();
+    let mut c = read_caveats(&[temp.path()]);
     c.exec = Scope::none();
     c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let mut gate = BuildGate::default();
@@ -371,7 +372,7 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
                 "run_command",
                 &args,
                 root.to_str().unwrap(),
-                &Caveats::top(),
+                &read_caveats(&[temp.path()]),
                 Path::new("/fixture/git")
             )
             .is_some(),

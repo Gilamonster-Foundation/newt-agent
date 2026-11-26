@@ -25,7 +25,7 @@ fn issue_2740_literal_pr_create_reaches_operator_approval() {
         let plan = plan_pr_create_test(
             source,
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut gate),
         )
         .unwrap();
@@ -87,7 +87,7 @@ fn issue_2740_pr_create_refusals_are_actionable_and_safe() {
         let out = execute_governed_pr_create(
             source,
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut gate),
             None,
         );
@@ -131,7 +131,7 @@ fn issue_2740_approved_pr_create_uses_verified_branches() {
     let (out, _) = dispatch_run_command_with_gate(
         repo.path(),
         "gh pr create --base=main --head=task --title='A title' --body='A body' 2>&1 | head -1",
-        &with_net(Scope::only([])),
+        &with_net(&[repo.path()], Scope::only([])),
         Some(&mut gate),
     );
     assert!(
@@ -172,7 +172,7 @@ fn issue_2740_linked_worktree_and_non_main_default() {
     let plan = plan_pr_create_test(
         "gh pr create --base=trunk --head=linked-task --title=t --body=b",
         &worktree,
-        &scoped_caveats(),
+        &read_only(&[repo.path(), &worktree]),
         &mut None,
     )
     .unwrap();
@@ -183,7 +183,7 @@ fn issue_2740_linked_worktree_and_non_main_default() {
     let error = plan_pr_create_test(
         "gh pr create --base=trunk --head=task --title=t --body=b",
         &worktree,
-        &scoped_caveats(),
+        &read_only(&[repo.path(), &worktree]),
         &mut None,
     )
     .unwrap_err();
@@ -207,7 +207,7 @@ fn issue_2740_unknown_default_and_denied_approval_explain_refusal() {
     let out = execute_governed_pr_create(
         source,
         repo.path(),
-        &with_net(Scope::only([])),
+        &with_net(&[repo.path()], Scope::only([])),
         &mut Some(&mut gate),
         None,
     );
@@ -225,7 +225,7 @@ fn issue_2740_unknown_default_and_denied_approval_explain_refusal() {
     let out = execute_governed_pr_create(
         source,
         repo.path(),
-        &with_net(Scope::only([])),
+        &with_net(&[repo.path()], Scope::only([])),
         &mut Some(&mut gate),
         None,
     );
@@ -265,7 +265,7 @@ fn issue_2740_ambiguous_or_dynamic_commands_are_refused() {
         let out = execute_governed_pr_create(
             source,
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut gate),
             None,
         );
@@ -284,7 +284,7 @@ fn issue_2740_literal_title_and_body_content_is_preserved() {
     let plan = plan_pr_create_test(
         "gh pr create --title '- title' --body '- body'",
         repo.path(),
-        &scoped_caveats(),
+        &read_only(&[repo.path()]),
         &mut None,
     )
     .unwrap();

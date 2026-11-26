@@ -1,5 +1,6 @@
 //! #2733: admission tests must not depend on host Git or shell-engine selection.
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 
 /// #2733 round 6: injected trust and engine decisions drive the classifier,
 /// including the exact CI wrapper. Rejection is an error, never “no creation.”
@@ -24,7 +25,7 @@ fn worktree_adoption_round6_injected_trust_and_engine_matrix() {
                     "run_command",
                     &serde_json::json!({"command":source}),
                     root.to_str().unwrap(),
-                    &Caveats::top(),
+                    &read_caveats(&[temp.path()]),
                     engine,
                     |_| {
                         if trusted {
@@ -50,7 +51,7 @@ fn worktree_adoption_round6_injected_trust_and_engine_matrix() {
             "run_command",
             &serde_json::json!({"command":"git branch --show-current"}),
             root.to_str().unwrap(),
-            &Caveats::top(),
+            &read_caveats(&[temp.path()]),
             engine,
             |_| panic!("noncreation must not resolve Git for adoption"),
         );
@@ -78,7 +79,7 @@ async fn worktree_adoption_round6_untrusted_host_git_refuses_dispatch() {
     let _virtual_env = EnvVar::unset("VIRTUAL_ENV");
     let _paths = EnvVar::set("NEWT_EXEC_PATHS", bin.to_str().unwrap());
     let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "brush");
-    let caveats = Caveats::top();
+    let caveats = read_caveats(&[temp.path()]);
     assert!(git_identity::resolve(&caveats).is_err());
     let args = serde_json::json!({"command":"git worktree add ../fresh -b fresh; git branch --show-current"});
     assert!(creation(
@@ -189,7 +190,7 @@ fn worktree_2810_admission_refuses_tail_input_redirects() {
     let _paths = EnvVar::set("NEWT_EXEC_PATHS", "/usr/bin:/bin");
     let caveats = Caveats {
         fs_write: crate::Scope::only([temp.path().to_string_lossy().into_owned()]),
-        ..Caveats::top()
+        ..read_caveats(&[temp.path()])
     };
     let admit = |redirect: &str| {
         creation_admission(

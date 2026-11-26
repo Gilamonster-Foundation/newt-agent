@@ -2,6 +2,7 @@
 #[cfg(all(unix, feature = "confine"))]
 use super::round2_tests::dispatch;
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 #[cfg(all(unix, feature = "confine"))]
 use crate::{worktree_adoption::WorktreeSession, Scope};
 
@@ -149,7 +150,7 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
             "run_command",
             &serde_json::json!({"command":source}),
             root.to_str().unwrap(),
-            &Caveats::top(),
+            &read_caveats(&[temp.path()]),
             crate::ShellEngine::Brush,
             |_| Ok(PathBuf::from("/fixture/git")),
         );
@@ -178,7 +179,7 @@ fn worktree_adoption_round3_exact_creation_and_noncreation_controls() {
                 "run_command",
                 &serde_json::json!({"command":source}),
                 root.to_str().unwrap(),
-                &Caveats::top(),
+                &read_caveats(&[temp.path()]),
                 crate::ShellEngine::Brush,
                 |_| Ok(PathBuf::from("/fixture/git"))
             )

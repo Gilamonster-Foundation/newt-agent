@@ -2,6 +2,8 @@
 //! for oneline log. Real Git grounds the admission grammar's read-only claim.
 #![cfg(feature = "confine")]
 
+use crate::agentic::tools::git_fixture::read_caveats;
+
 use super::super::*;
 use crate::agentic::tools::{
     disable_ocap_tests::{env_lock, EnvVar},
@@ -109,7 +111,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, Caveats) {
     let caveats = Caveats {
         fs_write: Scope::only([temp.path().to_string_lossy().into_owned()]),
         net: Scope::none(),
-        ..Caveats::top()
+        ..read_caveats(&[temp.path()])
     };
     (temp, root, caveats)
 }
