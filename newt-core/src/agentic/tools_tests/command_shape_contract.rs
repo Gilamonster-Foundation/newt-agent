@@ -454,7 +454,7 @@ async fn check(row: Row) {
         row.command
     );
     assert_eq!(
-        session.task_root(&root),
+        session.task_root(&root).unwrap(),
         row.bound
             .then(|| if row.command.contains(".worktrees/task") {
                 root.join(".worktrees/task")

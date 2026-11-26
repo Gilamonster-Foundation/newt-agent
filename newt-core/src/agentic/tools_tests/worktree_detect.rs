@@ -67,7 +67,7 @@ async fn worktree_detect_2791_compound_routes_tools() {
         if let Some(prior) = prior {
             session.record_task_worktree(&temp.path().join(prior), prior);
         }
-        let previous = session.task_root(&root);
+        let previous = session.task_root(&root).unwrap();
         let before = detect::Snapshot::before(&root, &crate::Scope::All).unwrap();
         real_git(&root, &["status", "--short"]);
         real_git(
@@ -81,7 +81,7 @@ async fn worktree_detect_2791_compound_routes_tools() {
             Some(&crate::ExecOutcome::Passed),
         );
         assert_eq!(
-            session.task_root(&root),
+            session.task_root(&root).unwrap(),
             previous,
             "unrelated status captured another process's checkout"
         );
@@ -100,7 +100,11 @@ async fn worktree_detect_2791_compound_routes_tools() {
     ).await;
     assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Passed), "{text}");
     let task = temp.path().join("detected").canonicalize().unwrap();
-    assert_eq!(session.task_root(&root), Some(task.clone()), "{text}");
+    assert_eq!(
+        session.task_root(&root).unwrap(),
+        Some(task.clone()),
+        "{text}"
+    );
     assert!(text.contains("Task worktree:"), "{text}");
     assert!(
         session.snapshot().is_none(),
@@ -235,7 +239,7 @@ fn worktree_detect_2791_zero_or_multiple_preserve_state() {
         )
         .unwrap();
     assert!(notice.contains("Multiple new worktrees"));
-    assert_eq!(session.task_root(&root), Some(old));
+    assert_eq!(session.task_root(&root).unwrap(), Some(old));
 }
 
 /// #2791: a linked starting checkout uses the common directory; detection
@@ -256,7 +260,7 @@ fn worktree_detect_2791_linked_origin_and_once_only() {
         )
         .unwrap();
     assert!(text.contains("branch task"));
-    assert_eq!(session.task_root(&original), Some(task));
+    assert_eq!(session.task_root(&original).unwrap(), Some(task));
     assert!(session.snapshot().is_none());
     let before = detect::Snapshot::before(&original, &crate::Scope::All).unwrap();
     assert!(before
@@ -312,7 +316,7 @@ fn worktree_detect_2791_rejects_unproven_candidates() {
                 .is_none(),
             "{case}"
         );
-        assert_eq!(session.task_root(&root), Some(old), "{case}");
+        assert_eq!(session.task_root(&root).unwrap(), Some(old), "{case}");
     }
 }
 
@@ -335,7 +339,7 @@ fn worktree_detect_2791_preserves_adoption_and_unknown_snapshot() {
             Some(&crate::ExecOutcome::Passed)
         )
         .is_none());
-    assert_eq!(session.task_root(&root), Some(policy.worktree));
+    assert_eq!(session.task_root(&root).unwrap(), Some(policy.worktree));
     assert!(session.snapshot().is_some());
     assert!(detect::Snapshot::before(&root, &crate::Scope::none()).is_none());
     let temp = metadata_repo();
@@ -419,7 +423,7 @@ fn worktree_detect_2792_destination_provenance() {
             .record(&session, &root, &args, Some(&crate::ExecOutcome::Passed))
             .unwrap();
         assert_eq!(
-            session.task_root(&root).is_some(),
+            session.task_root(&root).unwrap().is_some(),
             matches,
             "{command}: {notice}"
         );

@@ -13,6 +13,168 @@ impl ToolPresentation for Notices {
     fn override_result(&mut self, _: String) {}
 }
 
+/// #3268: metadata loss must not turn an adopted task into an original-checkout
+/// command. The injected resolver models the reciprocal-link check without I/O.
+#[tokio::test]
+async fn task_cwd_3268_invalid_binding_refuses_default_commands() {
+    use crate::worktree_adoption::tests::{policy_fixture, TASK_ROOT};
+    let original = PathBuf::from("original");
+    let task = PathBuf::from("task`[bound]");
+    let session = WorktreeSession::default();
+    session.record_task_worktree(&task, "task");
+    session.adopt(policy_fixture(original.clone(), task.clone()));
+    TASK_ROOT
+        .scope(std::cell::RefCell::new(Some(task.clone())), async {
+            for name in ["run_command", "bash", "build_exec", "lifecycle"] {
+                let args = serde_json::json!({"command": "git log --oneline -1"});
+                let project = || {
+                    shell::command_args_with_default_cwd(
+                        name,
+                        &args,
+                        original.to_str().unwrap(),
+                        Some(Path::new("operator-default")),
+                        Some(&session),
+                    )
+                };
+                let key = shell::command_cwd_key(name).unwrap();
+                assert_eq!(project().unwrap()[key], task.to_str().unwrap());
+                TASK_ROOT.with(|root| *root.borrow_mut() = None);
+                let error = project().expect_err("invalid binding must not fall back");
+                assert!(error.contains(&task_path_literal(&task)), "{error}");
+                assert!(error.contains("reciprocal Git metadata"), "{error}");
+                TASK_ROOT.with(|root| *root.borrow_mut() = Some(task.clone()));
+            }
+            TASK_ROOT.with(|root| *root.borrow_mut() = None);
+            let args = serde_json::json!({"command": "git log --oneline -1"});
+            assert!(
+                shell::command_args_with_default_cwd(
+                    "run_command",
+                    &args,
+                    original.to_str().unwrap(),
+                    None,
+                    Some(&session)
+                )
+                .is_err(),
+                "no operator default must not fall back to the original either"
+            );
+            assert!(crate::agentic::selected_target::root(
+                original.to_str().unwrap(),
+                Some(&session)
+            )
+            .is_err());
+            assert!(crate::agentic::progress_workspace_state(
+                "run_command",
+                &serde_json::json!({"command": "echo changed > marker"}),
+                original.to_str().unwrap(),
+                &crate::Scope::none(),
+                Some(&session),
+            )
+            .await
+            .is_none());
+            session.lift();
+            assert_eq!(
+                crate::agentic::selected_target::root(original.to_str().unwrap(), Some(&session))
+                    .unwrap(),
+                original
+            );
+        })
+        .await;
+}
+
+/// #3268: dispatch reports unavailable before any tool or permission prompt.
+/// Metadata and adoption are in memory; deny-all scopes require no filesystem I/O.
+#[tokio::test]
+async fn task_cwd_3268_dispatch_stops_on_invalid_binding() {
+    use crate::worktree_adoption::tests::{policy_fixture, TASK_ROOT};
+    let _lock = env_lock().await;
+    let _ocap = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let original = PathBuf::from("original");
+    let task = PathBuf::from("task`[bound]");
+    let session = WorktreeSession::default();
+    session.adopt(policy_fixture(original.clone(), task.clone()));
+    TASK_ROOT
+        .scope(std::cell::RefCell::new(None), async {
+            for name in [
+                "run_command",
+                "bash",
+                "build_exec",
+                "lifecycle",
+                "read_file",
+                "write_file",
+            ] {
+                let mut notices = Notices::default();
+                let outcome = std::sync::OnceLock::new();
+                let directory = std::sync::OnceLock::new();
+                let result = execute(
+                    &mut notices,
+                    name,
+                    &serde_json::json!({"command": "git log --oneline -1", "path": "marker"}),
+                    original.to_str().unwrap(),
+                    false,
+                    40,
+                    &Caveats {
+                        fs_read: crate::Scope::none(),
+                        fs_write: crate::Scope::none(),
+                        exec: crate::Scope::none(),
+                        ..Caveats::top()
+                    },
+                    &mut crate::agentic::NoMcp,
+                    ToolCollaborators {
+                        worktree_session: Some(&session),
+                        execution: Some(&outcome),
+                        command_directory: Some(&directory),
+                        ..Default::default()
+                    },
+                    false,
+                    PromptDisposition::Act,
+                )
+                .await;
+                assert!(
+                    result.contains(&task_path_literal(&task)),
+                    "{name}: {result}"
+                );
+                assert!(
+                    result.contains("reciprocal Git metadata"),
+                    "{name}: {result}"
+                );
+                assert!(result.contains("no command was run"), "{name}: {result}");
+                assert_eq!(
+                    outcome.get(),
+                    Some(&crate::ExecOutcome::Unavailable),
+                    "{name}: {result}"
+                );
+                assert!(directory.get().is_none() && notices.0.is_empty());
+            }
+        })
+        .await;
+}
+
+/// #3268: verified detached creation has a task root even without a branch hint.
+#[tokio::test]
+async fn task_cwd_3268_detached_creation_uses_adopted_root() {
+    use crate::worktree_adoption::tests::{policy_fixture, TASK_ROOT};
+    let original = PathBuf::from("original");
+    let task = PathBuf::from("detached-task");
+    let mut policy = policy_fixture(original.clone(), task.clone());
+    policy.task_branch = None;
+    let session = WorktreeSession::default();
+    record_verified_creation(&session, policy, false);
+    TASK_ROOT
+        .scope(std::cell::RefCell::new(Some(task.clone())), async {
+            let args = serde_json::json!({"command": "git log --oneline -1"});
+            let projected = shell::command_args_with_default_cwd(
+                "run_command",
+                &args,
+                original.to_str().unwrap(),
+                None,
+                Some(&session),
+            )
+            .unwrap();
+            assert_eq!(projected["cwd"], task.to_str().unwrap());
+        })
+        .await;
+}
+
 /// #3254: replay redundant creation at the dispatch boundary with in-memory
 /// adoption state. No child, filesystem fixture, or presentation notice is needed.
 #[tokio::test]
@@ -66,7 +228,7 @@ async fn worktree_creation_3254_bound_task_is_a_quiet_result() {
             "{command}: {result}"
         );
         assert!(
-            result.contains("Commands already run there by default"),
+            result.contains("Commands default there and stop if the binding is unavailable"),
             "{result}"
         );
         assert!(result.contains("No command was run"), "{result}");
@@ -482,7 +644,10 @@ async fn bound_task_error_rendering(tool: &str) {
     let original = temp.path().join("main").canonicalize().unwrap();
     let session = WorktreeSession::default();
     session.record_task_worktree(&policy.worktree, "task");
-    assert_eq!(session.task_root(&original), Some(policy.worktree.clone()));
+    assert_eq!(
+        session.task_root(&original).unwrap(),
+        Some(policy.worktree.clone())
+    );
     let missing = policy.worktree.join("missing");
     let task_text = dunce::simplified(&policy.worktree).display().to_string();
     let missing_text = dunce::simplified(&missing).display().to_string();

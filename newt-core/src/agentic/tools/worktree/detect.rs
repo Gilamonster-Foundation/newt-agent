@@ -73,7 +73,7 @@ impl Snapshot {
         let head = std::fs::read_to_string(admin.join("HEAD")).ok()?;
         let branch = head.trim().strip_prefix("ref: refs/heads/")?;
         crate::git_staging::validate_branch_name(branch).ok()?;
-        if session.task_root(workspace).as_ref() == Some(&root) {
+        if session.task_root(workspace).ok().flatten().as_ref() == Some(&root) {
             return None; // The literal/adoption recorder already handled it.
         }
         if !destination_matches(args, workspace, &root) {

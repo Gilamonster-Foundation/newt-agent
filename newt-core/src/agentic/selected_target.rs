@@ -105,10 +105,11 @@ fn valid_path(path: &str) -> bool {
 pub(crate) fn root(
     workspace: &str,
     session: Option<&crate::worktree_adoption::WorktreeSession>,
-) -> std::path::PathBuf {
+) -> Result<std::path::PathBuf, String> {
     session
-        .and_then(|s| s.task_root(Path::new(workspace)))
-        .unwrap_or_else(|| workspace.into())
+        .map(|s| s.task_root(Path::new(workspace)))
+        .transpose()
+        .map(|root| root.flatten().unwrap_or_else(|| workspace.into()))
 }
 
 pub(crate) fn baseline(root: &Path, scope: &crate::Scope<String>) -> Option<String> {
@@ -182,7 +183,9 @@ impl Projection {
             return;
         };
         let paths = if target.valid() {
-            diff_paths(&target, &root(workspace, session), scope)
+            root(workspace, session)
+                .ok()
+                .and_then(|root| diff_paths(&target, &root, scope))
         } else {
             None
         };
