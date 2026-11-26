@@ -406,17 +406,7 @@ pub(super) async fn execute_governed_push(
         || run_staged_push(&plan, caveats, &held),
     ) {
         Ok(result) => result,
-        Err(reason) => {
-            return command.render(
-                format!(
-                    "{}: pre-push hook refused; no push was staged. {reason}",
-                    crate::git_staging::Outcome::Failed {
-                        category: crate::git_staging::FailureCategory::RefusedByHarness,
-                    }
-                ),
-                false,
-            )
-        }
+        Err(reason) => return command.render(reason, false),
     };
     if let (Some(slot), Ok(outcome)) = (observed, &result) {
         let _ = slot.set(outcome.clone());
@@ -474,20 +464,32 @@ fn after_pre_push<T>(
     hook: agent_bridle::ToolResult<serde_json::Value>,
     stage: impl FnOnce() -> T,
 ) -> Result<T, String> {
-    let envelope = hook.map_err(|error| error.to_string())?;
-    let outcome = super::shell::envelope_outcome(&envelope);
-    if outcome != crate::ExecOutcome::Passed {
-        let output =
-            super::shell::shell_envelope_output(&envelope, usize::MAX, false, false, None, None);
-        return Err(match outcome {
-            crate::ExecOutcome::TimedOut => {
-                format!("configured command deadline expired. {output}")
+    use super::shell::{envelope_outcome, shell_envelope_output};
+
+    let (status, output) = match hook {
+        Ok(envelope) => {
+            let outcome = envelope_outcome(&envelope);
+            if outcome == crate::ExecOutcome::Passed {
+                return Ok(stage());
             }
-            crate::ExecOutcome::Denied => format!("confined execution denied. {output}"),
-            _ => output,
-        });
-    }
-    Ok(stage())
+            let status = match outcome {
+                crate::ExecOutcome::TimedOut => " Configured command deadline expired.",
+                crate::ExecOutcome::Denied => " Confined execution denied.",
+                _ => "",
+            };
+            let output = shell_envelope_output(&envelope, usize::MAX, false, false, None, None);
+            (status, output)
+        }
+        Err(error) => ("", error.to_string()),
+    };
+    // #3295: bound bytes as well as lines before exempting this diagnostic
+    // from folding; a single long hook line must not flood the transcript.
+    let tail =
+        super::OutputTrim::Tail(6).apply(crate::agentic::tail_on_char_boundary(&output, 2_048), "");
+    Err(format!(
+        "{}{status}\n{tail}",
+        crate::agentic::display::PRE_PUSH_REFUSAL
+    ))
 }
 
 /// Only harness-authored reasons cross the fixed-form boundary; raw config
@@ -1358,6 +1360,58 @@ mod tests {
     };
     use super::*;
     use crate::agentic::{NoMcp, PromptDisposition};
+
+    /// #3295: the hook's diagnostic must survive the actual result fold, even
+    /// when the broker adds its generic refusal after the failing line.
+    #[test]
+    fn pre_push_3295_refusal_tail_stays_visible() {
+        let diagnostic = ".githooks/pre-push: line 523: just: Permission denied";
+        for stream in ["stdout", "stderr"] {
+            let mut hook = serde_json::json!({"exit_code": 1});
+            hook[stream] = format!(
+                "checking format\nchecking clippy\nchecking tests\n{diagnostic}\n\
+                 native Git helper refused: original pre-push hook refused\n"
+            )
+            .into();
+            let output = after_pre_push(Ok(hook), || panic!("refused hook staged")).unwrap_err();
+            assert!(output.contains(diagnostic), "model diagnostic: {output}");
+            for summary in [false, true] {
+                let mut display =
+                    crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 3, summary);
+                display.result(&output);
+                let shown = String::from_utf8(display.into_inner()).unwrap();
+                assert!(shown.contains(diagnostic), "fold hid diagnostic: {shown}");
+                assert!(!shown.contains("lines hidden"), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn pre_push_3295_refusal_is_bounded_and_names_stage() {
+        for progress in ["old progress\n".repeat(1_000), "界".repeat(10_000)] {
+            let output = after_pre_push(
+                Ok(serde_json::json!({
+                    "exit_code": 1,
+                    "stdout": format!("{progress}\nlast check\n"),
+                    "stderr": "decisive failure\nhelper refused\n"
+                })),
+                || panic!("refused hook staged"),
+            )
+            .unwrap_err();
+            let first = output.lines().next().unwrap();
+            assert!(
+                first.starts_with("failed(refused_by_harness): pre-push hook refused"),
+                "{first}"
+            );
+            assert!(first.contains("local pre-push stage"), "{first}");
+            assert!(first.contains("remote not contacted"), "{first}");
+            assert!(first.contains("no push was staged"), "{first}");
+            assert!(output.ends_with("last check\ndecisive failure\nhelper refused"));
+            assert!(output.lines().count() <= 7, "hook tail must be bounded");
+            assert!(output.len() <= 2_200, "long lines must also be bounded");
+            assert!(!output.contains("old progress\nold progress\nold progress\nold progress"));
+        }
+    }
 
     #[test]
     fn pre_push_3258_refusal_never_stages_or_dials() {
