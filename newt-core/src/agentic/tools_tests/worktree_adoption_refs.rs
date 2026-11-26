@@ -730,7 +730,13 @@ fn worktree_notice_hint_requires_standalone_branch_stderr() {
     let source = "git worktree add task step-x";
     let fatal = "fatal: 'step-x' is already used by worktree at '/original'";
     let failed = |stdout: &str, stderr: &str| serde_json::json!({"exit_code":128,"stdout":stdout,"stderr":stderr});
-    assert!(creation_failure_hint(source, &failed("", fatal)).is_some());
+    assert!(creation_failure_hint(
+        source,
+        &failed("", fatal),
+        "original",
+        &crate::Scope::none()
+    )
+    .is_some());
     for (command, envelope) in [
         (source, failed(fatal, "fatal: invalid reference: other")),
         (
@@ -757,7 +763,7 @@ fn worktree_notice_hint_requires_standalone_branch_stderr() {
         ),
     ] {
         assert!(
-            creation_failure_hint(command, &envelope).is_none(),
+            creation_failure_hint(command, &envelope, "original", &crate::Scope::none()).is_none(),
             "{command}: {envelope}"
         );
     }

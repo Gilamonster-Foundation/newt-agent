@@ -36,7 +36,6 @@ pub struct WorktreeSession {
     adoption_progress_pending: std::sync::atomic::AtomicBool,
     pub(crate) command_cwd_notice_shown: std::sync::atomic::AtomicBool,
     pub(crate) publish_early: std::sync::Mutex<crate::agentic::publish_early::State>,
-    pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
 }
 impl WorktreeSession {
     /// Explicit operator lift, also used at the existing new-task boundary.

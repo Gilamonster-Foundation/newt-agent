@@ -265,6 +265,7 @@ fn denial_like_child_text_does_not_become_host_authority_evidence() {
     let envelope = serde_json::json!({"exit_code": 1, "stdout": "", "stderr": stderr});
     let (text, outcome) = shell::confined_result(
         "check",
+        "original",
         &envelope,
         &Caveats::top(),
         false,
