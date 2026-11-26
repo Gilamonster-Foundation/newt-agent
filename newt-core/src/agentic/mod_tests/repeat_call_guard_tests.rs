@@ -1505,6 +1505,49 @@ fn evidence_only_progress_ceiling_exempts_non_act_and_zero_disables_it() {
     }
 }
 
+/// #3278: replay 43 fresh reads, a write, and three fresh reads, then an
+/// early-continue round to reach attempt 48. Snapshots are injected here;
+/// the real task-root dispatch tests ground the same replay in file bytes.
+#[test]
+fn task_worktree_write_progress_replay_survives_attempt_48() {
+    let snapshot = |bytes: &[u8]| {
+        Some(ProgressSnapshot::File(
+            content_addressable::ContentId::from_canonical_bytes(bytes),
+        ))
+    };
+    task_worktree_progress_replay(snapshot(b"before"), snapshot(b"after"));
+}
+
+pub(in crate::agentic) fn task_worktree_progress_replay(
+    before: Option<ProgressSnapshot>,
+    after: Option<ProgressSnapshot>,
+) {
+    let mut state = WorkflowRuntimeState::default();
+    for round in 1..=48 {
+        if round == 44 {
+            let wrote = state.record_workspace_change(before, after);
+            assert!(
+                wrote,
+                "a task-worktree write must count as a workspace change"
+            );
+            state.record_round_outcome(wrote, false);
+        } else if round < 48 {
+            let progress = state.record_observation(
+                "read_file",
+                &serde_json::json!({"path":"source.rs", "offset":round}),
+                &format!("source page {round}"),
+                true,
+                None,
+                None,
+            );
+            state.record_round_outcome(false, progress);
+        }
+        assert_eq!(gate(&mut state, false), "continue", "attempt {round}");
+    }
+    assert_eq!(state.rounds_without_action_progress, 4);
+    assert_eq!(state.rounds_without_change, 1);
+}
+
 #[test]
 fn evidence_only_progress_ceiling_resets_on_writes_checks_and_operator_steering() {
     for reset in ["write", "check", "steering"] {
@@ -1776,22 +1819,22 @@ async fn workspace_progress_uses_real_bytes_without_reading_outside_authority() 
     let denied = newt_policy::caveats::Scope::none();
     let allowed = newt_policy::caveats::Scope::only([workspace.to_string()]);
     assert!(
-        progress_workspace_state("run_command", &args, workspace, &denied)
+        progress_workspace_state("run_command", &args, workspace, &denied, None)
             .await
             .is_none()
     );
     assert!(
-        progress_workspace_state("read_file", &args, workspace, &allowed)
+        progress_workspace_state("read_file", &args, workspace, &allowed, None)
             .await
             .is_none()
     );
-    let before = progress_workspace_state("run_command", &args, workspace, &allowed).await;
+    let before = progress_workspace_state("run_command", &args, workspace, &allowed, None).await;
     std::fs::write(root.path().join("output.txt"), "changed").unwrap();
-    let after = progress_workspace_state("run_command", &args, workspace, &allowed).await;
+    let after = progress_workspace_state("run_command", &args, workspace, &allowed, None).await;
     let mut state = WorkflowRuntimeState::default();
     assert!(state.record_workspace_change(before, after));
     std::fs::write(root.path().join("output.txt"), "changed").unwrap();
-    let unchanged = progress_workspace_state("run_command", &args, workspace, &allowed).await;
+    let unchanged = progress_workspace_state("run_command", &args, workspace, &allowed, None).await;
     assert!(
         !state.record_workspace_change(after, unchanged),
         "successful no-op write is not progress"
@@ -1807,19 +1850,19 @@ async fn named_mutation_progress_uses_exact_file_grants_and_absent_postimage() {
     let args = serde_json::json!({"path":"source.txt"});
     let scope = newt_policy::caveats::Scope::only([file.to_string_lossy().into_owned()]);
     std::fs::write(&file, "before").unwrap();
-    let before = progress_workspace_state("edit_file", &args, workspace, &scope).await;
+    let before = progress_workspace_state("edit_file", &args, workspace, &scope, None).await;
     assert!(matches!(before, Some(ProgressSnapshot::File(_))));
     std::fs::write(&file, "after").unwrap();
-    let after = progress_workspace_state("edit_file", &args, workspace, &scope).await;
+    let after = progress_workspace_state("edit_file", &args, workspace, &scope, None).await;
     let mut state = WorkflowRuntimeState::default();
     assert!(state.record_workspace_change(before, after));
     std::fs::remove_file(&file).unwrap();
-    let absent = progress_workspace_state("delete_file", &args, workspace, &scope).await;
+    let absent = progress_workspace_state("delete_file", &args, workspace, &scope, None).await;
     assert!(matches!(absent, Some(ProgressSnapshot::File(_))));
     assert!(state.record_workspace_change(after, absent));
     let sibling = serde_json::json!({"path":"not-granted.txt"});
     assert!(
-        progress_workspace_state("write_file", &sibling, workspace, &scope)
+        progress_workspace_state("write_file", &sibling, workspace, &scope, None)
             .await
             .is_none()
     );

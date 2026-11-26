@@ -1281,9 +1281,9 @@ async fn progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change() 
 
     // Unchanged: two snapshots with no write between them agree.
     let unchanged_before =
-        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read, None).await;
     let unchanged_after =
-        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read, None).await;
     let mut unchanged_runtime = WorkflowRuntimeState::default();
     assert!(
         !unchanged_runtime.record_workspace_change(unchanged_before, unchanged_after),
@@ -1292,7 +1292,7 @@ async fn progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change() 
 
     // Changed: a real shell redirect runs between the two snapshots.
     let before =
-        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read, None).await;
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(args["command"].as_str().unwrap())
@@ -1300,7 +1300,7 @@ async fn progress_workspace_state_snapshots_a_real_shell_redirect_as_a_change() 
         .expect("the real shell redirect must run");
     assert!(status.success(), "the fixture redirect must succeed");
     let after =
-        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read).await;
+        progress_workspace_state("run_command", &args, workspace_str, &caveats.fs_read, None).await;
     let mut runtime = WorkflowRuntimeState::default();
     assert!(
         runtime.record_workspace_change(before, after),
