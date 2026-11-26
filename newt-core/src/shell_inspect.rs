@@ -3,9 +3,10 @@
 //! Copied unchanged from agent-bridle-tool-shell (`vendor/agent-bridle-tool-shell/src/shell_inspect.rs`)
 //! so newt-core can inspect shell syntax without a bridle crate (#3160, the `confine`
 //! feature). `shell_inspect_parity_tests` holds it equal to bridle's while bridle is a
-//! dependency.
+//! dependency. `known_delegated_programs` adds a best-effort diagnostic query
+//! without changing that strict projection.
 
-// The body below is bridle's, byte for byte, so it keeps bridle's formatting.
+// The inherited inspector keeps bridle's formatting.
 #![allow(clippy::semicolon_if_nothing_returned)]
 
 use brush_parser::ast::{
@@ -178,6 +179,109 @@ impl std::error::Error for ShellInspectionError {}
 /// even an apparently simple target is outside this projection's safe subset.
 pub fn inspect_shell(cmd: &str) -> Result<ShellInspection, ShellInspectionError> {
     inspect_shell_at_depth(cmd, 0)
+}
+
+/// Known dispatchers and their children for early permission diagnostics, not a complete
+/// execution inventory or an authorization decision. Keep `inspect_shell`'s
+/// strict contract: xargs can turn input into runtime code or arguments.
+#[cfg(any(test, feature = "confine"))]
+pub(crate) fn known_delegated_programs(source: &str) -> Vec<String> {
+    fn collect(inspection: ShellInspection, programs: &mut Vec<String>) {
+        for command in inspection.commands {
+            if !command.descendant_execs.is_empty() {
+                programs.extend(command.program);
+                programs.extend(
+                    command
+                        .descendant_execs
+                        .into_iter()
+                        .map(|child| child.program),
+                );
+            }
+        }
+        for nested in inspection
+            .constructs
+            .into_iter()
+            .filter_map(|c| c.inspection)
+        {
+            collect(*nested, programs);
+        }
+    }
+    let mut programs = Vec::new();
+    if let Ok(inspection) = inspect_shell(source) {
+        collect(inspection, &mut programs);
+        return programs;
+    }
+    if source.len() > MAX_SOURCE_BYTES {
+        return programs;
+    }
+    // Reuse the AST and literal-word parser, never split shell source on pipes
+    // or search quoted text for command names. An opaque stage must not hide
+    // the inspectable descendants of another stage.
+    let options = ParserOptions::default();
+    let Ok(ast) = Parser::new(std::io::Cursor::new(source.as_bytes()), &options).parse_program()
+    else {
+        return programs;
+    };
+    let mut nodes = Vec::new();
+    if collect_inspection_nodes(&ast, &mut nodes, &mut Vec::new()).is_err() {
+        return programs;
+    }
+    for node in nodes {
+        let InspectNode::Simple(simple) = node else {
+            continue;
+        };
+        let Ok(stage) = simple_command_source(simple, source) else {
+            continue;
+        };
+        if let Ok(inspection) = inspect_shell(&stage) {
+            collect(inspection, &mut programs);
+            continue;
+        }
+        let Some(program) = simple
+            .word_or_name
+            .as_ref()
+            .and_then(|word| static_shell_word(word, &options).ok())
+        else {
+            continue;
+        };
+        if classification_basename(&program) != "xargs" {
+            continue;
+        }
+        let mut words = simple
+            .suffix
+            .iter()
+            .flat_map(|suffix| &suffix.0)
+            .filter_map(|item| match item {
+                CommandPrefixOrSuffixItem::Word(word)
+                | CommandPrefixOrSuffixItem::AssignmentWord(_, word) => Some(word),
+                _ => None,
+            });
+        while let Some(word) = words.next() {
+            let Ok(mut child) = static_shell_word(word, &options) else {
+                break;
+            };
+            // These switches do not replace the child name. Other option
+            // grammars (especially -I) stay opaque rather than guessing.
+            if matches!(child.as_str(), "-0" | "--null" | "-r" | "--no-run-if-empty") {
+                continue;
+            }
+            if child == "--" {
+                let Some(word) = words.next() else { break };
+                let Ok(literal) = static_shell_word(word, &options) else {
+                    break;
+                };
+                child = literal;
+            } else if child.starts_with('-') {
+                break;
+            }
+            if !child.is_empty() {
+                programs.push(program);
+                programs.push(child);
+            }
+            break;
+        }
+    }
+    programs
 }
 
 /// Resolve exactly one literal argument with the inspector's existing word
@@ -1380,6 +1484,34 @@ fn source_between_words(first: &Word, last: &Word, source: &str) -> Option<Strin
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn descendant_exec_3276_recognizes_literals_without_inventing_children() {
+        for (source, expected) in [
+            ("printf file | xargs wc -l", vec!["xargs", "wc"]),
+            (
+                "printf file | '/usr/bin/xargs' -0 -r -- 'wc' -l",
+                vec!["/usr/bin/xargs", "wc"],
+            ),
+            (
+                "find . -exec wc -l {} +; xargs wc -l",
+                vec!["find", "wc", "xargs", "wc"],
+            ),
+        ] {
+            assert_eq!(known_delegated_programs(source), expected, "{source}");
+        }
+        for source in [
+            "echo 'xargs wc -l'",
+            "cat <<'EOF'\nxargs wc -l\nEOF",
+            "python3 -c 'print(\"xargs wc\")'",
+            "xargs -I {} {}",
+            "xargs -n 1 wc -l",
+            "xargs \"$PROGRAM\"",
+        ] {
+            assert!(known_delegated_programs(source).is_empty(), "{source}");
+        }
+        assert!(inspect_shell("xargs wc -l").is_err());
+    }
 
     const COMPOUND_EXAMPLE: &str = r#"ls -1 $(find . -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | sort -nr | head -10)"#;
 

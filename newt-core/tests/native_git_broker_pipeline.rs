@@ -111,6 +111,11 @@ fn main() {
     }
     newt_core::answer_nextest_listing("native_git_broker_pipeline");
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if std::env::args().any(|arg| arg == "--regression-3276") {
+        native::descendant_exec_regression();
+        return;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if std::env::args().any(|arg| arg == "--confined-contract") {
         contract::run();
         return;
@@ -136,6 +141,7 @@ fn main() {
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        native::descendant_exec_regression();
         native::run();
         // Keep the push fixture's environment isolated from the commit fixtures,
         // and run it in the same scheduled/release real-resource tier.
@@ -176,6 +182,139 @@ mod native {
     const MARKER: &str = "NATIVE_GIT_BROKER_PIPELINE_CONFIRMED";
     const TRAILER: &str =
         "Co-Authored-By: native-git-broker-pipeline-fixture <fixture@example.invalid>";
+
+    /// #3276: real Brush, xargs and wc ground the mocked child-grant preflight.
+    /// The skill's exact measurement command must see nested tracked sources
+    /// under the default fence and recover after a missing child grant.
+    pub fn descendant_exec_regression() {
+        use newt_policy::permissions::{
+            HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
+        };
+        struct AllowOnce(usize);
+        impl PermissionGate for AllowOnce {
+            fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
+                panic!("the current invocation's caveats must be retained")
+            }
+            fn ask_with_caveats(
+                &mut self,
+                base: &Caveats,
+                requests: &[PermissionRequest],
+            ) -> PermissionDecision {
+                self.0 += 1;
+                assert!(
+                    requests.iter().any(|r| r.target.ends_with("/wc")),
+                    "{requests:?}"
+                );
+                PermissionDecision::Allow(newt_policy::permissions::widen_caveats(
+                    base,
+                    &requests
+                        .iter()
+                        .map(|r| (r.kind, r.target.clone()))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            fn ask_dependency_fetch(
+                &mut self,
+                _: &Caveats,
+                _: &PermissionRequest,
+            ) -> PermissionDecision {
+                panic!("measurement needs no dependencies")
+            }
+            fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
+                HumanQuestionOutcome::Unavailable
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        newt_core::process_env::set_var(
+            "NEWT_EVENT_JOURNAL",
+            temp.path().join("events.jsonl").to_str().unwrap(),
+        );
+        newt_core::process_env::set_var("NEWT_SHELL_ENGINE", "brush");
+        assert!(newt_core::confined_exec::kernel_fs_fence_available());
+        let (root, _) = init_worktree(&temp.path().canonicalize().unwrap());
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("src/nested/largest.rs"), "// line\n".repeat(12)).unwrap();
+        std::fs::write(root.join("small.rs"), "// line\n").unwrap();
+        real_git(&root, &["add", "src", "small.rs"]);
+        let command = "git ls-files '*.rs' | xargs wc -l | sort -nr | head -10";
+        let default =
+            newt_core::config::ToolPermissions::default().to_caveats(root.to_str().unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for mode in ["deny", "allow-child", "allow-both", "default"] {
+                let mut caveats = default.clone();
+                if mode != "default" {
+                    let Scope::Only(exec) = &mut caveats.exec else {
+                        panic!("default exec must be restricted")
+                    };
+                    assert!(exec.remove("wc"));
+                    if mode == "allow-both" {
+                        assert!(exec.remove("xargs"));
+                    }
+                }
+                let mut gate = AllowOnce(0);
+                let invocation = if mode.starts_with("allow") {
+                    format!("printf x >> {mode}; {command}")
+                } else {
+                    command.to_owned()
+                };
+                let out = newt_core::execute_tool(
+                    "run_command",
+                    &serde_json::json!({"command": invocation}),
+                    root.to_str().unwrap(),
+                    false,
+                    200,
+                    &caveats,
+                    &mut NoMcp,
+                    None,
+                    None,
+                    None,
+                    None,
+                    mode.starts_with("allow")
+                        .then_some(&mut gate as &mut dyn PermissionGate),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                if mode == "deny" {
+                    assert!(
+                        out.contains("capability denied")
+                            && out.contains("wc")
+                            && out.contains("request_permissions"),
+                        "{out}"
+                    );
+                    assert!(!out.contains("src/nested/largest.rs"), "{out}");
+                    println!("REGRESSION_3276_CHILD_DENIAL_CONFIRMED");
+                } else {
+                    assert!(!out.contains("capability denied"), "{out}");
+                    let rows: Vec<_> = out.lines().filter(|line| line.contains(".rs")).collect();
+                    assert_eq!(rows.len(), 2, "{out}");
+                    assert_eq!(
+                        rows[0].split_whitespace().collect::<Vec<_>>(),
+                        ["12", "src/nested/largest.rs"]
+                    );
+                    assert_eq!(
+                        rows[1].split_whitespace().collect::<Vec<_>>(),
+                        ["1", "small.rs"]
+                    );
+                    assert_eq!(gate.0, usize::from(mode.starts_with("allow")));
+                    if mode.starts_with("allow") {
+                        assert_eq!(std::fs::read(root.join(mode)).unwrap(), b"x");
+                    }
+                    println!("REGRESSION_3276_{mode}_SKILL_COMMAND_CONFIRMED");
+                }
+            }
+        });
+    }
 
     pub fn run() {
         // Cancellation may leave an orphan candidate; never journal fixtures

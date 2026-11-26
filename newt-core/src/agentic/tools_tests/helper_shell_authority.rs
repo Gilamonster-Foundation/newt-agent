@@ -1,5 +1,54 @@
 use super::*;
 
+/// #3276: an approved dispatcher must name its ungranted child before any
+/// pipeline stage runs. The I/O probe keeps this regression entirely mocked.
+#[cfg(feature = "confine")]
+#[cfg(any(not(windows), feature = "windows-appcontainer"))]
+#[tokio::test]
+async fn descendant_exec_3276_requires_child_grant() {
+    use crate::Scope;
+    use std::sync::{atomic::Ordering, Arc};
+    let probe = Arc::new(super::command_probe::Probe::default());
+    super::command_probe::IO
+        .scope(probe.clone(), async {
+            for command in [
+                "git ls-files '*.rs' | xargs wc -l | sort -nr | head -10",
+                "find . -name '*.rs' -exec wc -l {} + | sort -nr | head -10",
+                "printf '%s' \"$(find . -exec wc -l {} +)\"",
+            ] {
+                let mut caveats = crate::config::ToolPermissions::default().to_caveats("workspace");
+                caveats.exec = Scope::only(
+                    ["git", "xargs", "find", "sort", "head", "printf"].map(str::to_string),
+                );
+                let args = serde_json::json!({"cmd": command, "cwd": "workspace"});
+                let denied = super::shell::dispatch_bridled_shell(args.clone(), &caveats, None)
+                    .await
+                    .unwrap();
+                assert!(envelope_denied(&denied), "{command}: {denied}");
+                let requests = exec_denial_requests(&denied).expect("promptable child denial");
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].target, "wc");
+                assert!(
+                    denied_run_command_result(&denied, false)
+                        .contains(r#"request_permissions(capability="exec", target="wc""#),
+                    "{denied}"
+                );
+                assert_eq!(probe.confined.load(Ordering::SeqCst), 0);
+
+                if let Scope::Only(allowed) = &mut caveats.exec {
+                    allowed.insert("wc".into());
+                }
+                let granted = super::shell::dispatch_bridled_shell(args, &caveats, None)
+                    .await
+                    .unwrap();
+                assert_eq!(granted["exit_code"], 0, "{granted}");
+                assert!(!envelope_denied(&granted));
+                assert_eq!(probe.confined.swap(0, Ordering::SeqCst), 1);
+            }
+        })
+        .await;
+}
+
 /// b1 slice 2 — the LIVE attacker-exec path proof: `run_command` →
 /// `dispatch_bridled_shell` → agent-bridle `ShellTool` (child_network =
 /// `DenyDirect`, 0.7.15) → spawn. Under `net: none` the seccomp egress floor
