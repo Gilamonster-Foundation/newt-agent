@@ -7175,16 +7175,16 @@ where
     // single prompt of the turn, output = sum across rounds (Step 18.1
     // semantics); `None` (backend reported nothing) is stored as NULL.
     // #717: phantom reaches persist alongside the events column.
-    // The displayed harness report belongs to the outcome artifact, not the
-    // assistant's authored turn. Keep new rows clean; replay also handles old rows.
-    let model_reply = newt_core::agentic::model_reply_for_history(reply);
+    // Preserve a harness-only outcome with its authorship envelope (#3277).
+    // Ordinary replies store model prose; model replay strips either envelope.
+    let transcript_reply = newt_core::agentic::reply_for_transcript(reply);
     store.append_turn_full(
         conversation_id,
         task,
-        &model_reply,
+        &transcript_reply,
         events,
         phantom_reaches,
-        // A model turn is witnessed, never derived: empty sources always.
+        // A turn is witnessed, never derived: empty sources always.
         &[],
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),

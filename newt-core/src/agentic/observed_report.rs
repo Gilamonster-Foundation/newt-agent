@@ -7,6 +7,7 @@ pub(crate) mod review;
 pub use prose::assistant_prose;
 pub(crate) use prose::replay_messages;
 pub use prose::split_report;
+pub use prose::transcript_reply;
 #[cfg(test)]
 pub(crate) mod tests;
 

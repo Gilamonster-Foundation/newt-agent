@@ -1470,6 +1470,12 @@ fn evidence_only_progress_replay_ends_no_progress_with_harness_notice() {
     assert!(text.contains("Stopped: 48 consecutive rounds"), "{text}");
     assert!(text.contains("Work done so far is left in the workspace."));
     assert_eq!(model_reply_for_history(&text), "");
+    assert!(text.contains("Last turn harness notices (historical, not assistant-authored):"));
+    assert_eq!(
+        reply_for_transcript(&text),
+        text,
+        "#3277: the durable reply must retain the harness-authored stop notice"
+    );
 }
 
 #[test]

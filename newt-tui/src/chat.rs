@@ -296,6 +296,11 @@ fn fold_observed_report(
     retain: impl FnOnce(&str) -> Option<String>,
 ) -> Option<String> {
     let (report, rest) = newt_core::agentic::split_observed_report(reply)?;
+    // A harness-only stop has no explanation outside the report. Folding it
+    // would hide the entire reply, including why the turn stopped (#3277).
+    if rest.trim().is_empty() {
+        return None;
+    }
     let handle = retain(report)?;
     let fold = newt_core::agentic::Fold::lines(
         report.lines().count(),
@@ -10316,8 +10321,8 @@ fn session_body(
                                         // ACTION is known to have succeeded — drained
                                         // once per loop iteration at the head of the
                                         // loop (`persist_preference_actions`).
-                                        // Keep the model prose in the transcript and
-                                        // the displayed report in the outcome artifact.
+                                        // Keep the full displayed report in the outcome
+                                        // artifact even when the transcript projects prose.
                                         // Record the outcome only after transcript save.
                                         if let (Some(sink), Some(turn)) =
                                             (artifact_sink, active_prompt_context.as_ref())

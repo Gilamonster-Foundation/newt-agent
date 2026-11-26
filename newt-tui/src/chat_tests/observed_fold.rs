@@ -67,3 +67,21 @@ fn the_turn_loop_gates_the_fold_on_the_surface_policy() {
     assert!(window.contains("observed_report_folds("), "{window}");
     assert!(!window.contains("spill_summary()"), "{window}");
 }
+
+/// #3277: a brake exit has no model explanation. Its harness notice is the
+/// reply, so collapsing the report must not hide the only thing said.
+#[test]
+fn no_progress_notice_stays_unfolded() {
+    let reply = REPORT.replace(
+        "\n## Model explanation\n\n",
+        "\nLast turn harness notices (historical, not assistant-authored):\n- `Stopped: 48 consecutive rounds produced no workspace change or newly verified check. Work done so far is left in the workspace.`\n\n## Model explanation\n\n",
+    );
+    let displayed = fold_observed_report(&reply, |_| Some("/spill open 3".into()))
+        .unwrap_or_else(|| reply.clone());
+    assert_eq!(
+        displayed, reply,
+        "the full notice must remain above metrics"
+    );
+    assert_eq!(newt_core::agentic::reply_for_transcript(&reply), reply);
+    assert!(newt_core::agentic::model_reply_for_history(&reply).is_empty());
+}
