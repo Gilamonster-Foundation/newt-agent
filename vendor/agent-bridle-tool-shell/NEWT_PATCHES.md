@@ -14,8 +14,13 @@ Integration changes:
   macOS `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` lookups, and distinguish the
   delegation channel from the per-request socket. Injected disconnect and
   truncated-frame tests keep these failures fatal; a complete frame followed
-  by EOF remains valid. This diagnoses the intermittent native-commit failure;
-  its underlying close race still needs native macOS evidence.
+  by EOF remains valid. Refuse an exhausted invocation before its server hello
+  instead of flooring the remaining budget to 1 ms; retain the 30 s cap and
+  recheck the deadline after hello setup. Report server failures on the host's
+  captured stderr with the computed timeout in milliseconds, syscall phase,
+  I/O error kind and raw errno; malformed-frame diagnostics omit decoder text
+  that can echo peer-supplied fields. Pure injected-budget and diagnostic tests
+  cover this boundary; the hosted macOS close cause still needs native evidence.
 
 - #3093: expose the existing static word parser through a source-bound
   single-argument helper. Broker arguments such as `owner/r` and `done` are

@@ -441,6 +441,15 @@ pub(crate) fn read_broker_peer(
     u32::try_from(pid).map_err(|_| ToolError::denied("invalid broker writer PID"))
 }
 
+/// Preserve syscall metadata before contextual wrappers turn an I/O error into text.
+pub(crate) fn io_diagnostic(operation: &str, error: std::io::Error) -> String {
+    format!(
+        "{operation}: {error} (kind={:?}, raw_os_error={:?})",
+        error.kind(),
+        error.raw_os_error(),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn recv_exact_frame(stream: &UnixStream, bytes: &mut [u8]) -> Result<FrameCredentials, String> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags, UnixCredentials};
@@ -456,11 +465,11 @@ fn recv_exact_frame(stream: &UnixStream, bytes: &mut [u8]) -> Result<FrameCreden
             Some(&mut cmsgspace),
             MsgFlags::MSG_WAITALL,
         )
-        .map_err(|error| format!("receive authenticated control frame: {error}"))?;
+        .map_err(|error| io_diagnostic("receive authenticated control frame", error.into()))?;
         let mut credentials = None;
         for control in message
             .cmsgs()
-            .map_err(|error| format!("decode control-frame credentials: {error}"))?
+            .map_err(|error| io_diagnostic("decode control-frame credentials", error.into()))?
         {
             if let ControlMessageOwned::ScmCredentials(seen) = control {
                 if credentials.replace(seen).is_some() {
@@ -488,7 +497,7 @@ fn recv_exact_frame(stream: &UnixStream, bytes: &mut [u8]) -> Result<FrameCreden
 fn recv_exact_frame(stream: &UnixStream, bytes: &mut [u8]) -> Result<FrameCredentials, String> {
     (&*stream)
         .read_exact(bytes)
-        .map_err(|error| format!("receive authenticated control frame: {error}"))?;
+        .map_err(|error| io_diagnostic("receive authenticated control frame", error))?;
     Ok(FrameCredentials {})
 }
 

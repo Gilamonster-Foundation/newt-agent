@@ -185,7 +185,7 @@ impl State {
                     let expected = request_session
                         .is_none()
                         .then_some(request_state.worker_pid);
-                    let _ = broker_transport::serve_request(
+                    if let Err(error) = broker_transport::serve_request(
                         stream,
                         &request_state.control,
                         expected,
@@ -224,7 +224,11 @@ impl State {
                                 request_state.worker_request(payload)
                             }
                         },
-                    );
+                    ) {
+                        // Host stderr is captured by the native broker proof even
+                        // when the peer is gone and no reply can be delivered.
+                        eprintln!("{error}");
+                    }
                     request_state.active.fetch_sub(1, Ordering::AcqRel);
                 });
                 state.retain_thread(request_thread);
