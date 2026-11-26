@@ -90,7 +90,40 @@ pub(super) fn commit_in_an_uninspectable_source(source: &str) -> bool {
 /// every commit argument rather than duplicating Git's message-option grammar
 /// (including bundled short flags and attached values). Other commands' arguments
 /// and literal code spans are unaffected; nested commits receive the same check.
+/// A single `cat` of a quoted here-document only captures literal message data.
 pub(super) fn commit_has_command_substitution(source: &str) -> bool {
+    fn literal_heredoc_capture(body: &str) -> bool {
+        use brush_parser::ast::{
+            Command, CommandPrefixOrSuffixItem, CompoundListItem, IoRedirect, SeparatorOperator,
+        };
+        let options = brush_parser::ParserOptions::default();
+        let Ok(program) =
+            brush_parser::Parser::new(std::io::Cursor::new(body.as_bytes()), &options)
+                .parse_program()
+        else {
+            return false;
+        };
+        let [list] = program.complete_commands.as_slice() else {
+            return false;
+        };
+        let [CompoundListItem(list, SeparatorOperator::Sequence)] = list.0.as_slice() else {
+            return false;
+        };
+        let [Command::Simple(command)] = list.first.seq.as_slice() else {
+            return false;
+        };
+        list.additional.is_empty()
+            && !list.first.bang
+            && list.first.timed.is_none()
+            && command.prefix.is_none()
+            && command.word_or_name.as_ref().and_then(|word| literal(&word.value)).as_deref()
+                == Some("cat")
+            // The inspection projection omits delimiter quoting. Read that fact
+            // from Brush's AST; never inspect the literal document's contents.
+            && matches!(command.suffix.as_ref().map(|suffix| suffix.0.as_slice()),
+                Some([CommandPrefixOrSuffixItem::IoRedirect(IoRedirect::HereDocument(None | Some(0), document))])
+                    if !document.requires_expansion)
+    }
     fn contains(inspection: &ShellInspection) -> bool {
         if inspection.constructs.is_empty() {
             return false;
@@ -102,11 +135,9 @@ pub(super) fn commit_has_command_substitution(source: &str) -> bool {
                 && command.argv.iter().any(|word| {
                     inspect_shell(&format!(": {word}")).is_ok_and(|word| {
                         word.constructs.iter().any(|construct| {
-                            matches!(
-                                construct.kind,
-                                ShellConstructKind::CommandSubstitution
-                                    | ShellConstructKind::BackquoteSubstitution
-                            )
+                            construct.kind == ShellConstructKind::BackquoteSubstitution
+                                || (construct.kind == ShellConstructKind::CommandSubstitution
+                                    && !literal_heredoc_capture(&construct.body))
                         })
                     })
                 })
@@ -216,6 +247,7 @@ mod tests {
             r#"git commit -m "Extract \`function\` and \$(literal)""#,
             r#"git commit --message='Extract `function`'"#,
             "git commit -F - <<'EOF'\nExtract `function` and $(literal)\nEOF\n",
+            "git commit -m \"$(cat <<'EOF'\nExtract `function`\nEOF\n)\"",
             r#"echo "$(pwd)" && git commit -m 'Extract `function`'"#,
             r#"git log --format="$(printf literal)""#,
             r#"printf '%s' 'git commit -m "Extract `function`"'"#,
@@ -228,9 +260,37 @@ mod tests {
             r#"git -C repo commit -m "Extract `function_name`""#,
             r#"git.exe commit -m "Extract `function_name`""#,
             r#"echo "$(git commit -m "Extract `function_name`")""#,
-            "git commit -m \"$(cat <<'EOF'\nExtract `function`\nEOF\n)\"",
             r#"git commit --author="$(printf author)" -m literal"#,
         ] {
+            assert!(commit_has_command_substitution(source), "{source}");
+        }
+    }
+
+    /// The native Git contract's exact command must also be checked without a
+    /// filesystem or subprocess, including on hosts that cannot run Seatbelt.
+    #[test]
+    fn commit_message_substitution_3296_allows_only_literal_heredoc_capture() {
+        for source in [
+            "cd newt-core && git branch --show-current && git commit -m \"$(cat <<'EOF'\nRefactor fixture\n\nPreserve multiline message semantics.\nLiteral `backticks` and $(printf literal) remain message text.\nEOF\n)\" 2>&1 | tail -5",
+            "git commit -m \"$(cat <<\"DELIM\"\nLiteral `unclosed and $(if)\ngit commit -m \"$(prose)\"\nDELIM\n)\"",
+            "git commit -m \"$(cat <<\\DELIM\nLiteral $(prose)\nDELIM\n)\"",
+            "git commit -m \"$(cat <<-'EOF'\n\tLiteral `backticks`\n\tEOF\n)\"",
+        ] {
+            assert!(needs_commit_broker(source), "{source}");
+            assert!(!commit_has_command_substitution(source), "{source}");
+        }
+        for source in [
+            "git commit -m \"$(cat <<EOF\nExtract `function_name`\nEOF\n)\"",
+            "git commit -m \"$(cat <<EOF\n'$(function_name)'\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nliteral\nEOF\nprintf extra)\"",
+            "git commit -m \"$(cat <<'EOF' | cat\nliteral\nEOF\n)\"",
+            "git commit -m \"$(cat extra <<'EOF'\nliteral\nEOF\n)\"",
+            "git commit -m \"$(ENV=value cat <<'EOF'\nliteral\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF' > output\nliteral\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nliteral\nEOF\n) $(function_name)\"",
+            "git commit -m \"$(cat <<'EOF'\nliteral\nEOF\n) `function_name`\"",
+        ] {
+            assert!(needs_commit_broker(source), "{source}");
             assert!(commit_has_command_substitution(source), "{source}");
         }
     }

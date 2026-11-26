@@ -2900,6 +2900,7 @@ async fn commit_message_substitution_3296_is_refused_before_the_shell_route() {
 }
 
 /// #3296: the governed PR broker already rejects substitutions in either prose field.
+/// Windows refuses the governed route itself before inspecting those fields.
 #[cfg(feature = "confine")]
 #[tokio::test]
 async fn pr_prose_substitution_3296_is_already_refused_before_the_shell_route() {
@@ -2910,7 +2911,13 @@ async fn pr_prose_substitution_3296_is_already_refused_before_the_shell_route() 
         "gh pr create --title literal --body \"Extract $(function_name)\"",
     ] {
         let (result, reached) = shell_route_count(command, None).await;
+        #[cfg(not(windows))]
         assert!(result.contains("substitutions"), "{command}: {result}");
+        #[cfg(windows)]
+        assert!(
+            result.contains("governed push/PR-create is not available under Windows"),
+            "{command}: {result}"
+        );
         assert_eq!(reached, 0, "{command}: {result}");
     }
 }
