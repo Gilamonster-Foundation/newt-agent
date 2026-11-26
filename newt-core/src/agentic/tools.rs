@@ -4914,7 +4914,7 @@ async fn execute_authorized_tool(
                     Ok(output) => {
                         let envelope = serde_json::json!({"exit_code": output.code, "timed_out": output.timed_out, "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr)});
                         let mut text = shell::shell_envelope_output(&envelope, tool_output_lines, color, tool_offload, spill_store, Some(presentation));
-                        if let Some(hint) = worktree::creation_failure_hint(cmd, &envelope) {
+                        if let Some(hint) = worktree::creation_failure_hint(cmd, &envelope, &run_cwd, &current.fs_read) {
                             text.push_str(hint);
                         }
                         (text, shell::envelope_outcome(&envelope))

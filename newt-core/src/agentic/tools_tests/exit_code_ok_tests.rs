@@ -211,7 +211,15 @@ fn confined_with(
     envelope: serde_json::Value,
     caveats: &newt_policy::caveats::Caveats,
 ) -> (String, ExecOutcome) {
-    super::shell::confined_result(cmd, &envelope, caveats, false, render, Default::default())
+    super::shell::confined_result(
+        cmd,
+        "original",
+        &envelope,
+        caveats,
+        false,
+        render,
+        Default::default(),
+    )
 }
 
 fn confined(cmd: &str, envelope: serde_json::Value) -> (String, ExecOutcome) {

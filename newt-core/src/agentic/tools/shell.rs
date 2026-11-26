@@ -1588,7 +1588,9 @@ pub(super) async fn exec_confined_command_with_broker(
                         spill_store,
                         Some(&mut *presentation),
                     );
-                    if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
+                    if let Some(hint) =
+                        super::worktree::creation_failure_hint(cmd, envelope, cwd, &caveats.fs_read)
+                    {
                         text.push_str(hint);
                     }
                     text
@@ -1943,6 +1945,7 @@ async fn exec_bridled(
                                 }
                                 Ok(env2) => confined_result(
                                     cmd,
+                                    cwd,
                                     &env2,
                                     &widened,
                                     color,
@@ -1977,6 +1980,7 @@ async fn exec_bridled(
             }
             confined_result(
                 cmd,
+                cwd,
                 &envelope,
                 caveats,
                 color,
@@ -2054,6 +2058,7 @@ pub(super) fn envelope_outcome(envelope: &serde_json::Value) -> ExecOutcome {
 #[cfg(any(test, feature = "confine"))]
 pub(super) fn confined_result(
     cmd: &str,
+    cwd: &str,
     envelope: &serde_json::Value,
     caveats: &newt_policy::caveats::Caveats,
     color: bool,
@@ -2100,7 +2105,8 @@ pub(super) fn confined_result(
     // this can be rendered as a named denial.
     let outcome = envelope_outcome(envelope);
     let mut text = render(envelope);
-    if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope) {
+    if let Some(hint) = super::worktree::creation_failure_hint(cmd, envelope, cwd, &caveats.fs_read)
+    {
         text.push_str(hint);
     }
     if let Some(note) = absent {

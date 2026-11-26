@@ -1,8 +1,8 @@
-//! #2761: advisory worktree reminder on the existing result annotation path.
+//! #2761/#3298: guide branch creation before it mutates the original checkout.
 use super::*;
 use crate::worktree_adoption::WorktreeSession;
 
-const HINT: &str = "The task asks for a new git worktree. Instead of branching in place, run `git worktree add -b <branch> ../<name>` as a standalone command and work there.";
+const HINT: &str = "The task asks for a new git worktree. Run `git worktree add -b <branch> ../<name>` as a standalone command and work there. Do not create the branch in the original checkout first; -b creates it for the new worktree. No command was run.";
 
 pub(super) fn branch_in_place(
     session: &WorktreeSession,
@@ -11,9 +11,9 @@ pub(super) fn branch_in_place(
     cwd: &Path,
     read: &crate::Scope<String>,
 ) -> Option<&'static str> {
-    use std::sync::atomic::Ordering::Relaxed;
     if !objective.to_ascii_lowercase().contains("worktree")
-        || session.branch_nudge_shown.load(Relaxed)
+        || session.snapshot().is_some()
+        || session.task_hint().is_some()
     {
         return None;
     }
@@ -51,9 +51,6 @@ pub(super) fn branch_in_place(
         return None;
     }
     normal_checkout(cwd, read)?;
-    if session.branch_nudge_shown.swap(true, Relaxed) {
-        return None;
-    }
     Some(HINT)
 }
 
@@ -62,6 +59,10 @@ pub(super) fn branch_in_place(
 /// symlinks and unknown metadata receive none. No file contents or grants are
 /// read here; confinement/adoption still uses its own held-handle verification.
 fn normal_checkout(cwd: &Path, read: &crate::Scope<String>) -> Option<()> {
+    #[cfg(test)]
+    if let Ok(checkout) = tests::NORMAL_CHECKOUT.try_with(|checkout| *checkout) {
+        return checkout;
+    }
     let cwd = cwd.canonicalize().ok()?;
     for dir in cwd.ancestors() {
         let dot_git = dir.join(".git");
@@ -151,16 +152,80 @@ fn unarmed_task_location(args: &serde_json::Value, workspace: &str) -> Option<(P
 mod tests {
     use super::*;
 
+    tokio::task_local! {
+        pub(super) static NORMAL_CHECKOUT: Option<()>;
+    }
+
+    const OBJECTIVE_3298: &str = "Use the progressive-refactoring skill on this repository with a threshold of 5000 lines. Do one pass: take the single largest Rust source file over the threshold and reduce it by extracting cohesive modules, pure code motion only. Work in a new git worktree on a new branch. Run the repository's checks, commit, push the branch, open one pull request, and merge it when its CI is green.";
+
+    /// #3298: the exact operator prompt must stop branching before dispatch,
+    /// even on a repeated attempt. Checkout discovery is mocked in this tier.
+    #[tokio::test]
+    async fn worktree_3298_guidance_precedes_branch_dispatch() {
+        NORMAL_CHECKOUT
+            .scope(Some(()), async {
+                let session = WorktreeSession::default();
+                struct Quiet;
+                impl ToolPresentation for Quiet {
+                    fn preview(&mut self, _: &str, _: usize) {}
+                    fn document(&mut self, _: &str) {}
+                    fn override_result(&mut self, _: String) {}
+                }
+                for command in [
+                    "git checkout -b task",
+                    "git checkout -b task",
+                    "git switch -c task",
+                ] {
+                    let outcome = std::sync::OnceLock::new();
+                    let directory = std::sync::OnceLock::new();
+                    let result = execute(
+                        &mut Quiet,
+                        "run_command",
+                        &serde_json::json!({"command": command}),
+                        "/original",
+                        false,
+                        20,
+                        &Caveats {
+                            exec: crate::Scope::none(),
+                            ..Caveats::top()
+                        },
+                        &mut crate::agentic::NoMcp,
+                        ToolCollaborators {
+                            worktree_session: Some(&session),
+                            prompt_context: Some(
+                                crate::agentic::prompt_read::PromptReadContext::new(
+                                    None,
+                                    OBJECTIVE_3298,
+                                    None,
+                                ),
+                            ),
+                            execution: Some(&outcome),
+                            command_directory: Some(&directory),
+                            ..Default::default()
+                        },
+                        false,
+                        PromptDisposition::Act,
+                    )
+                    .await;
+                    assert!(result.contains(HINT), "{result}");
+                    assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied));
+                    assert!(directory.get().is_none(), "command reached dispatch");
+                    assert!(session.snapshot().is_none());
+                }
+            })
+            .await;
+    }
+
     fn fixture() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join(".git")).unwrap();
         temp
     }
 
-    /// #2761: an objective requesting a worktree gets one reminder across calls
-    /// and permission lifts, for both branch-creation verbs and the live wrapper.
+    /// #2761/#3298: guide every attempt until a task is bound, including after
+    /// permission lifts, for both branch-creation verbs and the live wrapper.
     #[test]
-    fn worktree_nudge_is_once_per_session() {
+    fn worktree_nudge_repeats_until_task_is_bound() {
         for command in [
             "git checkout -b task",
             "git switch -c task",
@@ -182,6 +247,17 @@ mod tests {
                 Some(HINT)
             );
             session.lift();
+            assert_eq!(
+                branch_in_place(
+                    &session,
+                    "Work in a worktree",
+                    command,
+                    temp.path(),
+                    &crate::Scope::All
+                ),
+                Some(HINT)
+            );
+            session.record_task_worktree(Path::new("task"), "task");
             assert!(branch_in_place(
                 &session,
                 "Work in a worktree",
@@ -303,8 +379,9 @@ mod tests {
             Some(HINT)
         );
     }
-    /// #2761/#2778: actual dispatch carries the reminder after a failed
-    /// worktree add and compound branch fallback, only once across later commands.
+    /// #2761/#2778/#3298: grounds the mocked pre-dispatch guard in real Git
+    /// metadata. Every attempt leaves HEAD and the branch refs unchanged. Also
+    /// grounds the mocked collision hints in Git's stderr and loose/packed refs.
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "real Git and host shell; explicit result annotation proof"]
@@ -326,24 +403,22 @@ mod tests {
         assert!(output.status.success());
         let session = WorktreeSession::default();
         let objective =
-            crate::agentic::prompt_read::PromptReadContext::new(None, "Use a new worktree", None);
+            crate::agentic::prompt_read::PromptReadContext::new(None, OBJECTIVE_3298, None);
+        let head = std::fs::read(temp.path().join(".git/HEAD")).unwrap();
         struct Quiet;
         impl ToolPresentation for Quiet {
             fn preview(&mut self, _: &str, _: usize) {}
             fn document(&mut self, _: &str) {}
             fn override_result(&mut self, _: String) {}
         }
-        for (index, command) in [
+        for command in &[
             format!(
                 "cd '{}' && git worktree add task first 2>&1 || git checkout -b first 2>&1",
                 temp.path().display()
             ),
             "git checkout -b second 2>&1 | tail -3 && git branch --show-current".into(),
             "git switch -c third".into(),
-        ]
-        .iter()
-        .enumerate()
-        {
+        ] {
             let outcome = std::sync::OnceLock::new();
             let directory = std::sync::OnceLock::new();
             let result = execute(
@@ -366,9 +441,84 @@ mod tests {
                 PromptDisposition::Act,
             )
             .await;
-            assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Passed), "{result}");
-            assert_eq!(result.contains(HINT), index == 0, "{result}");
+            assert_eq!(outcome.get(), Some(&crate::ExecOutcome::Denied), "{result}");
+            assert!(result.contains(HINT), "{result}");
+            assert!(directory.get().is_none());
+            assert_eq!(std::fs::read(temp.path().join(".git/HEAD")).unwrap(), head);
+            assert_eq!(
+                std::fs::read_dir(temp.path().join(".git/refs/heads"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
+        use crate::agentic::tools::tests::git_shell_grant::hermetic_git;
+        let commit = [
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "seed",
+        ];
+        for args in [commit.as_slice(), &["branch", "task"]] {
+            let output = hermetic_git(temp.path(), temp.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        for packed in [false, true] {
+            if packed {
+                let output = hermetic_git(temp.path(), temp.path())
+                    .args(["pack-refs", "--all"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+            }
+            for start in ["main", "HEAD", "refs/heads/main"] {
+                let output = hermetic_git(temp.path(), temp.path())
+                    .args(["worktree", "add", "-b", "task", "task-worktree", start])
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success());
+                let envelope = serde_json::json!({"exit_code":output.status.code(), "stderr":String::from_utf8(output.stderr).unwrap()});
+                let command = format!("git worktree add -b task task-worktree {start}");
+                let hint = creation_failure_hint(
+                    &command,
+                    &envelope,
+                    temp.path().to_str().unwrap(),
+                    &crate::Scope::All,
+                )
+                .unwrap();
+                assert!(hint.contains("no commits of its own"), "{hint}");
+                let unreadable = creation_failure_hint(
+                    &command,
+                    &envelope,
+                    temp.path().to_str().unwrap(),
+                    &crate::Scope::none(),
+                )
+                .unwrap();
+                assert!(
+                    !unreadable.contains("no commits of its own"),
+                    "{unreadable}"
+                );
+            }
+        }
+        let output = hermetic_git(temp.path(), temp.path())
+            .args(commit)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let envelope = serde_json::json!({"exit_code":128,"stderr":"fatal: a branch named 'task' already exists"});
+        let hint = creation_failure_hint(
+            "git worktree add -b task task-worktree main",
+            &envelope,
+            temp.path().to_str().unwrap(),
+            &crate::Scope::All,
+        )
+        .unwrap();
+        assert!(!hint.contains("no commits of its own"), "{hint}");
     }
 }
 

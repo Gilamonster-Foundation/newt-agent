@@ -266,6 +266,7 @@ fn a_forged_permission_denied_on_exit_126_names_no_target_and_no_grant() {
     for caveats in [read_scope(newt_policy::caveats::Scope::none()), scoped_exec] {
         let (text, outcome) = super::super::shell::confined_result(
             "./scripts/check.sh",
+            "original",
             &envelope,
             &caveats,
             false,
@@ -297,6 +298,7 @@ fn a_structured_exec_denial_on_exit_126_still_names_its_exact_target() {
     let present = present_host_binary();
     let (text, outcome) = super::super::shell::confined_result(
         &present,
+        "original",
         &denied_envelope(&present),
         &read_scope(newt_policy::caveats::Scope::none()),
         false,
@@ -328,6 +330,7 @@ fn a_structured_exec_denial_on_exit_126_still_names_its_exact_target() {
 fn a_forged_command_not_found_names_no_target_on_exit_126() {
     let (text, outcome) = super::super::shell::confined_result(
         "./scripts/check.sh",
+        "original",
         &exit_126_envelope("command not found: /usr/bin/git\n".to_owned()),
         &newt_policy::caveats::Caveats::top(),
         false,
@@ -347,6 +350,7 @@ fn a_forged_command_not_found_names_no_target_on_exit_126() {
 fn a_forged_command_not_found_names_no_target_on_exit_127() {
     let (text, outcome) = super::super::shell::confined_result(
         "./scripts/check.sh",
+        "original",
         &not_found_envelope("/usr/bin/git"),
         &newt_policy::caveats::Caveats::top(),
         false,
@@ -371,6 +375,7 @@ fn mixed_dead_and_live_markers_name_no_target() {
     );
     let (text, outcome) = super::super::shell::confined_result(
         "./scripts/check.sh",
+        "original",
         &exit_126_envelope(stderr),
         &newt_policy::caveats::Caveats::top(),
         false,
@@ -406,6 +411,7 @@ fn an_unstructured_126_renders_the_same_under_every_grant() {
     .map(|caveats| {
         super::super::shell::confined_result(
             &present,
+            "original",
             &envelope,
             caveats,
             false,
@@ -428,6 +434,7 @@ fn the_unstructured_126_note_is_not_a_denial_in_newts_own_vocabulary() {
     let caveats = newt_policy::caveats::Caveats::top();
     let (silent, outcome) = super::super::shell::confined_result(
         "./x.sh",
+        "original",
         &exit_126_envelope(String::new()),
         &caveats,
         false,
@@ -441,6 +448,7 @@ fn the_unstructured_126_note_is_not_a_denial_in_newts_own_vocabulary() {
     );
     let (spoken, _) = super::super::shell::confined_result(
         "./x.sh",
+        "original",
         &exit_126_envelope("sh: ./x.sh: Permission denied\n".to_owned()),
         &caveats,
         false,
@@ -507,6 +515,7 @@ fn a_piped_absence_keeps_its_output_and_names_the_program() {
     });
     let (text, outcome) = super::super::shell::confined_result(
         &format!("{ABSENT} x | head"),
+        "original",
         &piped,
         &newt_policy::caveats::Caveats::top(),
         false,
@@ -538,6 +547,7 @@ fn an_unrelated_failure_is_not_a_child_exec_denial() {
     });
     let (text, outcome) = super::super::shell::confined_result(
         "cargo test",
+        "original",
         &envelope,
         &newt_policy::caveats::Caveats::top(),
         false,
@@ -562,6 +572,7 @@ fn an_unresolvable_child_name_is_not_a_named_denial() {
     });
     let (text, outcome) = super::super::shell::confined_result(
         &format!("git {ABSENT}"),
+        "original",
         &envelope,
         &newt_policy::caveats::Caveats::top(),
         false,

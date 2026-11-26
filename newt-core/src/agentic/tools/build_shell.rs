@@ -219,6 +219,7 @@ pub(super) async fn execute(
     {
         Ok(envelope) => shell::confined_result(
             source,
+            &cwd.to_string_lossy(),
             &envelope,
             build,
             color,

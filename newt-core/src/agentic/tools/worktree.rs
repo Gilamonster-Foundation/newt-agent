@@ -26,6 +26,8 @@ fn worktree_add_args(words: &[String]) -> Option<&[String]> {
 pub(super) fn creation_failure_hint(
     source: &str,
     envelope: &serde_json::Value,
+    cwd: &str,
+    read: &crate::Scope<String>,
 ) -> Option<&'static str> {
     if shell::envelope_outcome(envelope) != crate::ExecOutcome::Failed {
         return None;
@@ -34,8 +36,9 @@ pub(super) fn creation_failure_hint(
     // Admission allows only -C before the subcommand, not config overrides.
     let mut global = words.iter().skip(1);
     let mut word = global.next()?;
+    let mut cwd = PathBuf::from(cwd);
     while word == "-C" {
-        global.next()?;
+        cwd = cwd.join(global.next()?);
         word = global.next()?;
     }
     if word != "worktree" {
@@ -57,10 +60,52 @@ pub(super) fn creation_failure_hint(
     if args.len() == 2 && stderr.lines().any(|line| line == invalid_reference) {
         return Some("\nWorktree hint: To create a new branch for the worktree, use `git worktree add -b <name> <path>`.");
     }
+    let already_exists = format!("fatal: a branch named '{branch}' already exists");
+    if args.first() == Some(&"-b") && stderr.lines().any(|line| line == already_exists) {
+        let start = args.get(3).copied().unwrap_or("HEAD");
+        if revision_oid(&cwd, &format!("refs/heads/{branch}"), read)
+            .is_some_and(|oid| revision_oid(&cwd, start, read).as_ref() == Some(&oid))
+        {
+            return Some("\nWorktree hint: the existing branch equals the start point and has no commits of its own relative to it. Use `git worktree add <path> <branch>` without `-b` to attach it. If it is checked out in the original checkout, switch the original back with `git switch -` first.");
+        }
+        return Some("\nWorktree hint: the branch already exists; equality with the start point was not established. Preserve it and choose a new branch name for `git worktree add -b <new-branch> <path> [<start>]`. Do not create the branch in the original checkout first; -b creates it for the new worktree.");
+    }
     let prefix = format!("fatal: '{branch}' is already used by worktree at ");
     stderr.lines().any(|line| line.starts_with(&prefix)).then_some(
-        "\nWorktree hint: if you switched the original to that branch, switch it back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command."
+        "\nWorktree hint: if you switched the original to that branch, switch it back with `git switch -`. To create a new task branch, pick a new branch name and run `git worktree add -b <new-branch> <path> [<start>]` as a standalone command. Do not create the branch in the original checkout first; -b creates it for the new worktree."
     )
+}
+
+/// Advisory ref reads reuse the broker's scoped, symlink-safe metadata readers.
+/// Unsupported revision expressions remain unknown; no Git subprocess is run.
+fn revision_oid(cwd: &Path, revision: &str, read: &crate::Scope<String>) -> Option<String> {
+    #[cfg(test)]
+    if let Ok(oid) = invalid_reference_tests::REFS
+        .try_with(|refs| refs.get(&(cwd.to_owned(), revision.to_owned())).cloned())
+    {
+        return oid;
+    }
+    use crate::git_staging::{
+        discover_git_dirs, is_hex_oid, read_branch_oid, read_head_branch, HeldRoots,
+    };
+    let held = HeldRoots::bind(read).ok()?;
+    let (common, admin) = discover_git_dirs(cwd, &held).ok()?;
+    if revision == "HEAD" {
+        let head = held.read_to_string(&admin, Path::new("HEAD")).ok()??;
+        if is_hex_oid(head.trim()) {
+            return Some(head.trim().to_owned());
+        }
+        return read_branch_oid(&common, &read_head_branch(&admin, &held).ok()?, &held).ok();
+    }
+    if is_hex_oid(revision) {
+        return Some(revision.to_owned());
+    }
+    read_branch_oid(
+        &common,
+        revision.strip_prefix("refs/heads/").unwrap_or(revision),
+        &held,
+    )
+    .ok()
 }
 
 /// Literal standalone Git argv, shared by advisory notices and task recording.
@@ -584,6 +629,33 @@ pub(super) async fn execute(
             return error;
         }
     };
+    // #3298: a post-success reminder is too late to protect the original branch.
+    if name == "run_command" {
+        if let (Some(session), Some(objective), Some(raw)) = (
+            session,
+            objective,
+            normalized.get("command").and_then(|value| value.as_str()),
+        ) {
+            let (cd, command) = shell::split_leading_cd(raw);
+            let base = shell::resolve_exec_cwd(
+                workspace,
+                normalized.get("cwd").and_then(|value| value.as_str()),
+            );
+            let cwd = PathBuf::from(shell::resolve_exec_cwd(&base, cd.as_deref()));
+            if let Some(hint) =
+                nudge::branch_in_place(session, objective, &command, &cwd, &caveats.fs_read)
+            {
+                if let Some(invocation) = collab.invocation {
+                    invocation.host();
+                }
+                if let Some(slot) = collab.execution {
+                    let _ = slot.set(crate::ExecOutcome::Denied);
+                }
+                presentation.preview(hint, 0);
+                return hint.into();
+            }
+        }
+    }
     // Announce only an implicit task default, never an explicit cwd/dir/cd.
     // Keep the path chosen for this call; the inner dispatcher receives the
     // same projected args, rather than independently choosing another root.
@@ -818,30 +890,6 @@ pub(super) async fn execute(
             result.push_str(&format!("\n{notice}"));
         }
     }
-    if name == "run_command"
-        && execution.and_then(|slot| slot.get()) == Some(&crate::ExecOutcome::Passed)
-    {
-        if let (Some(session), Some(objective), Some(raw)) = (
-            session,
-            objective,
-            normalized.get("command").and_then(|value| value.as_str()),
-        ) {
-            let (cd, command) = shell::split_leading_cd(raw);
-            let base = shell::resolve_exec_cwd(
-                workspace,
-                normalized.get("cwd").and_then(|value| value.as_str()),
-            );
-            let fallback = PathBuf::from(shell::resolve_exec_cwd(&base, cd.as_deref()));
-            let cwd = command_directory
-                .and_then(|slot| slot.get())
-                .unwrap_or(&fallback);
-            if let Some(hint) =
-                nudge::branch_in_place(session, objective, &command, cwd, &caveats.fs_read)
-            {
-                result.push_str(&format!("\n{hint}"));
-            }
-        }
-    }
     // This describes launch policy, not verified creation success. Recognition
     // is text-only so even unsupported platforms never enter the verifier.
     if bypass
@@ -972,6 +1020,107 @@ mod sibling_tests;
 mod invalid_reference_tests {
     use super::*;
 
+    tokio::task_local! {
+        pub(super) static REFS: std::collections::HashMap<(PathBuf, String), String>;
+    }
+
+    #[test]
+    fn worktree_3298_existing_branch_at_start_gets_attach_guidance() {
+        let failure = serde_json::json!({"exit_code":128,"stderr":"fatal: a branch named 'task' already exists"});
+        for (command, cwd, start) in [
+            ("git worktree add -b task ../task main", "original", "main"),
+            ("git worktree add -b task ../task", "original", "HEAD"),
+            (
+                "git -C child worktree add -b task ../task main",
+                "original/child",
+                "main",
+            ),
+        ] {
+            for tip in [Some("a"), Some("b"), None] {
+                let mut refs = std::collections::HashMap::from([(
+                    (PathBuf::from(cwd), "refs/heads/task".into()),
+                    "a".repeat(40),
+                )]);
+                if let Some(tip) = tip {
+                    refs.insert((PathBuf::from(cwd), start.into()), tip.repeat(40));
+                }
+                REFS.sync_scope(refs, || {
+                    let (text, outcome) = shell::confined_result(
+                        command,
+                        "original",
+                        &failure,
+                        &Caveats::top(),
+                        false,
+                        |_| String::new(),
+                        Default::default(),
+                    );
+                    assert_eq!(outcome, crate::ExecOutcome::Failed);
+                    assert!(text.contains("Worktree hint:"), "{text}");
+                    for phrase in [
+                        "no commits of its own",
+                        "git worktree add <path> <branch>",
+                        "without `-b`",
+                    ] {
+                        assert_eq!(text.contains(phrase), tip == Some("a"), "{text}");
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn worktree_3298_existing_branch_hint_requires_matching_failed_stderr() {
+        let command = "git worktree add -b task ../task main";
+        let fatal = "fatal: a branch named 'task' already exists";
+        for (source, envelope) in [
+            (command, serde_json::json!({"exit_code":0,"stderr":fatal})),
+            (command, serde_json::json!({"exit_code":128,"stdout":fatal})),
+            (
+                command,
+                serde_json::json!({"exit_code":128,"stderr":fatal,"denied":true}),
+            ),
+            (
+                command,
+                serde_json::json!({"exit_code":128,"stderr":fatal,"timed_out":true}),
+            ),
+            (
+                command,
+                serde_json::json!({"exit_code":128,"stderr":"fatal: a branch named 'other' already exists"}),
+            ),
+            (
+                "echo fake; git worktree add -b task ../task main",
+                serde_json::json!({"exit_code":128,"stderr":fatal}),
+            ),
+            (
+                "git worktree add -B task ../task main",
+                serde_json::json!({"exit_code":128,"stderr":fatal}),
+            ),
+        ] {
+            REFS.sync_scope(Default::default(), || {
+                assert!(creation_failure_hint(
+                    source,
+                    &envelope,
+                    "original",
+                    &crate::Scope::none()
+                )
+                .is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn worktree_3298_already_used_guidance_teaches_branch_at_creation() {
+        let hint = creation_failure_hint(
+            "git worktree add ../task main",
+            &serde_json::json!({"exit_code":128,"stderr":"fatal: 'main' is already used by worktree at 'original'"}),
+                "original", &crate::Scope::none(),
+        ).expect("worktree guidance");
+        assert!(
+            hint.contains("Do not create the branch in the original checkout first"),
+            "{hint}"
+        );
+    }
+
     /// #2778: only the missing explicit branch of worktree add gets -b advice.
     #[test]
     fn worktree_invalid_reference_2778_requires_matching_git_failure() {
@@ -982,7 +1131,12 @@ mod invalid_reference_tests {
             "git -C repo worktree add '../task path' task",
         ] {
             assert_eq!(
-                creation_failure_hint(command, &failed("fatal: invalid reference: task\r\n")),
+                creation_failure_hint(
+                    command,
+                    &failed("fatal: invalid reference: task\r\n"),
+                    "original",
+                    &crate::Scope::none()
+                ),
                 Some(hint)
             );
         }
@@ -1029,7 +1183,8 @@ mod invalid_reference_tests {
             ),
         ] {
             assert!(
-                creation_failure_hint(command, &envelope).is_none(),
+                creation_failure_hint(command, &envelope, "original", &crate::Scope::none())
+                    .is_none(),
                 "{command}: {envelope}"
             );
         }
