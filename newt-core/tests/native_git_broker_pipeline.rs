@@ -647,6 +647,12 @@ mod native {
              `ExecOrigin::BrokerMediated`, or a revert to `AgentInfluenced`, in \
              native_git_broker.rs: {out}"
         );
+        // Grounds the mocked build-only mechanism selection: Git also holds
+        // an execution lease, but must retain its original deny-all floor.
+        assert!(
+            !out.contains("Build network:"),
+            "Git entered the build network lane: {out}"
+        );
 
         // #2720: full access must never turn a failed signer into an unsigned commit.
         if signing_required {

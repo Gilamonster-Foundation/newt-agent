@@ -51,3 +51,67 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
     #[cfg(not(target_os = "macos"))]
     policy
 }
+
+/// The build-only network floor, shared by argv and shell build execution.
+/// A real network grant and every non-Linux backend retain existing behavior.
+pub(crate) fn build_sandbox_policy(network: &crate::Scope<String>) -> agent_bridle::SandboxPolicy {
+    let mut policy = runtime_sandbox_policy();
+    if cfg!(target_os = "linux") && *network == crate::Scope::none() {
+        policy.child_network = agent_bridle::ChildNetworkPolicy::PrivateLoopback;
+    }
+    policy
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::confined_exec::{ExecOrigin, ExecRequest, NetGrant};
+    use crate::{Caveats, Scope};
+    use agent_bridle::ChildNetworkPolicy::{DenyDirect, PrivateLoopback};
+
+    /// Pure prepared-request policy: no toolchain discovery or real resources.
+    /// The real build-network probes ground the builder and both spawn routes.
+    #[test]
+    fn private_loopback_is_exclusive_to_deny_all_builds() {
+        for network in [
+            Scope::none(),
+            Scope::only(["example.test".into()]),
+            Scope::All,
+        ] {
+            let net = newt_policy::caveats::spawn_net_scope(&network);
+            let mut request = ExecRequest::new(
+                ExecOrigin::AgentInfluenced,
+                "cargo",
+                ["test"],
+                "/workspace",
+                Caveats {
+                    net,
+                    ..Caveats::top()
+                },
+            )
+            .net_grant(NetGrant::DenyAll);
+            assert_eq!(
+                request.sandbox_policy().child_network,
+                DenyDirect,
+                "ordinary shell/git requests"
+            );
+            request.private_build_network = true;
+            assert_eq!(
+                request.sandbox_policy().child_network,
+                if network == Scope::All {
+                    DenyDirect
+                } else {
+                    PrivateLoopback
+                }
+            );
+            assert_eq!(
+                request
+                    .net_grant(NetGrant::Unrestricted)
+                    .sandbox_policy()
+                    .child_network,
+                DenyDirect
+            );
+        }
+        assert_eq!(runtime_sandbox_policy().child_network, DenyDirect);
+    }
+}

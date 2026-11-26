@@ -135,3 +135,18 @@ payload as one optional field. Broker preparation and this substitution share
 one `rebuild_command` so neither drops argv[0], the environment, the working
 directory or a descriptor delegation. Retire this section if the mechanism is
 upstreamed.
+
+## Build network diagnostic (#3297)
+
+The supervisor retains the bounded `Build network:` pre-exec diagnostic alongside
+the authenticated worker transcript. This reports private-loopback versus deny-all
+fallback to the operator and model without adding a worker protocol field or
+using a diagnostic as authority. The worker's authenticated terminal outcome
+remains authoritative.
+
+With agent-bridle#527's obsolete user-namespace refusal removed in core, the
+filesystem-restricted Brush worker reaches the same private-loopback pre-exec
+hook as argv builds. A successful namespace is supported by the existing
+authenticated worker transport; no fallback-only assumption or namespace syscall
+backstop is introduced. Newt's real build-pipeline harness can require private
+mode and can independently force setup failure to prove the deny-all retry.

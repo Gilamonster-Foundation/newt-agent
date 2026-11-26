@@ -86,7 +86,7 @@ mod executor;
 #[cfg(not(feature = "confine"))]
 mod executor_off;
 #[cfg(feature = "confine")]
-mod sandbox_policy;
+pub(crate) mod sandbox_policy;
 
 #[cfg(feature = "confine")]
 pub use executor::{
@@ -141,7 +141,9 @@ pub enum NetGrant {
     ///
     /// * **Linux** — the child is wrapped in `newt-net-guard`, which installs
     ///   the seccomp `socket()`-family deny (TCP/UDP/DNS/raw) *in addition to*
-    ///   the inherited Landlock fs fence.
+    ///   the inherited Landlock fs fence. Deny-all build requests instead
+    ///   establish private loopback together with the filesystem fence before
+    ///   this helper runs, retaining both denials if namespace setup fails.
     /// * **macOS** — the child's `net` caveat is narrowed to deny-all. Seatbelt
     ///   must supply Bridle's kernel network witness for the audited pipe/null,
     ///   unprivileged launch shape. Missing backend or witness refuses before
@@ -176,6 +178,8 @@ pub struct ExecRequest {
     env: Vec<(String, String)>,
     /// The kernel network floor (see [`NetGrant`]).
     net_grant: NetGrant,
+    /// Only build_tool_request may select the private-loopback mechanism.
+    private_build_network: bool,
     /// Explicit path to the `newt-net-guard` wrapper (tests set this; production
     /// resolves it next to the running executable). Only consulted for
     /// [`NetGrant::DenyAll`].
@@ -214,6 +218,7 @@ impl ExecRequest {
             env: Vec::new(),
             timeout: None,
             net_grant: NetGrant::Unrestricted,
+            private_build_network: false,
             net_guard_bin: None,
             scratch_dirs: Vec::new(),
             held_read_roots: Vec::new(),
@@ -267,6 +272,15 @@ impl ExecRequest {
     #[cfg(feature = "confine")]
     pub(crate) fn build_held_read_roots(&self) -> Vec<crate::sandbox_seam::HeldReadRoot> {
         self.held_read_roots.clone()
+    }
+
+    #[cfg(feature = "confine")]
+    pub(crate) fn sandbox_policy(&self) -> agent_bridle::SandboxPolicy {
+        if self.private_build_network && self.net_grant == NetGrant::DenyAll {
+            sandbox_policy::build_sandbox_policy(&self.caveats.net)
+        } else {
+            runtime_sandbox_policy()
+        }
     }
 
     /// Give the run a private scratch `dir`: created just before spawning
@@ -649,7 +663,7 @@ pub fn build_tool_request(
     } else {
         NetGrant::Unrestricted
     };
-    toolchain_request(
+    let mut request = toolchain_request(
         ExecOrigin::AgentInfluenced,
         workspace,
         cwd,
@@ -658,7 +672,9 @@ pub fn build_tool_request(
         caveats,
     )
     .net_grant(net_grant)
-    .env("CARGO_NET_OFFLINE", "true")
+    .env("CARGO_NET_OFFLINE", "true");
+    request.private_build_network = true;
+    request
 }
 
 /// A build's unique temporary directory under a private managed base outside

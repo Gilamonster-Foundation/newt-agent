@@ -162,6 +162,10 @@ pub enum ChildNetworkPolicy {
     /// safe `seccompiler` install path); on other platforms it is inert, so a
     /// caller that *requires* it must fail closed via `backends.require_landlock`.
     DenyDirect,
+    /// Build-only floor: private user/network namespaces with loopback up, or
+    /// the existing DenyDirect floor if any namespace setup step fails. The
+    /// filesystem fence is installed in the child after namespace setup.
+    PrivateLoopback,
 }
 
 /// Sandbox path lists + ABI floors (`sandbox.rs` constants).

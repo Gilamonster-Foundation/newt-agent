@@ -1361,7 +1361,7 @@ fn lifecycle_build_request(
         tool: "lifecycle".into(),
         kind: DenialKind::Build,
         target: workspace.into(),
-        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nWrites within the workspace and its build scratch directory; {network}. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
+        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nNetwork mode: {network}.\nWrites within the workspace and its build scratch directory. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
         harness_bound: false,
     }
 }
@@ -1385,6 +1385,8 @@ fn build_authorized(
 fn build_network_description(network: &crate::Scope<String>) -> &'static str {
     match network {
         crate::Scope::All => "network allowed by the existing operator grant",
+        crate::Scope::Only(hosts) if hosts.is_empty() && cfg!(target_os = "linux") =>
+            "private loopback when namespace setup succeeds; otherwise network denied (deny-all fallback, including loopback); effective mode reported at execution",
         crate::Scope::Only(hosts) if hosts.is_empty() => "network denied",
         crate::Scope::Only(_) => "network limited to the existing operator grant",
     }
@@ -1576,6 +1578,7 @@ fn render_confined_build_result(
     spill_store: Option<&dyn super::content_spill::SpillStore>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
+    let mut network_note = None;
     let (mut text, outcome) = match run {
         Ok(out) => {
             // The build's own exit code (`out.code`) is untouched by `trim` —
@@ -1584,12 +1587,22 @@ fn render_confined_build_result(
             // exists to avoid).
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
+            network_note = stderr
+                .lines()
+                .find(|line| line.starts_with("Build network: "))
+                .map(str::to_owned);
             let view = trim.map(|trim| trim.apply(&stdout, &stderr));
             // #2731: the terminal override is installed inside the renderer.
             // Include recovery there, not only in the returned model text.
-            let recovery_view = fetch_note.map(|note| {
-                let selected = view.clone().unwrap_or_else(|| format!("{stdout}{stderr}"));
-                format!("{selected}\n{note}")
+            let recovery_view = (fetch_note.is_some() || network_note.is_some()).then(|| {
+                let mut selected = view.clone().unwrap_or_else(|| format!("{stdout}{stderr}"));
+                for note in fetch_note.into_iter().chain(network_note.as_deref()) {
+                    if !selected.contains(note) {
+                        selected.push('\n');
+                        selected.push_str(note);
+                    }
+                }
+                selected
             });
             let envelope = serde_json::json!({
                 "exit_code": out.code,
@@ -1612,9 +1625,13 @@ fn render_confined_build_result(
         }
         Err(error) => (format!("error: {error}"), crate::ExecOutcome::Unavailable),
     };
-    if let Some(note) = fetch_note.filter(|note| !text.contains(note)) {
-        text.push('\n');
-        text.push_str(note);
+    // Keep recovery and the effective network mode outside the model's output
+    // cap as well: a failed mock server must not lose its fence diagnostic.
+    for note in fetch_note.into_iter().chain(network_note.as_deref()) {
+        if !text.contains(note) {
+            text.push('\n');
+            text.push_str(note);
+        }
     }
     (text, outcome)
 }

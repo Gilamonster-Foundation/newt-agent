@@ -25,6 +25,11 @@
 //! ACTIVE `local-deputy-egress` deviation and closed only by the deferred netns /
 //! mediated-egress floor (#1599). The direct-socket floor here still stands: no
 //! `AF_INET`/`AF_INET6`/`AF_PACKET` socket can be created.
+//!
+//! Deny-all builds select their network floor together with Landlock before
+//! this helper executes: private loopback in a fresh network namespace, or
+//! both existing denials on setup failure. The internal inherited-build path
+//! preserves that already-installed floor. Other lanes keep this family deny.
 
 /// Whether the seccomp egress-deny floor can be built and installed on this
 /// platform. Linux-only; elsewhere the confined executor fails closed before a
@@ -216,8 +221,15 @@ mod linux {
         // pathname confinement, so drop it before the program can observe it.
         close_inherited_fds();
 
-        // Install the seccomp egress-deny floor on this soon-to-exec process.
-        if let Err(e) = install_egress_deny() {
+        // Build spawns already installed their network floor atomically with
+        // Landlock in the child: either a private loopback namespace or the
+        // original deny-all filters. Reinstalling a family denial here would
+        // destroy loopback in the successful namespace. This internal selector
+        // is supplied only by the build spawn path, never from model argv/env.
+        let inherited_build = args.peek().is_some_and(|a| a == "--inherit-build-network");
+        if inherited_build {
+            args.next();
+        } else if let Err(e) = install_egress_deny() {
             eprintln!("newt-net-guard: seccomp install failed (fail-closed): {e}");
             std::process::exit(120);
         }

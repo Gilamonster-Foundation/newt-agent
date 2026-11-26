@@ -966,6 +966,7 @@ fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
 #[cfg(feature = "confine")]
 fn bridle_registry(
     engine: crate::ShellEngine,
+    policy: agent_bridle::SandboxPolicy,
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     wall: std::time::Duration,
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
@@ -979,7 +980,7 @@ fn bridle_registry(
         crate::ShellEngine::SafeSubset => {
             // F20: the wall rides on the limits — see `shell_limits`.
             let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
-                .with_sandbox_policy(b1_run_command_sandbox_policy())
+                .with_sandbox_policy(policy.clone())
                 .with_held_read_roots(held_read_roots.clone());
             if let Some(lease) = execution_lease {
                 tool = tool.with_execution_lease(lease);
@@ -992,7 +993,7 @@ fn bridle_registry(
         crate::ShellEngine::Host => {
             let mut tool = agent_bridle::HostShellTool::new()
                 .with_timeout(wall)
-                .sandbox_policy(Arc::new(b1_run_command_sandbox_policy()))
+                .sandbox_policy(Arc::new(policy.clone()))
                 .with_held_read_roots(held_read_roots.clone());
             if let Some(lease) = execution_lease {
                 tool = tool.with_execution_lease(lease);
@@ -1011,7 +1012,7 @@ fn bridle_registry(
             #[cfg(test)]
             let shell = {
                 let mut tool = agent_bridle::ShellTool::with_config(shell_limits(wall))
-                    .with_sandbox_policy(b1_run_command_sandbox_policy())
+                    .with_sandbox_policy(policy.clone())
                     .with_held_read_roots(held_read_roots.clone());
                 if let Some(lease) = execution_lease {
                     tool = tool.with_execution_lease(lease);
@@ -1030,7 +1031,7 @@ fn bridle_registry(
                     .with_max_output_bytes(shell_limits(wall).max_output_bytes)
                     .expect("shared shell output limit fits Brush protocol bounds")
                     .with_timeout(wall)
-                    .with_sandbox_policy(Arc::new(b1_run_command_sandbox_policy()))
+                    .with_sandbox_policy(Arc::new(policy.clone()))
                     .with_held_read_roots(held_read_roots.clone());
                 if let Some(lease) = execution_lease {
                     tool = tool.with_execution_lease(lease);
@@ -1147,7 +1148,18 @@ pub(super) async fn dispatch_bridled_shell(
         args.get("timeout_secs").and_then(serde_json::Value::as_u64),
         Default::default(),
     );
-    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None, Vec::new(), wall).await
+    dispatch_bridled_shell_with_floor(
+        args,
+        caveats,
+        sink,
+        None,
+        None,
+        None,
+        Vec::new(),
+        wall,
+        None,
+    )
+    .await
 }
 
 /// A prepared build keeps the native build executor's strength floor while
@@ -1180,6 +1192,9 @@ pub(super) async fn dispatch_bridled_build_shell(
         command_broker,
         request.build_held_read_roots(),
         wall,
+        Some(crate::confined_exec::sandbox_policy::build_sandbox_policy(
+            &request.caveats().net,
+        )),
     )
     .await
 }
@@ -1195,6 +1210,7 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     wall: std::time::Duration,
+    sandbox_policy: Option<agent_bridle::SandboxPolicy>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     if let Some(denied) = descendant_exec_denial(
         args.get("cmd")
@@ -1251,8 +1267,13 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     ) else {
         unreachable!("bridled dispatch cannot bypass confinement")
     };
+    // A lease also belongs to native Git recovery. Only the explicit build
+    // entry point supplies a build network policy; ordinary shell/Git retain
+    // their existing floor regardless of resource ownership.
+    let policy = sandbox_policy.unwrap_or_else(b1_run_command_sandbox_policy);
     let registry = bridle_registry(
         engine,
+        policy,
         live.as_ref().map(LiveOutputSession::relay),
         wall,
         held_read_roots,
@@ -1775,6 +1796,7 @@ async fn exec_bridled(
                 command_broker.clone(),
                 Vec::new(),
                 command_wall(cmd, timeout_secs, command_budget),
+                None,
             )
             .await
         }
@@ -1926,6 +1948,7 @@ async fn exec_bridled(
                                 command_broker,
                                 Vec::new(),
                                 command_wall(cmd, timeout_secs, command_budget),
+                                None,
                             )
                             .await
                             {
@@ -3940,6 +3963,7 @@ mod bridle_registry_tests {
     fn bridle_registry_registers_only_the_shell_tool() {
         let registry = bridle_registry(
             crate::ShellEngine::SafeSubset,
+            b1_run_command_sandbox_policy(),
             None,
             std::time::Duration::from_secs(1),
             Vec::new(),

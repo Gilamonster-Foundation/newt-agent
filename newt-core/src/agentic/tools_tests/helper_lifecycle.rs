@@ -649,6 +649,13 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     assert_eq!(request.target, "/ws");
     assert!(request.reason.contains("cargo test --offline"));
     assert!(request.reason.contains("network denied"));
+    assert!(request.reason.contains("Network mode:"));
+    if cfg!(target_os = "linux") {
+        assert!(request.reason.contains("private loopback"));
+        assert!(request
+            .reason
+            .contains("deny-all fallback, including loopback"));
+    }
     assert!(
         !request.reason.contains("escalation"),
         "a direct action=build call names no escalation: {}",
@@ -748,37 +755,43 @@ fn cold_cache_recovery_is_visible_to_model_and_operator() {
             self.0 = text;
         }
     }
-    for trim in [
-        None,
-        OutputTrim::from_json(Some(&serde_json::json!({"mode":"head","n":1}))),
-    ] {
-        let mut display = Display::default();
-        let out = crate::confined_exec::ConfinedOutput {
-            success: false,
-            code: Some(101),
-            stdout: b"build header\n".to_vec(),
-            stderr: b"error: cache missing\n".to_vec(),
-            timed_out: false,
-            sandbox_kind: crate::sandbox_seam::SandboxKind::None,
-        };
-        let note = "note: automatic locked fetch was declined by the operator";
-        let (model, outcome) = render_confined_build_result(
-            Ok(out),
-            Some(note),
-            trim,
-            10,
-            false,
-            false,
+    let recovery = "note: automatic locked fetch was declined by the operator";
+    let network = "Build network: deny-all fallback; loopback unavailable";
+    for (fetch_note, stderr_note, note) in
+        [(Some(recovery), "", recovery), (None, network, network)]
+    {
+        for trim in [
             None,
-            &mut display,
-        );
-        assert_eq!(model.matches(note).count(), 1);
-        assert_eq!(outcome, crate::ExecOutcome::Failed);
-        assert!(
-            display.0.contains(note),
-            "operator missed recovery: {}",
-            display.0
-        );
+            OutputTrim::from_json(Some(&serde_json::json!({"mode":"head","n":1}))),
+            OutputTrim::from_json(Some(&serde_json::json!({"mode":"tail","n":1}))),
+        ] {
+            let mut display = Display::default();
+            let out = crate::confined_exec::ConfinedOutput {
+                success: false,
+                code: Some(101),
+                stdout: b"build header\n".to_vec(),
+                stderr: format!("{stderr_note}\nerror: fixture failed\n").into_bytes(),
+                timed_out: false,
+                sandbox_kind: crate::sandbox_seam::SandboxKind::None,
+            };
+            let (model, outcome) = render_confined_build_result(
+                Ok(out),
+                fetch_note,
+                trim,
+                10,
+                false,
+                false,
+                None,
+                &mut display,
+            );
+            assert_eq!(model.matches(note).count(), 1);
+            assert_eq!(outcome, crate::ExecOutcome::Failed);
+            assert!(
+                display.0.contains(note),
+                "operator missed recovery: {}",
+                display.0
+            );
+        }
     }
 }
 

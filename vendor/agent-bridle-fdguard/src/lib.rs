@@ -347,3 +347,8 @@ mod delegated_control_tests {
         assert!(file.metadata().is_ok());
     }
 }
+
+// Build-only namespace setup must precede Landlock, in the single-threaded
+// fork child. Keep its raw syscalls in the existing unsafe boundary.
+#[cfg(target_os = "linux")]
+pub mod build_network;

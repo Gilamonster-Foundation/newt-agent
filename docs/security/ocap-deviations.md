@@ -204,8 +204,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** a confined attacker-exec child cannot cause network egress by ANY path —
   neither a direct off-box socket NOR an indirect relay through an ambient local deputy (a host
   process reachable over local IPC that performs network on the child's behalf).
-- **Practical caveat (now):** the DIRECT half is enforced — the seccomp floor denies
-  `socket(AF_INET/AF_INET6/AF_PACKET)` on every live path. The INDIRECT half is NOT: the floor
+- **Practical caveat (now):** the ordinary DenyDirect floor enforces the DIRECT half by denying
+  `socket(AF_INET/AF_INET6/AF_PACKET)`. The INDIRECT half is NOT enforced: the floor
   deliberately allows `AF_UNIX`, and Landlock's `AccessFs` rights include no unix-socket-connect
   right, so a confined child can `connect()` to ANY host AF_UNIX socket it can address — BOTH pathname
   (outside the fs fence) AND abstract-namespace. Proven by `af_unix_deputy.rs` (control: an
@@ -216,8 +216,15 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves the child can send a payload to the
   pipe and cause the host deputy to relay over loopback. If a network-relaying local deputy is
   reachable (e.g. an exposed container-runtime socket or pipe), indirect egress is possible.
-- **Residual:** 🟠 REACHABLE — this is exactly why the public claim is "direct AF_INET/AF_INET6/
-  AF_PACKET socket creation is denied", NOT "hostile code cannot exfiltrate over the network".
+- **Build-only exception (#3297):** deny-all Linux builds attempt a private user/network namespace
+  before installing their fences. Success allows AF_INET/AF_INET6 within that namespace, initially
+  containing only loopback, without a host interface or external route; AF_PACKET and io_uring stay
+  denied. Host abstract Unix sockets are isolated too, but pathname Unix deputies remain reachable.
+  The descriptor guard closes ambient inherited sockets in either mode. Failed namespace setup
+  retries in a fresh child with the original DenyDirect floor and its existing IPC limitations.
+  This narrows the build route's abstract-socket surface; it does not close this deviation.
+- **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
+  denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable
   `run_command` / build_check / crew paths, not a gated capability: there is no fail-closed toggle
   (the child runs with the incomplete confinement). It is therefore honestly **ACTIVE**, not

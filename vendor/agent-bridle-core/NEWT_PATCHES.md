@@ -228,3 +228,33 @@ Run the excluded vendor crates through their own manifests, with Cargo path
 patches for this core and `agent-bridle-fdguard`; the workspace patch table does
 not apply to standalone vendor tests. Retire this section when the vendor base
 includes #527.
+
+## Confined build private loopback (#3297)
+
+`ChildNetworkPolicy::PrivateLoopback` is selected only by Newt's deny-all build
+requests. The existing Landlock rule builder prepares both full filesystem
+rulesets before fork: one with the original TCP deny and one without it. The
+existing fdguard seam creates a user/network namespace and brings up loopback
+before installing the chosen rules and seccomp program. The namespace has no
+host interface or external route. Namespace setup errors occur before exec;
+the spawn funnel retries once in a fresh child with the original deny-all floor.
+This avoids carrying partially mapped user namespaces into fallback builds.
+
+Both choices retain the filesystem rules, descriptor hygiene and io_uring deny.
+A separate network-only Landlock domain is deliberately avoided: its implicit
+REFER denial would break cross-directory build renames. Ordinary shell/git
+policy and real network grants are unchanged. The existing admitted-fence
+content identity and apply verifier remain the authority handoff.
+
+This composes with the #527 refusal removal above: the Brush worker and argv
+child use the same `ConfinedCommand` pre-exec setup. Setup completes before
+either seccomp or Landlock and before any worker/build code executes; seccomp
+sets no-new-privileges before Landlock is installed. No production namespace
+syscall backstop is added. Child capabilities belong to the new user namespace,
+not the host; subsequent namespace creation cannot remove either inherited fence
+or import host network devices. Landlock still refuses mount-topology changes.
+
+The network namespace isolates host internet and abstract Unix sockets, and
+the descriptor guard closes inherited host descriptors. Pathname Unix socket
+deputies remain the existing `local-deputy-egress` limitation; this patch does
+not claim to close that separate IPC surface.
