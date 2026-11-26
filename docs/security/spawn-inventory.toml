@@ -48,6 +48,7 @@
 #   test                Spawns confined to `#[cfg(test)]` / a `_test.rs` file.
 
 [files]
+"vendor/agent-bridle-core/src/spawn.rs" = { count = 45, class = "confined", note = "Existing core spawn funnel and its test fixtures. The #527 backport adds three ConfinedCommand constructions plus one test-only raw Python positive control for a bind mount in a new user/mount namespace. Fixed interpreter and script, owned temporary directories, no model input. The unconfined control must succeed before the same helper proves Landlock denies the mount; vendor sources are outside the scanner's current roots." }
 # Explicit real-resource binary: fixture-only Cargo metadata runs offline;
 # existing child probes exercise sockets and PTYs, never model-supplied argv.
 "newt-core/tests/brush_build_pipeline.rs" = { count = 5, class = "test", note = "#3289 adds an unconfined offline Cargo metadata positive control against an isolated fixture cache; cache population and builds use ConstrainedExecutor with network denied." }

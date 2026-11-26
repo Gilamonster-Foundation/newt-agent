@@ -147,6 +147,12 @@ fn run_platform() {
         "brush_deny_direct_denies_a_childs_socket",
         brush_deny_direct_denies_a_childs_socket,
     );
+    #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+    run_async_case(
+        &runtime,
+        "fs_restricted_command_runs_under_landlock",
+        fs_restricted_command_runs_under_landlock,
+    );
     // agent-bridle#416 round-3 / newt#2673 regression: the trusted-worker
     // control channel is now an audited stdio shape (ADR 0015 E7), so a
     // `net: none` BrushShellTool spawn resolves a real bound instead of
@@ -678,7 +684,7 @@ async fn restricted_exec_denies_out_of_scope_command_in_worker() {
 /// seam the safe-subset engine uses.
 #[cfg(all(target_os = "linux", feature = "linux-landlock"))]
 async fn brush_deny_direct_denies_a_childs_socket() {
-    use agent_bridle_core::{ChildNetworkPolicy, SandboxPolicy, landlock_is_supported};
+    use agent_bridle_core::{landlock_is_supported, ChildNetworkPolicy, SandboxPolicy};
     if !landlock_is_supported() || !std::path::Path::new("/usr/bin/python3").exists() {
         eprintln!("skipping brush_deny_direct: needs Landlock + python3");
         return;
@@ -832,6 +838,66 @@ async fn restricted_exec_allows_in_scope_command() {
 
     assert_ne!(out["denied"], true, "in-scope command must run: {out}");
     assert_eq!(out["stdout"].as_str().unwrap_or("").trim(), "ok", "{out}");
+}
+
+/// #498: a filesystem-restricted Brush command runs under Landlock whether or
+/// not the host allows unprivileged user namespaces. Core refused the worker
+/// on a host that allows them; upstream's `Userns Proofs` lane runs this with them on.
+/// Grounds core's pure `unenforceable_predicate_fs_axes_always_strength_floor_for_exec`
+/// test through the real authenticated worker and its reported Landlock fence.
+#[cfg(all(target_os = "linux", feature = "linux-landlock"))]
+async fn fs_restricted_command_runs_under_landlock() {
+    if !agent_bridle_core::landlock_is_supported() {
+        // The `Userns Proofs` lane sets the flag: a runner without Landlock
+        // fails the lane instead of passing it unproven.
+        assert!(
+            std::env::var_os("BRIDLE_REQUIRE_LANDLOCK").is_none(),
+            "BRIDLE_REQUIRE_LANDLOCK is set, but this kernel lacks Landlock"
+        );
+        eprintln!("skipping: kernel lacks Landlock");
+        return;
+    }
+    let dir = unique_temp("fs-restricted");
+    std::fs::create_dir_all(&dir).expect("create the granted directory");
+    let caveats = Caveats {
+        fs_write: Scope::only([dir.to_string_lossy().into_owned()]),
+        ..Caveats::top()
+    };
+    let out = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("echo written > '{}/out'", dir.display()) }),
+            &ctx(caveats),
+        )
+        .await
+        .expect("an fs-restricted Brush command must run");
+    assert_ne!(out["denied"], true, "{out}");
+    // The worker ran under the OS fence: the result names Landlock.
+    assert_eq!(out["sandbox_kind"], "landlock", "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out")).expect("the command wrote its file"),
+        "written\n",
+        "{out}"
+    );
+    // A write outside the grant must not land. Brush's own open check (L2) or
+    // the fence (L3) refuses it; the Landlock proof is the `sandbox_kind`
+    // assertion above, not this one.
+    let outside = unique_temp("fs-restricted-outside");
+    std::fs::create_dir_all(&outside).expect("create the directory outside the grant");
+    let _ = tool()
+        .invoke(
+            serde_json::json!({ "cmd": format!("echo escaped > '{}/out'", outside.display()) }),
+            &ctx(Caveats {
+                fs_write: Scope::only([dir.to_string_lossy().into_owned()]),
+                ..Caveats::top()
+            }),
+        )
+        .await;
+    assert!(
+        !outside.join("out").exists(),
+        "a write outside the grant must be refused"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// A restricted filesystem grant is never silently downgraded to the L2

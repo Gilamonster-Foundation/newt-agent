@@ -1307,22 +1307,10 @@ impl SandboxedWorker {
         let confined = if crate::is_unbridled() {
             command.spawn_authorized(cx, Caveats::top(), SpawnAuthority::TrustedWorker)
         } else {
+            // No user-namespace precondition: a thread under a Landlock
+            // filesystem ruleset cannot `mount(2)`, in a new namespace or not
+            // (#498, `bind_mount_in_a_new_user_namespace_is_refused_...`).
             let effective = cx.caveats().clone();
-            let available = best_available_sandbox(&command.sandbox_policy).kind();
-            let reported = crate::effective_sandbox_kind(available, &effective);
-            #[cfg(not(target_os = "linux"))]
-            let _ = reported;
-            #[cfg(target_os = "linux")]
-            if reported == SandboxKind::Landlock
-                && crate::sandbox::restricts_fs(&effective)
-                && !linux_user_namespaces_hardened()
-            {
-                return Err(ToolError::denied(
-                    "refusing the Brush worker: Landlock filesystem confinement \
-                     is not a complete boundary while unprivileged user namespaces \
-                     remain available; disable them or add the namespace syscall backstop",
-                ));
-            }
             command.spawn_authorized(cx, effective, SpawnAuthority::TrustedWorker)
         }?;
         Ok(SandboxedWorkerChild {
@@ -1712,20 +1700,6 @@ fn trusted_worker_closure(
         }
         SandboxKind::AppContainer | SandboxKind::None => Ok(RuntimeClosure::empty()),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_user_namespaces_hardened() -> bool {
-    fn sysctl_is(path: &str, expected: &str) -> bool {
-        std::fs::read_to_string(path).is_ok_and(|value| value.trim() == expected)
-    }
-
-    sysctl_is("/proc/sys/kernel/unprivileged_userns_clone", "0")
-        || sysctl_is("/proc/sys/user/max_user_namespaces", "0")
-        || sysctl_is(
-            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
-            "1",
-        )
 }
 
 /// Spawn `program args` confined by `cx`, with the inherited stdio of the parent.
@@ -3099,6 +3073,170 @@ mod landlock_child_tests {
 
         let _ = fs::remove_dir_all(&allowed);
         let _ = fs::remove_dir_all(&extra);
+    }
+
+    /// Whether a proof test should skip for a missing prerequisite. A required
+    /// run (the `Userns Proofs` lane) fails instead, so it cannot go green
+    /// without exercising the kernel boundary.
+    fn skip_unless(present: bool, required: bool, what: &str) -> bool {
+        if present {
+            return false;
+        }
+        assert!(!required, "a required proof cannot run: {what}");
+        eprintln!("skipping: {what}");
+        true
+    }
+
+    #[test]
+    fn a_required_proof_with_a_missing_prerequisite_fails_not_skips() {
+        assert!(!skip_unless(true, true, "present"));
+        assert!(skip_unless(false, false, "absent, not required"));
+        let refused = std::panic::catch_unwind(|| skip_unless(false, true, "absent, required"));
+        assert!(refused.is_err(), "required and absent must fail");
+    }
+
+    /// The helper for the #498 proof: unshare a user and a mount namespace,
+    /// bind-mount `argv[1]` over `argv[2]`, and print `argv[2]/payload`. It
+    /// makes the two syscalls itself and writes no `uid_map`, as ADR 0011's
+    /// scenario does, so its exit code says which step was refused: 3 for
+    /// `unshare`, 4 for `mount`.
+    const BIND_MOUNT_ESCAPE: &str = r#"
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+CLONE_NEWNS, CLONE_NEWUSER, MS_BIND = 0x00020000, 0x10000000, 4096
+if libc.unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0:
+    sys.stderr.write("unshare: " + os.strerror(ctypes.get_errno()))
+    sys.exit(3)
+if libc.mount(sys.argv[1].encode(), sys.argv[2].encode(), None, MS_BIND, None) != 0:
+    sys.stderr.write("mount: " + os.strerror(ctypes.get_errno()))
+    sys.exit(4)
+sys.stdout.write(open(os.path.join(sys.argv[2], "payload")).read())
+"#;
+
+    /// #498: the bind-mount escape, on a real host with a positive control
+    /// (#361). ADR 0011 recorded this escape as confirmed: a confined process
+    /// unshares a user and a mount namespace, bind-mounts a payload over a
+    /// path its grant can read, and reads the payload there. It is not: a
+    /// thread with Landlock filesystem rules cannot change the mount topology,
+    /// and the confined helper's `mount` fails with `EPERM`.
+    ///
+    /// The control runs the same helper unconfined and must read the payload.
+    /// Where it cannot (a host that restricts unprivileged user namespaces),
+    /// the host cannot show the escape and this proves nothing: the test
+    /// skips, or fails when `BRIDLE_REQUIRE_USERNS` is set.
+    /// Grounds the pure `unenforceable_predicate_fs_axes_always_strength_floor_for_exec`
+    /// test's claim that Landlock can enforce restricted filesystem axes.
+    #[test]
+    fn bind_mount_in_a_new_user_namespace_is_refused_under_an_fs_restricted_grant() {
+        // The `Userns Proofs` lane sets both flags, so a runner that lost
+        // Landlock or python3 fails the lane instead of passing it unproven.
+        let flag = |name: &str| std::env::var_os(name).is_some();
+        if skip_unless(
+            landlock_is_supported(),
+            flag("BRIDLE_REQUIRE_LANDLOCK"),
+            "kernel lacks Landlock",
+        ) {
+            return;
+        }
+        let python = "/usr/bin/python3";
+        if skip_unless(
+            std::path::Path::new(python).exists(),
+            flag("BRIDLE_REQUIRE_USERNS"),
+            "no /usr/bin/python3",
+        ) {
+            return;
+        }
+        let readable = unique_dir("userns-readable");
+        let secret = unique_dir("userns-secret");
+        let mount_point = readable.join("mnt");
+        fs::create_dir(&mount_point).unwrap();
+        fs::write(secret.join("payload"), "escaped").unwrap();
+        let cleanup = || {
+            let _ = fs::remove_dir_all(&readable);
+            let _ = fs::remove_dir_all(&secret);
+        };
+
+        // The grant can read `readable` but not `secret`. The interpreter's
+        // own files come from the sandbox policy's base read paths, as for any
+        // confined program; naming `/lib` here would be refused, because it is
+        // a symlink on a merged-`/usr` host and admission cannot decide a
+        // symlinked grant root.
+        let cx = ctx(Caveats {
+            fs_read: Scope::only([readable.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([readable.to_string_lossy().into_owned()]),
+            ..Caveats::top()
+        });
+
+        // First control, on every Landlock host: under this grant the
+        // interpreter starts, and the fence hides the payload at its real
+        // path. Without it, a helper that died for an unrelated reason could
+        // pass for a refused mount.
+        let direct = ConfinedCommand::new(python)
+            .args([
+                "-c",
+                "import sys\ntry:\n    open(sys.argv[1]).read()\nexcept PermissionError:\n    sys.exit(7)",
+            ])
+            .arg(secret.join("payload"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn(&cx)
+            .expect("an fs-restricted spawn is admitted under Landlock")
+            .child
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(
+            direct.status.code(),
+            Some(7),
+            "the confined interpreter must start and be denied the payload's real path: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        );
+
+        // Second control: unconfined, the escape works on this host.
+        let control = std::process::Command::new(python)
+            .args(["-c", BIND_MOUNT_ESCAPE])
+            .arg(&secret)
+            .arg(&mount_point)
+            .output()
+            .expect("run the unconfined control");
+        if control.stdout != b"escaped" {
+            let why = String::from_utf8_lossy(&control.stderr).into_owned();
+            cleanup();
+            assert!(
+                std::env::var_os("BRIDLE_REQUIRE_USERNS").is_none(),
+                "BRIDLE_REQUIRE_USERNS is set, but the unconfined control could not \
+                 bind-mount in a new user namespace ({why}); this host cannot show the escape"
+            );
+            eprintln!("skipping: the unconfined control cannot bind-mount here ({why})");
+            return;
+        }
+
+        // The same helper, under the grant that already hid the payload.
+        let confined = ConfinedCommand::new(python)
+            .args(["-c", BIND_MOUNT_ESCAPE])
+            .arg(&secret)
+            .arg(&mount_point)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn(&cx)
+            .expect("an fs-restricted spawn is admitted under Landlock")
+            .child
+            .wait_with_output()
+            .unwrap();
+        cleanup();
+        let stderr = String::from_utf8_lossy(&confined.stderr);
+        eprintln!(
+            "confined helper: status {:?}, stderr {stderr:?}",
+            confined.status.code()
+        );
+        assert_ne!(
+            confined.stdout, b"escaped",
+            "the payload was read through a bind mount: the escape is real"
+        );
+        assert_eq!(
+            confined.status.code(),
+            Some(4),
+            "Landlock must refuse the mount itself (exit 4), not some earlier step: {stderr}"
+        );
     }
 
     /// A held root's descriptor is genuinely paired with its label (so

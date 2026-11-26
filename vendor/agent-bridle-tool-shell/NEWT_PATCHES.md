@@ -10,6 +10,13 @@ temporary dependency override, not a second shell implementation.
 
 Integration changes:
 
+- Backport agent-bridle#527 (`67cf41243dc46ac73ce942a88a070b5907f9dfed`,
+  released in `0.8.0-rc.8`): the real Brush test now proves an fs-restricted
+  command starts with `sandbox_kind: landlock`, writes inside its grant and
+  cannot write outside it. Core removes its obsolete user-namespace refusal.
+  This snapshot has no `engine_conformance.rs` or corresponding refusal skip.
+  Retain the existing harnessless worker dispatch and all Newt integrations.
+
 - #3220: name the broker RPC socket and operation in I/O failures, including
   macOS `LOCAL_PEERPID` and `LOCAL_PEERTOKEN` lookups, and distinguish the
   delegation channel from the per-request socket. Injected disconnect and

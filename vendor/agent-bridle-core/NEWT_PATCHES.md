@@ -203,3 +203,28 @@ binding keeps both original objects after their pathnames are replaced
 Newt #3156 makes `xcselect::is_xcselect_stub` public (`pub use` in `lib.rs`). The
 shell tool's launcher substitution recognises Apple's locator stub by identity
 rather than by a fixed path. The function and its checks are unchanged.
+
+## Brush user-namespace refusal backport (agent-bridle#527, 2026-11-26)
+
+Backports upstream commit `67cf41243dc46ac73ce942a88a070b5907f9dfed`, released
+in `0.8.0-rc.8`. Remove the filesystem-restricted Brush worker refusal and
+`linux_user_namespaces_hardened` sysctl probe. Upstream corrected its claimed
+bind-mount escape: a thread under a Landlock filesystem ruleset cannot mount,
+even with capabilities in a new user namespace. No namespace syscall backstop
+is needed for that filesystem boundary.
+
+Port the upstream bind-mount proof and its required-prerequisite test into the
+existing Landlock child tests; the shell vendor carries the accompanying
+filesystem-restricted Brush proof. The mount proof first checks direct read
+denial, then requires an unconfined positive control before testing the confined
+mount. `BRIDLE_REQUIRE_USERNS=1` and `BRIDLE_REQUIRE_LANDLOCK=1` make unavailable
+prerequisites fail instead of silently leaving the namespace path unproven.
+The upstream conformance skip is absent from this vendor snapshot, so there is
+no skip to remove. Preserve Newt's held roots, bound worker image, helper read
+resources and authenticated worker-control integrations. No grant, protocol,
+record, dependency version or network policy changes.
+
+Run the excluded vendor crates through their own manifests, with Cargo path
+patches for this core and `agent-bridle-fdguard`; the workspace patch table does
+not apply to standalone vendor tests. Retire this section when the vendor base
+includes #527.

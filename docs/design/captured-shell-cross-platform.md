@@ -82,11 +82,16 @@ which is the honest current state.
 
 | Capability | Linux | macOS | Windows |
 |---|---|---|---|
-| **Filesystem confinement** | Landlock LSM (+ mount/user namespaces) | Seatbelt / `sandbox_init` profiles (`sandbox-exec`); App Sandbox entitlements if bundled | AppContainer profile + capability SIDs; restricted/lowbox token |
+| **Filesystem confinement** | Landlock LSM (no user-namespace precondition) | Seatbelt / `sandbox_init` profiles (`sandbox-exec`); App Sandbox entitlements if bundled | AppContainer profile + capability SIDs; restricted/lowbox token |
 | **Syscall / API restriction** | seccomp-bpf | Seatbelt operation filters (no raw syscall filter; profile-scoped) | Job Object limits + restricted token + (optionally) a syscall/AppContainer policy |
 | **Network egress (the proxy is the boundary)** | network namespace + the *only* route is the egress proxy (DNS included) | `sandbox-exec` `(deny network*)` + a local egress proxy as the sole allowed peer; Network Extension content-filter if bundled | WFP (Windows Filtering Platform) / AppContainer network capability stripped except loopback to the egress proxy |
 | **Process isolation** | namespaces (pid/ipc/uts) | per-process Seatbelt; no namespace equiv | Job Object + separate desktop/station optional |
 | **Maturity / caveat** | Mature, well-trodden | `sandbox_init` API is **deprecated** (but functional and still used widely); App Sandbox is the supported-but-heavier path (requires bundling/entitlements) | AppContainer is mature for store-style apps; wiring it for an embedded shell is the most bespoke of the three |
+
+Landlock's filesystem boundary does not require disabling user namespaces:
+an fs-confined thread cannot mount, including inside a new user namespace.
+The vendored [agent-bridle#527 backport](../../vendor/agent-bridle-core/NEWT_PATCHES.md#brush-user-namespace-refusal-backport-agent-bridle527-2026-11-26)
+removes the old Brush refusal and carries upstream's positive-control proof.
 
 **Binding rule (amends `captured-shell-ocap.md` §5.1):** "do not seed a live
 token until B1 is a fail-closed precondition" means **the host platform's B1**.
