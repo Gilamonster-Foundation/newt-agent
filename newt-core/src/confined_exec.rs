@@ -1006,6 +1006,11 @@ pub fn toolchain_read_roots() -> Vec<String> {
     if let Some(home) = operator_tool_home("CARGO_HOME", ".cargo") {
         roots.extend(cargo_home_read_roots(&home));
     }
+    // Cargo's libgit2 opens the system config when loading cached Git repos.
+    // Denial is reported as a missing offline checkout (#3289). Grant just
+    // this file, as dispatch_caveats_for_git_shell already does.
+    #[cfg(unix)]
+    roots.push("/etc/gitconfig".to_owned());
     if let Some(path) = operator_tool_home("RUSTUP_HOME", ".rustup") {
         roots.push(path);
     }
@@ -1224,6 +1229,16 @@ mod tests {
         // The credential files are never covered — ancestor-or-equal check,
         // the same containment logic the fence itself enforces.
         let read_scope = Scope::only(roots.clone());
+        // #3289: Cargo opens this file while loading cached Git repositories.
+        // Require the exact file; unrelated system files stay excluded.
+        #[cfg(unix)]
+        {
+            assert!(roots.contains(&"/etc/gitconfig".to_owned()));
+            assert!(!newt_policy::caveats::permits_path(
+                &read_scope,
+                "/etc/shadow"
+            ));
+        }
         for secret in ["credentials.toml", "credentials"] {
             let forbidden = cargo_home.join(secret).to_string_lossy().into_owned();
             assert!(
