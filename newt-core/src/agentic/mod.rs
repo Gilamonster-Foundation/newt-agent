@@ -1338,10 +1338,10 @@ mod retry_ledger_tests;
 /// `outcome`), so the frame stays consistent.
 macro_rules! no_progress_gate {
     (
-        $runtime:expr, $disposition:expr, $steer_allowed:expr, $messages:expr, $end_reason:expr,
+        $runtime:expr, $worktree_session:expr, $disposition:expr, $steer_allowed:expr, $messages:expr, $end_reason:expr,
         $solve_obs:expr, $usage:expr, $halluc:expr, $smart:expr, ($workspace:expr, $read:expr, $evidence:expr, $disclosure:expr, $claims:expr, $verification:expr), |$h:ident| $record:expr
     ) => {
-        match $runtime.no_progress_verdict($disposition, $steer_allowed) {
+        match $runtime.no_progress_verdict($disposition, $steer_allowed, $worktree_session) {
             NoProgress::Continue => {}
             NoProgress::Steer(text) => {
                 $messages.push(serde_json::json!({ "role": "user", "content": text }));
@@ -1941,6 +1941,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                worktree_session,
                 prompt_disposition,
                 action_nudges,
                 messages,
@@ -4497,7 +4498,7 @@ struct WorkflowRuntimeState {
     /// Counts every completed round, including early continues, but fresh
     /// evidence and action-forcing nudges cannot reset this longer ceiling.
     rounds_without_action_progress: usize,
-    /// A workspace change or newly verified check in the completed round.
+    /// A workspace change, task adoption, or newly verified check in the completed round.
     round_action_progressed: bool,
     /// The one steer for this stall has been sent.
     no_progress_steered: bool,
@@ -4625,7 +4626,10 @@ impl WorkflowRuntimeState {
         &mut self,
         disposition: PromptDisposition,
         steer_allowed: bool,
+        worktree_session: Option<&crate::worktree_adoption::WorktreeSession>,
     ) -> NoProgress {
+        self.round_action_progressed |= worktree_session
+            .is_some_and(crate::worktree_adoption::WorktreeSession::take_adoption_progress);
         if std::mem::take(&mut self.round_action_progressed) {
             self.rounds_without_action_progress = 0;
         } else {
@@ -7325,6 +7329,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                worktree_session,
                 prompt_disposition,
                 action_nudges,
                 messages,
@@ -10234,6 +10239,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                worktree_session,
                 prompt_disposition,
                 action_nudges,
                 messages,
@@ -12914,6 +12920,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         if round > 0 {
             no_progress_gate!(
                 workflow_runtime,
+                worktree_session,
                 prompt_disposition,
                 action_nudges,
                 input,

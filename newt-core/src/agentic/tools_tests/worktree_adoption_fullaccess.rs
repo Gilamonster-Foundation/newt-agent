@@ -1,5 +1,120 @@
 use super::*;
 
+/// #3274: verified adoption at the evidence-only ceiling earns one reset.
+/// Inject the existing policy fixture; no filesystem or subprocess is needed.
+#[test]
+fn adoption_progress_resets_evidence_only_ceiling_once() {
+    use crate::agentic::{NoProgress, WorkflowRuntimeState};
+
+    for (bypass, detached) in [(false, false), (false, true), (true, false)] {
+        let session = crate::worktree_adoption::WorktreeSession::default();
+        let mut policy =
+            crate::worktree_adoption::tests::policy_fixture("original".into(), "task".into());
+        if detached {
+            policy.task_branch = None;
+        }
+        let mut state = WorkflowRuntimeState::default();
+        for round in 1..=47 {
+            state.record_round_outcome(false, true);
+            assert!(
+                matches!(
+                    state.no_progress_verdict(PromptDisposition::Act, false, Some(&session)),
+                    NoProgress::Continue
+                ),
+                "round {round}"
+            );
+        }
+        assert_eq!(state.rounds_without_action_progress, 47);
+        record_verified_creation(&session, policy.clone(), bypass);
+        state.record_round_outcome(false, true);
+        assert!(
+            matches!(
+                state.no_progress_verdict(PromptDisposition::Act, false, Some(&session)),
+                NoProgress::Continue
+            ),
+            "adoption must reset the ceiling: bypass={bypass}, detached={detached}"
+        );
+        assert_eq!(state.rounds_without_action_progress, 0);
+
+        for round in 1..=48 {
+            // A redundant receipt or branch hint cannot keep renewing progress.
+            record_verified_creation(&session, policy.clone(), bypass);
+            if !detached {
+                session.record_task_worktree(&policy.worktree, &format!("renamed-{round}"));
+            }
+            state.record_round_outcome(false, true);
+            let verdict = state.no_progress_verdict(PromptDisposition::Act, false, Some(&session));
+            assert_eq!(matches!(verdict, NoProgress::Stop), round == 48);
+            assert_eq!(state.rounds_without_action_progress, round);
+        }
+    }
+}
+
+/// #3274: failed/refused creation and success-looking text carry no adoption.
+#[test]
+fn adoption_progress_requires_session_transition() {
+    use crate::agentic::{NoProgress, WorkflowRuntimeState};
+
+    for outcome in [
+        None,
+        Some(crate::ExecOutcome::Denied),
+        Some(crate::ExecOutcome::Failed),
+    ] {
+        let session = crate::worktree_adoption::WorktreeSession::default();
+        let args = serde_json::json!({"command":"git worktree add -b task task"});
+        nudge::record_unarmed_creation(&session, &args, ".", outcome.as_ref());
+        let mut state = WorkflowRuntimeState {
+            rounds_without_action_progress: 47,
+            ..Default::default()
+        };
+        let progress = state.record_observation(
+            "run_command",
+            &args,
+            "Adopted task worktree: task",
+            true,
+            outcome,
+            None,
+        );
+        state.record_round_outcome(false, progress);
+        assert!(matches!(
+            state.no_progress_verdict(PromptDisposition::Act, false, Some(&session)),
+            NoProgress::Stop
+        ));
+        assert_eq!(state.rounds_without_action_progress, 48);
+    }
+}
+
+/// #3274: a lift discards pending progress; a new adoption leaves the short
+/// brake intact, and its consumed signal cannot be replayed in another turn.
+#[test]
+fn adoption_progress_lifecycle_preserves_short_brake() {
+    use crate::agentic::{NoProgress, WorkflowRuntimeState};
+
+    let session = crate::worktree_adoption::WorktreeSession::default();
+    session.record_task_worktree(Path::new("task"), "task");
+    session.lift();
+    assert!(!session.take_adoption_progress());
+
+    let mut state = WorkflowRuntimeState::default();
+    state.rounds_without_change = state.no_progress.stop_after - 1;
+    session.record_task_worktree(Path::new("task"), "task");
+    assert!(matches!(
+        state.no_progress_verdict(PromptDisposition::Act, false, Some(&session)),
+        NoProgress::Stop
+    ));
+    assert_eq!(state.rounds_without_action_progress, 0);
+    assert_eq!(state.rounds_without_change, state.no_progress.stop_after);
+
+    let mut next_turn = WorkflowRuntimeState {
+        rounds_without_action_progress: 47,
+        ..Default::default()
+    };
+    assert!(matches!(
+        next_turn.no_progress_verdict(PromptDisposition::Act, false, Some(&session)),
+        NoProgress::Stop
+    ));
+}
+
 struct Approve {
     asked: bool,
 }
@@ -66,6 +181,7 @@ impl ToolPresentation for Notices {
 /// #2763 also grounds bypass admission for standalone and compound creations,
 /// including destinations the confined verifier rejects. #2766 checks that the
 /// actual dispatch records task location for post-compaction/captured state.
+/// #3274 grounds the mocked adoption-progress reset in actual Git creation.
 /// Selected explicitly by ci.yml's Linux `test` job (ambient worktree proof).
 #[cfg(unix)]
 #[tokio::test]
@@ -143,6 +259,8 @@ async fn adoption_2750_full_access_creation_then_task_command() {
             Some(&crate::ExecOutcome::Passed),
             "call {index}: {text}"
         );
+        assert_eq!(session.take_adoption_progress(), matches!(index, 0 | 3));
+        assert!(!session.take_adoption_progress());
         if index == 0 {
             // #2766: this scheduled real-dispatch proof must exercise recording,
             // not merely seed session state before testing compaction.
