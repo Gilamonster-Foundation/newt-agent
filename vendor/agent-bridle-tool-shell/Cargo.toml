@@ -61,6 +61,12 @@ path = "src/bin/bridle-netmon.rs"
 required-features = ["shell"]
 
 [[test]]
+name = "broker_transport_real"
+path = "tests/broker_transport_real.rs"
+harness = false
+required-features = ["brush"]
+
+[[test]]
 name = "brush_real"
 path = "tests/brush_real.rs"
 harness = false
