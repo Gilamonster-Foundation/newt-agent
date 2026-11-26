@@ -182,7 +182,7 @@ fn verify_frame(frame: &Frame, challenge: &[u8], parents: BTreeSet<ContentId>) -
 pub(crate) fn broker_io(operation: &str, error: std::io::Error) -> ToolError {
     ToolError::Exec(std::io::Error::new(
         error.kind(),
-        format!("broker RPC socket {operation}: {error}"),
+        crate::private_control::io_diagnostic(&format!("broker RPC socket {operation}"), error),
     ))
 }
 
@@ -213,22 +213,56 @@ fn read_frame(stream: &mut impl Read) -> ToolResult<Frame> {
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes)
         .map_err(|error| broker_io("read frame body", error))?;
+    // Decoder errors can quote peer-supplied field names or values. This error
+    // also reaches the server diagnostic stream, so retain only the phase.
     canonical::from_canonical_dagcbor_checked(&bytes)
-        .map_err(|error| ToolError::denied(format!("invalid canonical broker frame: {error}")))
+        .map_err(|_| ToolError::denied("invalid canonical broker frame"))
 }
 
 pub(crate) fn serve_request(
-    mut stream: UnixStream,
+    stream: UnixStream,
     control: &BrokerControl,
     expected_peer: Option<u32>,
     callback: impl FnOnce(&BrokerPeer, &[u8]) -> ToolResult<RpcReply>,
 ) -> ToolResult<()> {
+    with_request_timeout(
+        control
+            .deadline()
+            .saturating_duration_since(std::time::Instant::now()),
+        |timeout| serve_request_inner(stream, control, expected_peer, callback, timeout),
+    )
+}
+
+// The remaining budget is injected so expiry between the control check and
+// socket setup can be exercised without a real clock or socket.
+fn with_request_timeout(
+    remaining: Duration,
+    request: impl FnOnce(Duration) -> ToolResult<()>,
+) -> ToolResult<()> {
+    let timeout = remaining.min(Duration::from_secs(30));
+    let result = if timeout.is_zero() {
+        Err(ToolError::denied(
+            "command broker invocation budget exhausted before hello",
+        ))
+    } else {
+        request(timeout)
+    };
+    result.map_err(|error| {
+        ToolError::denied(format!(
+            "broker server request failed (timeout_ms={}): {error}",
+            timeout.as_secs_f64() * 1000.0,
+        ))
+    })
+}
+
+fn serve_request_inner(
+    mut stream: UnixStream,
+    control: &BrokerControl,
+    expected_peer: Option<u32>,
+    callback: impl FnOnce(&BrokerPeer, &[u8]) -> ToolResult<RpcReply>,
+    timeout: Duration,
+) -> ToolResult<()> {
     control.check()?;
-    let timeout = control
-        .deadline()
-        .saturating_duration_since(std::time::Instant::now())
-        .min(Duration::from_secs(30))
-        .max(Duration::from_millis(1));
     stream.set_read_timeout(Some(timeout))
         .map_err(|error| broker_io("set read timeout", error))?;
     stream.set_write_timeout(Some(timeout))
@@ -239,6 +273,8 @@ pub(crate) fn serve_request(
     let mut hello = Vec::from(*HELLO);
     hello.extend_from_slice(&std::process::id().to_le_bytes());
     hello.extend_from_slice(&challenge);
+    // Setup can consume the remaining budget; never announce an expired request.
+    control.check()?;
     stream.write_all(&hello)
         .map_err(|error| broker_io("write server hello", error))?;
     let mut declared_pid = [0; 4];
@@ -353,6 +389,94 @@ pub(crate) fn process_parent_and_birth(pid: u32) -> ToolResult<(u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_broker_budget_never_starts_the_hello() {
+        // Inject a clock at and past the invocation deadline after an earlier
+        // successful control check. The old floor starts the abandoned hello.
+        let deadline = Duration::from_secs(60);
+        for now in [deadline, deadline + Duration::from_millis(1)] {
+            let mut hello_written = false;
+            let error = with_request_timeout(deadline.saturating_sub(now), |_| {
+                hello_written = true;
+                Err(broker_io("read client PID", std::io::ErrorKind::TimedOut.into()))
+            })
+            .unwrap_err();
+            assert!(
+                !hello_written,
+                "exhausted invocation wrote a hello then timed out: {error}"
+            );
+            assert!(error.to_string().contains("budget exhausted"), "{error}");
+            assert!(error.to_string().contains("timeout_ms=0"), "{error}");
+        }
+    }
+
+    #[test]
+    fn broker_timeout_keeps_the_remaining_budget_and_cap() {
+        for (remaining, expected) in [
+            (Duration::from_micros(500), Duration::from_micros(500)),
+            (Duration::from_secs(60), Duration::from_secs(30)),
+        ] {
+            with_request_timeout(remaining, |timeout| {
+                assert_eq!(timeout, expected);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn broker_server_diagnostic_names_timeout_phase_kind_and_errno() {
+        let errno = nix::errno::Errno::ENOTCONN as i32;
+        let error = with_request_timeout(Duration::from_millis(7), |_| {
+            Err(broker_io(
+                "read peer handshake",
+                std::io::Error::from_raw_os_error(errno),
+            ))
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        for expected in [
+            "timeout_ms=7".to_owned(),
+            "broker RPC socket read peer handshake".to_owned(),
+            "kind=NotConnected".to_owned(),
+            format!("raw_os_error=Some({errno})"),
+        ] {
+            assert!(message.contains(&expected), "missing {expected}: {message}");
+        }
+
+        // Authenticated reads pass through a String-valued error before the
+        // broker adds its context. Keep metadata even when there is no errno.
+        let error = with_request_timeout(Duration::from_micros(500), |_| {
+            Err(ToolError::denied(crate::private_control::io_diagnostic(
+                "receive authenticated control frame",
+                std::io::ErrorKind::TimedOut.into(),
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "denied: broker server request failed (timeout_ms=0.5): denied: receive authenticated control frame: timed out (kind=TimedOut, raw_os_error=None)");
+    }
+
+    #[test]
+    fn broker_server_diagnostic_does_not_echo_malformed_payload() {
+        for bytes in [
+            canonical::to_canonical_dagcbor(&"private-payload-marker").unwrap(),
+            canonical::to_canonical_dagcbor(&std::collections::BTreeMap::from([(
+                "private-payload-marker", 1,
+            )]))
+            .unwrap(),
+        ] {
+            let mut wire = (bytes.len() as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&bytes);
+            let error = with_request_timeout(Duration::from_secs(1), |_| {
+                read_frame(&mut wire.as_slice()).map(|_| ())
+            })
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(!message.contains("private-payload-marker"), "{message}");
+            assert!(message.contains("invalid canonical broker frame"), "{message}");
+        }
+    }
 
     /// Inject macOS's disconnected-socket errno on Linux without real I/O.
     struct Disconnected;

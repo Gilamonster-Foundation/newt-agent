@@ -46,7 +46,7 @@ impl BrokerControl {
     pub fn check(&self) -> ToolResult<()> {
         if self.is_cancelled() {
             Err(ToolError::denied(
-                "command broker invocation cancelled or expired",
+                "command broker invocation cancelled or budget exhausted",
             ))
         } else {
             Ok(())
