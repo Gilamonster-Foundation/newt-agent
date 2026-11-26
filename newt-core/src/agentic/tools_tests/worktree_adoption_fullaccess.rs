@@ -700,7 +700,8 @@ async fn relative_task_root(bypass: bool) {
             original.to_string_lossy().into_owned(),
             task.to_string_lossy().into_owned(),
         ]),
-        ..read_caveats(&[temp.path()])
+        // Recorded task roots use the canonical (verbatim on Windows) spelling.
+        ..read_caveats(&[temp.path(), &temp.path().canonicalize().unwrap()])
     };
     struct Quiet;
     impl ToolPresentation for Quiet {

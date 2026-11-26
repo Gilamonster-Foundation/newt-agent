@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::agentic::tools::git_fixture::read_caveats;
 
 // Invocation-local metadata seam: None simulates invalidated reciprocal links.

@@ -1,6 +1,7 @@
 //! #2780: task cwd routing through the actual dispatch boundary, portable to Windows.
 use super::*;
 use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+#[cfg(feature = "confine")]
 use crate::agentic::tools::git_fixture::read_caveats;
 use crate::worktree_adoption::{AdoptedWorktree, WorktreeSession};
 

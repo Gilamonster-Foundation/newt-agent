@@ -260,7 +260,10 @@ async fn check(row: Row) {
     let _engine = EnvVar::set("NEWT_SHELL_ENGINE", "brush");
     let _routing = EnvVar::set("NEWT_NO_ROUTE", "0");
     let mut caveats = Caveats {
-        fs_read: git_fixture::read_caveats(&[&temp_root]).fs_read,
+        // Windows discovery/file routing uses the verbatim canonical spelling;
+        // child commands use the plain spelling. Both name this fixture tree.
+        fs_read: git_fixture::read_caveats(&[&temp_root, &temp_root.canonicalize().unwrap()])
+            .fs_read,
         net: Scope::none(),
         fs_write: Scope::only([match row.setup {
             Setup::Fresh => temp_root.as_path(),
