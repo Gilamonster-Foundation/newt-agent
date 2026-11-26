@@ -1430,6 +1430,10 @@ fn spill_summary_line_with_hint(
     Some(format!("{head} · {shown}{ellipsis}"))
 }
 
+/// #3295: this result already carries a bounded hook tail; folding it again
+/// hides the hook's reason behind the broker's generic last line.
+pub(super) const PRE_PUSH_REFUSAL: &str = "failed(refused_by_harness): pre-push hook refused in the local pre-push stage; remote not contacted; no push was staged.";
+
 /// Injected writer for one tool's operator-facing audit block. Production uses
 /// stdout; tests use a `Vec<u8>` so dispatcher routing can be verified without
 /// process-wide fd redirection.
@@ -1670,7 +1674,9 @@ impl<W: Write> ToolDisplay<W> {
         // conversation spine (green prompts/replies) stays dominant. A result
         // that fits the budget, and `/spill 0` (unbounded), keep the normal
         // render — `spill_summary_line` returns `None` for both.
-        let rendered = if let Some(recovery_hint) = recovery_hint.as_deref() {
+        let rendered = if output.starts_with(PRE_PUSH_REFUSAL) {
+            output.to_owned()
+        } else if let Some(recovery_hint) = recovery_hint.as_deref() {
             // Committed scrollback outlives the viewport, so this text may only
             // ever name a COMMAND — never `space`, which would stop being true
             // the moment the next canonical write dismisses the frame.
