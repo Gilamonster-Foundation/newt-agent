@@ -28,18 +28,31 @@ fn main() {
             return;
         }
         if automatic {
-            let interfaces = std::fs::read_to_string("/proc/net/dev").unwrap();
-            let names: Vec<_> = interfaces
-                .lines()
-                .filter_map(|line| line.split_once(':'))
-                .map(|(name, _)| name.trim())
-                .collect();
-            assert_eq!(names, ["lo"], "private namespace must expose only loopback");
+            // Enumerate via libc's netlink API; the build fence intentionally
+            // does not grant procfs network files. The allocation ends with a
+            // zero-index/null-name sentinel and must be freed even on mismatch.
+            let interfaces = unsafe { libc::if_nameindex() };
+            assert!(!interfaces.is_null(), "{}", std::io::Error::last_os_error());
+            // SAFETY: libc returned a sentinel-terminated array with C-string
+            // names. Short-circuiting checks the first entry before advancing.
+            let only_loopback = unsafe {
+                (*interfaces).if_index != 0
+                    && !(*interfaces).if_name.is_null()
+                    && std::ffi::CStr::from_ptr((*interfaces).if_name) == c"lo"
+                    && (*interfaces.add(1)).if_index == 0
+                    && (*interfaces.add(1)).if_name.is_null()
+            };
+            unsafe { libc::if_freenameindex(interfaces) };
+            assert!(only_loopback, "private namespace must expose only loopback");
+            println!("BUILD_PRIVATE_INTERFACE_CONFIRMED: lo");
         }
         for host in ["127.0.0.1", "127.23.45.67", "::1"] {
             let listener = TcpListener::bind((host, 0))
                 .unwrap_or_else(|error| panic!("loopback bind {host}: {error}"));
             let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
             client.write_all(b"ping").unwrap();
             let (mut server, _) = listener.accept().unwrap();
             server
@@ -48,6 +61,10 @@ fn main() {
             let mut payload = [0; 4];
             server.read_exact(&mut payload).unwrap();
             assert_eq!(&payload, b"ping");
+            server.write_all(b"pong").unwrap();
+            client.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"pong");
+            println!("BUILD_LOOPBACK_ADDRESS_CONFIRMED: {host}");
         }
         println!("BUILD_LOOPBACK_ROUNDTRIP_CONFIRMED");
         return;
