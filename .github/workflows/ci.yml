@@ -348,7 +348,8 @@ jobs:
         # (see scripts/changed-scope.sh), which still wouldn't run this
         # non-workspace manifest's own `cargo test`. `just
         # check-vendor-crossterm` runs it locally on demand.
-        run: cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_2644 -- --test-threads=1
+        # Include the mocked resize/cursor readiness regression (#3128) too.
+        run: cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_ -- --test-threads=1
 
   lean-build:
     name: lean strip-down build + tests (--no-default-features)

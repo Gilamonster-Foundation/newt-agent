@@ -424,7 +424,7 @@ check-mesh:
 # .github/workflows/ci.yml.
 [unix]
 check-vendor-crossterm:
-    RUSTC_WRAPPER= cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_2644 -- --test-threads=1
+    RUSTC_WRAPPER= cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_ -- --test-threads=1
 
 # --- Security audit (A1) ---
 
