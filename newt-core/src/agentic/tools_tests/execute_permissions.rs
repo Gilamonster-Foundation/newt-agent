@@ -5660,3 +5660,49 @@ async fn full_access_headless_permission_request_reports_existing_authority() {
     .unwrap();
     assert!(result.contains("already granted"), "{result}");
 }
+
+/// #3294: the shared Build gate must recheck consent, including an insufficient
+/// allow response; publication's network grant is never part of the hook request.
+#[test]
+fn pre_push_3294_requires_the_exact_build_authority() {
+    let root = std::path::Path::new("/workspace");
+    let build = crate::confined_exec::workspace_confined_caveats(root);
+    let mut session = build.clone();
+    session.exec = Scope::only(["git".into()]);
+    session.net = Scope::All;
+    assert!(!build_authorized(
+        root,
+        "git hook run pre-push",
+        &build,
+        &session,
+        &mut None,
+        None
+    ));
+    for (allow, granted, expected) in [
+        (false, &build, false),
+        (true, &session, false),
+        (true, &build, true),
+    ] {
+        let mut gate = MockGate::new(allow, granted);
+        assert_eq!(
+            build_authorized(
+                root,
+                "git hook run pre-push",
+                &build,
+                &session,
+                &mut Some(&mut gate),
+                None
+            ),
+            expected
+        );
+        assert_eq!(gate.asks, [("lifecycle".into(), "build:/workspace".into())]);
+    }
+    assert!(build_authorized(
+        root,
+        "git hook run pre-push",
+        &build,
+        &build,
+        &mut None,
+        None
+    ));
+}

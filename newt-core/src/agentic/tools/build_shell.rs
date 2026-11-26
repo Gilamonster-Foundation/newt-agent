@@ -9,7 +9,7 @@ use super::super::display::ToolPresentation;
 use super::super::smart_harness::SmartHarness;
 use super::shell;
 #[cfg(feature = "confine")]
-use super::{PermissionDecision, PermissionGate, PermissionRequest};
+use super::{PermissionGate, PermissionRequest};
 #[cfg(feature = "confine")]
 use crate::confined_exec::build_tool_request;
 use crate::ExecOutcome;
@@ -197,45 +197,23 @@ pub(super) async fn execute(
             ExecOutcome::Denied,
         );
     }
-    if !build.leq(caveats) {
-        let permission =
-            super::lifecycle_build_request(&root.to_string_lossy(), source, build, None);
-        let allowed = gate.as_deref_mut().is_some_and(|gate| {
-            matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
-        });
-        if !allowed {
-            return (
-                "capability denied: command requires explicit confined build authority; no command ran".into(),
-                ExecOutcome::Denied,
-            );
-        }
+    if !super::build_authorized(&root, source, build, caveats, gate, None) {
+        return (
+            "capability denied: command requires explicit confined build authority; no command ran"
+                .into(),
+            ExecOutcome::Denied,
+        );
     }
 
-    // Admission precedes even scratch creation, redirections, and pipeline
-    // stages. Transfer a lease to the actual worker owner so cancellation of
-    // this future cannot remove scratch before that worker has been reaped.
-    let scratch: Arc<dyn Send + Sync> = match request.prepare_scratch() {
-        Ok(scratch) => Arc::new(scratch),
-        Err(error) => {
-            return (
-                format!("error: build scratch: {error}"),
-                ExecOutcome::Unavailable,
-            )
-        }
-    };
-    let environment: std::collections::BTreeMap<_, _> =
-        request.env_grants().iter().cloned().collect();
-    let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment, "timeout_secs": timeout_secs});
     // Never retry this source after execution: an earlier pipeline stage may
     // already have had an effect, even if a later command was denied.
     match shell::dispatch_bridled_build_shell(
-        args,
-        build,
+        source,
+        &cwd,
+        &request,
         live_output,
-        scratch,
         command_broker,
-        request.build_held_read_roots(),
-        command_budget,
+        shell::command_wall(source, timeout_secs, command_budget),
     )
     .await
     {

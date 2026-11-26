@@ -309,3 +309,19 @@ async fn command_budget_2747_host_dispatch_carries_captured_budget() {
     assert_eq!(envelope["exit_code"], 0);
     assert_eq!(envelope["stdout"], "ready");
 }
+
+/// #3294: a prepared hook gets build time even though its executable is Git.
+#[test]
+fn pre_push_3294_uses_build_budget_and_preserves_explicit_hang_guards() {
+    let budget = crate::RunCommandBudget::from_configured(Some("17"));
+    assert_eq!(super::shell::build_wall(None, budget), build_wall());
+    assert_eq!(super::shell::build_wall(Some(0), budget), build_wall());
+    assert_eq!(
+        super::shell::build_wall(Some(1), budget),
+        Duration::from_secs(1)
+    );
+    assert_eq!(
+        super::shell::build_wall(Some(9999), budget),
+        Duration::from_secs(300)
+    );
+}

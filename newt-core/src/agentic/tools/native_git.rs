@@ -401,9 +401,10 @@ pub(super) async fn execute_governed_push(
         Ok(planned) => planned,
         Err(error) => return render_governed_result(&command, Err(error), PUSH_RETRY),
     };
-    let result = match after_pre_push(run_pre_push(&plan, cwd, caveats, wall).await, || {
-        run_staged_push(&plan, caveats, &held)
-    }) {
+    let result = match after_pre_push(
+        run_pre_push(&plan, cwd, caveats, gate, &held, wall).await,
+        || run_staged_push(&plan, caveats, &held),
+    ) {
         Ok(result) => result,
         Err(reason) => {
             return command.render(
@@ -427,35 +428,44 @@ async fn run_pre_push(
     plan: &GovernedPushPlan,
     cwd: &Path,
     caveats: &Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+    held: &crate::git_staging::HeldRoots,
     wall: std::time::Duration,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
-    use super::shell;
-    let broker =
-        crate::native_git_broker::NativeGitBroker::pre_push(plan.branch.clone(), plan.oid.clone())
-            .map_err(agent_bridle::ToolError::denied)?;
-    // Reuse the commit lane's attenuation: immutable helpers cannot coexist
-    // with ambient writes. No filesystem or executable grant is added here.
-    let mut confined = crate::git_hardening::commit_invocation_caveats(caveats, cwd)
-        .map_err(agent_bridle::ToolError::denied)?;
-    confined.net = crate::Scope::none();
+    let (root, _, _) = crate::git_staging::discover_worktree(cwd, held)
+        .map_err(|error| agent_bridle::ToolError::denied(error.to_string()))?;
+    let (root, cwd) = super::build_shell::build_directory(&root.to_string_lossy(), cwd, caveats)
+        .map_err(|(reason, _)| agent_bridle::ToolError::denied(reason))?;
     let cmd = format!(
         "git hook run pre-push -- {} {}",
         crate::mcp::shell_quote_arg(&plan.remote),
         crate::mcp::shell_quote_arg(&plan.url)
     );
-    let mut args = shell::confined_dispatch_args(&cmd, &cwd.to_string_lossy(), &confined);
-    args["timeout_secs"] = wall.as_secs().into();
-    shell::dispatch_bridled_shell_with_floor(
-        args,
-        &confined,
-        None,
-        Some(agent_bridle::EnforcementFloor::CONFINED),
-        None,
-        Some(broker),
-        Vec::new(),
-        Default::default(),
-    )
-    .await
+    // A repository hook is build code: use the existing Build fence, including
+    // its private environment and scratch. Publication consent never grants it network.
+    let request = crate::confined_exec::build_tool_request(
+        &root,
+        &cwd,
+        "git",
+        std::iter::empty::<String>(),
+        &crate::Scope::none(),
+    );
+    if !super::build_authorized(
+        &root,
+        &cmd,
+        request.caveats(),
+        caveats,
+        gate,
+        Some("the repository pre-push hook runs build checks"),
+    ) {
+        return Err(agent_bridle::ToolError::denied(
+            "pre-push requires explicit confined build authority; no hook ran",
+        ));
+    }
+    let broker =
+        crate::native_git_broker::NativeGitBroker::pre_push(plan.branch.clone(), plan.oid.clone())
+            .map_err(agent_bridle::ToolError::denied)?;
+    super::shell::dispatch_bridled_build_shell(&cmd, &cwd, &request, None, Some(broker), wall).await
 }
 
 /// Keep staging unreachable for every hook failure, including missing confinement

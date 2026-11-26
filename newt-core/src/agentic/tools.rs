@@ -1366,6 +1366,22 @@ fn lifecycle_build_request(
     }
 }
 
+/// Admit the exact prepared build fence, retaining call-scoped consent and
+/// rechecking the returned grant before scratch or subprocesses can be created.
+fn build_authorized(
+    root: &std::path::Path,
+    display: &str,
+    build: &crate::Caveats,
+    caveats: &crate::Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+    escalation_note: Option<&str>,
+) -> bool {
+    build.leq(caveats) || gate.as_deref_mut().is_some_and(|gate| {
+        let permission = lifecycle_build_request(&root.to_string_lossy(), display, build, escalation_note);
+        matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
+    })
+}
+
 fn build_network_description(network: &crate::Scope<String>) -> &'static str {
     match network {
         crate::Scope::All => "network allowed by the existing operator grant",
@@ -1502,18 +1518,18 @@ async fn run_confined_build_lane(
             );
         }
     }
-    if !build.leq(caveats) {
-        let permission =
-            lifecycle_build_request(&root.to_string_lossy(), display, build, escalation_note);
-        let allowed = permission_gate.as_deref_mut().is_some_and(|gate| {
-            matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
-        });
-        if !allowed {
-            return (
-                "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".into(),
-                crate::ExecOutcome::Denied,
-            );
-        }
+    if !build_authorized(
+        &root,
+        display,
+        build,
+        caveats,
+        permission_gate,
+        escalation_note,
+    ) {
+        return (
+            "capability denied: lifecycle action=build requires explicit confined build authority; no command ran".into(),
+            crate::ExecOutcome::Denied,
+        );
     }
     let mut run = ConstrainedExecutor::run_async(request.clone()).await;
     let mut fetch_note = None;
@@ -4817,7 +4833,7 @@ async fn execute_authorized_tool(
                     caveats,
                     &mut permission_gate,
                     governed_pr,
-                    shell::command_wall(cmd, args.get("timeout_secs").and_then(serde_json::Value::as_u64), command_budget),
+                    shell::build_wall(args.get("timeout_secs").and_then(serde_json::Value::as_u64), command_budget),
                 ).await);
             }
             #[cfg(feature = "confine")]

@@ -1140,43 +1140,46 @@ pub(super) async fn dispatch_bridled_shell(
     caveats: &newt_policy::caveats::Caveats,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
-    dispatch_bridled_shell_with_floor(
-        args,
-        caveats,
-        sink,
-        None,
-        None,
-        None,
-        Vec::new(),
+    let wall = command_wall(
+        args.get("cmd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        args.get("timeout_secs").and_then(serde_json::Value::as_u64),
         Default::default(),
-    )
-    .await
+    );
+    dispatch_bridled_shell_with_floor(args, caveats, sink, None, None, None, Vec::new(), wall).await
 }
 
 /// A prepared build keeps the native build executor's strength floor while
 /// the same shell engine evaluates the original source and pipelines once.
-#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "confine")]
 pub(super) async fn dispatch_bridled_build_shell(
-    args: serde_json::Value,
-    caveats: &newt_policy::caveats::Caveats,
+    source: &str,
+    cwd: &std::path::Path,
+    request: &crate::confined_exec::ExecRequest,
     sink: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
-    execution_lease: std::sync::Arc<dyn Send + Sync>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
-    held_read_roots: Vec<agent_bridle::HeldReadRoot>,
-    command_budget: crate::RunCommandBudget,
+    wall: std::time::Duration,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
+    // Admission precedes scratch creation. The worker owns the lease through
+    // cancellation so scratch survives until all hook/build descendants exit.
+    let scratch = request.prepare_scratch().map_err(|error| {
+        agent_bridle::ToolError::Other(anyhow::anyhow!("build scratch: {error}"))
+    })?;
+    let environment: std::collections::BTreeMap<_, _> =
+        request.env_grants().iter().cloned().collect();
+    let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment});
     dispatch_bridled_shell_with_floor(
         args,
-        caveats,
+        request.caveats(),
         sink,
         Some(agent_bridle::EnforcementFloor::from_scalar(
             agent_bridle::AxisEnforcement::Kernel,
         )),
-        Some(execution_lease),
+        Some(std::sync::Arc::new(scratch)),
         command_broker,
-        held_read_roots,
-        command_budget,
+        request.build_held_read_roots(),
+        wall,
     )
     .await
 }
@@ -1191,7 +1194,7 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     execution_lease: Option<std::sync::Arc<dyn Send + Sync>>,
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
-    command_budget: crate::RunCommandBudget,
+    wall: std::time::Duration,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     if let Some(denied) = descendant_exec_denial(
         args.get("cmd")
@@ -1222,14 +1225,7 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     // blanket Kernel floor would refuse every exec-restricted command even on
     // Landlock. The correct fix is a PER-AXIS floor at the bridle boundary
     // (fs/net = Kernel, exec = Interceptor-OK); tracked as an ACTIVE deviation.
-    // #2732: prepared build work retains its build budget; version/help probes
-    // must not lend a following arbitrary command that longer deadline.
     let cmd = args.get("cmd").and_then(serde_json::Value::as_str);
-    let wall = command_wall(
-        cmd.unwrap_or_default(),
-        args.get("timeout_secs").and_then(serde_json::Value::as_u64),
-        command_budget,
-    );
     // dec1-build-grant round 2 (Reviewer FIX-FIRST, PR #2579): the toolchain
     // read roots for a build-tool command are added ONLY to the caveats used
     // for THIS dispatch, never folded back into the session's standing
@@ -1776,7 +1772,7 @@ async fn exec_bridled(
                 execution_lease.clone(),
                 command_broker.clone(),
                 Vec::new(),
-                command_budget,
+                command_wall(cmd, timeout_secs, command_budget),
             )
             .await
         }
@@ -1927,7 +1923,7 @@ async fn exec_bridled(
                                 execution_lease.clone(),
                                 command_broker,
                                 Vec::new(),
-                                command_budget,
+                                command_wall(cmd, timeout_secs, command_budget),
                             )
                             .await
                             {
@@ -2160,13 +2156,22 @@ pub(super) fn command_wall(
     command_budget: crate::RunCommandBudget,
 ) -> std::time::Duration {
     if super::build_shell::has_build_work(cmd) {
-        requested
-            .filter(|secs| *secs > 0)
-            .map(|secs| std::time::Duration::from_secs(command_budget.seconds(Some(secs))))
-            .unwrap_or(LIFECYCLE_BUILD_TIMEOUT)
+        build_wall(requested, command_budget)
     } else {
         std::time::Duration::from_secs(command_budget.seconds(requested))
     }
+}
+
+/// Prepared build work, including repository hooks, uses the build budget.
+/// Explicit per-call hang guards retain the ordinary bounded override.
+pub(super) fn build_wall(
+    requested: Option<u64>,
+    command_budget: crate::RunCommandBudget,
+) -> std::time::Duration {
+    requested
+        .filter(|secs| *secs > 0)
+        .map(|secs| std::time::Duration::from_secs(command_budget.seconds(Some(secs))))
+        .unwrap_or(LIFECYCLE_BUILD_TIMEOUT)
 }
 
 pub(super) fn dispatch_wall(
