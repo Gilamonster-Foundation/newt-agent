@@ -159,15 +159,15 @@ fn creation_admission(
     {
         return Ok(None);
     }
-    if !creation_batch_is_read_only_after_add(args, engine) {
+    if !creation_batch_is_read_only_after_add(args, engine, None) {
         return Err(());
     }
-    let candidate = creation(name, args, workspace, caveats).ok_or(())?;
-    let source = git_identity::pin(
-        args["command"].as_str().ok_or(())?,
-        &trusted_git(caveats)?,
-        caveats,
-    )?;
+    let git = trusted_git(caveats)?;
+    if !creation_batch_is_read_only_after_add(args, engine, Some(&git)) {
+        return Err(());
+    }
+    let candidate = creation(name, args, workspace, caveats, &git).ok_or(())?;
+    let source = git_identity::pin(args["command"].as_str().ok_or(())?, &git, caveats)?;
     Ok(Some((candidate, source)))
 }
 
@@ -176,6 +176,7 @@ fn creation(
     args: &serde_json::Value,
     workspace: &str,
     caveats: &Caveats,
+    git: &Path,
 ) -> Option<Creation> {
     if name != "run_command" {
         return None;
@@ -188,7 +189,7 @@ fn creation(
         if command.program.as_deref() == Some("cd") {
             return None;
         }
-        if command.program.as_deref()? != "git" {
+        if !git_identity::matches(command.program.as_deref()?, git) {
             continue;
         }
         let words = command
@@ -252,6 +253,7 @@ fn display_builtin(program: &str, engine: crate::ShellEngine) -> bool {
 fn creation_batch_is_read_only_after_add(
     args: &serde_json::Value,
     engine: crate::ShellEngine,
+    git: Option<&Path>,
 ) -> bool {
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
         return false;
@@ -283,7 +285,14 @@ fn creation_batch_is_read_only_after_add(
         };
         let args: Vec<_> = words.iter().skip(1).map(String::as_str).collect();
         match c.program.as_deref() {
-            Some("git") => {
+            // Preflight rejects unsafe syntax before resolving any executable;
+            // admission then repeats this check against the pinned identity.
+            Some(program)
+                if git.map_or_else(
+                    || resembles_git(program),
+                    |git| git_identity::matches(program, git),
+                ) =>
+            {
                 if worktree_add_args(&words).is_some() {
                     additions += 1;
                     c.redirects.iter().all(|r| {

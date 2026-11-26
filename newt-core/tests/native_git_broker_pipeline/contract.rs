@@ -87,6 +87,7 @@ pub fn run() {
                 for wrapper in [false, true] {
                     creation_and_security(wrapper).await;
                 }
+                creation_with_absolute_git().await;
                 println!("NATIVE_CONFINED_CONTRACT_CONFIRMED");
             }
         });
@@ -215,6 +216,54 @@ async fn adopt(
         "keep me"
     );
     println!("PASS creation_adoption_original_fence wrapper={wrapper}");
+}
+
+/// #3275: ground the mocked program-identity classifier in real dispatch:
+/// the pinned Git creates and adopts, while a different image named git refuses.
+async fn creation_with_absolute_git() {
+    let (temp, main, task, caveats) = fixture();
+    let session = WorktreeSession::default();
+    let impostor = temp.path().join("git");
+    std::os::unix::fs::symlink("/usr/bin/true", &impostor).unwrap();
+    for command in [
+        format!("'{}' worktree add -b task ../task", impostor.display()),
+        format!(
+            "git worktree add -b task ../task; '{}' worktree list",
+            impostor.display()
+        ),
+    ] {
+        let refused = dispatch(&session, &main, &caveats, &command).await;
+        assert!(
+            refused.contains("cannot verify this worktree creation"),
+            "{refused}"
+        );
+        assert!(!task.exists());
+    }
+    let git = newt_core::git_hardening::trusted_git_program(
+        newt_core::exec_grants::dispatch_path().as_deref(),
+    )
+    .unwrap()
+    .canonicalize()
+    .unwrap();
+    let command = format!(
+        "'{}' worktree add -b task ../task . && '{}' branch --show-current",
+        git.display(),
+        git.display()
+    );
+    let out = dispatch(&session, &main, &caveats, &command).await;
+    assert!(out.contains("Adopted task worktree:"), "{out}");
+    assert!(task.join(".git").is_file());
+    assert_eq!(
+        real_git_output(&task, &["symbolic-ref", "HEAD"]),
+        "refs/heads/task"
+    );
+    let cwd = dispatch(&session, &main, &caveats, "pwd").await;
+    assert!(cwd.contains(task.to_str().unwrap()), "{cwd}");
+    assert_eq!(
+        std::fs::read_to_string(main.join("sentinel")).unwrap(),
+        "keep me"
+    );
+    println!("PASS worktree_3275_absolute_git_adopts_and_different_binary_refuses");
 }
 
 async fn creation_and_security(wrapper: bool) {

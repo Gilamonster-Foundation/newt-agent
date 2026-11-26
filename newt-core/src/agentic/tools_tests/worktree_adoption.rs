@@ -49,6 +49,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
         &args,
         root.to_str().unwrap(),
         &Caveats::top(),
+        Path::new("/fixture/git"),
     )
     .unwrap();
     assert!(candidate.verify().is_none());
@@ -57,6 +58,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
         &args,
         root.to_str().unwrap(),
         &Caveats::top(),
+        Path::new("/fixture/git"),
     )
     .unwrap();
     link(&policy);
@@ -65,7 +67,8 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
         "run_command",
         &args,
         root.to_str().unwrap(),
-        &Caveats::top()
+        &Caveats::top(),
+        Path::new("/fixture/git")
     )
     .is_none());
     for cmd in [
@@ -79,7 +82,8 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
                 "run_command",
                 &serde_json::json!({"command":cmd}),
                 root.to_str().unwrap(),
-                &Caveats::top()
+                &Caveats::top(),
+                Path::new("/fixture/git")
             )
             .is_none(),
             "{cmd}"
@@ -371,12 +375,14 @@ fn worktree_adoption_creation_is_an_execution_boundary() {
     ] {
         assert!(!creation_batch_is_read_only_after_add(
             &serde_json::json!({"command":cmd}),
-            crate::ShellEngine::Brush
+            crate::ShellEngine::Brush,
+            Some(Path::new("/fixture/git"))
         ));
     }
     assert!(creation_batch_is_read_only_after_add(
         &serde_json::json!({"command":"git worktree add -b task ../task 2>&1; echo ready; pwd; git branch --show-current"}),
-        crate::ShellEngine::Brush
+        crate::ShellEngine::Brush,
+        Some(Path::new("/fixture/git"))
     ));
 }
 

@@ -204,7 +204,8 @@ fn worktree_adoption_round4_display_identity() {
                 &serde_json::json!({
                     "command": format!("git worktree add ../task -b task; {sibling}")
                 }),
-                crate::ShellEngine::Brush
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "accepted {sibling}"
         );
@@ -215,7 +216,8 @@ fn worktree_adoption_round4_display_identity() {
                 &serde_json::json!({
                     "command": format!("git worktree add ../task -b task; {sibling}")
                 }),
-                crate::ShellEngine::Brush
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "builtin identity for {sibling}"
         );

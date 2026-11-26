@@ -7,7 +7,61 @@ use crate::worktree_adoption::WorktreeSession;
 #[cfg(unix)]
 use crate::Scope;
 
-/// #2733: no path-qualified or basename-equivalent Git can authorize a batch.
+/// #3275: the injected trusted executable is the same Git for creation,
+/// read-only siblings, and dot-start normalization, regardless of quoting.
+#[test]
+#[cfg(unix)]
+fn worktree_3275_pinned_absolute_git_matches_bare() {
+    for (program, git) in [
+        ("/fixture/git", "/fixture/git"),
+        ("'/trusted tool/bin/git'", "/trusted tool/bin/git"),
+        ("\"/trusted tool/bin/git\"", "/trusted tool/bin/git"),
+    ] {
+        let git = Path::new(git);
+        for suffix in [
+            "worktree add -b task ../task",
+            "-C . worktree add -b task ../task .",
+            "worktree add -b task ../task && git branch --show-current",
+        ] {
+            let bare = format!("git {suffix}");
+            let absolute = format!("{program} {suffix}");
+            for source in [&absolute, &format!("{bare}; {program} worktree list")] {
+                assert!(
+                    creation_batch_is_read_only_after_add(
+                        &serde_json::json!({"command": source}),
+                        crate::ShellEngine::Brush,
+                        Some(git)
+                    ),
+                    "trusted Git must be accepted: {source}"
+                );
+            }
+            assert_eq!(
+                git_identity::pin(&absolute, git, &Caveats::top()),
+                git_identity::pin(&bare, git, &Caveats::top()),
+                "the same Git must receive the same pinning: {absolute}"
+            );
+        }
+    }
+}
+
+/// #3275: an absolute executable with the same basename cannot acquire the
+/// trusted Git's creation authority, whether it creates or follows creation.
+#[test]
+fn worktree_3275_different_absolute_git_is_refused() {
+    for source in [
+        "/different/bin/git worktree add -b task ../task",
+        "git worktree add -b task ../task; /different/bin/git worktree list",
+    ] {
+        assert!(possible_creation(source));
+        assert!(!creation_batch_is_read_only_after_add(
+            &serde_json::json!({"command": source}),
+            crate::ShellEngine::Brush,
+            Some(Path::new("/fixture/git"))
+        ));
+    }
+}
+
+/// #2733: an unpinned path or basename-equivalent Git cannot authorize a batch.
 #[test]
 fn worktree_adoption_round5_git_identity_sweep() {
     for program in [
@@ -28,7 +82,8 @@ fn worktree_adoption_round5_git_identity_sweep() {
             assert!(
                 !creation_batch_is_read_only_after_add(
                     &serde_json::json!({"command": source}),
-                    crate::ShellEngine::Brush
+                    crate::ShellEngine::Brush,
+                    Some(Path::new("/fixture/git"))
                 ),
                 "{source}"
             );
@@ -41,14 +96,16 @@ fn worktree_adoption_round5_git_identity_sweep() {
         assert!(
             !creation_batch_is_read_only_after_add(
                 &serde_json::json!({"command": source}),
-                crate::ShellEngine::Brush
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
             ),
             "{source}"
         );
     }
     assert!(creation_batch_is_read_only_after_add(
         &serde_json::json!({"command": "git worktree add ../task -b task; git branch --show-current"}),
-        crate::ShellEngine::Brush
+        crate::ShellEngine::Brush,
+        Some(Path::new("/fixture/git"))
     ));
 }
 
@@ -174,7 +231,8 @@ fn worktree_adoption_round5_candidate_rejects_path_qualified_git() {
             "run_command",
             &serde_json::json!({"command": format!("{program} worktree add ../task -b task")}),
             root.to_str().unwrap(),
-            &Caveats::top()
+            &Caveats::top(),
+            Path::new("/fixture/git")
         )
         .is_none());
     }

@@ -83,7 +83,8 @@ fn worktree_adoption_round2_git_clean_operands_are_not_creation() {
         &serde_json::json!({
             "command":"git worktree add ../task -b task; git clean -fd -- victim worktree add"
         }),
-        crate::ShellEngine::Brush
+        crate::ShellEngine::Brush,
+        Some(Path::new("/fixture/git"))
     ));
 }
 
@@ -370,7 +371,8 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
                 "run_command",
                 &args,
                 root.to_str().unwrap(),
-                &Caveats::top()
+                &Caveats::top(),
+                Path::new("/fixture/git")
             )
             .is_some(),
             cfg!(unix),
@@ -378,7 +380,11 @@ fn worktree_adoption_round2_siblings_cannot_hide_creation() {
             crate::shell_inspect::inspect_shell(args["command"].as_str().unwrap())
         );
         assert!(
-            !creation_batch_is_read_only_after_add(&args, crate::ShellEngine::Brush),
+            !creation_batch_is_read_only_after_add(
+                &args,
+                crate::ShellEngine::Brush,
+                Some(Path::new("/fixture/git"))
+            ),
             "{suffix}"
         );
     }
