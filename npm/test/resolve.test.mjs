@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { runInNewContext } from 'node:vm';
+import { removeFixture } from '../test-support/cleanup.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
@@ -19,9 +20,9 @@ const umbrella = JSON.parse(readFileSync(join(root, 'newt-agent', 'package.json'
 const currentPlatform = platforms.find((p) => p.key === `${process.platform}-${process.arch}`);
 const skipPosixFixture = !currentPlatform || process.platform === 'win32';
 
-function installedShim(t, shim, script) {
+function installedShim(t, shim, script, beforeRemove) {
   const tmp = mkdtempSync(join(tmpdir(), 'newt-npm-'));
-  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  t.after(() => removeFixture(tmp, beforeRemove));
   const scoped = join(tmp, 'node_modules', '@gilamonster');
   const binaryShim = shim === 'newt-agent' ? 'newt' : shim;
   cpSync(join(root, binaryShim), join(scoped, binaryShim), { recursive: true });
@@ -181,26 +182,28 @@ for (const shim of SHIMS) {
 
   // A real subprocess grounds the resolver's package selection and the launcher's
   // claimed signal forwarding. The ready message is the barrier before signalling.
+  // Its teardown also grounds the mocked cleanup wait for child close.
   test(`${shim}: a signal sent to the launcher reaches its child`, {
     skip: skipPosixFixture,
     timeout: 5000,
   }, async (t) => {
+    let child, closed, binaryPid;
     const launcher = installedShim(t, shim, '#!/usr/bin/env node\n' +
       "process.on('SIGTERM', () => process.stdout.write('forwarded\\n', () => process.exit(42)));\n" +
-      "process.stdout.write(`ready:${process.pid}\\n`);\nsetInterval(() => {}, 60000);\n");
-    const child = spawn(process.execPath, [launcher], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const exited = once(child, 'exit');
-    const closed = once(child, 'close');
-    let output = '';
-    let binaryPid;
-    t.after(() => {
-      child.kill('SIGKILL');
+      "process.stdout.write(`ready:${process.pid}\\n`);\nsetInterval(() => {}, 60000);\n", async () => {
+      child?.kill('SIGKILL');
       if (binaryPid) {
         try { process.kill(binaryPid, 'SIGKILL'); } catch (err) {
           if (err.code !== 'ESRCH') throw err;
         }
       }
+      await closed;
     });
+    child = spawn(process.execPath, [launcher], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const exited = once(child, 'exit');
+    // Capture close at spawn time, including on launch failure or early assertion failure.
+    closed = new Promise((resolve) => child.once('close', resolve));
+    let output = '';
     await new Promise((resolve, reject) => {
       child.on('error', reject);
       child.stdout.on('data', (chunk) => {
