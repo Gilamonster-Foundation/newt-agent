@@ -77,14 +77,12 @@ pub(crate) async fn create_worktree(
     let identity = crate::AgentIdentity::resolve().unwrap_or_default();
     let (name, email) = identity.sandbox_author();
     let env = crate::git_hardening::sandbox_git_env((&name, &email), &identity.git.config);
-    let mut confined = authority.clone();
-    confined.net = crate::Scope::none();
+    let exec_twins = match &authority.exec {
+        crate::Scope::Only(exec) => crate::confined_exec::developer_exec_twins(exec.iter()),
+        crate::Scope::All => Vec::new(),
+    };
     // Only fixed, hook-free registration receives common-dir writes. No files
     // are checked out here, so repository smudge/process filters cannot run.
-    confined.fs_write = crate::Scope::only([
-        common.to_string_lossy().into_owned(),
-        destination.to_string_lossy().into_owned(),
-    ]);
     let mut output = ConstrainedExecutor::run_async(
         ExecRequest::new(
             ExecOrigin::BrokerMediated,
@@ -102,7 +100,7 @@ pub(crate) async fn create_worktree(
                 start,
             ],
             original,
-            confined.clone(),
+            worktree_caveats(authority, [common, destination], &exec_twins),
         )
         .envs(env.clone())
         .env("GIT_NO_LAZY_FETCH", "1"),
@@ -120,17 +118,13 @@ pub(crate) async fn create_worktree(
     }
     // read-tree populates the new index and checkout without updating any ref.
     // Repository filters run here under only the task/admin write fence.
-    confined.fs_write = crate::Scope::only([
-        destination.to_string_lossy().into_owned(),
-        admin.to_string_lossy().into_owned(),
-    ]);
     let checkout = ConstrainedExecutor::run_async(
         ExecRequest::new(
             ExecOrigin::BrokerMediated,
             git.to_string_lossy(),
             ["read-tree", "--reset", "-u", "HEAD"],
             destination,
-            confined,
+            worktree_caveats(authority, [destination, &admin], &exec_twins),
         )
         .envs(env)
         .env("GIT_NO_LAZY_FETCH", "1"),
@@ -153,6 +147,23 @@ pub(crate) async fn create_worktree(
     output.code = checkout.code;
     output.timed_out |= checkout.timed_out;
     Ok(output)
+}
+
+/// Both creation steps use the shell commit path's developer exec identities
+/// with their own write fence. Runtime reads come from the executor's policy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn worktree_caveats(
+    authority: &crate::Caveats,
+    writes: [&Path; 2],
+    exec_twins: &[String],
+) -> crate::Caveats {
+    let mut confined = authority.clone();
+    confined.net = crate::Scope::none();
+    confined.fs_write = crate::Scope::only(writes.map(|path| path.to_string_lossy().into_owned()));
+    if let crate::Scope::Only(exec) = &mut confined.exec {
+        exec.extend(exec_twins.iter().cloned());
+    }
+    confined
 }
 
 fn denied(error: impl std::fmt::Display) -> ToolError {
@@ -1172,6 +1183,46 @@ mod tests {
     use super::forward_original_hook_input;
     use std::io::Read;
     use std::process::{Command, Stdio};
+
+    /// Model the host-resolved Xcode twin without reading a real toolchain.
+    /// The native creation contract grounds this policy in Landlock/Seatbelt.
+    #[test]
+    fn worktree_creation_admits_developer_git_without_widening_writes() {
+        use crate::{Caveats, Scope};
+        use std::path::Path;
+
+        let authority = Caveats {
+            fs_read: Scope::only(["/repo".into(), "/task".into()]),
+            fs_write: Scope::only(["/task".into()]),
+            exec: Scope::only(["git".into(), "sh".into(), "cat".into()]),
+            ..Caveats::top()
+        };
+        let original = authority.clone();
+        let git = "/toolchain/usr/bin/git".to_owned();
+        for writes in [
+            ["/repo/.git", "/task"],
+            ["/task", "/repo/.git/worktrees/task"],
+        ] {
+            let confined = super::worktree_caveats(
+                &authority,
+                writes.map(Path::new),
+                std::slice::from_ref(&git),
+            );
+            assert_eq!(
+                confined.exec,
+                Scope::only(["git".into(), "sh".into(), "cat".into(), git.clone()]),
+                "both creation steps must admit the resolved developer Git image"
+            );
+            let expected = Caveats {
+                fs_write: Scope::only(writes.map(str::to_owned)),
+                net: Scope::none(),
+                exec: confined.exec.clone(),
+                ..original.clone()
+            };
+            assert_eq!(confined, expected);
+        }
+        assert_eq!(authority, original, "invocation grants must not escape");
+    }
 
     #[test]
     fn pre_push_3258_uses_the_original_hook_chain() {
