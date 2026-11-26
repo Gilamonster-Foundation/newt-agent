@@ -33,6 +33,7 @@ pub(crate) mod observed_report;
 use final_reply::FinalReply;
 pub use observed_report::assistant_prose as model_reply_for_history;
 pub use observed_report::split_report as split_observed_report;
+pub use observed_report::transcript_reply as reply_for_transcript;
 mod selected_target;
 mod semantic_pins;
 pub use claim_check::{

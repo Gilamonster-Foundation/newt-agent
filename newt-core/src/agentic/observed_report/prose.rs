@@ -37,6 +37,18 @@ pub fn assistant_prose(text: &str) -> String {
     }
 }
 
+/// Project the displayed reply into the durable transcript. Assistant speech
+/// and the operator's record are separate views of a harness-only outcome.
+pub fn transcript_reply(text: &str) -> String {
+    if split_report(text).is_some_and(|(_, prose)| prose.trim().is_empty()) {
+        // Keep the existing harness-authored envelope. Replay still removes it;
+        // flattening its notices into prose would misattribute them to the model.
+        text.to_owned()
+    } else {
+        assistant_prose(text)
+    }
+}
+
 pub(crate) fn replay_messages(messages: &[crate::MemMessage]) -> Vec<crate::MemMessage> {
     messages
         .iter()
@@ -243,6 +255,22 @@ impl Fence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_projection_preserves_model_prose_and_partial_reports() {
+        let report = "## Observed\n\nFacts unavailable: root retention limit reached.\n\n## Model explanation\n\n";
+        assert_eq!(transcript_reply(&format!("{report}Done.")), "Done.");
+        for prose in [
+            "",
+            "Done.",
+            "## Observed\n\nMy own observations.",
+            "## Observed\n\nReport `unfinished`",
+        ] {
+            assert_eq!(transcript_reply(prose), prose);
+        }
+        let quoted = format!("```markdown\n{report}\n```");
+        assert_eq!(transcript_reply(&quoted), quoted);
+    }
 
     fn genuine_report() -> String {
         let dir = tempfile::tempdir().unwrap();
