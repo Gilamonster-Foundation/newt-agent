@@ -32,6 +32,8 @@ pub struct WorktreeSession {
     pub(crate) report: std::sync::Arc<std::sync::Mutex<crate::agentic::observed_report::State>>,
     // Advisory working state, independent of whether confinement is armed.
     task_worktree: std::sync::Mutex<Option<(PathBuf, String)>>,
+    // One-shot action progress, independent of whether confinement is armed.
+    adoption_progress_pending: std::sync::atomic::AtomicBool,
     pub(crate) command_cwd_notice_shown: std::sync::atomic::AtomicBool,
     pub(crate) publish_early: std::sync::Mutex<crate::agentic::publish_early::State>,
     pub(crate) branch_nudge_shown: std::sync::atomic::AtomicBool,
@@ -42,12 +44,22 @@ impl WorktreeSession {
         *self.report.lock().expect("report state") = Default::default();
         *self.adopted.lock().expect("worktree session lock") = None;
         *self.task_worktree.lock().expect("worktree hint lock") = None;
+        self.adoption_progress_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.command_cwd_notice_shown
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
     pub(crate) fn record_task_worktree(&self, path: &Path, branch: &str) {
-        *self.task_worktree.lock().expect("worktree hint lock") =
-            Some((path.to_owned(), branch.to_owned()));
+        let mut task = self.task_worktree.lock().expect("worktree hint lock");
+        if task.as_ref().is_none_or(|(prior, _)| prior != path) {
+            self.adoption_progress_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        *task = Some((path.to_owned(), branch.to_owned()));
+    }
+    pub(crate) fn take_adoption_progress(&self) -> bool {
+        self.adoption_progress_pending
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
     pub(crate) fn task_hint(&self) -> Option<String> {
         self.task_worktree.lock().expect("worktree hint lock").as_ref().map(|(path, branch)| format!(
@@ -96,6 +108,8 @@ impl WorktreeSession {
         let mut state = self.adopted.lock().expect("worktree session lock");
         if state.is_none() {
             *state = Some(candidate);
+            self.adoption_progress_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

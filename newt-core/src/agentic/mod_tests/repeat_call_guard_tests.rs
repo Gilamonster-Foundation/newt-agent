@@ -1354,7 +1354,7 @@ fn no_progress_state(steer_after: usize, stop_after: usize) -> WorkflowRuntimeSt
 
 /// The verdict at one round start, as a word.
 fn gate(state: &mut WorkflowRuntimeState, steer_allowed: bool) -> &'static str {
-    match state.no_progress_verdict(PromptDisposition::Act, steer_allowed) {
+    match state.no_progress_verdict(PromptDisposition::Act, steer_allowed, None) {
         NoProgress::Continue => "continue",
         NoProgress::Steer(_) => "steer",
         NoProgress::Stop => "stop",
@@ -1441,6 +1441,7 @@ fn evidence_only_progress_replay_ends_no_progress_with_harness_notice() {
             completed += 1;
             no_progress_gate!(
                 state,
+                None,
                 PromptDisposition::Act,
                 false,
                 messages,
@@ -1487,19 +1488,19 @@ fn evidence_only_progress_ceiling_exempts_non_act_and_zero_disables_it() {
         for _ in 0..221 {
             state.record_round_outcome(false, true);
             assert!(matches!(
-                state.no_progress_verdict(disposition, false),
+                state.no_progress_verdict(disposition, false, None),
                 NoProgress::Continue
             ));
         }
         // The old short brake still bounds repeated/idle observations.
         for _ in 1..12 {
             assert!(matches!(
-                state.no_progress_verdict(disposition, false),
+                state.no_progress_verdict(disposition, false, None),
                 NoProgress::Continue
             ));
         }
         assert!(matches!(
-            state.no_progress_verdict(disposition, false),
+            state.no_progress_verdict(disposition, false, None),
             NoProgress::Stop
         ));
     }
@@ -1628,7 +1629,8 @@ fn a_write_then_idle_rounds_are_steered_once_then_stopped() {
     state.record_round_outcome(false, false);
     assert_eq!(gate(&mut state, true), "continue"); // 1 idle round
     state.record_round_outcome(false, false);
-    let NoProgress::Steer(text) = state.no_progress_verdict(PromptDisposition::Act, true) else {
+    let NoProgress::Steer(text) = state.no_progress_verdict(PromptDisposition::Act, true, None)
+    else {
         panic!("2 idle rounds must steer");
     };
     assert!(text.contains("2 rounds produced no new evidence"), "{text}");
