@@ -1052,16 +1052,28 @@ impl ConfinedCommand {
             // involved, and calling `apply` would be wrong (AppContainer fails
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
             // non-empty. The held roots stay alive here, past `restrict_self`.
-            if prefix.is_empty() {
-                if let Some(image) = &worker_image {
-                    sandbox.apply_with_worker(&mechanism_effective, &image.program, &image.file, &held_read_roots)?;
-                } else {
-                    sandbox.apply_with_held_roots(&mechanism_effective, &held_read_roots)?;
-                }
-            }
+            let network_fallback = if prefix.is_empty() {
+                sandbox.apply_to_command(
+                    &mut cmd, &mechanism_effective,
+                    worker_image.as_ref().map(|image| (image.program.as_str(), &image.file)),
+                    &held_read_roots,
+                )?
+            } else { None };
 
             after_apply();
-            cmd.spawn().map_err(ToolError::from)
+            let spawned = cmd.spawn();
+            #[cfg(target_os = "linux")]
+            if let (Some(fallback), Err(error)) = (network_fallback, &spawned) {
+                if error.raw_os_error() == Some(agent_bridle_fdguard::build_network::RETRY_DENY_ALL) {
+                    // The first child failed in namespace setup BEFORE exec.
+                    // Retry only that failure, once, with both deny-all floors.
+                    fallback.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return cmd.spawn().map_err(ToolError::from);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = network_fallback;
+            spawned.map_err(ToolError::from)
         })
         .join()
         .map_err(|_| ToolError::denied("confined-spawn thread panicked before exec"))?;

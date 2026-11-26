@@ -20,6 +20,7 @@ use newt_policy::caveats::Scope;
 
 #[cfg(unix)]
 use super::kill_process_group;
+#[cfg(target_os = "macos")]
 use super::runtime_sandbox_policy;
 #[cfg(target_os = "windows")]
 use super::WindowsJob;
@@ -172,7 +173,7 @@ impl ConstrainedExecutor {
         let cx = mint_context(req.origin, &caveats)?;
 
         let mut cmd = ConfinedCommand::new(&program)
-            .sandbox_policy(std::sync::Arc::new(runtime_sandbox_policy()))
+            .sandbox_policy(std::sync::Arc::new(req.sandbox_policy()))
             .args(&args)
             .current_dir(&req.cwd)
             // A fresh process group so a supervisor could kill the whole
@@ -313,6 +314,13 @@ impl ConstrainedExecutor {
                     extend_write_root(&mut caveats, procs.clone());
                     args.push("--cgroup-procs".to_string());
                     args.push(procs);
+                }
+                if req.sandbox_policy().child_network
+                    == agent_bridle::ChildNetworkPolicy::PrivateLoopback
+                {
+                    // The spawn funnel installs either private loopback or both
+                    // deny-all mechanisms before this helper can run.
+                    args.push("--inherit-build-network".to_string());
                 }
                 args.push("--".to_string());
                 args.push(req.program.clone());

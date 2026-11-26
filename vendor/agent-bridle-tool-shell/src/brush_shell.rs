@@ -585,7 +585,7 @@ fn supervise_worker(
         }
         return Ok(Supervised::TimedOut);
     }
-    let outcome = stdout_reader
+    let mut outcome = stdout_reader
         .join()
         .map_err(|_| ToolError::denied("brush worker stdout reader panicked"))??;
     let stderr = stderr_reader
@@ -599,6 +599,15 @@ fn supervise_worker(
             "brush worker diagnostic stderr: {}",
             String::from_utf8_lossy(&stderr)
         );
+    }
+    // The build network hook reports its actual mode before the worker starts
+    // its authenticated stream. Preserve that bounded diagnostic in the result
+    // so a fallback mock-server failure cannot look like an ordinary test bug.
+    for line in String::from_utf8_lossy(&stderr).lines() {
+        if line.starts_with("Build network: ") {
+            outcome.stderr.extend_from_slice(line.as_bytes());
+            outcome.stderr.push(b'\n');
+        }
     }
     Ok(Supervised::Complete(outcome))
 }

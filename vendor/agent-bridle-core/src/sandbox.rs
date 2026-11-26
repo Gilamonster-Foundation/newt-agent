@@ -199,6 +199,25 @@ pub trait Sandbox: Send + Sync {
         ))
     }
 
+    /// Prepare the confinement for this command. Most backends confine the
+    /// disposable spawning thread; private build networking must instead apply
+    /// its prepared rules in the fork child, after namespace setup. A returned
+    /// flag permits ONE fresh-child deny-all retry after a namespace-only
+    /// pre-exec failure; no program code has run at that point.
+    fn apply_to_command(
+        &self,
+        _command: &mut std::process::Command,
+        effective: &Caveats,
+        worker: Option<(&str, &std::fs::File)>,
+        held: &[HeldReadRoot],
+    ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+        match worker {
+            Some((program, image)) => self.apply_with_worker(effective, program, image, held),
+            None => self.apply_with_held_roots(effective, held),
+        }?;
+        Ok(None)
+    }
+
     /// The argv prefix that wraps a child so a *wrapper-based* L3 backend
     /// confines it (macOS `sandbox-exec`). The returned vector, prepended to a
     /// `(program, args…)`, is the argv that must actually be spawned.
@@ -1998,12 +2017,13 @@ pub(crate) mod landlock_impl {
     }
 
     impl LandlockSandbox {
-        fn apply_rules(
+        fn prepare_rules(
             &self,
             effective: &Caveats,
             worker: Option<(&str, &std::fs::File)>,
             held: &[super::HeldReadRoot],
-        ) -> ToolResult<()> {
+            confine_net: bool,
+        ) -> ToolResult<landlock::RulesetCreated> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
             // govern separately (only when `exec` is restricted), never via the
@@ -2019,7 +2039,6 @@ pub(crate) mod landlock_impl {
             // Non-empty host allow-lists are not expressible in Landlock (port-
             // based, not hostname-based) and stay advisory — only the empty-set
             // case maps cleanly to a deny-all TCP rule.
-            let confine_net = super::net_fully_denied(effective);
             let mut handled = write;
             if confine_read {
                 handled |= read;
@@ -2134,6 +2153,37 @@ pub(crate) mod landlock_impl {
             } else {
                 ruleset
             };
+            Ok(ruleset)
+        }
+
+        fn apply_rules(
+            &self,
+            effective: &Caveats,
+            worker: Option<(&str, &std::fs::File)>,
+            held: &[super::HeldReadRoot],
+            command: Option<&mut std::process::Command>,
+        ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+            let confine_net = super::net_fully_denied(effective);
+            let private_build = confine_net
+                && self.policy.child_network == ChildNetworkPolicy::PrivateLoopback
+                && command.is_some();
+            let ruleset = self.prepare_rules(effective, worker, held, confine_net && !private_build)?;
+            if private_build {
+                // Both choices reuse the full filesystem rules. A separate
+                // net-only Landlock domain would implicitly deny REFER and
+                // break cross-directory build renames even in fallback mode.
+                let require_fd = |rules: landlock::RulesetCreated| {
+                    let fd: Option<std::os::fd::OwnedFd> = rules.into();
+                    fd.ok_or_else(|| ToolError::denied("Landlock filesystem rules unavailable"))
+                };
+                let fallback_rules = self.prepare_rules(effective, worker, held, true)?;
+                let fallback = agent_bridle_fdguard::build_network::confine(
+                    command.expect("private build requires a command"),
+                    require_fd(ruleset)?, require_fd(fallback_rules)?,
+                    seccomp_egress_program(false)?, seccomp_egress_program(true)?,
+                );
+                return Ok(Some(fallback));
+            }
             let status = ruleset.restrict_self().map_err(landlock_denied)?;
 
             // Fail closed: if the kernel did not actually enforce the ruleset,
@@ -2150,10 +2200,10 @@ pub(crate) mod landlock_impl {
             // already fully denied (a granted net scope leaves it inert), and
             // fail-closed: a failed install refuses the spawn rather than let the
             // caller believe UDP/DNS/raw egress is denied when it is not.
-            if self.policy.child_network == ChildNetworkPolicy::DenyDirect && confine_net {
+            if matches!(self.policy.child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateLoopback) && confine_net {
                 install_seccomp_egress_deny()?;
             }
-            Ok(())
+            Ok(None)
         }
     }
 
@@ -2167,7 +2217,7 @@ pub(crate) mod landlock_impl {
         }
 
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
-            self.apply_rules(effective, None, &[])
+            self.apply_rules(effective, None, &[], None).map(|_| ())
         }
 
         fn apply_with_held_roots(
@@ -2175,7 +2225,7 @@ pub(crate) mod landlock_impl {
             effective: &Caveats,
             held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
-            self.apply_rules(effective, None, held)
+            self.apply_rules(effective, None, held, None).map(|_| ())
         }
 
         fn apply_with_worker(
@@ -2185,7 +2235,17 @@ pub(crate) mod landlock_impl {
             image: &std::fs::File,
             held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
-            self.apply_rules(effective, Some((program, image)), held)
+            self.apply_rules(effective, Some((program, image)), held, None).map(|_| ())
+        }
+
+        fn apply_to_command(
+            &self,
+            command: &mut std::process::Command,
+            effective: &Caveats,
+            worker: Option<(&str, &std::fs::File)>,
+            held: &[super::HeldReadRoot],
+        ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+            self.apply_rules(effective, worker, held, Some(command))
         }
 
         fn resolved_authority(
@@ -2254,7 +2314,7 @@ pub(crate) mod landlock_impl {
             let net = if matches!(effective.net, Scope::All) {
                 ResolvedScope::Unbounded
             } else if super::net_fully_denied(effective)
-                && self.policy.child_network == ChildNetworkPolicy::DenyDirect
+                && matches!(self.policy.child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateLoopback)
             {
                 ResolvedScope::from_scope(&effective.net)
             } else {
@@ -2376,8 +2436,13 @@ pub(crate) mod landlock_impl {
     /// `apply_filter` is a safe fn, so core keeps `unsafe_code = forbid`. Must run
     /// on the confining thread, after `restrict_self`, immediately before the spawn.
     fn install_seccomp_egress_deny() -> ToolResult<()> {
+        seccompiler::apply_filter(&seccomp_egress_program(false)?)
+            .map_err(|e| ToolError::denied(format!("seccomp egress deny not installed: {e}")))
+    }
+
+    fn seccomp_egress_program(private_loopback: bool) -> ToolResult<seccompiler::BpfProgram> {
         use seccompiler::{
-            apply_filter, BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
+            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp,
             SeccompCondition, SeccompFilter, SeccompRule, TargetArch,
         };
         use std::collections::BTreeMap;
@@ -2393,6 +2458,7 @@ pub(crate) mod landlock_impl {
         ];
         let rules: Vec<SeccompRule> = families
             .into_iter()
+            .filter(|family| !private_loopback || *family == libc::AF_PACKET as u64)
             .map(|fam| {
                 let cond = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, fam)
                     .map_err(|e| denied(e.to_string()))?;
@@ -2420,8 +2486,7 @@ pub(crate) mod landlock_impl {
         )
         .map_err(|e| denied(e.to_string()))?;
 
-        let prog: BpfProgram = BpfProgram::try_from(filter).map_err(|e| denied(e.to_string()))?;
-        apply_filter(&prog).map_err(|e| denied(e.to_string()))
+        BpfProgram::try_from(filter).map_err(|e| denied(e.to_string()))
     }
 
     /// Resolve the granted `exec` scope to absolute, existing program **files**
@@ -3175,8 +3240,9 @@ pub(crate) mod landlock_impl {
                 net: Scope::only(Vec::<String>::new()),
                 ..Caveats::top()
             };
+            for child_network in [crate::ChildNetworkPolicy::DenyDirect, crate::ChildNetworkPolicy::PrivateLoopback] {
             let policy = crate::SandboxPolicy {
-                child_network: crate::ChildNetworkPolicy::DenyDirect,
+                child_network,
                 ..crate::SandboxPolicy::default()
             };
             let resolved = LandlockSandbox::with_policy(Arc::new(policy))
@@ -3193,6 +3259,7 @@ pub(crate) mod landlock_impl {
                 ),
                 "enforced net:none (DenyDirect) must admit"
             );
+            }
         }
 
         /// The conservative rule only bites RESTRICTED axes: an unrestricted grant

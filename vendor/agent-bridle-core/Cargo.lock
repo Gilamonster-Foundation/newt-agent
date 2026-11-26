@@ -27,10 +27,9 @@ dependencies = [
 [[package]]
 name = "agent-bridle-fdguard"
 version = "0.8.0-rc.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1faf343f3355da2ef715fe5ed05646306a1e388021c05b5a7c9f6f6b298419"
 dependencies = [
  "libc",
+ "seccompiler",
 ]
 
 [[package]]

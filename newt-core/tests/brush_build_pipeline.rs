@@ -12,6 +12,115 @@ fn main() {
         std::process::exit(code);
     }
     newt_core::answer_nextest_listing("brush_build_pipeline");
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--build-loopback-probe") {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        let automatic = std::env::args().any(|arg| arg == "--build-network-auto");
+        if automatic && TcpListener::bind(("127.0.0.1", 0)).is_err() {
+            for host in ["127.0.0.1", "127.23.45.67", "::1"] {
+                assert_eq!(
+                    TcpListener::bind((host, 0)).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+            println!("BUILD_LOOPBACK_DENIED_FALLBACK");
+            return;
+        }
+        if automatic {
+            // Enumerate via libc's netlink API; the build fence intentionally
+            // does not grant procfs network files. The allocation ends with a
+            // zero-index/null-name sentinel and must be freed even on mismatch.
+            let interfaces = unsafe { libc::if_nameindex() };
+            assert!(!interfaces.is_null(), "{}", std::io::Error::last_os_error());
+            // SAFETY: libc returned a sentinel-terminated array with C-string
+            // names. Short-circuiting checks the first entry before advancing.
+            let only_loopback = unsafe {
+                (*interfaces).if_index != 0
+                    && !(*interfaces).if_name.is_null()
+                    && std::ffi::CStr::from_ptr((*interfaces).if_name) == c"lo"
+                    && (*interfaces.add(1)).if_index == 0
+                    && (*interfaces.add(1)).if_name.is_null()
+            };
+            unsafe { libc::if_freenameindex(interfaces) };
+            assert!(only_loopback, "private namespace must expose only loopback");
+            println!("BUILD_PRIVATE_INTERFACE_CONFIRMED: lo");
+        }
+        for host in ["127.0.0.1", "127.23.45.67", "::1"] {
+            let listener = TcpListener::bind((host, 0))
+                .unwrap_or_else(|error| panic!("loopback bind {host}: {error}"));
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(b"ping").unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            server
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut payload = [0; 4];
+            server.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"ping");
+            server.write_all(b"pong").unwrap();
+            client.read_exact(&mut payload).unwrap();
+            assert_eq!(&payload, b"pong");
+            println!("BUILD_LOOPBACK_ADDRESS_CONFIRMED: {host}");
+        }
+        println!("BUILD_LOOPBACK_ROUNDTRIP_CONFIRMED");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--build-external-connect-probe") {
+        let private = std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok();
+        for address in ["192.0.2.1:9", "[2001:db8::1]:9"] {
+            let error = std::net::TcpStream::connect_timeout(
+                &address.parse().unwrap(),
+                std::time::Duration::from_secs(1),
+            )
+            .expect_err("external connect must remain denied");
+            if private {
+                assert!(
+                    matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENETUNREACH | libc::EHOSTUNREACH)
+                    ),
+                    "{address}: {error}"
+                );
+            } else {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "{address}: {error}"
+                );
+            }
+        }
+        println!("BUILD_EXTERNAL_CONNECT_DENIED");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--inherited-socket=")
+            .and_then(|fd| fd.parse::<i32>().ok())
+    }) {
+        let mut kind = 0;
+        let mut size = std::mem::size_of_val(&kind) as libc::socklen_t;
+        // SAFETY: writable locals of the stated size; a closed fd returns EBADF.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut kind as *mut i32).cast(),
+                    &mut size,
+                )
+            },
+            -1,
+            "host socket must not survive the confined spawn"
+        );
+        println!("BUILD_INHERITED_SOCKET_DENIED");
+        return;
+    }
     #[cfg(unix)]
     if std::env::args().any(|arg| arg == "--build-unix-socket-probe") {
         use std::io::{Read, Write};
@@ -193,6 +302,59 @@ mod native {
     }
 
     pub fn run() {
+        #[cfg(target_os = "linux")]
+        if std::env::args().any(|arg| arg == "--deny-build-netns") {
+            assert!(
+                !std::env::args().any(|arg| arg == "--require-build-netns"),
+                "cannot both deny and require namespace setup"
+            );
+            // Test-only fault injection, before starting any runtime threads:
+            // descendants inherit EACCES for unshare on permissive hosts too.
+            // This is not a production namespace policy or an escape filter.
+            let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+            let mut filters = [
+                instruction((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0, 0, 0),
+                instruction(
+                    (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    0,
+                    1,
+                    libc::SYS_unshare as u32,
+                ),
+                instruction(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    0,
+                    0,
+                    libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+                ),
+                instruction(
+                    (libc::BPF_RET | libc::BPF_K) as u16,
+                    0,
+                    0,
+                    libc::SECCOMP_RET_ALLOW,
+                ),
+            ];
+            let program = libc::sock_fprog {
+                len: filters.len() as u16,
+                filter: filters.as_mut_ptr(),
+            };
+            // SAFETY: the kernel copies this live filter during prctl. Offset
+            // zero is seccomp_data.nr; all other syscalls remain allowed here.
+            unsafe {
+                assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+                assert_eq!(
+                    libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+                    0
+                );
+            }
+            // unshare(0) changes nothing. This control must observe the injected
+            // errno, independently of the host's user-namespace restrictions.
+            assert_eq!(unsafe { libc::unshare(0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EACCES)
+            );
+            eprintln!("BUILD_NETNS_SETUP_FAILURE_INJECTED");
+        }
         #[cfg(target_os = "macos")]
         let native_fence = agent_bridle::seatbelt_is_supported();
         #[cfg(target_os = "linux")]
@@ -236,6 +398,28 @@ mod native {
             }
             if selected("build_tests_can_bind_a_unix_socket_in_a_tempdir") {
                 build_tests_can_bind_a_unix_socket_in_a_tempdir(&root).await;
+            }
+            #[cfg(target_os = "linux")]
+            for (name, probe, marker) in [
+                (
+                    "build_tests_external_connect_stays_denied",
+                    "--build-external-connect-probe",
+                    "BUILD_EXTERNAL_CONNECT_DENIED",
+                ),
+                (
+                    "build_tests_loopback_roundtrip",
+                    "--build-loopback-probe",
+                    "BUILD_LOOPBACK_ROUNDTRIP_CONFIRMED",
+                ),
+                (
+                    "build_tests_inherited_host_socket_denied",
+                    "--inherited-socket=200",
+                    "BUILD_INHERITED_SOCKET_DENIED",
+                ),
+            ] {
+                if selected(name) {
+                    build_network_probe(&root, name, probe, marker).await;
+                }
             }
             if selected("denied_build_runs_no_pipeline_stage_or_redirection") {
                 denied_build_runs_no_pipeline_stage_or_redirection(&root).await;
@@ -596,6 +780,117 @@ mod native {
         assert!(!outside.join("write").exists());
         assert_eq!(gate.queries, 1, "one prepared Build admission: {output}");
         eprintln!("test cached_build_runs_the_original_pipeline_once ... ok");
+    }
+
+    /// Grounds the mocked build-network scope contract in real socket calls
+    /// through both build routes: a private namespace supports loopback with
+    /// no external route; unavailable namespaces retain the socket-family deny.
+    /// Also grounds the inherited-descriptor floor with a real host TCP socket.
+    /// `--require-build-netns` rejects fallback on every probe and both routes;
+    /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
+    #[cfg(target_os = "linux")]
+    async fn build_network_probe(root: &Path, name: &str, probe: &str, marker: &str) {
+        use newt_core::confined_exec::{
+            build_tool_caveats, build_tool_request, ConstrainedExecutor,
+        };
+
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let host_socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // SAFETY: F_DUPFD returns a new owned fd without CLOEXEC. The fixture
+        // reserves a high slot so neither stdio nor a transient pipe can mask it.
+        let fd = unsafe { libc::fcntl(host_socket.as_raw_fd(), libc::F_DUPFD, 200) };
+        assert!(fd >= 200);
+        let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(
+            unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) },
+            0
+        );
+        let probe = if probe.starts_with("--inherited-socket=") {
+            format!("--inherited-socket={fd}")
+        } else {
+            probe.to_owned()
+        };
+        let (workspace, outside) = project(root, name);
+        let executable = std::env::current_exe().unwrap();
+        let argv = ConstrainedExecutor::run(&build_tool_request(
+            &workspace,
+            &workspace,
+            executable.to_str().unwrap(),
+            [probe.as_str(), "--build-network-auto"],
+            &Scope::none(),
+        ))
+        .unwrap();
+        let source = format!(
+            "cargo build --lib --offline && '{}' {probe} --build-network-auto",
+            executable.display()
+        );
+        let brush = execute_tool(
+            "run_command",
+            &serde_json::json!({"command": source}),
+            workspace.to_str().unwrap(),
+            false,
+            100,
+            &build_tool_caveats(&workspace),
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let stdout = String::from_utf8_lossy(&argv.stdout);
+        let stderr = String::from_utf8_lossy(&argv.stderr);
+        for (route, output, diagnostic) in [
+            ("argv", stdout.as_ref(), stderr.as_ref()),
+            ("Brush", brush.as_str(), brush.as_str()),
+        ] {
+            let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK");
+            assert!(
+                output.contains(marker) || (name == "build_tests_loopback_roundtrip" && fallback),
+                "{name} ({route}): {output}\n{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("Build network:"),
+                "missing effective network mode ({route}): {diagnostic}"
+            );
+            for (switch, mode) in [
+                ("--require-build-netns", "private loopback only"),
+                ("--deny-build-netns", "deny-all fallback"),
+            ] {
+                if std::env::args().any(|arg| arg == switch) {
+                    assert!(
+                        diagnostic.contains(mode),
+                        "{name} ({route}) requires {mode}: {diagnostic}"
+                    );
+                    eprintln!("{name} ({route}): required {mode} measured");
+                }
+            }
+            if fallback {
+                assert!(diagnostic.contains("deny-all fallback"), "{diagnostic}");
+            } else if name == "build_tests_loopback_roundtrip" {
+                assert!(diagnostic.contains("private loopback only"), "{diagnostic}");
+            }
+            eprintln!(
+                "{name} ({route}): {}",
+                if fallback {
+                    "deny-all fallback measured"
+                } else {
+                    marker
+                }
+            );
+        }
+        assert!(argv.success, "{stderr}");
+        assert!(!outside.join("write").exists());
+        eprintln!("test {name} ... ok (argv and Brush)");
     }
 
     /// Grounds structural wrapper selection in the actual native timeout and
