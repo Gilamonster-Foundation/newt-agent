@@ -168,12 +168,11 @@ async fn plan_release_preserves_worktree_adoption() {
             .await;
             let outcome = outcome.get().copied();
             assert!(
-                notices.0.iter().any(|n| n
-                    == &format!(
-                        "left empty directory `{}`; remove it if unwanted",
-                        failed_target.display()
-                    )),
-                "operator missed notice: {:?}",
+                notices
+                    .0
+                    .iter()
+                    .all(|notice| !notice.contains("left empty directory")),
+                "successful empty-leaf cleanup must not ask the operator to remove it: {:?}",
                 notices.0
             );
             assert_ne!(
@@ -182,20 +181,12 @@ async fn plan_release_preserves_worktree_adoption() {
                 "failure control: {text}"
             );
             assert!(
-                failed_target.is_dir(),
-                "failure must retain the empty leaf: {text}"
+                !failed_target.exists(),
+                "failure left its empty leaf: {text}"
             );
-            assert!(
-                text.contains(&format!(
-                    "left empty directory `{}`; remove it if unwanted",
-                    failed_target.display()
-                )),
-                "missing leftover notice: {text}"
-            );
-            assert_eq!(std::fs::read_dir(&failed_target).unwrap().count(), 0);
+            assert!(!text.contains("left empty directory"), "{text}");
             assert!(failed_gate.2.is_empty());
             assert!(session.snapshot().is_none());
-            std::fs::remove_dir(&failed_target).unwrap();
         }
         let mut gate = AllowOnce::default();
         let (text, outcome) = super::round2_tests::dispatch(

@@ -246,6 +246,19 @@ pub(super) fn dispatch_network_read(
     caveats: &Caveats,
     gate: &mut Option<&mut dyn PermissionGate>,
 ) -> std::ops::ControlFlow<String, Option<Caveats>> {
+    if git_verb_in(source, &["fetch"]).is_some() {
+        if let Ok((common, admin)) = crate::git_staging::HeldRoots::bind(&caveats.fs_read)
+            .and_then(|held| crate::git_staging::discover_git_dirs(cwd, &held))
+        {
+            if [&common, &admin].iter().any(|dir| {
+                !newt_policy::caveats::permits_path(&caveats.fs_write, &dir.to_string_lossy())
+            }) {
+                return std::ops::ControlFlow::Break(
+                    "capability denied: `git fetch` is unavailable while Git metadata is read-only. Fetch from an operator terminal, then retry the task. No command ran and no network approval was requested.".into(),
+                );
+            }
+        }
+    }
     dispatch_network_read_with(
         source,
         caveats,

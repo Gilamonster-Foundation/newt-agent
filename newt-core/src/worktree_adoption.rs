@@ -248,6 +248,10 @@ impl Creation {
         &self.destination
     }
 
+    pub(crate) fn repository(&self) -> (&Path, &Path) {
+        (&self.original, &self.common)
+    }
+
     /// Only after approval: create the destination through its held parent so
     /// the child fence can bind the destination itself, never its whole parent.
     pub(crate) fn prepare(&mut self, authority: &Caveats) -> Result<(), String> {
@@ -318,9 +322,12 @@ impl Creation {
         Ok(())
     }
 
-    pub(crate) fn leftover_notice(&self) -> Option<String> {
+    pub(crate) fn cleanup_notice(&self) -> Option<String> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if self.path_guard.left_empty() {
+            if self.path_guard.remove_empty().is_ok() {
+                return None;
+            }
             return Some(format!(
                 "left empty directory {}; remove it if unwanted",
                 task_path_literal(&self.destination)
