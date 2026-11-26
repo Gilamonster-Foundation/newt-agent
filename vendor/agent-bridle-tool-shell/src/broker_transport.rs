@@ -89,21 +89,28 @@ impl BrokerClient {
                 "broker request exceeds its bounded payload budget",
             ));
         }
-        let (mut local, remote) = UnixStream::pair()?;
-        local.set_read_timeout(Some(timeout))?;
-        local.set_write_timeout(Some(timeout))?;
+        let (mut local, remote) = UnixStream::pair()
+            .map_err(|error| broker_io("create pair", error))?;
+        local.set_read_timeout(Some(timeout))
+            .map_err(|error| broker_io("set read timeout", error))?;
+        local.set_write_timeout(Some(timeout))
+            .map_err(|error| broker_io("set write timeout", error))?;
         crate::private_control::prepare_broker_receiver(&local)?;
-        send_control_endpoint(&self.endpoint, &remote)?;
+        send_control_endpoint(&self.endpoint, &remote).map_err(|error| {
+            ToolError::denied(format!("broker delegation socket send RPC endpoint: {error}"))
+        })?;
         drop(remote);
         // The server names itself in a kernel-attested message. Endpoint
         // delegation, not this claimed PID, selected the server capability.
         let mut hello = [0; 44];
-        let server_pid = crate::private_control::read_broker_peer(&local, &mut hello)?;
+        let server_pid = crate::private_control::read_broker_peer(&local, &mut hello)
+            .map_err(|error| ToolError::denied(format!("broker server hello: {error}")))?;
         if &hello[..8] != HELLO || hello[8..12] != server_pid.to_le_bytes() {
             return Err(ToolError::denied("broker server hello identity mismatch"));
         }
         let challenge = hello[12..].to_vec();
-        local.write_all(&std::process::id().to_le_bytes())?;
+        local.write_all(&std::process::id().to_le_bytes())
+            .map_err(|error| broker_io("write client PID", error))?;
         let request = make_frame(
             payload.to_vec(),
             challenge.clone(),
@@ -118,7 +125,9 @@ impl BrokerClient {
             return Err(ToolError::denied(error.clone()));
         }
         let endpoint = if response.node.payload().endpoint {
-            Some(receive_control_endpoint(&local)?)
+            Some(receive_control_endpoint(&local).map_err(|error| {
+                ToolError::denied(format!("broker RPC socket receive reply endpoint: {error}"))
+            })?)
         } else {
             None
         };
@@ -169,21 +178,32 @@ fn verify_frame(frame: &Frame, challenge: &[u8], parents: BTreeSet<ContentId>) -
     Ok(())
 }
 
-fn write_frame(stream: &mut UnixStream, frame: &Frame) -> ToolResult<()> {
+/// Keep the channel and syscall phase without erasing the I/O error kind.
+pub(crate) fn broker_io(operation: &str, error: std::io::Error) -> ToolError {
+    ToolError::Exec(std::io::Error::new(
+        error.kind(),
+        format!("broker RPC socket {operation}: {error}"),
+    ))
+}
+
+fn write_frame(stream: &mut impl Write, frame: &Frame) -> ToolResult<()> {
     let bytes = canonical::to_canonical_dagcbor(frame)
         .map_err(|error| ToolError::denied(error.to_string()))?;
     if bytes.len() > MAX_FRAME {
         return Err(ToolError::denied("broker frame exceeds its bound"));
     }
-    stream.write_all(&(bytes.len() as u32).to_le_bytes())?;
-    stream.write_all(&bytes)?;
-    stream.flush()?;
+    stream.write_all(&(bytes.len() as u32).to_le_bytes())
+        .map_err(|error| broker_io("write frame length", error))?;
+    stream.write_all(&bytes)
+        .map_err(|error| broker_io("write frame body", error))?;
+    stream.flush().map_err(|error| broker_io("flush frame", error))?;
     Ok(())
 }
 
-fn read_frame(stream: &mut UnixStream) -> ToolResult<Frame> {
+fn read_frame(stream: &mut impl Read) -> ToolResult<Frame> {
     let mut length = [0; 4];
-    stream.read_exact(&mut length)?;
+    stream.read_exact(&mut length)
+        .map_err(|error| broker_io("read frame length", error))?;
     let length = u32::from_le_bytes(length) as usize;
     if length == 0 || length > MAX_FRAME {
         return Err(ToolError::denied(
@@ -191,7 +211,8 @@ fn read_frame(stream: &mut UnixStream) -> ToolResult<Frame> {
         ));
     }
     let mut bytes = vec![0; length];
-    stream.read_exact(&mut bytes)?;
+    stream.read_exact(&mut bytes)
+        .map_err(|error| broker_io("read frame body", error))?;
     canonical::from_canonical_dagcbor_checked(&bytes)
         .map_err(|error| ToolError::denied(format!("invalid canonical broker frame: {error}")))
 }
@@ -208,17 +229,21 @@ pub(crate) fn serve_request(
         .saturating_duration_since(std::time::Instant::now())
         .min(Duration::from_secs(30))
         .max(Duration::from_millis(1));
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout))
+        .map_err(|error| broker_io("set read timeout", error))?;
+    stream.set_write_timeout(Some(timeout))
+        .map_err(|error| broker_io("set write timeout", error))?;
     crate::private_control::prepare_broker_receiver(&stream)?;
     let mut challenge = [0; 32];
     getrandom::getrandom(&mut challenge).map_err(|error| ToolError::denied(error.to_string()))?;
     let mut hello = Vec::from(*HELLO);
     hello.extend_from_slice(&std::process::id().to_le_bytes());
     hello.extend_from_slice(&challenge);
-    stream.write_all(&hello)?;
+    stream.write_all(&hello)
+        .map_err(|error| broker_io("write server hello", error))?;
     let mut declared_pid = [0; 4];
-    let peer_pid = crate::private_control::read_broker_peer(&stream, &mut declared_pid)?;
+    let peer_pid = crate::private_control::read_broker_peer(&stream, &mut declared_pid)
+        .map_err(|error| ToolError::denied(format!("broker client identity: {error}")))?;
     if peer_pid != u32::from_le_bytes(declared_pid)
         || expected_peer.is_some_and(|pid| pid != peer_pid)
     {
@@ -251,7 +276,9 @@ pub(crate) fn serve_request(
     )?;
     write_frame(&mut stream, &response)?;
     if let Some(endpoint) = endpoint {
-        send_control_endpoint(&stream, &endpoint)?;
+        send_control_endpoint(&stream, &endpoint).map_err(|error| {
+            ToolError::denied(format!("broker RPC socket send reply endpoint: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -326,6 +353,83 @@ pub(crate) fn process_parent_and_birth(pid: u32) -> ToolResult<(u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inject macOS's disconnected-socket errno on Linux without real I/O.
+    struct Disconnected;
+
+    impl Read for Disconnected {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(
+                nix::errno::Errno::ENOTCONN as i32,
+            ))
+        }
+    }
+
+    impl Write for Disconnected {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(
+                nix::errno::Errno::ENOTCONN as i32,
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            unreachable!("the write must fail first")
+        }
+    }
+
+    #[test]
+    fn enotconn_read_names_broker_socket_and_frame_phase() {
+        for (prefix, phase) in [
+            (Vec::new(), "read frame length"),
+            (4_u32.to_le_bytes().to_vec(), "read frame body"),
+        ] {
+            let mut stream = std::io::Cursor::new(prefix).chain(Disconnected);
+            let error = read_frame(&mut stream)
+                .err()
+                .expect("disconnect must refuse");
+            assert!(
+                matches!(&error, ToolError::Exec(e) if e.kind() == std::io::ErrorKind::NotConnected)
+            );
+            let message = error.to_string();
+            assert!(message.contains("broker RPC socket"), "{message}");
+            assert!(message.contains(phase), "{message}");
+        }
+    }
+
+    #[test]
+    fn enotconn_write_names_broker_socket_and_refuses() {
+        let frame = make_frame(Vec::new(), vec![7; 32], BTreeSet::new(), None, false).unwrap();
+        let error = write_frame(&mut Disconnected, &frame).expect_err("disconnect must refuse");
+        assert!(
+            matches!(&error, ToolError::Exec(e) if e.kind() == std::io::ErrorKind::NotConnected)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("broker RPC socket write frame length"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn enotconn_regression_complete_frame_survives_eof_but_truncation_refuses() {
+        let frame =
+            make_frame(b"reply".to_vec(), vec![7; 32], BTreeSet::new(), None, false).unwrap();
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &frame).unwrap();
+        let received = read_frame(&mut bytes.as_slice()).unwrap();
+        verify_frame(&received, &[7; 32], BTreeSet::new()).unwrap();
+        assert_eq!(received.node.payload().payload, b"reply");
+        for length in [0, 3, bytes.len() - 1] {
+            let error = read_frame(&mut &bytes[..length])
+                .err()
+                .expect("truncated frame must refuse");
+            assert!(
+                matches!(&error, ToolError::Exec(e) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+            );
+            assert!(error.to_string().contains("broker RPC socket"), "{error}");
+        }
+    }
 
     /// Grounds the message-credential check against a real child and a reply
     /// socket created in that child then transferred to its parent. In

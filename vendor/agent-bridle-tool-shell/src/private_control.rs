@@ -402,7 +402,9 @@ fn prepare_receiver(stream: &UnixStream) -> Result<(), String> {
 
 /// Enable per-message credentials before the peer writes its handshake.
 pub(crate) fn prepare_broker_receiver(stream: &UnixStream) -> agent_bridle_core::ToolResult<()> {
-    prepare_receiver(stream).map_err(agent_bridle_core::ToolError::denied)
+    prepare_receiver(stream).map_err(|error| {
+        agent_bridle_core::ToolError::denied(format!("broker RPC socket prepare receiver: {error}"))
+    })
 }
 
 /// Read the handshake then inspect the actual writer, not the socketpair creator.
@@ -411,7 +413,9 @@ pub(crate) fn read_broker_peer(
     bytes: &mut [u8],
 ) -> agent_bridle_core::ToolResult<u32> {
     use agent_bridle_core::ToolError;
-    let credentials = recv_exact_frame(stream, bytes).map_err(ToolError::denied)?;
+    let credentials = recv_exact_frame(stream, bytes).map_err(|error| {
+        ToolError::denied(format!("broker RPC socket read peer handshake: {error}"))
+    })?;
     #[cfg(target_os = "linux")]
     let pid = {
         if credentials.uid != nix::unistd::getuid().as_raw() {
@@ -425,9 +429,9 @@ pub(crate) fn read_broker_peer(
     let pid = {
         let _ = credentials;
         let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
-            .map_err(|error| ToolError::denied(error.to_string()))?;
+            .map_err(|error| crate::broker_transport::broker_io("LOCAL_PEERPID", error.into()))?;
         let token = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerToken)
-            .map_err(|error| ToolError::denied(error.to_string()))?;
+            .map_err(|error| crate::broker_transport::broker_io("LOCAL_PEERTOKEN", error.into()))?;
         // audit_token: auid,euid,egid,ruid,rgid,pid,asid,pidversion.
         if token.val[1] != nix::unistd::geteuid().as_raw() || token.val[5] != pid as u32 {
             return Err(ToolError::denied("broker writer audit identity mismatch"));
