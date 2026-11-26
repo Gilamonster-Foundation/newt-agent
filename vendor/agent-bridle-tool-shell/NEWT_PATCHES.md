@@ -138,7 +138,7 @@ upstreamed.
 
 ## Build network diagnostic (#3297)
 
-The supervisor retains the bounded `Build network:` pre-exec diagnostic alongside
+The supervisor retains the bounded `Build isolation:` pre-exec diagnostic alongside
 the authenticated worker transcript. This reports private-loopback versus deny-all
 fallback to the operator and model without adding a worker protocol field or
 using a diagnostic as authority. The worker's authenticated terminal outcome
@@ -150,3 +150,16 @@ hook as argv builds. A successful namespace is supported by the existing
 authenticated worker transport; no fallback-only assumption or namespace syscall
 backstop is introduced. Newt's real build-pipeline harness can require private
 mode and can independently force setup failure to prove the deny-all retry.
+
+## Combined build isolation diagnostic (#3314)
+
+The retained diagnostic now names private loopback plus bounded temporary mounts,
+or deny-all fallback without private scratch. It comes from the same pre-fence
+child setup as argv builds. Output trimming preserves that effective-mode report;
+no worker protocol field or diagnostic-based authority decision is added. Mount
+setup failure is exercised separately from namespace failure by the real pipeline
+test, through both execution routes.
+The caller's directory environment also reaches that same pre-exec initializer:
+Brush's full environment payload arrives after startup, too late to recreate a
+covered `HOME` or `TMPDIR`. Only the shared fixed directory-variable allow-list
+is seeded before exec; no protocol field or loader-control import is added.

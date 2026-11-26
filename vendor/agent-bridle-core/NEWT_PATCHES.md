@@ -231,8 +231,8 @@ includes #527.
 
 ## Confined build private loopback (#3297)
 
-`ChildNetworkPolicy::PrivateLoopback` is selected only by Newt's deny-all build
-requests. The existing Landlock rule builder prepares both full filesystem
+`ChildNetworkPolicy::PrivateBuild` (formerly `PrivateLoopback`) is selected only
+by Newt's deny-all build requests. The Landlock rule builder prepares both base filesystem
 rulesets before fork: one with the original TCP deny and one without it. The
 existing fdguard seam creates a user/network namespace and brings up loopback
 before installing the chosen rules and seccomp program. The namespace has no
@@ -280,3 +280,28 @@ No authority, framing discriminator, dependency, or public API changes. Retire
 this section when the vendored base contains this fix. Standalone vendor tests
 need the Cargo path override for `agent-bridle-fdguard`; the workspace patch
 table does not apply to the excluded manifest.
+
+## Private build scratch (#3314)
+
+The same child setup now creates a mount namespace, makes propagation recursively
+private, and mounts bounded tmpfs instances at `/tmp` and `/dev/shm`. The private
+ruleset receives read/write rules from directory handles opened after mounting;
+the fallback ruleset never receives them. The access mask comes from the existing
+filesystem rule builder. No host temporary directory is added to a path grant.
+Setup failures discard the child before exec; fence installation failures refuse
+execution. Workspaces beneath the covered roots retain the original fallback.
+The existing trusted-worker builder carries only directory environment values
+into private-build setup, before the later authenticated payload is read. The
+shared fdguard allow-list excludes loader controls and the worker nonce; normal
+workers and real network grants retain their empty bootstrap environment.
+
+`PrivateBuild` names both network and scratch isolation. The serialized field
+shape is unchanged and the old `private-loopback` tag is accepted as an alias;
+new output uses `private-build`. Older readers cannot decode that new tag. The
+existing canonical fence identity therefore distinguishes the broader mechanism
+from old network-only evidence, and its production verifier remains in place.
+
+Namespace setup changes no cgroup membership and grants no host-namespace capability.
+Landlock prevents mounting after the fence, including in later namespaces.
+Temporary filesystems disappear when their final namespace/mount references are
+released. See the fdguard patch note for resource bounds and environment handling.

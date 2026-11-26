@@ -650,7 +650,7 @@ mod native {
         // Grounds the mocked build-only mechanism selection: Git also holds
         // an execution lease, but must retain its original deny-all floor.
         assert!(
-            !out.contains("Build network:"),
+            !out.contains("Build isolation:"),
             "Git entered the build network lane: {out}"
         );
 

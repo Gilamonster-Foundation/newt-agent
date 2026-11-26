@@ -481,7 +481,7 @@ pub fn enforcement_report(
             // spawn, never the backend kind alone (agent-bridle#1631).
             SandboxKind::Landlock
                 if crate::sandbox::net_fully_denied(effective)
-                    && matches!(child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateLoopback) =>
+                    && matches!(child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateBuild) =>
             {
                 AxisEnforcement::Kernel
             }
@@ -1114,8 +1114,8 @@ mod tests {
                 Advisory,
             ),
             ("deny-direct + net:none", none(), ll(DenyDirect), Kernel),
-            ("private-loopback + net:none", none(), ll(ChildNetworkPolicy::PrivateLoopback), Kernel),
-            ("private-loopback + hosts", remote(), ll(ChildNetworkPolicy::PrivateLoopback), Advisory),
+            ("private-loopback + net:none", none(), ll(ChildNetworkPolicy::PrivateBuild), Kernel),
+            ("private-loopback + hosts", remote(), ll(ChildNetworkPolicy::PrivateBuild), Advisory),
             (
                 "seatbelt + net:none, audited stdio",
                 none(),

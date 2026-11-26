@@ -16,7 +16,7 @@ platform-specific verification; this note does not claim that work completed.
 
 ## Build network setup (#3297)
 
-`build_network` prepares a syscall-only pre-exec hook: unshare user and network
+`build_isolation` (formerly `build_network`) prepares a syscall-only pre-exec hook: unshare user and network
 namespaces together, map the original uid/gid, enable only loopback, then apply
 prebuilt Landlock and seccomp rules. All allocation precedes fork. A setup error
 signals the existing spawn funnel to discard the child and retry once with the
@@ -34,3 +34,27 @@ do not provide a host interface or route. AF_PACKET and io_uring stay denied.
 The normal nonzero uid loses its namespace capabilities on exec; nested user
 namespace creation remains permitted without removing the inherited fences.
 Pathname Unix socket deputies remain outside this patch's direct-egress proof.
+
+## Private temporary mounts (#3314)
+
+The same pre-exec hook also unshares the mount namespace and makes every mount
+recursively private before mounting tmpfs: `/tmp` has a 2 GiB data limit and
+65,536 inodes; `/dev/shm` has 256 MiB and 16,384 inodes. Both use mode 1777,
+nosuid and nodev; execution remains available to build/test artifacts. All
+allocation precedes fork. The existing `linux-raw-sys` dependency in the graph
+supplies the Landlock ABI layout, rather than duplicating it locally.
+
+Each private rule opens its directory after mounting. A failed mount or rule
+binding discards the entire child; the fresh fallback keeps its untouched rules
+and cannot write either host temporary root. The actual child cwd is checked
+before setup, so a workspace covered by either mount selects fallback rather
+than importing host contents. The diagnostic reports the effective combined mode.
+
+`HOME`, `TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR` are not rewritten. Any of
+their directories covered by the new mounts is recreated empty; no host files
+or bind mounts are imported. Data pages are allocated on demand and charged to
+the allocating build's existing memory cgroup; namespaces do not supply a new
+memory budget. Pages may use swap. Filesystem byte/inode bounds are per mount,
+not an aggregate memory limit across builds. Final namespace/mount-reference
+release frees the temporary filesystems. The child has no capabilities in host
+namespaces and cannot mount after the Landlock fence.

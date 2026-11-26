@@ -178,8 +178,8 @@ pub struct ExecRequest {
     env: Vec<(String, String)>,
     /// The kernel network floor (see [`NetGrant`]).
     net_grant: NetGrant,
-    /// Only build_tool_request may select the private-loopback mechanism.
-    private_build_network: bool,
+    /// Only build_tool_request may select the private build-isolation mechanism.
+    private_build_isolation: bool,
     /// Explicit path to the `newt-net-guard` wrapper (tests set this; production
     /// resolves it next to the running executable). Only consulted for
     /// [`NetGrant::DenyAll`].
@@ -218,7 +218,7 @@ impl ExecRequest {
             env: Vec::new(),
             timeout: None,
             net_grant: NetGrant::Unrestricted,
-            private_build_network: false,
+            private_build_isolation: false,
             net_guard_bin: None,
             scratch_dirs: Vec::new(),
             held_read_roots: Vec::new(),
@@ -276,7 +276,7 @@ impl ExecRequest {
 
     #[cfg(feature = "confine")]
     pub(crate) fn sandbox_policy(&self) -> agent_bridle::SandboxPolicy {
-        if self.private_build_network && self.net_grant == NetGrant::DenyAll {
+        if self.private_build_isolation && self.net_grant == NetGrant::DenyAll {
             sandbox_policy::build_sandbox_policy(&self.caveats.net)
         } else {
             runtime_sandbox_policy()
@@ -673,7 +673,7 @@ pub fn build_tool_request(
     )
     .net_grant(net_grant)
     .env("CARGO_NET_OFFLINE", "true");
-    request.private_build_network = true;
+    request.private_build_isolation = true;
     request
 }
 

@@ -353,6 +353,11 @@ impl Tool for BrushShellTool {
             Some(broker) => broker.read_only_resources(cx)?,
             None => Vec::new(),
         };
+        let worker = SandboxedWorker::brush()
+            .sandbox_policy(Arc::clone(&self.sandbox_policy))
+            .temporary_env(&env)
+            .read_only_resources(resources)
+            .held_read_roots(self.held_read_roots.clone());
         let mut payload = WorkerPayload::new(
             cmd,
             Some(cwd.to_string_lossy().into_owned()),
@@ -362,11 +367,7 @@ impl Tool for BrushShellTool {
         )
         .with_launcher_image_dir(self.launcher_image_dir.clone());
         payload.broker = self.command_broker.is_some();
-        let confined = SandboxedWorker::brush()
-            .sandbox_policy(Arc::clone(&self.sandbox_policy))
-            .read_only_resources(resources)
-            .held_read_roots(self.held_read_roots.clone())
-            .spawn(cx, &nonce, &cwd)?;
+        let confined = worker.spawn(cx, &nonce, &cwd)?;
         let sandbox_kind = confined.sandbox_kind;
         let caveats = cx.caveats().clone();
         // The mechanism governing the worker: reported kind + the child-network
@@ -604,7 +605,7 @@ fn supervise_worker(
     // its authenticated stream. Preserve that bounded diagnostic in the result
     // so a fallback mock-server failure cannot look like an ordinary test bug.
     for line in String::from_utf8_lossy(&stderr).lines() {
-        if line.starts_with("Build network: ") {
+        if line.starts_with("Build isolation: ") {
             outcome.stderr.extend_from_slice(line.as_bytes());
             outcome.stderr.push(b'\n');
         }

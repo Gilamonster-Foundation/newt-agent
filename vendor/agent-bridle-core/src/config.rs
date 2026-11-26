@@ -136,8 +136,9 @@ pub struct BackendToggles {
     pub disable: Vec<String>,
 }
 
-/// How a confined child's *direct* network-socket authority is enforced, beyond
-/// the caveat-driven Landlock TCP rule. A **mechanism** knob (it rides
+/// Child isolation beyond the caveat-driven Landlock rules. The historical
+/// network-policy container also carries the broader private Build mechanism.
+/// A **mechanism** knob (it rides
 /// [`SandboxPolicy`]), never authority (`Caveats`): the caller states the
 /// required floor and the backend owns the enforcement (ADR 0017).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -162,10 +163,13 @@ pub enum ChildNetworkPolicy {
     /// safe `seccompiler` install path); on other platforms it is inert, so a
     /// caller that *requires* it must fail closed via `backends.require_landlock`.
     DenyDirect,
-    /// Build-only floor: private user/network namespaces with loopback up, or
-    /// the existing DenyDirect floor if any namespace setup step fails. The
-    /// filesystem fence is installed in the child after namespace setup.
-    PrivateLoopback,
+    /// Build-only isolation: private user/network/mount namespaces, loopback,
+    /// and bounded private temporary filesystems. Any setup failure retains
+    /// the existing DenyDirect floor and grants no host temporary write access.
+    /// The legacy tag is readable; serialization names the broader mechanism
+    /// so its content-addressed fence identity cannot equal the network-only one.
+    #[serde(alias = "private-loopback")]
+    PrivateBuild,
 }
 
 /// Sandbox path lists + ABI floors (`sandbox.rs` constants).
@@ -805,6 +809,22 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let back: BridleConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn private_build_reads_the_legacy_tag_but_serializes_the_broader_mechanism() {
+        let policy: ChildNetworkPolicy = serde_json::from_str("\"private-loopback\"").unwrap();
+        assert_eq!(policy, ChildNetworkPolicy::PrivateBuild);
+        let sandbox = SandboxPolicy {
+            child_network: policy,
+            ..SandboxPolicy::default()
+        };
+        let json = serde_json::to_value(&sandbox).unwrap();
+        assert_eq!(json["child_network"], "private-build");
+        assert_eq!(
+            serde_json::from_value::<SandboxPolicy>(json).unwrap(),
+            sandbox
+        );
     }
 
     #[test]

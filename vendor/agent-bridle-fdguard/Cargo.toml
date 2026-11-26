@@ -50,6 +50,10 @@ version = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies.seccompiler]
 version = "0.5"
 
+[target.'cfg(target_os = "linux")'.dependencies.linux-raw-sys]
+version = "0.12"
+features = ["landlock"]
+
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies.libc]
 version = "0.2"
 
