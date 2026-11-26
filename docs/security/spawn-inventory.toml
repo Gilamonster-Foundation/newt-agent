@@ -48,6 +48,9 @@
 #   test                Spawns confined to `#[cfg(test)]` / a `_test.rs` file.
 
 [files]
+# Explicit real-resource binary: fixture-only Cargo metadata runs offline;
+# existing child probes exercise sockets and PTYs, never model-supplied argv.
+"newt-core/tests/brush_build_pipeline.rs" = { count = 5, class = "test", note = "#3289 adds an unconfined offline Cargo metadata positive control against an isolated fixture cache; cache population and builds use ConstrainedExecutor with network denied." }
 "newt-core/src/agentic/observed_report/tests.rs" = { count = 1, class = "test", note = "Observed-report real-Git fixtures: fixed init/add/commit/worktree argv in owned temporary directories, cleared environment, private config and disabled hooks/signing. Compiled only under cfg(test); no model input or production spawn." }
 "newt-core/src/agentic/tools_tests/worktree_detect.rs" = { count = 1, class = "test", note = "#2791 portable real-Git worktree discovery regression: fixed init/empty-commit argv in an owned temporary repository with private config/template fixtures. Test-only; production discovery reads admin metadata without spawning." }
 "crates/newt-carried-tools/src/main.rs" = { count = 1, class = "operator-yolo-optout", note = "#2776 standalone ambient grep helper; absolute adjacent rg only, no shell/PATH lookup; PR 2 owns sanitized environment and route authorization. Not wired into Newt or private confined dispatch here." }

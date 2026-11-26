@@ -1,6 +1,6 @@
 //! Production Brush route, complementing the rule-install race proof.
 #[path = "linked_git_fixture.rs"]
-mod fixture_support;
+pub(super) mod fixture_support;
 
 pub async fn run() {
     let (_fixture, _, linked) = fixture_support::fixture();

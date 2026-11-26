@@ -206,6 +206,10 @@ mod native {
         isolate(&root);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
+            #[cfg(target_os = "linux")]
+            if selected("cached_git_dependency_builds_offline") {
+                cached_git_dependency_builds_offline(&root).await;
+            }
             if selected("linked_worktree_build_reads") {
                 super::linked_build_shell::run().await;
             }
@@ -385,6 +389,167 @@ mod native {
             None,
         )
         .await
+    }
+
+    /// Grounds the mocked build-request cache read grants in a real cached
+    /// Git dependency, through both the argv executor and the Brush build lane.
+    /// Even fixture cache population runs with kernel-denied network access.
+    #[cfg(target_os = "linux")]
+    async fn cached_git_dependency_builds_offline(root: &Path) {
+        use super::linked_build_shell::fixture_support::{fixture, git};
+        use newt_core::confined_exec::{
+            build_tool_caveats, build_tool_request, ConstrainedExecutor, ExecOrigin, ExecRequest,
+            NetGrant,
+        };
+
+        let (_fixture, original_repo, _) = fixture();
+        let repo = root.join("dependency");
+        std::fs::rename(original_repo, &repo).unwrap();
+        std::fs::write(repo.join("Cargo.toml"),
+            "[package]\nname = \"cached-dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
+        std::fs::write(repo.join("lib.rs"), "pub fn value() -> u32 { 42 }\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "--no-gpg-sign", "-qm", "dependency"]);
+        let rev = git(&repo, &["rev-parse", "HEAD"]);
+        let (workspace, _) = project(root, "cached-git");
+        let manifest = workspace.join("Cargo.toml");
+        let original = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(&manifest, format!(
+            "{original}\n[dependencies]\ncached-dependency = {{ git = \"file://{}\", rev = \"{}\" }}\n",
+            repo.display(), rev.trim())).unwrap();
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn value() -> u32 { cached_dependency::value() }\n",
+        )
+        .unwrap();
+        // The fixture owns root, including its Cargo home and local Git remote.
+        // Cargo must populate that cache from file://, never from the network.
+        let cargo_home = root.join("cargo-home");
+        let mut seed_grant = build_tool_caveats(root);
+        if let Scope::Only(reads) = &mut seed_grant.fs_read {
+            reads.insert("/etc/gitconfig".into());
+        }
+        let seed = ExecRequest::new(
+            ExecOrigin::AgentInfluenced,
+            "cargo",
+            ["fetch"],
+            &workspace,
+            seed_grant,
+        )
+        .net_grant(NetGrant::DenyAll)
+        .env("HOME", root.join("home").to_string_lossy())
+        .env("CARGO_HOME", cargo_home.to_string_lossy())
+        .env("TMPDIR", root.to_string_lossy())
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_INCREMENTAL", "0")
+        .envs(
+            ["RUSTUP_HOME", "PATH"]
+                .into_iter()
+                .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value))),
+        );
+        let output = ConstrainedExecutor::run(&seed).unwrap();
+        assert!(
+            output.success,
+            "fixture fetch: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new(env!("CARGO"))
+            .current_dir(&workspace)
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_INCREMENTAL", "0")
+            .args(["metadata", "--locked", "--offline", "--format-version=1"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        eprintln!("unconfined cached Git metadata --locked --offline ... ok");
+        let marker = cargo_home.join("git/cache-sentinel");
+        let credentials = cargo_home.join("credentials.toml");
+        std::fs::write(&marker, "unchanged").unwrap();
+        std::fs::write(&credentials, "private-registry-sentinel").unwrap();
+        assert!(
+            std::fs::read("/etc/hostname").is_ok(),
+            "Linux system-file control"
+        );
+        let build_script = workspace.join("build.rs");
+        let script = std::fs::read_to_string(&build_script).unwrap().replace("fn main() {", &format!(r#"fn main() {{
+            assert_eq!(std::fs::write({marker:?}, b"poison").unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::read({credentials:?}).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(std::fs::read("/etc/hostname").unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        "#));
+        std::fs::write(build_script, script).unwrap();
+        for cached in [true, false] {
+            if !cached {
+                std::fs::remove_dir_all(cargo_home.join("git")).unwrap();
+            }
+            let request = build_tool_request(
+                &workspace,
+                &workspace,
+                "cargo",
+                ["build", "--locked", "--offline"],
+                &Scope::none(),
+            )
+            .env("CARGO_LOG", "cargo::sources::git=trace");
+            let argv = ConstrainedExecutor::run(&request).unwrap();
+            assert_eq!(
+                argv.sandbox_kind,
+                newt_core::sandbox_seam::SandboxKind::Landlock
+            );
+            let target = workspace.join("target");
+            if target.exists() {
+                std::fs::remove_dir_all(&target).unwrap();
+            }
+            let brush = execute_tool(
+                "run_command",
+                &serde_json::json!({"command": "cargo build --locked --offline && printf BRUSH_CACHED_GIT_FINISHED"}),
+                workspace.to_str().unwrap(),
+                false,
+                100,
+                &build_tool_caveats(&workspace),
+                &mut NoMcp,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            let stderr = String::from_utf8_lossy(&argv.stderr);
+            if cached {
+                assert!(
+                    argv.success && brush.contains("BRUSH_CACHED_GIT_FINISHED"),
+                    "cached Git build failed:\nargv:\n{stderr}\nBrush:\n{brush}"
+                );
+                assert!(target.join("debug/libbrush_build_fixture.rlib").is_file());
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "unchanged");
+                eprintln!("cached Git argv and Brush builds succeed offline; cache writes, credentials and unrelated system reads denied");
+            } else {
+                assert!(
+                    !argv.success && !target.join("debug/libbrush_build_fixture.rlib").exists()
+                );
+                for diagnostic in [stderr.as_ref(), brush.as_str()] {
+                    assert!(
+                        diagnostic.contains("cached-dependency") && diagnostic.contains("offline"),
+                        "{diagnostic}"
+                    );
+                }
+                eprintln!(
+                    "missing cached-dependency is named with offline context by argv and Brush"
+                );
+            }
+        }
+        eprintln!("test cached_git_dependency_builds_offline ... ok");
     }
 
     async fn cached_build_runs_the_original_pipeline_once(root: &Path) {

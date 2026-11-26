@@ -19,6 +19,7 @@ exclude = [
     "tests/closure_ledger.rs",
     "tests/confine_gate_parity_ratchet.rs",
     "tests/adapter.rs",
+    "tests/brush_build_pipeline.rs",
     "tests/epic_size.rs",
     "tests/extension_purity.rs",
     "tests/resolve_publishes_ratchet.rs",
