@@ -1,17 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { removeFixture } from '../test-support/cleanup.mjs';
 
 const npmRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const shims = ['newt', 'newt-mcp-server', 'newt-agent'];
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'newt-packaging-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.after(() => removeFixture(root));
   mkdirSync(join(root, 'npm'));
   for (const path of ['scripts', 'platforms.json', ...shims]) {
     cpSync(join(npmRoot, path), join(root, 'npm', path), { recursive: true });
