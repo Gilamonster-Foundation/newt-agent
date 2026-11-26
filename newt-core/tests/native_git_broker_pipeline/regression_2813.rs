@@ -74,6 +74,8 @@ async fn nested_creation_without_session_is_refused() {
 
 /// #2813 reg3-A: native AUTO_MERGE cleanup must not try to lock shared refs
 /// after a successful detached commit. Grounds the broker reference-event policy.
+/// #3296: real Git grounds the mocked substitution refusal: neither a prefix nor
+/// a message substitution runs, HEAD stays unchanged, and literal retries preserve prose.
 async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -107,10 +109,24 @@ async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
             .iter()
             .any(|p| main.join(".git").join(relative).starts_with(p)));
     }
+    let head_before = real_git_output(&wt, &["rev-parse", "HEAD"]);
+    for source in [
+        "touch prefix-ran && git commit --allow-empty -m \"Extract `touch substitution-ran`\"",
+        "git commit --allow-empty -m \"Extract $(touch substitution-ran)\"",
+    ] {
+        let refused = dispatch(&wt, source, &caveats, false).await;
+        assert!(
+            refused.contains("command substitution") && refused.contains("No command ran"),
+            "{refused}"
+        );
+        assert!(!wt.join("prefix-ran").exists());
+        assert!(!wt.join("substitution-ran").exists());
+        assert_eq!(real_git_output(&wt, &["rev-parse", "HEAD"]), head_before);
+    }
     let command = if heredoc {
-        "git commit -q -F - <<'EOF'\nfixture heredoc\nEOF\ngit log --oneline -1"
+        "git commit -q -F - <<'EOF'\nfixture heredoc: `function` and $(literal)\nEOF\ngit log --oneline -1"
     } else {
-        "git add seed && git commit -q -m 'fixture compound' && git log --oneline -2"
+        "git add seed && git commit -q -m 'fixture compound: `function` and $(literal)' && git log --oneline -2"
     };
     let command = format!("cd '{}' && {command}", wt.display());
     let out = dispatch(&wt, &command, &caveats, false).await;
@@ -119,6 +135,7 @@ async fn commit_cleanup_preserves_shared_refs(heredoc: bool, packed: bool) {
         message.contains("native-git-broker-pipeline-fixture"),
         "broker did not publish: {out}"
     );
+    assert!(message.contains("`function` and $(literal)"), "{message}");
     assert!(
         !out.contains("packed-refs.lock")
             && !out.contains("Operation not permitted")
