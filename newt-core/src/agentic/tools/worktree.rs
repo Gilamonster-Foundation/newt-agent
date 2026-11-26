@@ -694,6 +694,15 @@ pub(super) async fn execute(
     let before = (name == "run_command" && session.is_some())
         .then(|| detect::Snapshot::before(Path::new(workspace), &caveats.fs_read))
         .flatten();
+    // Observe under the same approved projection and refreshed ceilings as
+    // dispatch. The backend loop's base scope may exclude the task checkout.
+    let workspace_change = collab.workspace_change;
+    let before_change = if workspace_change.is_some() {
+        crate::agentic::progress_workspace_state(name, args, workspace, &caveats.fs_read, session)
+            .await
+    } else {
+        None
+    };
     // #2831: keep the large tool state off the provider/cancellation stack.
     let mut result = if let Some(policy) = &policy {
         let refuse_git = name == "git"
@@ -787,6 +796,19 @@ pub(super) async fn execute(
         ))
         .await
     };
+    if let (Some(slot), Some(before)) = (workspace_change, before_change) {
+        if let Some(after) = crate::agentic::progress_workspace_state(
+            name,
+            args,
+            workspace,
+            &caveats.fs_read,
+            session,
+        )
+        .await
+        {
+            let _ = slot.set((before, after));
+        }
+    }
     if let (Some(session), Some(notice)) = (session, command_default_notice) {
         if !session
             .command_cwd_notice_shown
