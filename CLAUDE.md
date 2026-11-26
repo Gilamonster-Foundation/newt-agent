@@ -552,6 +552,23 @@ mocked lease/suspend unit tests.
 Migration of the existing real-fs (`tempfile`) tests out of the unit tier
 is tracked in issue #514.
 
+### Flaky tests — the second sighting gets fixed
+
+A test that fails and then passes on the same tree is a bug with a low hit
+rate. Rerunning it is not a fix.
+
+- **First sighting:** read the log, file an issue that quotes the failing
+  lines and names the job, then rerun once.
+- **Second sighting** of the same test or failure signature, on any PR or
+  day: the issue becomes `priority:p1` and gets an owner before unrelated
+  merges continue. Record every rerun as a comment on that issue: the run,
+  the job, the date.
+- **A fix removes the nondeterminism:** wait on a causal signal, inject the
+  clock or the IO. A longer timeout, a sleep, a retry loop or `#[ignore]`
+  is not a fix.
+- **Cannot reproduce it?** Land diagnostics that make the next failure name
+  its cause. Keep the issue open and list the reproduction attempts on it.
+
 ## Versioning
 
 **Semver** (`0.MINOR.PATCH`). First crates.io release is **`0.6.0`**
