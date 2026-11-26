@@ -228,3 +228,25 @@ Run the excluded vendor crates through their own manifests, with Cargo path
 patches for this core and `agent-bridle-fdguard`; the workspace patch table does
 not apply to standalone vendor tests. Retire this section when the vendor base
 includes #527.
+
+## Delegated control descriptor cleanup (newt #3311, 2026-11-26)
+
+Carries the receiver fix from agent-bridle commit
+`7a8bbf03c62ff2d700079e66eb87ac787c30d173`, prepared for upstream review.
+`src/delegated_control.rs` matches that source, including its named tests.
+Darwin installs an entire SCM_RIGHTS batch before truncating ancillary copyout;
+receive enough space for the kernel-supported batch so every installed
+file descriptor is owned and closed when an excess count is refused. Receive
+all marker fragments with recvmsg, rejecting extra rights on the marker tail.
+
+The added tests belong to the standalone vendor's real-kernel suite and run
+serially. They ground the receiver's exact-count and owned-cleanup contract with
+isolated descriptor-table snapshots and peer EOF before and after socket drop;
+they do not substitute mocked evidence for kernel behavior. The maximum-batch
+and marker-tail cases also reproduce the defects on Linux. Native macOS
+validation of this vendor port remains a separate required check.
+
+No authority, framing discriminator, dependency, or public API changes. Retire
+this section when the vendored base contains this fix. Standalone vendor tests
+need the Cargo path override for `agent-bridle-fdguard`; the workspace patch
+table does not apply to the excluded manifest.
