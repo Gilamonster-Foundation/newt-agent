@@ -48,6 +48,7 @@
 #   test                Spawns confined to `#[cfg(test)]` / a `_test.rs` file.
 
 [files]
+"vendor/agent-bridle-core/src/delegated_control.rs" = { count = 1, class = "test", note = "#3311 imports the upstream real-kernel descriptor cleanup tests. Re-executes only the current test binary with a fixed exact case and serial execution, isolating descriptor-table snapshots; no shell, model input, or production spawn. Vendor sources are outside the scanner roots." }
 "vendor/agent-bridle-core/src/spawn.rs" = { count = 45, class = "confined", note = "Existing core spawn funnel and its test fixtures. The #527 backport adds three ConfinedCommand constructions plus one test-only raw Python positive control for a bind mount in a new user/mount namespace. Fixed interpreter and script, owned temporary directories, no model input. The unconfined control must succeed before the same helper proves Landlock denies the mount; vendor sources are outside the scanner's current roots." }
 # Explicit real-resource binary: fixture-only Cargo metadata runs offline;
 # existing child probes exercise sockets and PTYs, never model-supplied argv.
