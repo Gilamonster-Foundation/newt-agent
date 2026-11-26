@@ -1190,6 +1190,15 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     command_budget: crate::RunCommandBudget,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
+    if let Some(denied) = descendant_exec_denial(
+        args.get("cmd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        caveats,
+        host_path_lookup,
+    ) {
+        return Ok(denied);
+    }
     #[cfg(test)]
     if let Some(envelope) =
         super::command_probe::with_io(|probe| super::command_probe::Probe::ran(&probe.confined))
@@ -1698,6 +1707,12 @@ async fn exec_bridled(
     // retain their existing statically inspected matching behavior below.
     let bound = permission_gate.as_deref_mut().map(|gate| {
         let mut current = gate.apply_command_retry(cmd, cwd, caveats);
+        for program in crate::shell_inspect::known_delegated_programs(cmd) {
+            current = gate.apply_pending_once(DenialKind::Exec, &program, &current);
+            if let Some(target) = host_path_lookup(&program) {
+                current = gate.apply_pending_once(DenialKind::Exec, &target, &current);
+            }
+        }
         let Ok(inspection) = crate::shell_inspect::inspect_shell(cmd) else {
             return current;
         };
@@ -1745,18 +1760,25 @@ async fn exec_bridled(
     // which the confined safe-subset engine refuses.
     let mut dispatch_args = confined_dispatch_args(cmd, cwd, caveats);
     dispatch_args["timeout_secs"] = serde_json::json!(timeout_secs);
-    let result = match dispatch_bridled_shell_with_floor(
-        dispatch_args.clone(),
-        caveats,
-        live_tool_output.clone(),
-        None,
-        execution_lease.clone(),
-        command_broker.clone(),
-        Vec::new(),
-        command_budget,
-    )
-    .await
-    {
+    let preflight = descendant_exec_denial(cmd, caveats, host_path_lookup);
+    let no_command_ran = preflight.is_some();
+    let dispatched = match preflight {
+        Some(denied) => Ok(denied),
+        None => {
+            dispatch_bridled_shell_with_floor(
+                dispatch_args.clone(),
+                caveats,
+                live_tool_output.clone(),
+                None,
+                execution_lease.clone(),
+                command_broker.clone(),
+                Vec::new(),
+                command_budget,
+            )
+            .await
+        }
+    };
+    let result = match dispatched {
         // The confined shell ran. Its envelope carries
         // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the leash
         // refused a capability — the STRUCTURED denial fields
@@ -1847,7 +1869,10 @@ async fn exec_bridled(
                             // model's own next matching call instead of
                             // spending it on a replay that could duplicate an
                             // effect.
-                            if !requests_are_replay_safe(&requests, cmd) {
+                            // A preflight refusal ran no stage, even in a pipeline.
+                            // Execute once with the widened invocation so an unused
+                            // parent allow-once grant is not lost on a later retry.
+                            if !no_command_ran && !requests_are_replay_safe(&requests, cmd) {
                                 if requests
                                     .iter()
                                     .all(|request| request.kind == DenialKind::Exec)
@@ -3517,6 +3542,10 @@ fn granted_host_binaries(exec: &newt_policy::caveats::Scope<String>) -> String {
 /// answers "is it installed on this host", which is exactly the question the
 /// confined child cannot answer about itself.
 fn host_path_lookup(prog: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(program) = super::command_probe::with_io(|_| prog.to_owned()) {
+        return Some(program);
+    }
     fn executable(p: &std::path::Path) -> bool {
         #[cfg(unix)]
         {
@@ -3537,6 +3566,44 @@ fn host_path_lookup(prog: &str) -> Option<String> {
         .map(|dir| dir.join(prog))
         .find(|cand| executable(cand))
         .map(|p| p.display().to_string())
+}
+
+/// #3276: external dispatchers cannot report their child's kernel exec denial
+/// through Brush. Refuse known missing children before dispatch using the same
+/// envelope as Brush, so the existing prompt/retry and recovery text apply.
+#[cfg(feature = "confine")]
+fn descendant_exec_denial(
+    source: &str,
+    caveats: &newt_policy::caveats::Caveats,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Option<serde_json::Value> {
+    use newt_policy::caveats::CaveatsExt as _;
+    if matches!(caveats.exec, newt_policy::caveats::Scope::All) {
+        return None;
+    }
+    let mut denials = std::collections::BTreeMap::new();
+    for program in crate::shell_inspect::known_delegated_programs(source) {
+        let target = resolve(&program).unwrap_or_else(|| program.clone());
+        if caveats.permits_exec(&program)
+            || caveats.permits_exec(&target)
+            || std::path::Path::new(&target)
+                .file_name()
+                .and_then(|p| p.to_str())
+                .is_some_and(|name| caveats.permits_exec(name))
+        {
+            continue;
+        }
+        denials.entry(target.clone()).or_insert_with(|| serde_json::json!({
+            "kind": "exec", "target": target,
+            "reason": format!("descendant exec of {program:?} is not within the granted authority; no command ran")
+        }));
+    }
+    (!denials.is_empty()).then(|| {
+        serde_json::json!({
+            "denied": true, "denials": denials.into_values().collect::<Vec<_>>(),
+            "exit_code": 126, "stdout": "", "stderr": ""
+        })
+    })
 }
 
 /// The standard `run_command` success path: return stdout/stderr, or `(exit N)`
@@ -3873,6 +3940,35 @@ mod bridle_registry_tests {
 mod dispatch_caveats_tests {
     use super::*;
     use newt_policy::caveats::{Caveats, CaveatsExt as _, CountBound, Scope};
+
+    #[cfg(feature = "confine")]
+    #[test]
+    fn descendant_exec_3276_honors_exact_paths_and_deduplicates_denials() {
+        let mut caveats = base("workspace");
+        caveats.exec = Scope::only(["find".into(), "xargs".into(), "/tools/wc".into()]);
+        let source = "find . -exec wc -l {} +; xargs wc -l";
+        assert!(descendant_exec_denial(source, &caveats, |_| Some("/tools/wc".into())).is_none());
+        let denied =
+            descendant_exec_denial(source, &caveats, |_| Some("/other/wc".into())).unwrap();
+        assert_eq!(denied["denials"].as_array().unwrap().len(), 1);
+        assert_eq!(denied["denials"][0]["target"], "/other/wc");
+        caveats.exec = Scope::only(["find".into(), "xargs".into(), "wc".into()]);
+        assert!(descendant_exec_denial(source, &caveats, |_| Some("/other/wc".into())).is_none());
+        assert!(descendant_exec_denial("xargs /tools/wc", &caveats, |_| None).is_none());
+    }
+
+    #[cfg(feature = "confine")]
+    #[test]
+    fn descendant_exec_3276_batches_missing_dispatcher_and_child() {
+        let denied =
+            descendant_exec_denial("xargs wc -l", &base("workspace"), |p| Some(p.into())).unwrap();
+        let targets: Vec<_> = exec_denial_requests(&denied)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.target)
+            .collect();
+        assert_eq!(targets, ["wc", "xargs"]);
+    }
 
     fn base(ws: &str) -> Caveats {
         Caveats {
