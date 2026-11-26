@@ -2875,6 +2875,54 @@ async fn shell_route_count(
     (result, reached)
 }
 
+/// #3296: commit prose must be refused before the shell can execute its code spans.
+/// The existing route probe and virtual workspace keep this regression fully mocked.
+#[tokio::test]
+async fn commit_message_substitution_3296_is_refused_before_the_shell_route() {
+    for command in [
+        "git commit -m \"Extract the `compact_responses_input` function\"",
+        "git add -A && git commit -m \"Extract\n\nMove `ResponsesCompaction` from `mod.rs`\"",
+        "git commit -m \"Extract $(compact_responses_input)\"",
+        "git commit --message=\"Extract `compact_responses_input`\"",
+        "git commit -am\"Extract `compact_responses_input`\"",
+        "'git' 'commit' '--message' \"Extract `compact_responses_input`\"",
+        "git commit -m subject -m \"Move `mod.rs`\"",
+    ] {
+        let (result, reached) = shell_route_count(command, None).await;
+        assert!(
+            result.contains("command substitution")
+                && result.contains("single quotes")
+                && result.contains("-F -")
+                && result.contains("No command ran"),
+            "{command}: {result}"
+        );
+        assert_eq!(reached, 0, "{command}: {result}");
+    }
+}
+
+/// #3296: the governed PR broker already rejects substitutions in either prose field.
+/// Windows refuses the governed route itself before inspecting those fields.
+#[cfg(feature = "confine")]
+#[tokio::test]
+async fn pr_prose_substitution_3296_is_already_refused_before_the_shell_route() {
+    for command in [
+        "gh pr create --title \"Extract `function_name`\" --body literal",
+        "gh pr create --title literal --body \"Extract `function_name`\"",
+        "gh pr create --title \"Extract $(function_name)\" --body literal",
+        "gh pr create --title literal --body \"Extract $(function_name)\"",
+    ] {
+        let (result, reached) = shell_route_count(command, None).await;
+        #[cfg(not(windows))]
+        assert!(result.contains("substitutions"), "{command}: {result}");
+        #[cfg(windows)]
+        assert!(
+            result.contains("governed push/PR-create is not available under Windows"),
+            "{command}: {result}"
+        );
+        assert_eq!(reached, 0, "{command}: {result}");
+    }
+}
+
 /// #3160: with `confine` the push and PR-create brokers take a standalone `git push`
 /// and `gh pr create` before the shell route. Each command is one the broker refuses
 /// from its argv alone, so the counter, not the broker's answer, is the assertion.

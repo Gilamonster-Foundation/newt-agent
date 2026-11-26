@@ -4741,6 +4741,16 @@ async fn execute_authorized_tool(
                 ));
             }
 
+            // #3296: the broker sees expanded argv, too late to protect message prose.
+            if git_words::commit_has_command_substitution(cmd) {
+                return host_return(
+                    "error: refusing command substitution in git commit arguments: \
+                     backticks and $() execute shell commands and can silently alter the commit message. \
+                     Pass message text literally with single quotes, or use git commit -F - \
+                     with a quoted here-document (<<'EOF'). No command ran.".into()
+                );
+            }
+
             // Native commit runs the original shell source once, with Git's
             // expanded command bound to host-held attribution/signing policy.
             // Other commit-producing verbs still need multi-commit lifecycle
