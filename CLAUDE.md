@@ -560,7 +560,7 @@ rate. Rerunning it is not a fix.
 - **First sighting:** read the log, file an issue that quotes the failing
   lines and names the job, then rerun once.
 - **Second sighting** of the same test or failure signature, on any PR or
-  day: the issue becomes `priority:p1` and gets an owner before unrelated
+  day: the issue becomes `p1` and gets an owner before unrelated
   merges continue. Record every rerun as a comment on that issue: the run,
   the job, the date.
 - **A fix removes the nondeterminism:** wait on a causal signal, inject the
