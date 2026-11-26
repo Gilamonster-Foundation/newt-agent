@@ -24,6 +24,9 @@ const TTY_BUFFER_SIZE: usize = 1_024;
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
+    // newt #3128: returning one event must retain the rest of this poll batch.
+    // Mio reports edges: polling again can lose an already-ready cursor reply.
+    pending_tokens: VecDeque<Token>,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
@@ -54,6 +57,7 @@ impl UnixInternalEventSource {
         Ok(UnixInternalEventSource {
             poll,
             events: Events::with_capacity(3),
+            pending_tokens: VecDeque::with_capacity(3),
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
@@ -73,7 +77,11 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
+            if let Err(e) = poll_ready(&mut self.pending_tokens, |pending| {
+                self.poll.poll(&mut self.events, timeout.leftover())?;
+                pending.extend(self.events.iter().map(|event| event.token()));
+                Ok(())
+            }) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
@@ -84,12 +92,12 @@ impl EventSource for UnixInternalEventSource {
                 }
             };
 
-            if self.events.is_empty() {
+            if self.pending_tokens.is_empty() {
                 // No readiness events = timeout
                 return Ok(None);
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            while let Some(token) = self.pending_tokens.pop_front() {
                 match token {
                     TTY_TOKEN => {
                         loop {
@@ -155,6 +163,50 @@ impl EventSource for UnixInternalEventSource {
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker {
         self.waker.clone()
+    }
+}
+
+// Keep the poll boundary injectable: the regression must control readiness
+// ordering without a real terminal, signal, scheduler, or clock.
+fn poll_ready(
+    pending: &mut VecDeque<Token>,
+    poll: impl FnOnce(&mut VecDeque<Token>) -> io::Result<()>,
+) -> io::Result<()> {
+    if pending.is_empty() {
+        poll(pending)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod newt_3128_tests {
+    use super::{poll_ready, VecDeque, SIGNAL_TOKEN, TTY_TOKEN};
+
+    #[test]
+    fn returning_one_event_preserves_the_rest_of_the_readiness_batch() {
+        for batch in [[SIGNAL_TOKEN, TTY_TOKEN], [TTY_TOKEN, SIGNAL_TOKEN]] {
+            let mut pending = VecDeque::new();
+            poll_ready(&mut pending, |pending| {
+                pending.extend(batch);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(pending.pop_front(), Some(batch[0]));
+            // Returning the first event ends try_read. The second call must
+            // consume the already-reported edge, not ask the kernel again.
+            poll_ready(&mut pending, |_| {
+                panic!("unhandled readiness was discarded")
+            })
+            .unwrap();
+            assert_eq!(pending.pop_front(), Some(batch[1]));
+            let mut polled = false;
+            poll_ready(&mut pending, |_| {
+                polled = true;
+                Ok(())
+            })
+            .unwrap();
+            assert!(polled, "an exhausted batch must poll again");
+        }
     }
 }
 

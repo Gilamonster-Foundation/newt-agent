@@ -5,9 +5,19 @@ Upstream crossterm 0.28.1's `cursor::sys::unix::read_position_raw` swallows a
 answers `poll`/`read` with an error (vhs's bundled `ttyd`, not a plain
 timeout) the DSR cursor-position query never returns — not even past its own
 advertised 2s timeout. Confirmed still present in crossterm 0.29.0 and
-current `master` as of 2026-09-29 (an upgrade does not fix this). The one
-changed function is in `src/cursor/sys/unix.rs`, marked with a `newt #2644`
-comment; nothing else in this copy is touched, except `cursor::position_to` (newt #3014): the same query written to a caller-supplied writer instead of stdout.
+current `master` as of 2026-09-29 (an upgrade does not fix this). That cursor
+change is in `src/cursor/sys/unix.rs`, marked with a `newt #2644`
+comment. `cursor::position_to` (newt #3014) writes the same query to a
+caller-supplied writer instead of stdout.
+
+The mio event source also retains unhandled readiness tokens across `try_read`
+calls (#3128). Previously, returning a resize event discarded any input readiness
+later in the same poll batch. Since mio reports edges, a cursor reply already
+waiting on stdin could then time out without being read. The same loss could
+discard a resize notification after an input event. The injected poll seam tests
+both orders entirely in memory; the CLI's `terminal_exit_pty` test grounds the
+resize/cursor exchange in a real terminal. `just check-vendor-crossterm` and CI
+run both `newt_` regression suites.
 
 ## This only helps builds FROM the newt workspace
 
@@ -27,5 +37,5 @@ registry and reintroduces the hang. This vendoring does not fix that path.
    picks it up too.
 
 **Remove this vendored copy when crossterm's published version includes the
-`read_position_raw` fix** (check `src/cursor/sys/unix.rs` upstream before
-bumping — see the draft PR for the exact function).
+`read_position_raw` and readiness-batch fixes** (check `src/cursor/sys/unix.rs`
+and `src/event/source/unix/mio.rs` upstream before bumping).
