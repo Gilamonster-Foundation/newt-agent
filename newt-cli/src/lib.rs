@@ -866,6 +866,11 @@ pub enum Command {
         /// refused and reported (exit 2).
         #[arg(long = "sign-ocap")]
         sign_ocap: bool,
+        /// Review and sign the ordered build toolchain roots with the existing
+        /// operator key. Requires explicit terminal approval; saves a private
+        /// backup first. Never creates a key or automatically approves a policy.
+        #[arg(long = "sign-toolchains", conflicts_with_all = ["sign_ocap", "fix"])]
+        sign_toolchains: bool,
         /// Offer per-entry repair for stale durable grants and ambiguous backend
         /// drop-ins. Requires a terminal and explicit confirmation; piped runs
         /// report only. Grant pruning saves a dated backup and keeps signatures.
@@ -1945,8 +1950,14 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Doctor { sign_ocap, fix } => {
-            if sign_ocap {
+        Command::Doctor {
+            sign_ocap,
+            sign_toolchains,
+            fix,
+        } => {
+            if sign_toolchains {
+                doctor::toolchains::run()
+            } else if sign_ocap {
                 let code = doctor::sign_ocap()?;
                 if code != 0 {
                     std::process::exit(code);
@@ -2376,6 +2387,21 @@ mod backend_flag_axis_tests {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn toolchain_signing_is_an_explicit_exclusive_doctor_command() {
+        Cli::try_parse_from(["newt", "doctor", "--sign-toolchains"])
+            .expect("operator toolchain signing must be an explicit doctor command");
+        for incompatible in ["--sign-ocap", "--fix", "--yes"] {
+            assert!(
+                Cli::try_parse_from(["newt", "doctor", "--sign-toolchains", incompatible,])
+                    .is_err()
+            );
+        }
+        assert!(!newt_core::agentic::builtin_tool_names()
+            .iter()
+            .any(|name| name.contains("sign_toolchains") || name.contains("sign-toolchains")));
+    }
 
     #[test]
     fn shell_engine_flag_preserves_host_and_validates_brush_transport() {

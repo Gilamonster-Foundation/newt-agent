@@ -33,27 +33,30 @@ impl ContentAddressable for Body {
     }
 }
 
-fn verify(text: &str, verifier: &impl ApproveVerifier) -> Result<Body> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct File {
-        schema: String,
-        roots: Vec<Root>,
-        sig: String,
-    }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct File {
+    schema: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sig: Option<String>,
+    roots: Vec<Root>,
+}
+
+fn parse(text: &str) -> Result<(Body, Option<String>)> {
     let file: File = toml::from_str(text)?;
     let body = Body {
         schema: file.schema,
         roots: file.roots,
     };
+    validate_body(&body)?;
+    Ok((body, file.sig))
+}
+
+fn validate_body(body: &Body) -> Result<()> {
     ensure!(
         body.schema == "newt.build-toolchains/v1",
         "unsupported toolchain schema"
     );
-    let sig = crate::ocap_policy::hex_decode(&file.sig).map_err(anyhow::Error::msg)?;
-    verifier
-        .verify(&body.canonical_form()?, &sig)
-        .map_err(anyhow::Error::msg)?;
     for (index, root) in body.roots.iter().enumerate() {
         absolute(Path::new(&root.path))?;
         ensure!(
@@ -61,7 +64,50 @@ fn verify(text: &str, verifier: &impl ApproveVerifier) -> Result<Body> {
             "duplicate toolchain root"
         );
     }
+    Ok(())
+}
+
+/// Production load verification, also used to check an explicit operator write.
+/// Unsigned input is never accepted by a build, including after signing review.
+pub fn verify(text: &str, verifier: &impl ApproveVerifier) -> Result<Body> {
+    let (body, sig) = parse(text)?;
+    let sig = sig.context("missing toolchain signature")?;
+    let sig = crate::ocap_policy::hex_decode(&sig).map_err(anyhow::Error::msg)?;
+    verifier
+        .verify(&body.canonical_form()?, &sig)
+        .map_err(anyhow::Error::msg)?;
     Ok(body)
+}
+
+/// Encode an explicitly approved body using the existing OCAP signature seam.
+/// This pure helper owns no key and is not called by startup or any model tool.
+pub fn signed_toml(body: &Body, sign: &impl Fn(&[u8]) -> [u8; 64]) -> Result<String> {
+    validate_body(body)?;
+    let sig = crate::ocap_store::sign_entry(&body.canonical_form()?, sign);
+    Ok(toml::to_string(&File {
+        schema: body.schema.clone(),
+        sig: Some(sig),
+        roots: body.roots.clone(),
+    })?)
+}
+
+/// Read-only host review for the operator signing ceremony. Reuse every live
+/// admission check; this does not install policy or mint session authority.
+/// A signing command has no model session writes; each later build checks its
+/// complete write scope independently against the signed roots.
+pub fn review_for_signing(config_dir: &Path, home: Option<PathBuf>, text: &str) -> Result<Body> {
+    let (body, _) = parse(text)?;
+    let policy = Captured {
+        body,
+        source: config_dir.join("ocap/toolchains.toml"),
+        source_id: RawContentId::from_content(text.as_bytes()),
+        key: config_dir.join("identity.pem"),
+        home: home
+            .map(|path| newt_policy::paths::resolve_uncreated_path(&path))
+            .transpose()?,
+    };
+    admit_captured(&policy, &Scope::none())?;
+    Ok(policy.body)
 }
 
 #[derive(Debug)]
@@ -176,6 +222,13 @@ pub(crate) fn admit(writes: &Scope<String>) -> Result<Vec<(Admission, HeldReadRo
     let Some(policy) = snapshot()? else {
         return Ok(Vec::new());
     };
+    admit_captured(policy, writes)
+}
+
+fn admit_captured(
+    policy: &Captured,
+    writes: &Scope<String>,
+) -> Result<Vec<(Admission, HeldReadRoot)>> {
     // Git deliberately exempts ambient writes. Toolchains must not inherit it.
     let Scope::Only(writes) = writes else {
         bail!("toolchains require bounded model writes")

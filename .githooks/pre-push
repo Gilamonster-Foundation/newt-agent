@@ -46,6 +46,9 @@
 # CI-ONLY (never run here -- too slow, or needs infrastructure a dev box
 # lacks; each of these is named so CRAFT-14's "scoped in the hook or named
 # as CI-only" rule holds for every check the pipeline runs):
+#   - operator toolchain signing (#3327), mcp-import-real.yml: the explicit
+#     toolchain_signing --sign-toolchains-3327 harness runs serially on Linux
+#     with disposable keys/PTYs weekly and on release; pure guards stay here.
 #   - settings concurrent-update grounding (#3090), mcp-import-real.yml:
 #     settings_update_fs is ignored and runs with --ignored --test-threads=1
 #     weekly and on release; pure settings update guards stay in this hook.

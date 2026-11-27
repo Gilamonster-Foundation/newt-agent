@@ -1,6 +1,6 @@
 //! Serial host-resource grounding for the signed build-only policy. No real key/config.
+use agent_mesh_protocol::UserKey;
 use content_addressable::ContentAddressable;
-use ed25519_dalek::{Signer, SigningKey};
 use newt_core::confined_exec::{build_tool_caveats, build_tool_request, ConstrainedExecutor};
 use newt_core::{execute_tool, Caveats, NoMcp, Scope};
 use std::os::unix::fs::PermissionsExt;
@@ -115,7 +115,7 @@ pub fn run() {
             expected_tree: Some(tree),
         }],
     };
-    let key = SigningKey::from_bytes(&[71; 32]);
+    let key = UserKey::generate();
     let signature =
         newt_core::ocap_store::sign_entry(&body.canonical_form().unwrap(), &|payload| {
             key.sign(payload).to_bytes()
@@ -126,18 +126,14 @@ pub fn run() {
         format!("sig = \"{signature}\"\n{}", toml::to_string(&body).unwrap()),
     )
     .unwrap();
-    std::fs::write(
-        config.join("identity.pem"),
-        "test-only public key supplied by fixture",
-    )
-    .unwrap();
+    key.save(&config.join("identity.pem")).unwrap();
     for file in [&policy_file, &config.join("identity.pem")] {
         std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     newt_core::toolchains::initialize(
         Some(config.clone()),
         Some(fixture.path().join("home")),
-        |_| Ok(key.verifying_key().to_bytes()),
+        |_| Ok(key.public().as_bytes()),
     );
     // A second initialization and every child-side override must be inert.
     newt_core::toolchains::initialize(Some(workspace.clone()), None, |_| panic!("policy reloaded"));
@@ -168,6 +164,10 @@ pub fn run() {
         let out = ConstrainedExecutor::run(&overridden).unwrap();
         assert!(out.success && out.toolchains[0].policy == body.content_id().unwrap());
         println!("POLICY_REPLACEMENT_REFUSED_BOTH_ROUTES; CHILD_ENV_CANNOT_REPLACE_POLICY");
+        if std::env::args().any(|arg| arg.starts_with("--signer-binary=")) {
+            confined_signing_refused(&workspace, &config, &baseline).await;
+        }
+
 
         for test in TESTS {
             let out = argv(&workspace, tests.to_str().unwrap(), &[test, "--exact", "--nocapture", "--test-threads=1"], &baseline.fs_write).unwrap();
@@ -233,4 +233,85 @@ pub fn run() {
             }
         }
     });
+}
+
+// A private PTY is deliberately available to builds; it cannot substitute for
+// authority over the parent's protected policy and real disposable signing key.
+async fn confined_signing_refused(workspace: &Path, config: &Path, caveats: &Caveats) {
+    let signer = argument("--signer-binary=");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
+    let policy = config.join("ocap/toolchains.toml");
+    let key = config.join("identity.pem");
+    let access_probe = format!(
+        "const fs=require('node:fs'); for (const [p,w] of [[{},false],[{},true]]) {{ try {{ if(w) fs.writeFileSync(p,'unauthorized'); else fs.readFileSync(p); process.exit(20); }} catch(e) {{ if(!['EACCES','EPERM'].includes(e.code)) throw e; }} }} console.log('KEY_POLICY_ACCESS_DENIED')",
+        serde_json::to_string(&key).unwrap(), serde_json::to_string(&policy).unwrap(),
+    );
+    let command = format!(
+        "test -t 0 && test -t 1 && node -e {} && {} --config-dir {} doctor --sign-toolchains",
+        quote(&access_probe),
+        quote(signer.to_str().unwrap()),
+        quote(config.to_str().unwrap()),
+    );
+    let before_policy = std::fs::read(&policy).unwrap();
+    let before_key = std::fs::read(&key).unwrap();
+    for (inner, positive) in [
+        (
+            "test -t 0 && test -t 1 && printf PRIVATE_SIGNER_PTY_OK",
+            true,
+        ),
+        (command.as_str(), false),
+    ] {
+        // Supply an affirmative answer to the private terminal as an attacker
+        // could. Refusal must come from protected state, not stdin being a pipe.
+        let source = format!(
+            "printf 'y\\n' | /usr/bin/script -q -e -c {} /dev/null",
+            quote(inner)
+        );
+        let request = build_tool_request(
+            workspace,
+            workspace,
+            "/bin/sh",
+            ["-c", &source],
+            &Scope::none(),
+        )
+        .timeout(std::time::Duration::from_secs(30))
+        .with_operator_toolchains(&caveats.fs_write)
+        .unwrap();
+        let out = ConstrainedExecutor::run(&request).unwrap();
+        let argv_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let brush_text = brush(
+            workspace,
+            &format!("cargo build --help >/dev/null && {source}"),
+            caveats,
+        )
+        .await;
+        for (route, text) in [("argv", argv_text), ("Brush", brush_text)] {
+            if positive {
+                assert!(text.contains("PRIVATE_SIGNER_PTY_OK"), "{route}: {text}");
+            } else {
+                assert!(
+                    text.contains("Permission denied")
+                        && text.contains("KEY_POLICY_ACCESS_DENIED")
+                        && text.contains("cannot read operator toolchain policy")
+                        && !text.contains("Signed toolchain policy"),
+                    "{route}: {text}"
+                );
+                assert_eq!(std::fs::read(&policy).unwrap(), before_policy);
+                assert_eq!(std::fs::read(&key).unwrap(), before_key);
+                println!("MODEL_SIGNER_REFUSED {route}: private PTY works; policy read/write and key read denied; protected bytes unchanged");
+            }
+        }
+        if positive {
+            assert!(out.success, "private PTY control did not execute");
+        } else {
+            assert!(
+                !out.success && !out.timed_out,
+                "signer did not refuse promptly"
+            );
+        }
+    }
 }
