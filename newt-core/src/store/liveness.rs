@@ -4,14 +4,37 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use super::{validate_record_id, ConversationStore};
 
+/// Floor the difference, not the individual clocks. Missing readings, an
+/// impossible ordering, or an unrepresentable epoch leave identity unknown.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn boot_epoch(
+    realtime: Option<std::time::Duration>,
+    boottime: Option<std::time::Duration>,
+) -> Option<i64> {
+    i64::try_from(realtime?.checked_sub(boottime?)?.as_secs()).ok()
+}
+
+/// Compare foreign kernel locators, without minting a new content identity or
+/// changing the schema. Old unqualified rows are foreign to a qualified owner
+/// and remain subject to the existing liveness check before reclamation.
+/// Only the kernel's exact initial PID namespace link is exempt. An unreadable
+/// link preserves the existing coordinate; no namespace distinction is claimed.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn owner_coordinate(boot_id: &str, ns_link: Option<&str>) -> String {
+    match ns_link {
+        Some(link) if link != "pid:[4026531836]" => format!("{boot_id};{link}"),
+        _ => boot_id.to_owned(),
+    }
+}
+
 /// A `live_owners` row (#1030) — a process that has a conversation open —
 /// handed to the [`LivenessFn`] to decide whether it is still LIVE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOwner {
     /// Hostname of the owning process's machine.
     pub host: String,
-    /// Kernel boot id at claim time. A different boot id on the same host means
-    /// the machine rebooted, so every prior pid is gone (the claim is stale).
+    /// Kernel boot coordinate, qualified by the PID namespace on Linux outside
+    /// the initial namespace. Other boots/namespaces use heartbeat freshness.
     pub boot_id: String,
     /// OS process id of the owner.
     pub pid: i64,
@@ -136,15 +159,15 @@ pub type LivenessFn = fn(owner: &StoredOwner, now: i64) -> bool;
 
 /// A held conversation whose owner's last heartbeat is older than this is
 /// treated as stale (reclaimable) — but ONLY on the fallback path where the pid
-/// probe is not authoritative (a foreign host, or the same host after a reboot).
+/// probe is not authoritative (another host, boot, or PID namespace).
 /// One hour: comfortably longer than the gap between a live session's per-turn
 /// heartbeats, short enough that a genuinely dead cross-host session frees its
 /// conversation the same day.
 const LIVENESS_STALE_AFTER_NANOS: i64 = 3_600 * 1_000_000_000;
 
-/// The production [`LivenessFn`]. Same machine and boot: the pid probe is
-/// authoritative. Otherwise (a foreign host, or this host after a reboot — where
-/// the stored pid is meaningless) fall back to heartbeat freshness.
+/// The production [`LivenessFn`]. Same machine, boot and PID namespace: the pid
+/// probe is authoritative. Otherwise the stored pid is meaningless locally;
+/// fall back to heartbeat freshness.
 pub(super) fn system_liveness(owner: &StoredOwner, now: i64) -> bool {
     let (host, boot_id) = current_host_boot();
     if owner.host == host && owner.boot_id == boot_id {
@@ -179,7 +202,8 @@ pub(super) fn pid_identity_matches(started_at: Option<i64>, heartbeat_tick: i64)
 /// Unix-epoch nanos at which the process holding `pid` started, for comparison
 /// against a `live_owners.heartbeat_tick` (also unix nanos, see
 /// [`now_claim_nanos`](super::now_claim_nanos)). `/proc/<pid>/stat` field 22 is the start time in clock
-/// ticks since boot, which `/proc/stat`'s `btime` rebases onto the wall clock.
+/// ticks since boot. REALTIME minus BOOTTIME rebases it onto the wall clock
+/// without depending on the global `/proc/stat` (absent from `subset=pid`).
 ///
 /// Second-granularity truncation biases the result EARLIER, which is the
 /// fail-closed direction: an under-estimate can only make an impostor look like
@@ -199,17 +223,32 @@ pub(super) fn pid_start_unix_nanos(pid: i64) -> Option<i64> {
         return None;
     }
 
-    let btime_secs: i64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
+    // Read REALTIME first: elapsed sampling time biases the epoch earlier,
+    // never toward incorrectly reclaiming a live owner's conversation.
+    let realtime = kernel_clock(libc::CLOCK_REALTIME);
+    let boottime = kernel_clock(libc::CLOCK_BOOTTIME);
+    let btime_secs = boot_epoch(realtime, boottime)?;
 
     btime_secs
         .checked_add(start_ticks / ticks_per_sec)?
         .checked_mul(1_000_000_000)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn kernel_clock(id: libc::clockid_t) -> Option<std::time::Duration> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes only to the valid timespec; invalid clock
+    // IDs fail below. Successful readings have normalized nanoseconds.
+    if unsafe { libc::clock_gettime(id, &mut value) } != 0 {
+        return None;
+    }
+    Some(std::time::Duration::new(
+        value.tv_sec.try_into().ok()?,
+        value.tv_nsec.try_into().ok()?,
+    ))
 }
 
 /// Non-Linux fallback: no portable start-time probe, so identity is unknown and
@@ -291,9 +330,9 @@ pub(crate) fn pid_is_alive(pid: i64) -> bool {
     running
 }
 
-/// This machine's `(hostname, kernel boot id)`. Both come from `/proc` (Linux —
-/// the dev + CI + deploy target) and degrade to `("localhost", "")` off-Linux,
-/// which simply makes the pid probe the sole liveness signal on the local host.
+/// This process's `(hostname, boot coordinate)`. Linux qualifies non-initial
+/// PID namespaces when their link is readable. Off-Linux the existing
+/// `("localhost", "")` fallback leaves pid existence as the local signal.
 pub(super) fn current_host_boot() -> (String, String) {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
@@ -303,6 +342,14 @@ pub(super) fn current_host_boot() -> (String, String) {
     let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let boot_id = {
+        let namespace = std::fs::read_link("/proc/self/ns/pid").ok();
+        owner_coordinate(
+            &boot_id,
+            namespace.as_deref().and_then(std::path::Path::to_str),
+        )
+    };
     (host, boot_id)
 }
 

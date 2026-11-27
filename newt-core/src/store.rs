@@ -254,8 +254,8 @@ pub struct ConversationStore {
     /// so tests can drive the clock backwards mid-conversation and prove
     /// ordering never consults it (§6 clock-skew test).
     claim_clock: fn() -> i64,
-    /// #1030: this process's hostname + kernel boot id, captured once at open —
-    /// the machine-identity half of a `live_owners` claim (paired with `pid`).
+    /// #1030: hostname + boot coordinate, including a readable non-initial Linux
+    /// PID namespace, captured once at open and paired with `pid` for ownership.
     host: String,
     boot_id: String,
     /// This process's OS pid — the process-unique half of a claim. The writer
