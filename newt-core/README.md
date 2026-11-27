@@ -119,8 +119,11 @@ identify verified pins or unpinned roots. Missing policy means no extra roots;
 invalid policy or changed policy bytes refuse builds. Restart after operator
 policy changes. Linux retains held root descriptors; macOS reports its path-only
 binding. Platforms without ownership/confinement checks refuse configured roots.
-The explicit operator signing command is a separate follow-up; this change only
-consumes signed policy. Embedders call `toolchains::initialize` once at host startup
+`newt doctor --sign-toolchains` reviews exact ordered roots and optional pins,
+requires explicit operator-terminal approval with an existing identity, and saves
+a private backup before atomic replacement. It never signs at startup or through
+a model tool. Changed policy, key, or pinned tree during review refuses signing.
+Embedders call `toolchains::initialize` once at host startup
 and prepare build requests with `ExecRequest::with_operator_toolchains`, passing
 the complete session write scope.
 

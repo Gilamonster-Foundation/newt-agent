@@ -479,17 +479,19 @@ impl WorkerControlHandle {
 /// Opaque owner of a fresh worker output endpoint. Socketpairs cannot be
 /// opened again by pathname; the only constructor also seals both endpoints'
 /// unused directions before either reaches the child.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 #[derive(Debug)]
 pub struct WorkerOutputHandle(std::os::fd::OwnedFd);
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(unix, any(test, target_os = "linux", target_os = "macos")))]
 impl WorkerOutputHandle {
     fn pair() -> std::io::Result<(std::os::fd::OwnedFd, Self)> {
         use std::net::Shutdown;
         let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        // This fresh pair has no queued parent bytes: closing parent writes
+        // also gives the child EOF. A redundant child Read shutdown can return
+        // ENOTCONN on macOS. Keep one shutdown and propagate every failure.
         reader.shutdown(Shutdown::Write)?;
-        writer.shutdown(Shutdown::Read)?;
         Ok((reader.into(), Self(writer.into())))
     }
 }
@@ -2300,6 +2302,32 @@ mod tests {
     use super::*;
     use crate::enforcement_report;
     use crate::{Gate, Tool};
+
+    /// Real socket grounding for the sealed output handle's one-way contract.
+    /// Nonblocking I/O makes a missing half-close fail instead of hanging.
+    #[cfg(unix)]
+    #[test]
+    fn worker_output_pair_is_one_way() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (parent, child) = WorkerOutputHandle::pair().expect("worker output pair");
+        let mut parent = UnixStream::from(parent);
+        let mut child = UnixStream::from(child.0);
+        parent.set_nonblocking(true).unwrap();
+        child.set_nonblocking(true).unwrap();
+
+        assert!(parent.write(b"forbidden").is_err(), "parent cannot send");
+        let mut byte = [0];
+        assert_eq!(child.read(&mut byte).unwrap(), 0, "child only receives EOF");
+
+        child.write_all(b"result").unwrap();
+        let mut result = [0; 6];
+        parent.read_exact(&mut result).unwrap();
+        assert_eq!(&result, b"result");
+        drop(child);
+        assert_eq!(parent.read(&mut byte).unwrap(), 0, "parent receives EOF");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

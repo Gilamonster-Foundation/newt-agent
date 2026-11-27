@@ -153,8 +153,11 @@ rules already refuse writes.
 The common hook chooses fallback before the first fork when the working directory,
 any read/write grant root, PATH entry, tool home or temporary-directory environment
 value is covered by `/tmp` or `/dev/shm`. Resolution precedes comparison, including
-symlink targets and relative paths; unresolved paths and `..` select fallback
-conservatively. Known account-lookup failures also select fallback before setup.
+symlink targets and relative paths. A path that does not exist is judged by its
+nearest existing ancestor, so a stale PATH entry or an absent grant root does not
+cost the build its private mode; a missing working directory, any other resolution
+failure and `..` select fallback conservatively. Known account-lookup failures
+also select fallback before setup.
 Brush carries these directory values, including its default PATH, through the
 existing bootstrap seam, excluding loader and worker-authentication controls.
 

@@ -1877,7 +1877,14 @@ mod native {
                     "Build denial must precede the first source effect: {output}"
                 );
                 assert!(!workspace.join("build-count").exists(), "{output}");
-                assert!(!workspace.join("target").exists(), "{output}");
+                // The fixture creates `target` up front; denial leaves it empty.
+                assert!(
+                    std::fs::read_dir(workspace.join("target"))
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                    "{output}"
+                );
             } else {
                 assert!(
                     output.contains(MARKER),

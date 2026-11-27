@@ -90,11 +90,17 @@ fn assert_preserved(path: &Path, output: &str) {
     );
 }
 
+/// Grounds the mocked `native_cleanup_reaches_the_existing_authority_boundary`
+/// decision with real read/write/exec grants and the kernel directory fence.
 pub async fn run(root: &Path) {
     let workspace = root.join("cleanup-workspace");
     let outside = root.join("cleanup-outside");
     std::fs::create_dir(&workspace).unwrap();
-    let approved = outside.join("approved tree");
+    // Landlock removal rights apply to a directory's contents, not its own
+    // entry in the parent. Approve a container, then delete a tree inside it;
+    // granting `outside` would also authorize the unapproved sibling.
+    let grant = outside.join("approved scope");
+    let approved = grant.join("approved tree");
     let sibling = outside.join("unapproved tree");
     tree(&approved);
     tree(&sibling);
@@ -106,8 +112,8 @@ pub async fn run(root: &Path) {
     let source = format!("/bin/rm -rf -- '{}'", approved.display());
     let declared = serde_json::json!({
         "command": source,
-        "fs_read": [approved],
-        "fs_write": [approved],
+        "fs_read": [grant],
+        "fs_write": [grant],
     });
     let mut gate = OnceGate {
         allow: false,
@@ -120,8 +126,8 @@ pub async fn run(root: &Path) {
     assert_eq!(
         gate.requests,
         vec![
-            (DenialKind::FsRead, approved.to_string_lossy().into_owned()),
-            (DenialKind::FsWrite, approved.to_string_lossy().into_owned()),
+            (DenialKind::FsRead, grant.to_string_lossy().into_owned()),
+            (DenialKind::FsWrite, grant.to_string_lossy().into_owned()),
         ],
         "a scoped cleanup must reach the ordinary approval gate: {refused}"
     );
@@ -133,6 +139,31 @@ pub async fn run(root: &Path) {
         "approved native cleanup did not execute: {allowed}"
     );
     assert_preserved(&sibling, &allowed);
+
+    #[cfg(target_os = "linux")]
+    {
+        // Preserve the original #3335 case as a negative control: the grant
+        // permits removing children but must never silently grant the parent.
+        tree(&approved);
+        let root_cleanup = command(
+            &workspace,
+            serde_json::json!({
+                "command": format!("/bin/rm -rf -- '{}'", grant.display()),
+                "fs_read": [grant],
+                "fs_write": [grant],
+            }),
+            &baseline,
+            Some(&mut gate),
+        )
+        .await;
+        assert!(
+            !approved.exists(),
+            "grant must admit child deletion: {root_cleanup}"
+        );
+        assert!(grant.is_dir(), "grant root must survive: {root_cleanup}");
+        assert_preserved(&sibling, &root_cleanup);
+        eprintln!("native cleanup: children removed; grant root and sibling preserved");
+    }
 
     // An allow-once decision does not become a standing grant on the next call.
     tree(&approved);
@@ -152,8 +183,8 @@ pub async fn run(root: &Path) {
         &workspace,
         serde_json::json!({
             "command": format!("/bin/rm -rf -- '{}' '{}'", approved.display(), sibling.display()),
-            "fs_read": [approved],
-            "fs_write": [approved],
+            "fs_read": [grant],
+            "fs_write": [grant],
         }),
         &baseline,
         Some(&mut gate),
@@ -170,8 +201,8 @@ pub async fn run(root: &Path) {
     let mut no_exec = newt_policy::permissions::widen_caveats(
         &baseline,
         &[
-            (DenialKind::FsRead, approved.to_string_lossy().into_owned()),
-            (DenialKind::FsWrite, approved.to_string_lossy().into_owned()),
+            (DenialKind::FsRead, grant.to_string_lossy().into_owned()),
+            (DenialKind::FsWrite, grant.to_string_lossy().into_owned()),
         ],
     );
     no_exec.exec = Scope::none();

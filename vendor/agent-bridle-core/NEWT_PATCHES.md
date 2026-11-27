@@ -359,9 +359,13 @@ record, content identity, or caller grant changes.
 
 `SandboxedWorker` supplies stdout and stderr with fresh Unix socketpairs on
 Linux and macOS. The worker's stdout and stderr cannot be opened again by
-pathname. The unused direction of each endpoint is shut down before spawn.
-A sealed `ConfinedStdio::WorkerOutput` handle preserves audited stdio credit
-without admitting arbitrary descriptors or providing a host I/O service.
+pathname. A single parent write shutdown before spawn also gives the child's
+unused read side EOF on the fresh pair. This avoids a redundant read shutdown
+that can return ENOTCONN on macOS; errors from the required shutdown still
+propagate. A Unix constructor test checks both forbidden directions, result
+delivery and EOF. A sealed `ConfinedStdio::WorkerOutput` handle preserves
+audited stdio credit without admitting arbitrary descriptors or providing a
+host I/O service.
 
 The parent endpoints remain in `Child.stdout` and `Child.stderr`, preserving
 reader and supervisor ownership, including error paths. Ordinary argv stdio,
