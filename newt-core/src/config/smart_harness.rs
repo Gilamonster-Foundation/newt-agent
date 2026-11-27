@@ -361,7 +361,7 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
     let mut writable = Vec::new();
     // Automatic build checks use this calibrated authority independently of
     // the current tool gate; repository-authored commands must not read frames.
-    let build = crate::confined_exec::build_tool_caveats(workspace);
+    let build = crate::confined_exec::configured_build_caveats(workspace);
     for (scope, write) in [
         (&caveats.fs_read, false),
         (&caveats.fs_write, true),

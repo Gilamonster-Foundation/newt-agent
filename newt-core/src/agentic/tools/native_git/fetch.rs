@@ -368,6 +368,7 @@ mod tests {
     #[test]
     fn failed_delivery_does_not_claim_the_repository_is_unchanged() {
         let output = crate::confined_exec::ConfinedOutput {
+            toolchains: Vec::new(),
             success: false,
             code: Some(1),
             stdout: Vec::new(),
@@ -403,6 +404,7 @@ mod tests {
         let delivered = |stderr: &str| {
             delivery_result(
                 Ok(crate::confined_exec::ConfinedOutput {
+                    toolchains: Vec::new(),
                     success: true,
                     code: Some(0),
                     stdout: Vec::new(),

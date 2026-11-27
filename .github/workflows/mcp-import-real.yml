@@ -54,6 +54,12 @@ jobs:
         shell: bash
         run: bash .github/scripts/test-cargo-test-nonempty.sh
 
+      # Explicit harness: pure signing guards stay in the per-PR tier; this
+      # grounds approval/decline, private backups and races with disposable keys.
+      - name: Run operator toolchain signing acceptance
+        if: runner.os == 'Linux'
+        run: cargo test -p newt-agent --test toolchain_signing -- --sign-toolchains-3327
+
       # Patch containment needs native filesystem semantics; keep it out of
       # the unit tier and require every regression, including optional diffy.
       - name: Run patch read/write symlink containment grounding
