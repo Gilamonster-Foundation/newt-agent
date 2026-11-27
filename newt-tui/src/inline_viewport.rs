@@ -193,8 +193,8 @@ impl<W: Write> Backend for AnchoredBackend<W> {
         // entered its own raw-mode guard — a live reader plus a termios owner
         // left behind (PR #2646 review). The actual defect was in crossterm's
         // retry loop, not in this call being synchronous; it is patched at
-        // the source instead (`vendor/crossterm-0.28.1-patched/`, wired via
-        // workspace `[patch.crates-io]`), so the call here is synchronous
+        // the source in the pinned crossterm fork (workspace `[patch.crates-io]`),
+        // so the call here is synchronous
         // again and crossterm's own raw-mode enable/disable cleanup runs
         // uninterrupted, exactly as ratatui's `CrosstermBackend` expects.
         match crossterm::cursor::position().map(|(x, y)| Position { x, y }) {

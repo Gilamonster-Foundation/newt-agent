@@ -285,8 +285,6 @@ check:
     # CI is not repeated here.
     cargo clippy -p newt-mcp-server --no-default-features --all-targets -- -D warnings || rc=1
     cargo test -p newt-mcp-server --no-default-features || rc=1
-    # PIPELINE PARITY: the "vendor crossterm regression gate (newt #2644)" ci.yml step.
-    just check-vendor-crossterm || rc=1
     # PIPELINE PARITY: mirrors the "test (newt-interaction, inward protocol
     # layer)" step in .github/workflows/ci.yml's lean job. newt-interaction
     # (#1828) is the inward protocol layer and must build with no feature at
@@ -413,18 +411,6 @@ check-mesh:
     cargo fmt --manifest-path newt-mesh/Cargo.toml -- --check
     cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
     cargo test --manifest-path newt-mesh/Cargo.toml
-
-# Run the vendored crossterm regression gate (newt #2644).
-# The vendor crate is excluded from the workspace (`[patch.crates-io]`), so
-# `just test` / `just check` never reach its unit tests. This recipe runs
-# the regression directly on the patched source; a future restoration of the
-# old `Err(_) => {}` arm must fail this gate before reaching main.
-# Unix-only: the test is `#[cfg(all(test, unix))]`.
-# PIPELINE PARITY: mirrors the "vendor crossterm regression gate" step in
-# .github/workflows/ci.yml.
-[unix]
-check-vendor-crossterm:
-    RUSTC_WRAPPER= cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_ -- --test-threads=1
 
 # --- Security audit (A1) ---
 

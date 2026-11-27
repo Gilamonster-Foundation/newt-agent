@@ -13,8 +13,8 @@ name: CI
 # eval/harness/PTY/mcp-import-real real-resource lanes, the real-`newt`-
 # session / real-PTY integration binaries the hook's nextest filter excludes
 # by name (this file's `test` job is their per-PR run), OCAP
-# register honesty, cross-language conformance, the vendored crossterm
-# regression, checked move_from native proof, and this hook's own regression suites (they gate under CI, not
+# register honesty, cross-language conformance, checked move_from native proof,
+# and this hook's own regression suites (they gate under CI, not
 # by running themselves from inside the hook) are CI-ONLY and never run in
 # the hook — the hook's own header comment names each one, plus
 # the separately-triggered newt-web/mesh/formal/behavior-registry workflows,
@@ -335,21 +335,6 @@ jobs:
         run: |
           env RUSTC_WRAPPER= CARGO_BUILD_JOBS=4 nice -n 10 ionice -c3 cargo build -p newt-core --features ast --bin newt-net-guard
           env RUSTC_WRAPPER= CARGO_BUILD_JOBS=4 nice -n 10 ionice -c3 cargo test -p newt-core --features ast --lib agentic::tools::move_from::tests::real_move_from_fixture_compiles_and_failed_check_restores -- --ignored --exact
-      - name: vendor crossterm regression gate (newt #2644)
-        # The `[patch.crates-io]` vendored crossterm is excluded from the workspace
-        # so its unit tests are never reached by `cargo test --workspace`.
-        # This step runs the regression directly so a future `Err(_) => {}`
-        # restoration in unix.rs must fail this gate before reaching main.
-        # Unix-only: the test is `#[cfg(all(test, unix))]`.
-        # HOOK PARITY: CI-only (#1098) -- named in .githooks/pre-push's
-        # CI-ONLY header; `vendor/` is excluded from the workspace so the
-        # changed-scope classifier can't attribute a crate to it, and it
-        # falls under the workspace-wide `vendor/**` -> ALL rule instead
-        # (see scripts/changed-scope.sh), which still wouldn't run this
-        # non-workspace manifest's own `cargo test`. `just
-        # check-vendor-crossterm` runs it locally on demand.
-        # Include the mocked resize/cursor readiness regression (#3128) too.
-        run: cargo test --manifest-path vendor/crossterm-0.28.1-patched/Cargo.toml newt_ -- --test-threads=1
 
   lean-build:
     name: lean strip-down build + tests (--no-default-features)

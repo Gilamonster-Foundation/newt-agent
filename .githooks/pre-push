@@ -289,9 +289,6 @@
 #   - OCAP register honesty (`scripts/ocap_check.py`) and cross-language
 #     conformance (`newt-interaction/conformance/newt_conformance.py`) --
 #     both pure-Python but multi-invocation; the `lint` job's own steps
-#   - the vendored crossterm regression (`vendor/crossterm-0.28.1-patched`,
-#     `just check-vendor-crossterm`) -- outside the workspace the changed-
-#     scope classifier maps against
 #   - `reuse lint` (ci.yml lint job, fsfe/reuse-action) -- needs the `reuse`
 #     Python tool, which a dev box does not carry; REUSE.toml covers every file
 #   - the `windows` and `musl` jobs (ci.yml) -- no Windows dev box / musl

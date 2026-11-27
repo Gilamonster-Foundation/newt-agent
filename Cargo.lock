@@ -1466,6 +1466,7 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "crossterm"
 version = "0.28.1"
+source = "git+https://github.com/hartsock/crossterm?rev=76069c65405f84f0688e1d61ccc729baeee17b71#76069c65405f84f0688e1d61ccc729baeee17b71"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm_winapi",
