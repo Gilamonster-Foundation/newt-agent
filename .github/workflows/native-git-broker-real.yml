@@ -25,6 +25,9 @@ name: Native Git broker real tier (#2693)
 # Landlock ruleset + real git subprocess is too slow/environmental for a
 # local push gate. The pre-push hook mirrors ci.yml (the per-PR unit tier)
 # only.
+# Also runs brush_build_pipeline's Linux cases (#3335). Private-build probes
+# require namespaces when the host permits them; every host runs the explicit
+# deny-all fallback variants. See the matching CI-only entry in .githooks/pre-push.
 
 on:
   schedule:
@@ -40,6 +43,7 @@ on:
       - "newt-policy/**"
       - "agent-toolchain/**"
       - "newt-fdguard/**"
+      - "vendor/agent-bridle*/**"
       - "Cargo.lock"
       - ".github/workflows/native-git-broker-real.yml"
   workflow_dispatch: {}
@@ -82,3 +86,38 @@ jobs:
         run: |
           cargo test -p newt-core --test native_git_broker_pipeline \
             -- --ignored --test-threads=1
+
+      - name: Run brush_build_pipeline Linux real-resource tests
+        run: |
+          cargo test -p newt-core --test brush_build_pipeline \
+            -- --ignored --test-threads=1
+
+      # Namespace creation can be denied by hosted-runner policy. Detect that
+      # independently of the product: a failing required probe must fail the job,
+      # never be mistaken for an unsupported host and retried as a passing skip.
+      - name: Require private builds when namespaces are available
+        run: |
+          command -v unshare >/dev/null
+          if unshare --user --map-root-user --net --mount true; then
+            cargo test -p newt-core --test brush_build_pipeline -- --ignored \
+              --require-build-netns \
+              build_tests_can_use_a_private_pty \
+              build_tests_external_connect_stays_denied \
+              build_tests_loopback_roundtrip \
+              build_tests_inherited_host_socket_denied \
+              build_tests_private_scratch_capacity_mode_and_isolation \
+              build_tests_private_identity_isolated
+          else
+            echo "::notice::User/network/mount namespaces unavailable; private-build success is unproven on this host. Forced fallback probes run below."
+          fi
+          # A workspace beneath a covered temporary mount deliberately falls
+          # back even on namespace-capable hosts; never require private mode.
+          cargo test -p newt-core --test brush_build_pipeline -- --ignored \
+            build_tests_temporary_workspace_retains_fallback
+
+      - name: Require each private-build setup failure to fall back safely
+        run: |
+          for failure in netns mounts devpts identity; do
+            cargo test -p newt-core --test brush_build_pipeline -- --ignored \
+              build_tests_ "--deny-build-$failure"
+          done

@@ -150,6 +150,11 @@
 #   - private native commit dispatch proof (#2813), .github/workflows/ci.yml test job:
 #     native_git_broker_pipeline --regression-2813 uses real Git/Brush/kernel
 #     confinement with net:none; also run manually on macOS.
+#   - brush_build_pipeline Linux cases (#3335), native-git-broker-real.yml:
+#     native cleanup and private-build grounds use real processes and Landlock.
+#     Namespace-capable hosts require private mode on both routes; every host
+#     runs the forced netns/mounts/devpts/identity fallback variants. The temporary
+#     workspace probe always requires fallback. CI-only like the Git broker tier.
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command
 #     in newt-core's worktree module. Real Git/host shell, Linux CI only.
@@ -542,8 +547,9 @@ cargo fmt --all -- --check
 #   native_git_broker_pipeline  .github/workflows/native-git-broker-real.yml
 #                               (weekly, release tags, PRs touching one of the
 #                               paths it lists) and macos-confined-contract.yml
-#   brush_build_pipeline        macos-confined-contract.yml, which runs only its
-#                               linked_worktree_build_reads row
+#   brush_build_pipeline        native-git-broker-real.yml (Linux cases, required
+#                               private mode when available, forced fallbacks);
+#                               macos-confined-contract.yml (linked-worktree row)
 #   macos_exec_basenames        newt-tui-pty.yml (root-owned gh copy)
 #   native_git_commit           macos-confined-contract.yml (Seatbelt; the only lane
 #                               that runs its real body, #3156)
