@@ -2820,6 +2820,7 @@ mod governed_push_tests {
         /// `git config --global …` in this HOME, 0600 afterwards.
         fn global(&self, args: &[&str]) {
             let out = std::process::Command::new("/usr/bin/git")
+                .current_dir(self.home.path())
                 .args(["config", "--global"])
                 .args(args)
                 .env_clear()
