@@ -4,7 +4,7 @@
 
 use std::ffi::{CStr, CString};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -23,11 +23,43 @@ pub const TEMPORARY_ENV: [&str; 5] = ["HOME", "TMPDIR", "TMP", "TEMP", "XDG_RUNT
 pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; external networking unavailable.\n";
 pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable. Local tests may fail because of this fence.\n";
 
+/// One regular file a private build must reach under a second name: `source`
+/// is attached read-only over `target` in the child's own mount namespace,
+/// before either fence. The caller verified both in the host namespace and
+/// keeps them open here. The child inherits a mount, never a claim: nothing
+/// about the pair is written to the environment, a file or a message.
+pub struct SameObjectBind {
+    source: (CString, OwnedFd),
+    target: (CString, OwnedFd),
+}
+
+impl SameObjectBind {
+    /// Each path is the absolute, canonical spelling of the held file beside it.
+    pub fn new(
+        source_path: &std::path::Path,
+        source: OwnedFd,
+        target_path: &std::path::Path,
+        target: OwnedFd,
+    ) -> io::Result<Self> {
+        let spell = |path: &std::path::Path, held| match CString::new(path.as_os_str().as_bytes()) {
+            Ok(spelling) if path.is_absolute() => Ok((spelling, held)),
+            _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        Ok(Self {
+            source: spell(source_path, source)?,
+            target: spell(target_path, target)?,
+        })
+    }
+}
+
 /// Install the prepared filesystem fence after new user, network and mount
 /// namespaces, with private tmpfs/devpts grants bound after mounting. Setup errors
 /// return RETRY_DENY_ALL before exec; the caller sets the returned flag and
 /// spawns a fresh child using both fallback mechanisms. Fence installation
-/// errors refuse exec entirely.
+/// errors refuse exec entirely. `binds` are attached last, after the private
+/// mounts and account files; one that cannot be attached exactly is a setup
+/// error like any other, and the fallback child has no namespace, so it sees
+/// no binding at all.
 /// `deny_inherited_fds` must also be installed by the confined spawn funnel.
 pub fn confine(
     command: &mut Command,
@@ -36,6 +68,7 @@ pub fn confine(
     deny: seccompiler::BpfProgram,
     loopback: seccompiler::BpfProgram,
     scratch_access: u64,
+    binds: Vec<SameObjectBind>,
 ) -> io::Result<Arc<AtomicBool>> {
     let mut empty_dirs = Vec::new();
     for (name, value) in command.get_envs() {
@@ -127,6 +160,7 @@ pub fn confine(
                             .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
                         private_identity(filesystem.as_raw_fd(), scratch_access, files)
                     })
+                    .and_then(|()| binds.iter().try_for_each(bind_same_object))
                     .is_err()
             {
                 // A partial user namespace cannot be undone. Exit before exec;
@@ -473,9 +507,82 @@ fn namespace(uid: &[u8], gid: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Runs with the new namespace's capabilities, before exec drops them and
+/// before Landlock freezes the mount topology. Descriptors inherited from the
+/// parent sit on the host's mounts and can be neither cloned nor covered here,
+/// so each spelling is reopened in this namespace and accepted only as the
+/// held object. The mount is made detached, restricted, then attached by
+/// descriptor. Every descriptor is owned and closes on every path.
+fn bind_same_object(bind: &SameObjectBind) -> io::Result<()> {
+    use linux_raw_sys::general as sys;
+    let source = reopen(&bind.source.0, &bind.source.1)?;
+    let target = reopen(&bind.target.0, &bind.target.1)?;
+    // SAFETY: raw syscalls on live owned descriptors, static empty paths and a
+    // stack attribute of the stated size. No allocation after fork.
+    unsafe {
+        let mount = libc::syscall(
+            libc::SYS_open_tree,
+            source.as_raw_fd(),
+            c"".as_ptr(),
+            sys::AT_EMPTY_PATH | sys::OPEN_TREE_CLONE | sys::OPEN_TREE_CLOEXEC,
+        ) as i32;
+        check(mount)?;
+        let mount = OwnedFd::from_raw_fd(mount);
+        let attributes = sys::mount_attr {
+            attr_set: (sys::MOUNT_ATTR_RDONLY | sys::MOUNT_ATTR_NOSUID | sys::MOUNT_ATTR_NODEV)
+                as u64,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        check(libc::syscall(
+            libc::SYS_mount_setattr,
+            mount.as_raw_fd(),
+            c"".as_ptr(),
+            sys::AT_EMPTY_PATH,
+            &attributes,
+            std::mem::size_of_val(&attributes),
+        ) as i32)?;
+        check(libc::syscall(
+            libc::SYS_move_mount,
+            mount.as_raw_fd(),
+            c"".as_ptr(),
+            target.as_raw_fd(),
+            c"".as_ptr(),
+            sys::MOVE_MOUNT_F_EMPTY_PATH | sys::MOVE_MOUNT_T_EMPTY_PATH,
+        ) as i32)?;
+    }
+    // The second name must now reach the held source, or no program runs.
+    reopen(&bind.target.0, &bind.source.1).map(drop)
+}
+
+/// Open `path` in the current mount namespace with every symlink refused, and
+/// return it only if it is the regular file `held` already names. A held
+/// descriptor pins its inode, so equal device and inode means the same object.
+fn reopen(path: &CStr, held: &OwnedFd) -> io::Result<OwnedFd> {
+    let how = crate::beneath::OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: libc::RESOLVE_NO_SYMLINKS,
+    };
+    let found = crate::beneath::openat2_fd(libc::AT_FDCWD, path, &how)?;
+    let identity = |fd: &OwnedFd| {
+        // SAFETY: zeroed stat is valid storage for fstat on a live descriptor.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        check(unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) })?;
+        Ok::<_, io::Error>((stat.st_dev, stat.st_ino, stat.st_mode & libc::S_IFMT))
+    };
+    let seen = identity(&found)?;
+    if seen == identity(held)? && seen.2 == libc::S_IFREG {
+        Ok(found)
+    } else {
+        Err(io::Error::from_raw_os_error(libc::ESTALE))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::account_line;
+    use super::*;
 
     #[test]
     fn account_line_preserves_fields_without_adding_records() {
@@ -498,5 +605,48 @@ mod tests {
         for field in [b"other:0".as_slice(), b"\nother", b"\rother", b"\0other"] {
             assert!(account_line(&[b"builder", field]).is_err());
         }
+    }
+
+    /// Real files: the hook's only defence against a spelling that was
+    /// redirected after the caller's check is that `reopen` compares objects.
+    /// Grounded end to end by newt-core's `brush_build_pipeline` alias probes.
+    #[test]
+    fn a_spelling_is_accepted_only_as_the_held_regular_file() {
+        let directory = std::env::temp_dir().join(format!("fdguard-3318-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let spell = |name: &str| {
+            let path = directory.join(name);
+            (CString::new(path.as_os_str().as_bytes()).unwrap(), path)
+        };
+        let (held_spelling, held_path) = spell("held");
+        let (other_spelling, other_path) = spell("other");
+        let (link_spelling, link_path) = spell("link");
+        std::fs::write(&held_path, b"same bytes").unwrap();
+        std::fs::write(&other_path, b"same bytes").unwrap();
+        std::os::unix::fs::symlink(&held_path, &link_path).unwrap();
+        let held = OwnedFd::from(std::fs::File::open(&held_path).unwrap());
+        let folder = OwnedFd::from(std::fs::File::open(&directory).unwrap());
+        let directory_spelling = CString::new(directory.as_os_str().as_bytes()).unwrap();
+
+        let refused = |result: io::Result<OwnedFd>| result.unwrap_err().raw_os_error();
+        assert!(reopen(&held_spelling, &held).is_ok());
+        assert_eq!(refused(reopen(&other_spelling, &held)), Some(libc::ESTALE));
+        assert_eq!(refused(reopen(&link_spelling, &held)), Some(libc::ELOOP));
+        assert_eq!(
+            refused(reopen(&directory_spelling, &folder)),
+            Some(libc::ESTALE),
+            "only a regular file is ever bound"
+        );
+        let relative = SameObjectBind::new(
+            std::path::Path::new("held"),
+            held.try_clone().unwrap(),
+            &other_path,
+            held,
+        );
+        assert_eq!(
+            relative.err().and_then(|error| error.raw_os_error()),
+            Some(libc::EINVAL)
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

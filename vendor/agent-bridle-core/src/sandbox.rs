@@ -2182,6 +2182,9 @@ pub(crate) mod landlock_impl {
                     require_fd(ruleset)?, require_fd(fallback_rules)?,
                     seccomp_egress_program(false)?, seccomp_egress_program(true)?,
                     scratch_access,
+                    // Verified and held HERE, in the host namespace, before
+                    // any child exists (#3318).
+                    held_git_alias_binds(),
                 ).map_err(landlock_denied)?;
                 return Ok(Some(fallback));
             }
@@ -2600,13 +2603,17 @@ pub(crate) mod landlock_impl {
     ///   inode, or identical content by `content_addressable::RawContentId`)
     ///   — proving it really is the same git, not merely another root-owned
     ///   file that happens to be named `git`.
+    ///
+    /// **One more way in, which trusts no other file (#3318).** A candidate
+    /// that IS the granted object ([`is_spelling_of_granted_object`]) is
+    /// listed too, so the projection names every spelling the kernel rule
+    /// already admits. That decides identity, not ownership: the rules above
+    /// are unchanged for every candidate that is a different object.
     fn git_exec_path_binaries(canon_git_bin: &std::path::Path) -> Vec<String> {
         if canon_git_bin.file_name().and_then(|n| n.to_str()) != Some("git") {
             return Vec::new();
         }
-        if !ancestry_is_root_owned_and_unwritable(canon_git_bin) {
-            return Vec::new();
-        }
+        let root_owned = ancestry_is_root_owned_and_unwritable(canon_git_bin);
         let Some(bin_dir) = canon_git_bin.parent() else {
             return Vec::new();
         };
@@ -2627,14 +2634,140 @@ pub(crate) mod landlock_impl {
             if exec_path_git == *canon_git_bin {
                 continue; // same path as the granted binary — nothing extra to add.
             }
-            if !ancestry_is_root_owned_and_unwritable(&exec_path_git) {
-                continue;
-            }
-            if same_image(canon_git_bin, &exec_path_git) {
+            let same_image_of_a_root_owned_pair = root_owned
+                && ancestry_is_root_owned_and_unwritable(&exec_path_git)
+                && same_image(canon_git_bin, &exec_path_git);
+            if same_image_of_a_root_owned_pair
+                || is_spelling_of_granted_object(canon_git_bin, &exec_path_git)
+            {
                 return vec![exec_path_git.to_string_lossy().into_owned()];
             }
         }
         Vec::new()
+    }
+
+    /// `alias` is another spelling of the object `granted` already names: the
+    /// same device and inode, with no group- or other-writable component on
+    /// either path. Listing it grants nothing. Landlock ties a rule to the
+    /// object, so the rule for `granted` admits this name whether or not it is
+    /// listed; listing it keeps the projection honest about that.
+    ///
+    /// Ownership is not consulted here and no uid stands in for root. Identity
+    /// is the whole claim: a DIFFERENT object at this path, whatever its owner
+    /// or bytes, is admitted only by the root-owned same-image rule in
+    /// [`git_exec_path_binaries`]. A confined build reaches this arm because
+    /// its harness bound the verified Git over the alias before the user
+    /// namespace hid host owners ([`held_git_alias_binds`]); a hard-linked
+    /// install reaches it anywhere.
+    fn is_spelling_of_granted_object(granted: &std::path::Path, alias: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let unwritable = |path: &std::path::Path| {
+            path.ancestors().all(|component| {
+                std::fs::symlink_metadata(component).is_ok_and(|meta| meta.mode() & 0o022 == 0)
+            })
+        };
+        let object = |path| std::fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()));
+        object(granted).is_some_and(|id| Some(id) == object(alias))
+            && unwritable(granted)
+            && unwritable(alias)
+    }
+
+    /// The same-object bindings a private build is given (#3318), prepared in
+    /// the HOST namespace before the child exists: inside the build's user
+    /// namespace host root shows as the overflow uid, so the root-ownership
+    /// rule above cannot be evaluated there and is never loosened to fit.
+    ///
+    /// For each `git` in [`GIT_TRUSTED_DIRS`], the alias the unchanged
+    /// [`git_exec_path_binaries`] rules admit is re-verified on HELD
+    /// descriptors ([`hold_same_image`]), so what the build is given is what
+    /// was checked. The build's exec is ambient, so this cannot wait for a
+    /// `git` grant; it covers the finite set a nested grant could later name.
+    /// Anything that does not verify is left exactly as before: unbound.
+    fn held_git_alias_binds() -> Vec<agent_bridle_fdguard::build_isolation::SameObjectBind> {
+        let mut primaries = std::collections::BTreeSet::new();
+        let plans = GIT_TRUSTED_DIRS
+            .iter()
+            .filter_map(|dir| std::path::Path::new(dir).join("git").canonicalize().ok())
+            .filter(|primary| primaries.insert(primary.clone()))
+            .flat_map(|primary| {
+                git_exec_path_binaries(&primary).into_iter().map(move |alias| {
+                    let bind = hold_same_image(&primary, std::path::Path::new(&alias));
+                    (alias, bind)
+                })
+            });
+        one_source_per_alias(plans)
+    }
+
+    /// An alias two different Gits both claim is bound to neither: a nested
+    /// grant of the other one would not cover the object placed there.
+    fn one_source_per_alias<T>(plans: impl Iterator<Item = (String, Option<T>)>) -> Vec<T> {
+        let mut by_alias = std::collections::BTreeMap::new();
+        for (alias, bind) in plans {
+            by_alias
+                .entry(alias)
+                .and_modify(|claimed| *claimed = None)
+                .or_insert(bind);
+        }
+        by_alias.into_values().flatten().collect()
+    }
+
+    /// Hold `primary` and `alias` for one binding, or `None`. Both must be
+    /// regular files reached through held, root-owned, unwritable directories
+    /// ([`open_held_root_owned`]); they must be different objects (one object
+    /// needs no binding); and the bytes read from the held descriptors must
+    /// be one image by `content_addressable::RawContentId`, as in
+    /// [`same_image`]. A replacement between the by-name lookup and these
+    /// opens is therefore either verified itself or refused.
+    fn hold_same_image(
+        primary: &std::path::Path,
+        alias: &std::path::Path,
+    ) -> Option<agent_bridle_fdguard::build_isolation::SameObjectBind> {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let source = open_held_root_owned(primary).ok()?;
+        let target = open_held_root_owned(alias).ok()?;
+        let object = |file: &std::fs::File| file.metadata().ok().map(|meta| (meta.dev(), meta.ino()));
+        let image = |mut file: &std::fs::File| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
+            Some(content_addressable::RawContentId::from_content(&bytes))
+        };
+        if object(&source)? == object(&target)? || image(&source)? != image(&target)? {
+            return None;
+        }
+        agent_bridle_fdguard::build_isolation::SameObjectBind::new(
+            primary,
+            source.into(),
+            alias,
+            target.into(),
+        )
+        .ok()
+    }
+
+    /// Open `path` (absolute, canonical) read-only as a regular file reached
+    /// through directories that are each HELD while the next component is
+    /// opened beneath it with symlinks refused, and each `fstat`ed on its own
+    /// descriptor under the rule [`ancestry_passes`] applies by name. The file
+    /// that comes back is the object that was checked, not whatever the name
+    /// means later.
+    fn open_held_root_owned(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        use agent_bridle_fdguard::GrantedRoot;
+        use std::os::unix::fs::MetadataExt;
+        let refused = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let mut components = path.strip_prefix("/").map_err(|_| refused())?.components();
+        let mut held = GrantedRoot::acquire(std::path::Path::new("/"))?
+            .open_read(std::path::Path::new(""))?;
+        loop {
+            let meta = held.metadata()?;
+            if !root_owned_and_unwritable(OwnerMode { uid: meta.uid(), mode: meta.mode() }) {
+                return Err(refused());
+            }
+            let Some(component) = components.next() else {
+                return if meta.is_file() { Ok(held) } else { Err(refused()) };
+            };
+            held = GrantedRoot::from_owned_fd(held.into(), path)?
+                .open_read(std::path::Path::new(component.as_os_str()))?;
+        }
     }
 
     /// The subset of a filesystem object's identity the ancestry walk
@@ -2671,13 +2804,21 @@ pub(crate) mod landlock_impl {
         let Some(meta) = lookup(path) else {
             return false;
         };
-        if meta.uid != 0 || (meta.mode & 0o022) != 0 {
+        if !root_owned_and_unwritable(meta) {
             return false;
         }
         match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => ancestry_passes(parent, lookup),
             _ => true,
         }
+    }
+
+    /// The one ownership rule, shared by the walk by name ([`ancestry_passes`])
+    /// and the walk on held descriptors ([`open_held_root_owned`]): owned by
+    /// uid 0 exactly, and not writable by group or other.
+    #[cfg(unix)]
+    fn root_owned_and_unwritable(meta: OwnerMode) -> bool {
+        meta.uid == 0 && (meta.mode & 0o022) == 0
     }
 
     /// `true` iff `path` itself AND every ancestor directory up to and
@@ -3015,6 +3156,145 @@ pub(crate) mod landlock_impl {
                 same_image(&a, &b),
                 "identical content (different inode) must be recognized as the same image"
             );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn system_git() -> Option<std::path::PathBuf> {
+            GIT_TRUSTED_DIRS
+                .iter()
+                .find_map(|dir| std::path::Path::new(dir).join("git").canonicalize().ok())
+        }
+
+        /// #3318: host root seen from inside a user namespace has the overflow
+        /// uid. It is not root to either walk, whatever its mode.
+        #[test]
+        fn the_overflow_uid_is_never_root() {
+            let overflow = OwnerMode { uid: 65534, mode: 0o755 };
+            assert!(!root_owned_and_unwritable(overflow));
+            assert!(!ancestry_passes(std::path::Path::new("/usr/bin/git"), &|_| Some(overflow)));
+            assert!(root_owned_and_unwritable(OwnerMode { uid: 0, mode: 0o755 }));
+            assert!(!root_owned_and_unwritable(OwnerMode { uid: 0, mode: 0o775 }));
+        }
+
+        /// #3318: an alias two different Gits both claim is bound to neither,
+        /// including when the first claim alone would have bound nothing.
+        #[test]
+        fn one_alias_claimed_by_two_gits_is_bound_to_neither() {
+            let alias = |name: &str| name.to_string();
+            let plans = [
+                (alias("/a/git"), Some(1)),
+                (alias("/b/git"), Some(2)),
+                (alias("/a/git"), Some(3)),
+                (alias("/c/git"), None),
+                (alias("/c/git"), Some(4)),
+            ];
+            assert_eq!(one_source_per_alias(plans.into_iter()), vec![2]);
+        }
+
+        /// #3318: the spelling arm decides identity and nothing else. A hard
+        /// link is the granted object, but not when a component is writable by
+        /// others; a byte-identical copy is a different object and is refused
+        /// by this arm whatever [`same_image`] says about its bytes.
+        #[test]
+        fn only_the_granted_object_itself_is_another_spelling() {
+            let dir = unique_dir("spelling");
+            let granted = dir.join("git");
+            let link = dir.join("git-link");
+            let copy = dir.join("git-copy");
+            std::fs::write(&granted, b"one image\n").unwrap();
+            std::fs::hard_link(&granted, &link).unwrap();
+            std::fs::copy(&granted, &copy).unwrap();
+            assert!(same_image(&granted, &copy), "the copy is the same image");
+            assert!(
+                !is_spelling_of_granted_object(&granted, &copy),
+                "a different object is never a spelling of the granted one"
+            );
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(
+                !is_spelling_of_granted_object(&granted, &link),
+                "the same object under a component others can write is refused"
+            );
+            assert!(!is_spelling_of_granted_object(&granted, &dir.join("absent")));
+            if let Some(git) = system_git() {
+                // Positive control on a path no one but its owner can change.
+                assert!(is_spelling_of_granted_object(&git, &git));
+                assert!(!is_spelling_of_granted_object(&git, &copy));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #3318: the walk on held descriptors reaches the verdict of the walk
+        /// by name. On a host that is root-owned system Git; inside a user
+        /// namespace that hides host owners both refuse, because the overflow
+        /// uid is not root. A caller-owned file and a symlinked spelling are
+        /// refused everywhere.
+        #[test]
+        fn the_held_walk_refuses_whatever_the_named_walk_refuses() {
+            let dir = unique_dir("held-walk").canonicalize().unwrap();
+            let own = dir.join("git");
+            std::fs::write(&own, b"caller-owned\n").unwrap();
+            assert!(!ancestry_is_root_owned_and_unwritable(&own));
+            assert!(open_held_root_owned(&own).is_err());
+            assert!(open_held_root_owned(std::path::Path::new("relative/git")).is_err());
+            if let Some(git) = system_git() {
+                assert_eq!(
+                    open_held_root_owned(&git).is_ok(),
+                    ancestry_is_root_owned_and_unwritable(&git),
+                    "held and named walks must agree on {git:?}"
+                );
+                assert!(
+                    open_held_root_owned(git.parent().unwrap()).is_err(),
+                    "only a regular file is held"
+                );
+                let link = dir.join("link");
+                std::os::unix::fs::symlink(&git, &link).unwrap();
+                assert!(open_held_root_owned(&link).is_err());
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #3318, the issue's second "done when": preparation binds only a
+        /// DISTINCT, root-owned, same-image alias. A different root-owned
+        /// binary, a caller-owned copy with the right bytes, and the granted
+        /// object itself are each left unbound. The real pair is held exactly
+        /// when the unchanged by-name rules admit it as a second object.
+        #[test]
+        fn only_a_distinct_root_owned_same_image_alias_is_held() {
+            let Some(git) = system_git() else {
+                eprintln!("skipping: no git in a GIT_TRUSTED_DIRS location on this host");
+                return;
+            };
+            let dir = unique_dir("held-image").canonicalize().unwrap();
+            let copy = dir.join("git");
+            std::fs::copy(&git, &copy).unwrap();
+            assert!(hold_same_image(&git, &copy).is_none(), "caller-owned copy");
+            assert!(hold_same_image(&copy, &git).is_none(), "caller-owned source");
+            assert!(hold_same_image(&git, &git).is_none(), "one object needs no binding");
+            let loader = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"]
+                .into_iter()
+                .find_map(|loader| std::path::Path::new(loader).canonicalize().ok());
+            if let Some(other) = loader {
+                assert!(
+                    hold_same_image(&git, &other).is_none(),
+                    "a different root-owned binary is never bound"
+                );
+            }
+            let prefix = git.parent().and_then(std::path::Path::parent).unwrap();
+            for candidate in GIT_EXEC_PATH_CANDIDATES {
+                let Ok(alias) = prefix.join(candidate).join("git").canonicalize() else {
+                    continue;
+                };
+                let admitted_second_object = ancestry_is_root_owned_and_unwritable(&git)
+                    && ancestry_is_root_owned_and_unwritable(&alias)
+                    && same_image(&git, &alias)
+                    && !is_spelling_of_granted_object(&git, &alias);
+                assert_eq!(
+                    hold_same_image(&git, &alias).is_some(),
+                    admitted_second_object,
+                    "{alias:?}"
+                );
+                assert_eq!(held_git_alias_binds().len(), usize::from(admitted_second_object));
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

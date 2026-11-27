@@ -115,3 +115,33 @@ host account by uid, excluding the caller and built-in uids, and proves that
 lookup succeeds. The same lookup must fail inside each build route. It also
 forces failure at the account's readonly remount, after scratch and terminal
 setup, to prove the fresh fallback retains the original denials on argv and Brush.
+
+## Same-object file binding (#3318)
+
+`confine` takes prepared `SameObjectBind` values: a source and a target, each a
+canonical absolute path with the regular file the caller verified and holds
+open. After the private mounts and account files, and before seccomp and
+Landlock, the hook reopens
+each path in the new mount namespace with `openat2(RESOLVE_NO_SYMLINKS)` and
+accepts it only if its device, inode and regular-file type equal the held
+descriptor's. Inherited descriptors sit on the host's mounts and can be neither
+cloned nor covered in the new namespace, so the reopen is required. The source
+is cloned detached with `open_tree`, restricted with `mount_setattr` (read-only,
+nosuid, nodev) and attached over the target with a descriptor-targeted
+`move_mount`. The target path is then reopened and must be the held source.
+
+Only a file is covered, never a directory. Any failure is a setup error: the
+child exits before exec and the existing fresh-child fallback runs under the
+original deny-all rules, with no namespace and therefore no binding. No path,
+ownership fact or digest is passed through the environment, a file or a
+message; descendants inherit the mount. Every descriptor is owned and closes on
+every path, and the held pair is close-on-exec. `beneath`'s `openat2` wrapper is
+shared crate-internally instead of duplicated.
+
+Measured on Linux 6.8 with Landlock ABI 4: after the filesystem fence, `mount`,
+`umount2` and `move_mount` on the target return EPERM, also from a later user
+and mount namespace. `mount_setattr` is not mediated by Landlock; it needs
+`CAP_SYS_ADMIN` over the mount namespace, which a nonzero uid loses at exec, and
+it cannot change which object the target names. The binding's guarantee is that
+identity, not the read-only flag: the file's own mode and the build's write
+rules already refuse writes.
