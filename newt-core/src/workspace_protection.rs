@@ -151,8 +151,9 @@ impl WorkspaceProtection {
     /// validate its caller-supplied baseline and the combined granted caveats.
     pub fn validate_request(&self, kind: DenialKind, target: &str) -> anyhow::Result<()> {
         if kind == DenialKind::Build {
-            return self
-                .validate_caveats(&crate::confined_exec::build_tool_caveats(Path::new(target)));
+            return self.validate_caveats(&crate::confined_exec::configured_build_caveats(
+                Path::new(target),
+            ));
         }
         let none = Caveats {
             fs_read: Scope::none(),

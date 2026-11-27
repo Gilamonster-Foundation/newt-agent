@@ -27,6 +27,15 @@ permission fixtures. They run in the scheduled, dispatched, and called
 `mcp-import-real` workflow. The composed recovery test explicitly approves one
 exact remote tool while retaining the baseline execution caveats.
 
+`newt doctor --sign-toolchains` signs the user directory's `ocap/toolchains.toml`
+with the existing operator identity after showing the ordered roots, PATH entries,
+optional content pins, policy identity, and key fingerprint. It requires explicit
+terminal approval, saves an owner-only backup including comments, and refuses
+concurrent policy/key changes or failed root admission. It never creates a key,
+auto-signs, or exposes a model tool. Restart sessions after changing policy.
+The explicit serial acceptance harness uses only disposable keys:
+`cargo test -p newt-agent --test toolchain_signing -- --sign-toolchains-3327`.
+
 License: see [LICENSE](../LICENSE).
 
 Model: GPT-6 | Harness: Codex CLI v0.154.0 | Operator: S Hartsock | Time: 01:24 EDT | Date: 2026-09-18

@@ -5,6 +5,7 @@ use super::*;
 #[test]
 fn check_receipt_requires_real_zero_and_confinement() {
     let mut output = ConfinedOutput {
+        toolchains: Vec::new(),
         success: true,
         code: Some(0),
         stdout: Vec::new(),
@@ -195,14 +196,14 @@ fn real_move_from_fixture_compiles_and_failed_check_restores() {
         fn ask(
             &mut self,
             requests: &[newt_policy::permissions::PermissionRequest],
-        ) -> PermissionDecision {
+        ) -> newt_policy::permissions::PermissionDecision {
             assert_eq!(requests.len(), 1);
             assert_eq!(
                 requests[0].kind,
                 newt_policy::permissions::DenialKind::Build
             );
             self.0 += 1;
-            PermissionDecision::Allow(Caveats::top())
+            newt_policy::permissions::PermissionDecision::Allow(Caveats::top())
         }
     }
     let mut gate = ApproveBuild(0);

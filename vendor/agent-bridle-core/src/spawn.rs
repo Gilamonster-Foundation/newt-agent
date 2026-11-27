@@ -1215,7 +1215,7 @@ impl SandboxedWorker {
         }
     }
 
-    /// Carry only private-build directory variables into the existing pre-exec
+    /// Carry build directory controls (including PATH and tool homes) into pre-exec
     /// setup. The full environment remains in the authenticated worker payload;
     /// loader controls and the worker nonce cannot enter through this seam.
     #[must_use]
@@ -1223,9 +1223,9 @@ impl SandboxedWorker {
         self.temporary_env = {
             #[cfg(target_os = "linux")]
             {
-                agent_bridle_fdguard::build_isolation::TEMPORARY_ENV
-                    .into_iter()
-                    .filter_map(|name| env.get(name).map(|value| (name.to_owned(), value.clone())))
+                env.iter()
+                    .filter(|(name, _)| agent_bridle_fdguard::build_isolation::is_path_env(name.as_ref()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             }
             #[cfg(not(target_os = "linux"))]
@@ -2266,13 +2266,21 @@ mod tests {
             ("HOME", "/tmp/home"),
             ("TMPDIR", "/tmp/scratch"),
             ("XDG_RUNTIME_DIR", "/dev/shm/runtime"),
+            ("PATH", "/usr/bin:/tmp/bin"),
+            ("CARGO_HOME", "/tmp/cargo"),
+            ("RUSTUP_HOME", "/dev/shm/rustup"),
+            ("JAVA_HOME", "/tmp/java"),
             ("LD_PRELOAD", "/tmp/attacker.so"),
             ("BASH_ENV", "/tmp/attacker.sh"),
             ("AGENT_BRIDLE_WORKER_NONCE", "forged"),
         ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
         assert!(SandboxedWorker::brush().temporary_env.is_empty());
         assert_eq!(SandboxedWorker::brush().temporary_env(&env).temporary_env, vec![
+            ("CARGO_HOME".to_owned(), "/tmp/cargo".to_owned()),
             ("HOME".to_owned(), "/tmp/home".to_owned()),
+            ("JAVA_HOME".to_owned(), "/tmp/java".to_owned()),
+            ("PATH".to_owned(), "/usr/bin:/tmp/bin".to_owned()),
+            ("RUSTUP_HOME".to_owned(), "/dev/shm/rustup".to_owned()),
             ("TMPDIR".to_owned(), "/tmp/scratch".to_owned()),
             ("XDG_RUNTIME_DIR".to_owned(), "/dev/shm/runtime".to_owned()),
         ]);
