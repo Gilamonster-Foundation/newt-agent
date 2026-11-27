@@ -1258,6 +1258,15 @@ pub async fn dispatch(mut cli: Cli) -> anyhow::Result<()> {
         // SAFETY: single-threaded before any async work or config resolution.
         unsafe { std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir) };
     }
+    newt_core::toolchains::initialize(
+        newt_core::Config::user_config_dir(),
+        std::env::var_os("HOME").map(PathBuf::from),
+        |path| {
+            newt_identity::load_user_key(path)
+                .map(|key| key.public().as_bytes())
+                .map_err(|error| error.to_string())
+        },
+    );
     // #1320: `--config <file>` is otherwise only forwarded to the path-taking
     // subcommands (headless/config/mcp/doctor/…) via `Config::load`; it never reaches
     // the arg-free `Config::resolve()` that chat/plan/worker use, so `newt --config

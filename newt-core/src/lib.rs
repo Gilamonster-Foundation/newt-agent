@@ -168,6 +168,8 @@ pub mod test_guard;
 /// Self-scheduled wake-up timers — see `timer` module docs.
 pub mod timer;
 pub mod tokens;
+pub mod tool_tree;
+pub mod toolchains;
 pub mod tooling;
 /// Terminal-line ownership: the process-wide arbiter every ephemeral writer
 /// (spinner, viewport, progress readout) leases the bottom line from, plus the

@@ -123,6 +123,13 @@ fn main() {
         println!("BUILD_PRIVATE_IDENTITY_CONFIRMED");
         return;
     }
+
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--toolchains-3327") {
+        toolchains::run();
+        return;
+    }
+
     #[cfg(target_os = "linux")]
     if let Some(names) = std::env::args().find_map(|arg| {
         arg.strip_prefix("--build-scratch-probe=")
@@ -2214,3 +2221,7 @@ mod native {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "common/toolchains.rs"]
+mod toolchains;

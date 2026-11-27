@@ -4,7 +4,7 @@ mod files;
 mod library;
 mod transaction;
 
-use super::{PermissionDecision, PermissionGate};
+use super::PermissionGate;
 use crate::confined_exec::{build_tool_request, ConfinedOutput, ConstrainedExecutor, ExecRequest};
 use files::DiskFiles;
 use newt_policy::caveats::Caveats;
@@ -90,27 +90,26 @@ pub(super) fn execute(
     }
     let before = super::file_capture::read_for_edit(&caveats.fs_read, &source, source_label)?;
     let after = extract::extract(&before, &names, module)?;
-    let request = check_request(&root, &crate_dir, &package, caveats);
+    let request = check_request(&root, &crate_dir, &package, caveats)
+        .with_operator_toolchains(&caveats.fs_write)
+        .map_err(|e| e.to_string())?;
     if let Some(harness) = harness {
         harness
             .validate_tool_authority(request.caveats(), &root)
             .map_err(|e| format!("frame isolation: {e}"))?;
     }
-    if !request.caveats().leq(caveats) {
-        let permission = super::lifecycle_build_request(
-            &root.to_string_lossy(),
-            &format!("cargo check -p {package} --lib (before and after move_from)"),
-            request.caveats(),
-            None,
+    if !super::build_authorized(
+        &root,
+        &format!("cargo check -p {package} --lib (before and after move_from)"),
+        request.caveats(),
+        caveats,
+        gate,
+        None,
+    ) {
+        return Err(
+            "capability denied: move_from needs explicit confined build authority; nothing changed"
+                .into(),
         );
-        if !gate.as_deref_mut().is_some_and(|g| {
-            matches!(
-                g.ask_with_caveats(request.caveats(), &[permission]),
-                PermissionDecision::Allow(allowed) if request.caveats().leq(&allowed)
-            )
-        }) {
-            return Err("capability denied: move_from needs explicit confined build authority; nothing changed".into());
-        }
     }
     if !super::confirm_unrestricted_fs_mutation(
         caveats,

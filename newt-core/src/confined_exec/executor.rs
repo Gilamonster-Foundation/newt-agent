@@ -148,6 +148,7 @@ impl ConstrainedExecutor {
                 "confined execution cancelled before spawn",
             )));
         }
+        req.require_toolchain_admission()?;
         let _scratch = req.prepare_scratch().map_err(ExecRefused::Spawn)?;
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
@@ -189,7 +190,7 @@ impl ConstrainedExecutor {
             .stdin(agent_bridle::ConfinedStdio::Null)
             .stdout(agent_bridle::ConfinedStdio::Piped)
             .stderr(agent_bridle::ConfinedStdio::Piped)
-            .held_read_roots(req.held_read_roots.iter().cloned());
+            .held_read_roots(req.build_held_read_roots());
         // The child's ENTIRE environment: the explicit grants and nothing else
         // (ConfinedCommand starts env-empty). No inherited credentials/switches.
         for (k, v) in &req.env {
@@ -262,6 +263,7 @@ impl ConstrainedExecutor {
         let stderr = err_thread.join().unwrap_or_default();
 
         Ok(ConfinedOutput {
+            toolchains: req.toolchains.clone(),
             // A killed/timed-out run is never a success even if the reaped status
             // is a signal-death the OS reports oddly.
             success: status.success() && !timed_out,

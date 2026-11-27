@@ -172,13 +172,18 @@ pub(super) async fn execute(
 
     // The existing argv request supplies the authority, environment, and
     // scratch policy. Its argv is not executed: Brush evaluates source once.
-    let request = build_tool_request(
+    let request = match build_tool_request(
         &root,
         &cwd,
         program,
         std::iter::empty::<String>(),
         &caveats.net,
-    );
+    )
+    .with_operator_toolchains(&caveats.fs_write)
+    {
+        Ok(request) => request,
+        Err(error) => return (error.to_string(), ExecOutcome::Denied),
+    };
     let build = request.caveats();
     if let Some(harness) = harness {
         if let Err(error) = harness.validate_tool_authority(build, &root) {
@@ -207,7 +212,7 @@ pub(super) async fn execute(
 
     // Never retry this source after execution: an earlier pipeline stage may
     // already have had an effect, even if a later command was denied.
-    match shell::dispatch_bridled_build_shell(
+    let (mut text, outcome) = match shell::dispatch_bridled_build_shell(
         source,
         &cwd,
         &request,
@@ -236,7 +241,13 @@ pub(super) async fn execute(
             command_budget,
         ),
         Err(error) => (format!("error: {error}"), ExecOutcome::Unavailable),
+    };
+    if let Some(note) = crate::toolchains::report(request.toolchains()) {
+        presentation.document(&note);
+        text.push('\n');
+        text.push_str(&note);
     }
+    (text, outcome)
 }
 
 #[cfg(test)]
