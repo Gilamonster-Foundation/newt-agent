@@ -1356,12 +1356,12 @@ fn lifecycle_build_request(
     let escalation = escalation_note
         .map(|note| format!("\nThis is an escalation: {note}."))
         .unwrap_or_default();
-    let network = build_network_description(&build.net);
+    let network = build_isolation_description(&build.net);
     PermissionRequest {
         tool: "lifecycle".into(),
         kind: DenialKind::Build,
         target: workspace.into(),
-        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nNetwork mode: {network}.\nWrites within the workspace and its build scratch directory. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
+        reason: format!("Run this resolved lifecycle command: {command}\nRead roots (including any credentials stored within them):\n{reads}\nBuild isolation: {network}.\nWrites within the workspace and its build scratch directory. Compiler, build-script and test subprocesses inherit the same filesystem fence.{escalation}"),
         harness_bound: false,
     }
 }
@@ -1382,11 +1382,11 @@ fn build_authorized(
     })
 }
 
-fn build_network_description(network: &crate::Scope<String>) -> &'static str {
+fn build_isolation_description(network: &crate::Scope<String>) -> &'static str {
     match network {
         crate::Scope::All => "network allowed by the existing operator grant",
         crate::Scope::Only(hosts) if hosts.is_empty() && cfg!(target_os = "linux") =>
-            "private loopback when namespace setup succeeds; otherwise network denied (deny-all fallback, including loopback); effective mode reported at execution",
+            "private loopback and bounded private /tmp and /dev/shm when setup succeeds; otherwise network denied and no private temporary mounts (deny-all fallback, including loopback); effective mode reported at execution",
         crate::Scope::Only(hosts) if hosts.is_empty() => "network denied",
         crate::Scope::Only(_) => "network limited to the existing operator grant",
     }
@@ -1578,7 +1578,7 @@ fn render_confined_build_result(
     spill_store: Option<&dyn super::content_spill::SpillStore>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
-    let mut network_note = None;
+    let mut isolation_note = None;
     let (mut text, outcome) = match run {
         Ok(out) => {
             // The build's own exit code (`out.code`) is untouched by `trim` —
@@ -1587,16 +1587,16 @@ fn render_confined_build_result(
             // exists to avoid).
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            network_note = stderr
+            isolation_note = stderr
                 .lines()
-                .find(|line| line.starts_with("Build network: "))
+                .find(|line| line.starts_with("Build isolation: "))
                 .map(str::to_owned);
             let view = trim.map(|trim| trim.apply(&stdout, &stderr));
             // #2731: the terminal override is installed inside the renderer.
             // Include recovery there, not only in the returned model text.
-            let recovery_view = (fetch_note.is_some() || network_note.is_some()).then(|| {
+            let recovery_view = (fetch_note.is_some() || isolation_note.is_some()).then(|| {
                 let mut selected = view.clone().unwrap_or_else(|| format!("{stdout}{stderr}"));
-                for note in fetch_note.into_iter().chain(network_note.as_deref()) {
+                for note in fetch_note.into_iter().chain(isolation_note.as_deref()) {
                     if !selected.contains(note) {
                         selected.push('\n');
                         selected.push_str(note);
@@ -1627,7 +1627,7 @@ fn render_confined_build_result(
     };
     // Keep recovery and the effective network mode outside the model's output
     // cap as well: a failed mock server must not lose its fence diagnostic.
-    for note in fetch_note.into_iter().chain(network_note.as_deref()) {
+    for note in fetch_note.into_iter().chain(isolation_note.as_deref()) {
         if !text.contains(note) {
             text.push('\n');
             text.push_str(note);
@@ -5586,7 +5586,7 @@ async fn execute_authorized_tool(
                 }
             };
             let wall_desc = format_wall(wall);
-            let network = build_network_description(&caveats.net);
+            let network = build_isolation_description(&caveats.net);
             let note = match trim {
                 Some(trim) => format!(
                     "[routed `{display}` to the confined build lane — {wall_desc} limit, \

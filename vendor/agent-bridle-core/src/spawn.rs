@@ -1052,7 +1052,7 @@ impl ConfinedCommand {
             // involved, and calling `apply` would be wrong (AppContainer fails
             // closed; Seatbelt is a no-op). Skip `apply` when the prefix is
             // non-empty. The held roots stay alive here, past `restrict_self`.
-            let network_fallback = if prefix.is_empty() {
+            let isolation_fallback = if prefix.is_empty() {
                 sandbox.apply_to_command(
                     &mut cmd, &mechanism_effective,
                     worker_image.as_ref().map(|image| (image.program.as_str(), &image.file)),
@@ -1063,8 +1063,8 @@ impl ConfinedCommand {
             after_apply();
             let spawned = cmd.spawn();
             #[cfg(target_os = "linux")]
-            if let (Some(fallback), Err(error)) = (network_fallback, &spawned) {
-                if error.raw_os_error() == Some(agent_bridle_fdguard::build_network::RETRY_DENY_ALL) {
+            if let (Some(fallback), Err(error)) = (isolation_fallback, &spawned) {
+                if error.raw_os_error() == Some(agent_bridle_fdguard::build_isolation::RETRY_DENY_ALL) {
                     // The first child failed in namespace setup BEFORE exec.
                     // Retry only that failure, once, with both deny-all floors.
                     fallback.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1072,7 +1072,7 @@ impl ConfinedCommand {
                 }
             }
             #[cfg(not(target_os = "linux"))]
-            let _ = network_fallback;
+            let _ = isolation_fallback;
             spawned.map_err(ToolError::from)
         })
         .join()
@@ -1194,6 +1194,7 @@ pub struct SandboxedWorker {
     sandbox_policy: Arc<SandboxPolicy>,
     read_only_resources: Vec<PathBuf>,
     held_read_roots: Vec<crate::HeldReadRoot>,
+    temporary_env: Vec<(String, String)>,
 }
 
 impl SandboxedWorker {
@@ -1210,7 +1211,30 @@ impl SandboxedWorker {
             sandbox_policy: Arc::new(SandboxPolicy::default()),
             read_only_resources: Vec::new(),
             held_read_roots: Vec::new(),
+            temporary_env: Vec::new(),
         }
+    }
+
+    /// Carry only private-build directory variables into the existing pre-exec
+    /// setup. The full environment remains in the authenticated worker payload;
+    /// loader controls and the worker nonce cannot enter through this seam.
+    #[must_use]
+    pub fn temporary_env(mut self, env: &std::collections::BTreeMap<String, String>) -> Self {
+        self.temporary_env = {
+            #[cfg(target_os = "linux")]
+            {
+                agent_bridle_fdguard::build_isolation::TEMPORARY_ENV
+                    .into_iter()
+                    .filter_map(|name| env.get(name).map(|value| (name.to_owned(), value.clone())))
+                    .collect()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = env;
+                Vec::new()
+            }
+        };
+        self
     }
 
     /// Set the sandbox mechanism policy used by the shared spawn funnel.
@@ -1302,6 +1326,8 @@ impl SandboxedWorker {
             ToolError::denied(format!("create worker control channel: {error}"))
         })?;
 
+        let private_build = self.sandbox_policy.child_network == crate::ChildNetworkPolicy::PrivateBuild
+            && crate::sandbox::net_fully_denied(cx.caveats());
         let mut command = ConfinedCommand::new(executable)
             .held_read_roots(self.held_read_roots)
             .args([flag, kind])
@@ -1314,6 +1340,11 @@ impl SandboxedWorker {
             .stderr(ConfinedStdio::Piped)
             .new_process_group()
             .sandbox_policy(self.sandbox_policy);
+        if private_build {
+            for (name, value) in self.temporary_env {
+                command = command.env(name, value);
+            }
+        }
         command.worker_read_resources = worker_read_resources;
 
         let confined = if crate::is_unbridled() {
@@ -2227,6 +2258,25 @@ mod tests {
     use super::*;
     use crate::enforcement_report;
     use crate::{Gate, Tool};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_worker_bootstrap_excludes_loader_and_authentication_controls() {
+        let env = [
+            ("HOME", "/tmp/home"),
+            ("TMPDIR", "/tmp/scratch"),
+            ("XDG_RUNTIME_DIR", "/dev/shm/runtime"),
+            ("LD_PRELOAD", "/tmp/attacker.so"),
+            ("BASH_ENV", "/tmp/attacker.sh"),
+            ("AGENT_BRIDLE_WORKER_NONCE", "forged"),
+        ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+        assert!(SandboxedWorker::brush().temporary_env.is_empty());
+        assert_eq!(SandboxedWorker::brush().temporary_env(&env).temporary_env, vec![
+            ("HOME".to_owned(), "/tmp/home".to_owned()),
+            ("TMPDIR".to_owned(), "/tmp/scratch".to_owned()),
+            ("XDG_RUNTIME_DIR".to_owned(), "/dev/shm/runtime".to_owned()),
+        ]);
+    }
 
     /// Mint a `ToolContext` the only legitimate way — through the gate.
     fn ctx(granted: Caveats) -> ToolContext {

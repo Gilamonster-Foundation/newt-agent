@@ -13,6 +13,80 @@ fn main() {
     }
     newt_core::answer_nextest_listing("brush_build_pipeline");
     #[cfg(target_os = "linux")]
+    if let Some(names) = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--build-scratch-probe=")
+            .map(str::to_owned)
+    }) {
+        let private = std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok();
+        let names: Vec<_> = names.split(':').collect();
+        assert_eq!(names.len(), 2);
+        for (directory, name) in ["/tmp", "/dev/shm"].into_iter().zip(names) {
+            let host = std::path::Path::new(directory).join(name);
+            let child = host.with_extension("child");
+            let write = std::fs::write(&child, b"private scratch");
+            if private {
+                write.unwrap_or_else(|error| panic!("private scratch write {directory}: {error}"));
+                assert_eq!(std::fs::read(&child).unwrap(), b"private scratch");
+                assert!(!host.exists(), "host scratch sentinel must be hidden");
+                std::fs::write(&host, b"private counterpart").unwrap();
+                assert_eq!(std::fs::read(&host).unwrap(), b"private counterpart");
+                let expected_capacity = if directory == "/tmp" {
+                    2 * 1024 * 1024 * 1024
+                } else {
+                    256 * 1024 * 1024
+                };
+                let directory = std::ffi::CString::new(directory).unwrap();
+                // SAFETY: live C path and writable statfs storage.
+                let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::statfs(directory.as_ptr(), &mut stats) }, 0);
+                assert_eq!(stats.f_type, libc::TMPFS_MAGIC);
+                let capacity = stats.f_blocks * stats.f_bsize as u64;
+                assert_eq!(capacity, expected_capacity);
+                // Grounds the mount-topology floor after the filesystem fence.
+                assert_eq!(
+                    unsafe {
+                        libc::mount(
+                            c"tmpfs".as_ptr(),
+                            directory.as_ptr(),
+                            c"tmpfs".as_ptr(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    },
+                    -1
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EPERM)
+                );
+            } else {
+                assert_eq!(
+                    write.unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+        }
+        // Grounds the shared toolchain environment contract: these values stay
+        // unchanged and their directories exist inside the private mounts too.
+        for name in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+            let directory = std::env::var_os(name).unwrap();
+            let path = std::path::Path::new(&directory).join("runtime-scratch");
+            std::fs::write(&path, b"runtime scratch")
+                .unwrap_or_else(|error| panic!("runtime scratch {name}: {error}"));
+            assert_eq!(std::fs::read(&path).unwrap(), b"runtime scratch");
+        }
+        println!("BUILD_RUNTIME_DIRECTORIES_CONFIRMED");
+        println!(
+            "{}",
+            if private {
+                "BUILD_PRIVATE_SCRATCH_CONFIRMED"
+            } else {
+                "BUILD_SCRATCH_DENIED_FALLBACK"
+            }
+        );
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--build-loopback-probe") {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
@@ -303,13 +377,18 @@ mod native {
 
     pub fn run() {
         #[cfg(target_os = "linux")]
-        if std::env::args().any(|arg| arg == "--deny-build-netns") {
+        if std::env::args()
+            .any(|arg| matches!(arg.as_str(), "--deny-build-netns" | "--deny-build-mounts"))
+        {
+            let deny_mounts = std::env::args().any(|arg| arg == "--deny-build-mounts");
             assert!(
                 !std::env::args().any(|arg| arg == "--require-build-netns"),
                 "cannot both deny and require namespace setup"
             );
             // Test-only fault injection, before starting any runtime threads:
-            // descendants inherit EACCES for unshare on permissive hosts too.
+            // Descendants inherit EACCES for namespace or mount setup, even on
+            // permissive hosts. A mount failure exercises partial setup after
+            // the child has already acquired its private namespaces.
             // This is not a production namespace policy or an escape filter.
             let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
             let mut filters = [
@@ -318,7 +397,11 @@ mod native {
                     (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                     0,
                     1,
-                    libc::SYS_unshare as u32,
+                    if deny_mounts {
+                        libc::SYS_mount
+                    } else {
+                        libc::SYS_unshare
+                    } as u32,
                 ),
                 instruction(
                     (libc::BPF_RET | libc::BPF_K) as u16,
@@ -346,14 +429,38 @@ mod native {
                     0
                 );
             }
-            // unshare(0) changes nothing. This control must observe the injected
-            // errno, independently of the host's user-namespace restrictions.
-            assert_eq!(unsafe { libc::unshare(0) }, -1);
+            // Neither unshare(0) nor mount with null operands can mutate the
+            // host. The control must observe the injected errno, independently
+            // of host namespace or mount permissions.
+            assert_eq!(
+                unsafe {
+                    libc::syscall(
+                        if deny_mounts {
+                            libc::SYS_mount
+                        } else {
+                            libc::SYS_unshare
+                        },
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    )
+                },
+                -1
+            );
             assert_eq!(
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::EACCES)
             );
-            eprintln!("BUILD_NETNS_SETUP_FAILURE_INJECTED");
+            eprintln!(
+                "{}",
+                if deny_mounts {
+                    "BUILD_MOUNT_SETUP_FAILURE_INJECTED"
+                } else {
+                    "BUILD_NETNS_SETUP_FAILURE_INJECTED"
+                }
+            );
         }
         #[cfg(target_os = "macos")]
         let native_fence = agent_bridle::seatbelt_is_supported();
@@ -363,7 +470,11 @@ mod native {
             native_fence,
             "this explicitly selected real-resource test requires a native filesystem fence"
         );
-        let root = tempfile::tempdir().unwrap();
+        // The host fixture workspace must survive covering temporary roots.
+        // Host scratch sentinels remain in /tmp and /dev/shm to prove isolation.
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target");
+        std::fs::create_dir_all(&target).unwrap();
+        let root = tempfile::tempdir_in(target).unwrap();
         let root = root.path().canonicalize().unwrap();
         isolate(&root);
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -400,6 +511,17 @@ mod native {
                 build_tests_can_bind_a_unix_socket_in_a_tempdir(&root).await;
             }
             #[cfg(target_os = "linux")]
+            if selected("build_tests_temporary_workspace_retains_fallback") {
+                let covered = tempfile::tempdir_in("/tmp").unwrap();
+                build_network_probe(
+                    covered.path(),
+                    "build_tests_temporary_workspace_retains_fallback",
+                    "--build-scratch-probe",
+                    "BUILD_PRIVATE_SCRATCH_CONFIRMED",
+                )
+                .await;
+            }
+            #[cfg(target_os = "linux")]
             for (name, probe, marker) in [
                 (
                     "build_tests_external_connect_stays_denied",
@@ -415,6 +537,11 @@ mod native {
                     "build_tests_inherited_host_socket_denied",
                     "--inherited-socket=200",
                     "BUILD_INHERITED_SOCKET_DENIED",
+                ),
+                (
+                    "build_tests_private_scratch_isolated",
+                    "--build-scratch-probe",
+                    "BUILD_PRIVATE_SCRATCH_CONFIRMED",
                 ),
             ] {
                 if selected(name) {
@@ -508,7 +635,7 @@ mod native {
         std::fs::write(&secret, "sibling-secret-sentinel").unwrap();
         std::fs::write(
             workspace.join("Cargo.toml"),
-            "[package]\nname = \"brush-build-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[workspace]\n[package]\nname = \"brush-build-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -786,6 +913,8 @@ mod native {
     /// through both build routes: a private namespace supports loopback with
     /// no external route; unavailable namespaces retain the socket-family deny.
     /// Also grounds the inherited-descriptor floor with a real host TCP socket.
+    /// The scratch twin grounds the Build write-root contract: private tmpfs
+    /// round trips cannot observe or replace host sentinels; fallback denies writes.
     /// `--require-build-netns` rejects fallback on every probe and both routes;
     /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
     #[cfg(target_os = "linux")]
@@ -795,6 +924,19 @@ mod native {
         };
 
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let scratch_canaries: Vec<_> = if probe == "--build-scratch-probe" {
+            ["/tmp", "/dev/shm"]
+                .into_iter()
+                .map(|directory| {
+                    let file = tempfile::NamedTempFile::new_in(directory).unwrap();
+                    std::fs::write(file.path(), b"host scratch sentinel").unwrap();
+                    assert!(!file.path().with_extension("child").exists());
+                    file
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let host_socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         // SAFETY: F_DUPFD returns a new owned fd without CLOEXEC. The fixture
         // reserves a high slot so neither stdio nor a transient pipe can mask it.
@@ -807,6 +949,22 @@ mod native {
         );
         let probe = if probe.starts_with("--inherited-socket=") {
             format!("--inherited-socket={fd}")
+        } else if !scratch_canaries.is_empty() {
+            format!(
+                "{probe}={}:{}",
+                scratch_canaries[0]
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                scratch_canaries[1]
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            )
         } else {
             probe.to_owned()
         };
@@ -853,18 +1011,22 @@ mod native {
             ("argv", stdout.as_ref(), stderr.as_ref()),
             ("Brush", brush.as_str(), brush.as_str()),
         ] {
-            let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK");
+            let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK")
+                || output.contains("BUILD_SCRATCH_DENIED_FALLBACK");
             assert!(
-                output.contains(marker) || (name == "build_tests_loopback_roundtrip" && fallback),
+                output.contains(marker)
+                    || ((name == "build_tests_loopback_roundtrip" || !scratch_canaries.is_empty())
+                        && fallback),
                 "{name} ({route}): {output}\n{diagnostic}"
             );
             assert!(
-                diagnostic.contains("Build network:"),
+                diagnostic.contains("Build isolation:"),
                 "missing effective network mode ({route}): {diagnostic}"
             );
             for (switch, mode) in [
                 ("--require-build-netns", "private loopback only"),
                 ("--deny-build-netns", "deny-all fallback"),
+                ("--deny-build-mounts", "deny-all fallback"),
             ] {
                 if std::env::args().any(|arg| arg == switch) {
                     assert!(
@@ -879,6 +1041,12 @@ mod native {
             } else if name == "build_tests_loopback_roundtrip" {
                 assert!(diagnostic.contains("private loopback only"), "{diagnostic}");
             }
+            if name == "build_tests_temporary_workspace_retains_fallback" {
+                assert!(
+                    fallback && diagnostic.contains("deny-all fallback"),
+                    "{diagnostic}"
+                );
+            }
             eprintln!(
                 "{name} ({route}): {}",
                 if fallback {
@@ -889,6 +1057,16 @@ mod native {
             );
         }
         assert!(argv.success, "{stderr}");
+        for file in scratch_canaries {
+            assert_eq!(
+                std::fs::read(file.path()).unwrap(),
+                b"host scratch sentinel"
+            );
+            assert!(
+                !file.path().with_extension("child").exists(),
+                "private child file leaked to the host"
+            );
+        }
         assert!(!outside.join("write").exists());
         eprintln!("test {name} ... ok (argv and Brush)");
     }

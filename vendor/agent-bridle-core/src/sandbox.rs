@@ -2023,7 +2023,7 @@ pub(crate) mod landlock_impl {
             worker: Option<(&str, &std::fs::File)>,
             held: &[super::HeldReadRoot],
             confine_net: bool,
-        ) -> ToolResult<landlock::RulesetCreated> {
+        ) -> ToolResult<(landlock::RulesetCreated, u64)> {
             let write = AccessFs::from_write(fs_abi_floor(&self.policy));
             // Pure read rights — `from_read` also bundles `Execute`, which we
             // govern separately (only when `exec` is restricted), never via the
@@ -2153,7 +2153,7 @@ pub(crate) mod landlock_impl {
             } else {
                 ruleset
             };
-            Ok(ruleset)
+            Ok((ruleset, (handled & (write | read)).bits()))
         }
 
         fn apply_rules(
@@ -2165,9 +2165,9 @@ pub(crate) mod landlock_impl {
         ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
             let confine_net = super::net_fully_denied(effective);
             let private_build = confine_net
-                && self.policy.child_network == ChildNetworkPolicy::PrivateLoopback
+                && self.policy.child_network == ChildNetworkPolicy::PrivateBuild
                 && command.is_some();
-            let ruleset = self.prepare_rules(effective, worker, held, confine_net && !private_build)?;
+            let (ruleset, scratch_access) = self.prepare_rules(effective, worker, held, confine_net && !private_build)?;
             if private_build {
                 // Both choices reuse the full filesystem rules. A separate
                 // net-only Landlock domain would implicitly deny REFER and
@@ -2176,12 +2176,13 @@ pub(crate) mod landlock_impl {
                     let fd: Option<std::os::fd::OwnedFd> = rules.into();
                     fd.ok_or_else(|| ToolError::denied("Landlock filesystem rules unavailable"))
                 };
-                let fallback_rules = self.prepare_rules(effective, worker, held, true)?;
-                let fallback = agent_bridle_fdguard::build_network::confine(
+                let (fallback_rules, _) = self.prepare_rules(effective, worker, held, true)?;
+                let fallback = agent_bridle_fdguard::build_isolation::confine(
                     command.expect("private build requires a command"),
                     require_fd(ruleset)?, require_fd(fallback_rules)?,
                     seccomp_egress_program(false)?, seccomp_egress_program(true)?,
-                );
+                    scratch_access,
+                ).map_err(landlock_denied)?;
                 return Ok(Some(fallback));
             }
             let status = ruleset.restrict_self().map_err(landlock_denied)?;
@@ -2200,7 +2201,7 @@ pub(crate) mod landlock_impl {
             // already fully denied (a granted net scope leaves it inert), and
             // fail-closed: a failed install refuses the spawn rather than let the
             // caller believe UDP/DNS/raw egress is denied when it is not.
-            if matches!(self.policy.child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateLoopback) && confine_net {
+            if matches!(self.policy.child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateBuild) && confine_net {
                 install_seccomp_egress_deny()?;
             }
             Ok(None)
@@ -2314,7 +2315,7 @@ pub(crate) mod landlock_impl {
             let net = if matches!(effective.net, Scope::All) {
                 ResolvedScope::Unbounded
             } else if super::net_fully_denied(effective)
-                && matches!(self.policy.child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateLoopback)
+                && matches!(self.policy.child_network, ChildNetworkPolicy::DenyDirect | ChildNetworkPolicy::PrivateBuild)
             {
                 ResolvedScope::from_scope(&effective.net)
             } else {
@@ -3240,7 +3241,7 @@ pub(crate) mod landlock_impl {
                 net: Scope::only(Vec::<String>::new()),
                 ..Caveats::top()
             };
-            for child_network in [crate::ChildNetworkPolicy::DenyDirect, crate::ChildNetworkPolicy::PrivateLoopback] {
+            for child_network in [crate::ChildNetworkPolicy::DenyDirect, crate::ChildNetworkPolicy::PrivateBuild] {
             let policy = crate::SandboxPolicy {
                 child_network,
                 ..crate::SandboxPolicy::default()

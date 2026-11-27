@@ -22,6 +22,10 @@ unsafe_op_in_unsafe_fn = "deny"
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = { version = "0.2" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.5"
+linux-raw-sys = { version = "0.12", features = ["landlock"] }
+
 # The hostile-inheritance suite (tests/hostile_fds.rs) builds ambient descriptors
 # of every shape (file / socket / pipe / dup / high-numbered) and clears
 # FD_CLOEXEC on them, which needs the same libc the guard uses. Integration tests

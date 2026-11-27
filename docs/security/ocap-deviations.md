@@ -216,11 +216,18 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves the child can send a payload to the
   pipe and cause the host deputy to relay over loopback. If a network-relaying local deputy is
   reachable (e.g. an exposed container-runtime socket or pipe), indirect egress is possible.
-- **Build-only exception (#3297):** deny-all Linux builds attempt a private user/network namespace
-  before installing their fences. Success allows AF_INET/AF_INET6 within that namespace, initially
+- **Build-only exception (#3297, #3314):** deny-all Linux builds attempt private user/network/mount
+  namespaces before installing their fences. Success allows AF_INET/AF_INET6 within that namespace, initially
   containing only loopback, without a host interface or external route; AF_PACKET and io_uring stay
-  denied. Host abstract Unix sockets are isolated too, but pathname Unix deputies remain reachable.
-  The descriptor guard closes ambient inherited sockets in either mode. Failed namespace setup
+  denied. Host abstract Unix sockets are isolated too. Private tmpfs mounts hide host `/tmp` and
+  `/dev/shm`; pathname Unix deputies outside those roots remain reachable. Host write roots remain
+  the workspace and its admitted scratch partition. The additional temporary read/write rules bind
+  only handles opened on the private mounts after mounting, never host temporary roots. Limits are
+  2 GiB/65,536 inodes for `/tmp` and 256 MiB/16,384 inodes for `/dev/shm`, charged to the build's
+  existing memory cgroup rather than a namespace-specific budget. Their final namespace/mount
+  references release the filesystems; Landlock prevents subsequent mounts. Environment paths stay
+  unchanged, with covered runtime directories recreated empty. A covered workspace uses fallback.
+  The descriptor guard closes ambient inherited sockets in either mode. Failed namespace/mount setup
   retries in a fresh child with the original DenyDirect floor and its existing IPC limitations.
   This narrows the build route's abstract-socket surface; it does not close this deviation.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family

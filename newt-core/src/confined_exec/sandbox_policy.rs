@@ -52,12 +52,12 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
     policy
 }
 
-/// The build-only network floor, shared by argv and shell build execution.
+/// The build-only network and scratch isolation, shared by argv and shell execution.
 /// A real network grant and every non-Linux backend retain existing behavior.
 pub(crate) fn build_sandbox_policy(network: &crate::Scope<String>) -> agent_bridle::SandboxPolicy {
     let mut policy = runtime_sandbox_policy();
     if cfg!(target_os = "linux") && *network == crate::Scope::none() {
-        policy.child_network = agent_bridle::ChildNetworkPolicy::PrivateLoopback;
+        policy.child_network = agent_bridle::ChildNetworkPolicy::PrivateBuild;
     }
     policy
 }
@@ -67,12 +67,12 @@ mod tests {
     use super::*;
     use crate::confined_exec::{ExecOrigin, ExecRequest, NetGrant};
     use crate::{Caveats, Scope};
-    use agent_bridle::ChildNetworkPolicy::{DenyDirect, PrivateLoopback};
+    use agent_bridle::ChildNetworkPolicy::{DenyDirect, PrivateBuild};
 
     /// Pure prepared-request policy: no toolchain discovery or real resources.
     /// The real build-network probes ground the builder and both spawn routes.
     #[test]
-    fn private_loopback_is_exclusive_to_deny_all_builds() {
+    fn private_build_is_exclusive_to_deny_all_builds() {
         for network in [
             Scope::none(),
             Scope::only(["example.test".into()]),
@@ -95,13 +95,13 @@ mod tests {
                 DenyDirect,
                 "ordinary shell/git requests"
             );
-            request.private_build_network = true;
+            request.private_build_isolation = true;
             assert_eq!(
                 request.sandbox_policy().child_network,
                 if network == Scope::All {
                     DenyDirect
                 } else {
-                    PrivateLoopback
+                    PrivateBuild
                 }
             );
             assert_eq!(

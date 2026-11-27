@@ -316,7 +316,7 @@ impl ConstrainedExecutor {
                     args.push(procs);
                 }
                 if req.sandbox_policy().child_network
-                    == agent_bridle::ChildNetworkPolicy::PrivateLoopback
+                    == agent_bridle::ChildNetworkPolicy::PrivateBuild
                 {
                     // The spawn funnel installs either private loopback or both
                     // deny-all mechanisms before this helper can run.

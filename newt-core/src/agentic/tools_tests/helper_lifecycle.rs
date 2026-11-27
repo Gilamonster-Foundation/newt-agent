@@ -649,7 +649,7 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     assert_eq!(request.target, "/ws");
     assert!(request.reason.contains("cargo test --offline"));
     assert!(request.reason.contains("network denied"));
-    assert!(request.reason.contains("Network mode:"));
+    assert!(request.reason.contains("Build isolation:"));
     if cfg!(target_os = "linux") {
         assert!(request.reason.contains("private loopback"));
         assert!(request
@@ -756,10 +756,13 @@ fn cold_cache_recovery_is_visible_to_model_and_operator() {
         }
     }
     let recovery = "note: automatic locked fetch was declined by the operator";
-    let network = "Build network: deny-all fallback; loopback unavailable";
-    for (fetch_note, stderr_note, note) in
-        [(Some(recovery), "", recovery), (None, network, network)]
-    {
+    let fallback = "Build isolation: deny-all fallback; loopback and private scratch unavailable";
+    let private = "Build isolation: private loopback only; private tmpfs /tmp (1 GiB) and /dev/shm (256 MiB); external networking unavailable.";
+    for (fetch_note, stderr_note, note) in [
+        (Some(recovery), "", recovery),
+        (None, fallback, fallback),
+        (None, private, private),
+    ] {
         for trim in [
             None,
             OutputTrim::from_json(Some(&serde_json::json!({"mode":"head","n":1}))),
