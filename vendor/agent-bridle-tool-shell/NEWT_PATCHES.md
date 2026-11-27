@@ -10,6 +10,12 @@ temporary dependency override, not a second shell implementation.
 
 Integration changes:
 
+- #3307: compile the launcher-image helper only for its Linux/macOS production
+  callers or Unix tests, and gate its Unix symlink regression to Unix. This
+  fixes Windows all-targets compilation without suppressing unused-code
+  warnings or changing the Unix assertions. The same fix is owed upstream in
+  agent-bridle.
+
 - Backport agent-bridle#527 (`67cf41243dc46ac73ce942a88a070b5907f9dfed`,
   released in `0.8.0-rc.8`): the real Brush test now proves an fs-restricted
   command starts with `sandbox_kind: landlock`, writes inside its grant and
