@@ -884,31 +884,84 @@ shrinking_headroom_test!(
     "anthropic"
 );
 
-/// #2907 P2 4: a stalled /v1/models must not wedge the recovery turn. The
-/// probe is a metadata request, not a generation: it carries its own short
-/// overall deadline, so the turn completes with UNKNOWN limits — the
-/// default*2 ceiling on every retry — instead of waiting out the
-/// inference client's generation timeout.
-#[tokio::test]
-#[serial_test::serial(anthropic_loop_env)]
-async fn stalled_probe_deadline_yields_unknown_limits() {
+/// Keep the backend result held until AFTER the turn returns. Only the probe
+/// boundary advances virtual time; yielding while polling wiremock keeps Tokio
+/// from auto-advancing transport deadlines while another thread handles I/O.
+async fn run_with_held_probe(cancel: bool) -> Run {
     let _settings = default_loop_settings();
     let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
-    let stalled = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+    let interrupt: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let (entered, mut entering) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let probe: crate::backend_probe::TestLimits = Box::pin(async move {
+        entered.send(()).unwrap();
+        held.await.expect("the test retains the probe release")
+    });
+    let mut turn = Box::pin(crate::backend_probe::TEST_ANTHROPIC_LIMITS.scope(
+        std::cell::RefCell::new(Some(probe)),
         run_on(
             "anthropic",
             None,
             None,
             None,
-            |_| {},
-            Some(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))),
+            |ctx| ctx.cancel = cancel.then_some(interrupt),
+            None::<ResponseTemplate>,
             move |attempt, _| reply("anthropic", attempt, true, true),
         ),
-    )
-    .await
-    .expect("the stalled metadata probe is bounded by its own short deadline");
-    let (result, requests, end, _dir) = stalled;
+    ));
+    loop {
+        tokio::select! {
+            biased;
+            entered = &mut entering => { entered.expect("the probe started"); break; }
+            result = &mut turn => panic!("turn ended before the probe started: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+    assert!(
+        !release.is_closed(),
+        "the probe is still awaiting its response"
+    );
+    if cancel {
+        interrupt.store(true, Ordering::Relaxed);
+    }
+    let elapsed = if cancel {
+        // Enough for the cancellation poll, strictly before the probe deadline:
+        // a missing cancellation arm cannot pass through the timeout fallback.
+        METADATA_PROBE_DEADLINE / 2
+    } else {
+        METADATA_PROBE_DEADLINE
+    };
+    let before = tokio::time::Instant::now();
+    tokio::time::advance(elapsed).await;
+    let next = futures_util::poll!(turn.as_mut());
+    assert!(
+        release.is_closed(),
+        "the bounded probe must drop its pending response"
+    );
+    let result = match next {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => loop {
+            tokio::select! {
+                biased;
+                result = &mut turn => break result,
+                _ = tokio::task::yield_now() => {}
+            }
+        },
+    };
+    assert_eq!(before.elapsed(), elapsed, "only the test advances time");
+    assert!(
+        release.send(Default::default()).is_err(),
+        "the turn ended before the probe was released"
+    );
+    result
+}
+
+/// #2907 P2 4 / #3345: the unchanged metadata deadline expires in virtual
+/// time; the turn uses UNKNOWN limits while the probe response remains held.
+#[tokio::test(start_paused = true)]
+#[serial_test::serial(anthropic_loop_env)]
+async fn stalled_probe_deadline_yields_unknown_limits() {
+    let (result, requests, end, _dir) = run_with_held_probe(false).await;
     assert_eq!(
         caps("anthropic", &requests),
         vec![Some(8_192), Some(16_384), Some(16_384)],
@@ -917,47 +970,12 @@ async fn stalled_probe_deadline_yields_unknown_limits() {
     assert_eq!(end, Some(crate::TurnEndReason::Failed));
 }
 
-/// #2907 P2 4: an operator interrupt must abort the optional probe. The
-/// flag flips AS the probe request arrives — with it still unanswered — so
-/// only probe-side cancellation can end the turn; the streaming dispatch's
-/// own cancel path has already passed. The whole probe rides the turn's
-/// cancellation wrapper, so the turn ends at the interrupt instead of
-/// waiting out the inference client's generation timeout.
-#[tokio::test]
+/// #2907 P2 4 / #3345: cancellation lands after the probe starts. The turn
+/// ends before either the controlled response or the virtual probe deadline.
+#[tokio::test(start_paused = true)]
 #[serial_test::serial(anthropic_loop_env)]
 async fn cancelled_probe_ends_the_turn_promptly() {
-    struct ProbeThatInterrupts {
-        interrupt: &'static std::sync::atomic::AtomicBool,
-    }
-    impl wiremock::Respond for ProbeThatInterrupts {
-        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-            self.interrupt
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60))
-        }
-    }
-    let _settings = default_loop_settings();
-    let _env = crate::agentic::anthropic_loop_tests::test_env_with_process_lock(true);
-    // Leaked for the turn's 'static ChatCtx borrow — a test-process flag.
-    let interrupted: &'static std::sync::atomic::AtomicBool =
-        Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
-    let (result, requests, end, _dir) = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        run_on(
-            "anthropic",
-            None,
-            None,
-            None,
-            // The interrupt flag the loop's own round-top checks consume.
-            |ctx| ctx.cancel = Some(interrupted),
-            Some(ProbeThatInterrupts {
-                interrupt: interrupted,
-            }),
-            move |attempt, _| reply("anthropic", attempt, true, true),
-        ),
-    )
-    .await
-    .expect("a cancelled turn must not wait for the probe");
+    let (result, requests, end, _dir) = run_with_held_probe(true).await;
     assert_eq!(
         requests.len(),
         1,
