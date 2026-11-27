@@ -2177,15 +2177,23 @@ pub(crate) mod landlock_impl {
                     fd.ok_or_else(|| ToolError::denied("Landlock filesystem rules unavailable"))
                 };
                 let (fallback_rules, _) = self.prepare_rules(effective, worker, held, true)?;
+                // Inspect the original request roots, including unresolved ones:
+                // dropping a missing grant here could hide a later build input.
+                let roots = [&effective.fs_read, &effective.fs_write].into_iter()
+                    .filter_map(|scope| match scope {
+                        Scope::Only(paths) => Some(paths.iter()),
+                        Scope::All => None,
+                    }).flatten().map(std::path::Path::new);
                 let fallback = agent_bridle_fdguard::build_isolation::confine(
                     command.expect("private build requires a command"),
-                    require_fd(ruleset)?, require_fd(fallback_rules)?,
+                    [require_fd(ruleset)?, require_fd(fallback_rules)?],
                     seccomp_egress_program(false)?, seccomp_egress_program(true)?,
                     scratch_access,
                     // Verified and held HERE, in the host namespace, before
                     // any child exists (#3318).
                     held_git_alias_binds(),
-                ).map_err(landlock_denied)?;
+                    roots,
+                );
                 return Ok(Some(fallback));
             }
             let status = ruleset.restrict_self().map_err(landlock_denied)?;

@@ -439,7 +439,9 @@ async fn run_pre_push(
         "git",
         std::iter::empty::<String>(),
         &crate::Scope::none(),
-    );
+    )
+    .with_operator_toolchains(&caveats.fs_write)
+    .map_err(|e| agent_bridle::ToolError::denied(e.to_string()))?;
     if !super::build_authorized(
         &root,
         &cmd,

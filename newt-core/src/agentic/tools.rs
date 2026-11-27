@@ -1059,23 +1059,24 @@ fn mutation_confirm_definition(question: &str) -> newt_interaction::InteractionD
 /// existing operator grant, with deny-all as the default. Where that fence cannot be established
 /// the spawn is **refused** rather than run unconfined (#10). It is no longer a
 /// raw `sh -c` on the host.
-pub(crate) fn run_build_check(
-    cmd: &str,
-    workspace: &str,
-    network: &crate::Scope<String>,
-) -> String {
+pub(crate) fn run_build_check(cmd: &str, workspace: &str, caveats: &crate::Caveats) -> String {
     use crate::confined_exec::{build_tool_request, ConstrainedExecutor};
     let (program, args) = build_check_argv(cmd);
     let workspace = std::path::Path::new(workspace);
-    let req = build_tool_request(workspace, workspace, program, args, network);
-
-    render_build_check_result(ConstrainedExecutor::run(&req))
+    let run = build_tool_request(workspace, workspace, program, args, &caveats.net)
+        .with_operator_toolchains(&caveats.fs_write)
+        .and_then(|req| ConstrainedExecutor::run(&req));
+    render_build_check_result(run)
 }
 
 fn render_build_check_result(
     run: Result<crate::confined_exec::ConfinedOutput, crate::confined_exec::ExecRefused>,
 ) -> String {
-    match run {
+    let note = run
+        .as_ref()
+        .ok()
+        .and_then(|out| crate::toolchains::report(&out.toolchains));
+    let mut text = match run {
         Ok(out) if out.success => "  ✓ build check passed".to_string(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1085,7 +1086,12 @@ fn render_build_check_result(
             format!("  ✗ build check failed:\n{excerpt}")
         }
         Err(e) => format!("  ⚠ build check could not run: {e}"),
+    };
+    if let Some(note) = note {
+        text.push('\n');
+        text.push_str(&note);
     }
+    text
 }
 
 /// U5: a model that sends `\n` as two characters on a single line lands a
@@ -1376,7 +1382,16 @@ fn build_authorized(
     gate: &mut Option<&mut dyn PermissionGate>,
     escalation_note: Option<&str>,
 ) -> bool {
-    build.leq(caveats) || gate.as_deref_mut().is_some_and(|gate| {
+    // These roots were admitted against the complete write scope before this
+    // call. Their signed policy supplies build-only reads; it must not add them
+    // to the session's ordinary shell/read authority merely to pass this gate.
+    let mut baseline = build.clone();
+    if let crate::Scope::Only(reads) = &mut baseline.fs_read {
+        for root in crate::toolchains::configured_roots() {
+            reads.remove(&root);
+        }
+    }
+    baseline.leq(caveats) || gate.as_deref_mut().is_some_and(|gate| {
         let permission = lifecycle_build_request(&root.to_string_lossy(), display, build, escalation_note);
         matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
     })
@@ -1510,7 +1525,13 @@ async fn run_confined_build_lane(
         Ok(directory) => directory,
         Err(refusal) => return refusal,
     };
-    let request = build_tool_request(&root, &cwd, program, argv, &caveats.net).timeout(wall);
+    let request = match build_tool_request(&root, &cwd, program, argv, &caveats.net)
+        .timeout(wall)
+        .with_operator_toolchains(&caveats.fs_write)
+    {
+        Ok(request) => request,
+        Err(error) => return (error.to_string(), crate::ExecOutcome::Denied),
+    };
     let build = request.caveats();
     if let Some(harness) = smart_harness {
         if let Err(error) = harness.validate_tool_authority(build, &root) {
@@ -1533,6 +1554,7 @@ async fn run_confined_build_lane(
             crate::ExecOutcome::Denied,
         );
     }
+    let evidence = crate::toolchains::report(request.toolchains());
     let mut run = ConstrainedExecutor::run_async(request.clone()).await;
     let mut fetch_note = None;
     if let Ok(out) = &run {
@@ -1555,7 +1577,8 @@ async fn run_confined_build_lane(
             }
         }
     }
-    render_confined_build_result(
+    let refused_evidence = run.is_err().then_some(evidence).flatten();
+    let (mut text, outcome) = render_confined_build_result(
         run,
         fetch_note.as_deref(),
         trim,
@@ -1564,7 +1587,13 @@ async fn run_confined_build_lane(
         tool_offload,
         spill_store,
         presentation,
-    )
+    );
+    if let Some(note) = refused_evidence {
+        presentation.document(&note);
+        text.push('\n');
+        text.push_str(&note);
+    }
+    (text, outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1578,6 +1607,10 @@ fn render_confined_build_result(
     spill_store: Option<&dyn super::content_spill::SpillStore>,
     presentation: &mut dyn ToolPresentation,
 ) -> (String, crate::ExecOutcome) {
+    let toolchain_note = run
+        .as_ref()
+        .ok()
+        .and_then(|out| crate::toolchains::report(&out.toolchains));
     let mut isolation_note = None;
     let (mut text, outcome) = match run {
         Ok(out) => {
@@ -1609,6 +1642,7 @@ fn render_confined_build_result(
                 "stdout": stdout,
                 "stderr": stderr,
                 "timed_out": out.timed_out,
+                "toolchains": out.toolchains,
             });
             (
                 shell::shell_envelope_output_with_view(
@@ -1632,6 +1666,11 @@ fn render_confined_build_result(
             text.push('\n');
             text.push_str(note);
         }
+    }
+    if let Some(note) = toolchain_note {
+        presentation.document(&note);
+        text.push('\n');
+        text.push_str(&note);
     }
     (text, outcome)
 }
@@ -5912,7 +5951,7 @@ async fn execute_authorized_tool(
                             }
                         };
                         let check = build_check_cmd
-                            .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
+                            .map(|cmd| run_build_check(cmd, build_workspace, caveats))
                             .unwrap_or_default();
                         receipt.present_success(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}{}", super::publish_early::bounded_move_hint(line_count)), presentation)
                     }
@@ -6040,7 +6079,7 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
+                        .map(|cmd| run_build_check(cmd, build_workspace, caveats))
                         .unwrap_or_default();
                     receipt.present_success(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
@@ -6253,7 +6292,7 @@ async fn execute_authorized_tool(
                         }
                     };
                     let check = build_check_cmd
-                        .map(|cmd| run_build_check(cmd, build_workspace, &caveats.net))
+                        .map(|cmd| run_build_check(cmd, build_workspace, caveats))
                         .unwrap_or_default();
                     let escape_warning = literal_newline_escape_warning(old_string, new_string)
                         .map(|w| format!("\n{w}"))

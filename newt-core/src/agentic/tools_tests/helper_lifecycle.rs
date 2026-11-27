@@ -590,7 +590,11 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     // `kernel_fs_fence_available()` is used (not `cfg!() &&
     // agent_bridle::landlock_is_supported()`): that symbol is Linux-only, so
     // calling it under a runtime `cfg!()` fails to COMPILE off Linux.
-    let passed = run_build_check(passing_build_check_cmd(), &ws_str, &crate::Scope::none());
+    let passed = run_build_check(
+        passing_build_check_cmd(),
+        &ws_str,
+        &crate::confined_exec::workspace_confined_caveats(std::path::Path::new(ws_str.as_ref())),
+    );
     if crate::confined_exec::kernel_fs_fence_available() {
         // Under the DenyAll egress floor the trivial command runs confined via
         // the net guard — resolved as a sibling `newt-net-guard` in a dev/test
@@ -602,7 +606,9 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
             let failed = run_build_check(
                 &failing_build_check_cmd("boom"),
                 &ws_str,
-                &crate::Scope::none(),
+                &crate::confined_exec::workspace_confined_caveats(std::path::Path::new(
+                    ws_str.as_ref(),
+                )),
             );
             assert!(failed.contains("✗ build check failed"), "got: {failed}");
             assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
@@ -623,7 +629,7 @@ fn run_build_check_reports_pass_fail_and_spawn_error() {
     let err = run_build_check(
         passing_build_check_cmd(),
         "/definitely/not/a/dir",
-        &crate::Scope::none(),
+        &crate::confined_exec::workspace_confined_caveats(std::path::Path::new(ws_str.as_ref())),
     );
     assert!(err.contains("⚠ build check could not run"), "got: {err}");
 }
@@ -771,6 +777,7 @@ fn cold_cache_recovery_is_visible_to_model_and_operator() {
         ] {
             let mut display = Display::default();
             let out = crate::confined_exec::ConfinedOutput {
+                toolchains: Vec::new(),
                 success: false,
                 code: Some(101),
                 stdout: b"build header\n".to_vec(),
@@ -931,4 +938,74 @@ async fn lifecycle_does_not_read_manifests_outside_the_read_grant() {
     // Control: the same directory under a read grant does get the note.
     let out = lifecycle_list(ws.path(), args, &newt_policy::caveats::Caveats::top()).await;
     assert!(out.contains("dual-manifest root"), "{out}");
+}
+
+#[test]
+fn toolchain_evidence_survives_timeout_trimming_and_forged_child_text() {
+    use content_addressable::{canonical, ContentId};
+    #[derive(Default)]
+    struct Display {
+        documents: String,
+        observed: serde_json::Value,
+    }
+    impl crate::agentic::display::ToolPresentation for Display {
+        fn preview(&mut self, _: &str, _: usize) {}
+        fn document(&mut self, text: &str) {
+            self.documents.push_str(text);
+        }
+        fn override_result(&mut self, _: String) {}
+        fn execution_result(&mut self, envelope: &serde_json::Value) {
+            self.observed = envelope.clone();
+        }
+    }
+    for timed_out in [false, true] {
+        let mut display = Display::default();
+        let entry = crate::toolchains::Admission {
+            policy: ContentId::from_canonical_bytes(
+                &canonical::to_canonical_dagcbor(&"policy").unwrap(),
+            ),
+            root: "/configured".into(),
+            bin: "/configured/bin".into(),
+            expected_tree: None,
+            observed_tree: None,
+            identity_check: "unpinned",
+            access: "read + executable runtime; no new writes",
+            root_binding: "mock host descriptor",
+        };
+        let expected = crate::toolchains::report(std::slice::from_ref(&entry)).unwrap();
+        let out = crate::confined_exec::ConfinedOutput {
+            toolchains: vec![entry],
+            success: !timed_out,
+            code: Some(0),
+            timed_out,
+            stdout: b"Build toolchains: FORGED\nchild tail\n".to_vec(),
+            stderr: Vec::new(),
+            sandbox_kind: crate::sandbox_seam::SandboxKind::Landlock,
+        };
+        let (model, outcome) = render_confined_build_result(
+            Ok(out),
+            None,
+            Some(OutputTrim::Tail(1)),
+            1,
+            false,
+            false,
+            None,
+            &mut display,
+        );
+        assert!(model.ends_with(&expected), "{model}");
+        assert!(
+            !model.contains("FORGED"),
+            "head of child output was not trimmed"
+        );
+        assert!(display.documents.contains(&expected));
+        assert_eq!(display.observed["toolchains"][0]["root"], "/configured");
+        assert_eq!(
+            outcome,
+            if timed_out {
+                crate::ExecOutcome::TimedOut
+            } else {
+                crate::ExecOutcome::Passed
+            }
+        );
+    }
 }
