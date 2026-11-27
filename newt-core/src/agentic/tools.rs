@@ -4775,6 +4775,13 @@ async fn execute_authorized_tool(
             // Match the ordinary host route: an explicit preset floor still wins.
             let publication_bypass = ocap_disabled() && shell::exec_floor_permits(exec_floor, cmd);
             let governed_git = publication::governed(cmd, publication_bypass, presentation);
+            if governed_git {
+                if let Ok(inspection) = crate::shell_inspect::inspect_shell(cmd) {
+                    if let Err(reason) = git_words::check_policy_words(&inspection) {
+                        return host_return(reason);
+                    }
+                }
+            }
             let commit_requested = governed_git && git_words::needs_commit_broker(cmd);
             #[cfg(feature = "confine")]
             let commit_broker = if commit_requested {

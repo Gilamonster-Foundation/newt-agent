@@ -173,3 +173,16 @@ The caller's directory environment also reaches that same pre-exec initializer:
 Brush's full environment payload arrives after startup, too late to recreate a
 covered `HOME` or `TMPDIR`. Only the shared fixed directory-variable allow-list
 is seeded before exec; no protocol field or loader-control import is added.
+
+## Static shell word classification
+
+Ports the same correction from agent-bridle, whose PR title is
+"fix(shell): classify extglob, later brace groups and array words as dynamic".
+The brace prefilter spans through the last closing brace, and unquoted
+parentheses are treated as dynamic. The existing Brush parser still decides
+brace expansion; quoted and escaped words keep their literal values.
+
+The pure program/printf/find regression and the 33-word real-worker
+differential test travel with the fix. Newt's independent inspector carries
+the same predicates and explicit parity expectations. Downstream Git/gh
+policy checks refuse unresolved policy words before command routing.
