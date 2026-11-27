@@ -401,10 +401,10 @@ fn cstr(bytes: &OsStr) -> io::Result<CString> {
 /// literal.
 #[cfg(target_os = "linux")]
 #[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
+pub(crate) struct OpenHow {
+    pub(crate) flags: u64,
+    pub(crate) mode: u64,
+    pub(crate) resolve: u64,
 }
 
 /// Raw `openat2` with the retry policy shared by acquisition and bounded
@@ -412,7 +412,11 @@ struct OpenHow {
 /// result) retries a bounded number of times, then surfaces (fail closed,
 /// never a fallback to an unbounded open).
 #[cfg(target_os = "linux")]
-fn openat2_fd(dirfd: libc::c_int, path: &std::ffi::CStr, how: &OpenHow) -> io::Result<OwnedFd> {
+pub(crate) fn openat2_fd(
+    dirfd: libc::c_int,
+    path: &std::ffi::CStr,
+    how: &OpenHow,
+) -> io::Result<OwnedFd> {
     let mut attempts = 0;
     loop {
         // SAFETY: raw `openat2` syscall with a valid dirfd, NUL-terminated
