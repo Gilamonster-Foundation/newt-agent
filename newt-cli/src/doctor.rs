@@ -2,6 +2,8 @@
 
 #[path = "doctor/durable_grants.rs"]
 mod durable_grants;
+#[path = "doctor/toolchains.rs"]
+pub(super) mod toolchains;
 
 use newt_core::dgx::{DgxConfig, EndpointKind};
 use newt_core::ocap::SecurityReport;

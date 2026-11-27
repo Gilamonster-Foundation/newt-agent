@@ -280,3 +280,37 @@ fn unsupported_ownership_checks_fail_closed_without_io() {
         .to_string()
         .contains("unavailable"));
 }
+
+#[test]
+fn explicit_signing_preserves_the_ordered_body_and_never_makes_unsigned_input_authority() {
+    let body = body();
+    let unsigned = toml::to_string(&body).unwrap();
+    let key = SigningKey::from_bytes(&[29; 32]);
+    let verifier = Ed25519ApproveVerifier {
+        verifying_key: key.verifying_key().to_bytes(),
+    };
+    assert!(verify(&unsigned, &verifier).is_err());
+    assert_eq!(
+        parse(&unsigned).unwrap().0.content_id().unwrap(),
+        body.content_id().unwrap()
+    );
+    let calls = std::cell::Cell::new(0);
+    let signed = signed_toml(&body, &|bytes| {
+        calls.set(calls.get() + 1);
+        assert_eq!(bytes, body.canonical_form().unwrap());
+        key.sign(bytes).to_bytes()
+    })
+    .unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        verify(&signed, &verifier).unwrap().content_id().unwrap(),
+        body.content_id().unwrap()
+    );
+    assert!(
+        verify(&unsigned, &verifier).is_err(),
+        "review/sign helpers cannot install authority"
+    );
+    let mut invalid = body.clone();
+    invalid.roots.push(body.roots[0].clone());
+    assert!(signed_toml(&invalid, &|_| panic!("invalid scope reached signing key")).is_err());
+}
