@@ -2469,6 +2469,21 @@ pub(crate) mod landlock_impl {
 
         let mut per_syscall: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
         per_syscall.insert(libc::SYS_socket, rules);
+        if private_loopback {
+            // Terminal settings and PTY allocation need device ioctls. These
+            // legacy injection/console operations are never part of that grant,
+            // even on kernels where unprivileged TIOCSTI is still enabled.
+            let rules = [libc::TIOCSTI, libc::TIOCLINUX]
+                .into_iter()
+                .map(|request| {
+                    let condition = SeccompCondition::new(
+                        1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, u64::from(request as u32),
+                    ).map_err(|e| denied(e.to_string()))?;
+                    SeccompRule::new(vec![condition]).map_err(|e| denied(e.to_string()))
+                })
+                .collect::<ToolResult<_>>()?;
+            per_syscall.insert(libc::SYS_ioctl, rules);
+        }
         // Empty rule vec ⇒ the syscall is denied UNCONDITIONALLY (the filter's
         // match action, EACCES). Closes the io_uring egress bypass of `net: none`.
         per_syscall.insert(libc::SYS_io_uring_setup, Vec::new());

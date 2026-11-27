@@ -252,11 +252,17 @@ fn main() {
     }
     #[cfg(unix)]
     if std::env::args().any(|arg| arg == "--build-pty-child") {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        assert_eq!(input, "private master input\n");
         println!("BUILD_PTY_ROUNDTRIP_CONFIRMED");
         return;
     }
     #[cfg(unix)]
-    if std::env::args().any(|arg| arg == "--build-pty-probe") {
+    if let Some(probe) = std::env::args()
+        .find(|arg| arg == "--build-pty-probe" || arg.starts_with("--build-pty-probe="))
+    {
+        #[cfg(not(target_os = "linux"))]
         if let Some(other) = std::env::args().nth(2) {
             for (read, write) in [(true, false), (false, true), (true, true)] {
                 let error = std::fs::OpenOptions::new()
@@ -267,7 +273,113 @@ fn main() {
                 assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
             }
         }
+        #[cfg(target_os = "linux")]
+        if std::net::TcpListener::bind(("127.0.0.1", 0)).is_err() {
+            // A failed setup must retain the original host-terminal refusal.
+            assert_eq!(
+                unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            println!("BUILD_PTY_DENIED_FALLBACK");
+            return;
+        }
         let pty = tests_pty::Pty::open();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::fs::MetadataExt;
+            let host: Vec<_> = probe
+                .strip_prefix("--build-pty-probe=")
+                .unwrap()
+                .split(':')
+                .collect();
+            let host_dev: u64 = host[0].parse().unwrap();
+            assert_ne!(std::fs::metadata("/dev/pts").unwrap().dev(), host_dev);
+            assert_eq!(
+                unsafe { libc::fcntl(host[2].parse::<i32>().unwrap(), libc::F_GETFD) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            if let Ok(metadata) = std::fs::metadata(host[1]) {
+                // The same numeric slave name can denote a different instance.
+                assert_ne!(metadata.dev(), host_dev);
+            }
+            for path in ["/dev/tty", "/dev/console"] {
+                let error = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap_err();
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                ));
+            }
+            let slaves: Vec<_> = std::fs::read_dir("/dev/pts")
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| entry.file_name() != "ptmx")
+                .collect();
+            assert_eq!(slaves.len(), 1, "only this build's slave may be visible");
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(slaves[0].path())
+                .unwrap();
+            let fd = slave.as_raw_fd();
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut termios) }, 0);
+            assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) }, 0);
+            let mut size = libc::winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) }, 0);
+            size.ws_row = 0;
+            assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) }, 0);
+            assert_eq!((size.ws_row, size.ws_col), (24, 80));
+            for request in [libc::TIOCSTI, libc::TIOCLINUX] {
+                let byte = 0u8;
+                assert_eq!(unsafe { libc::ioctl(fd, request, &byte) }, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EACCES)
+                );
+            }
+            // One pair is already held by Pty. Ground the per-instance max,
+            // not a timing assumption about the global host PTY allocation.
+            let mut masters = Vec::new();
+            for _ in 1..64 {
+                let fd =
+                    unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+                assert!(
+                    fd >= 0,
+                    "private PTY bound: {}",
+                    std::io::Error::last_os_error()
+                );
+                masters.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            assert_eq!(
+                unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOSPC)
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = probe;
+        pty.type_in("private master input\n");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--build-pty-child")
             .stdin(pty.slave_stdio())
@@ -402,10 +514,14 @@ mod native {
 
     pub fn run() {
         #[cfg(target_os = "linux")]
-        if std::env::args()
-            .any(|arg| matches!(arg.as_str(), "--deny-build-netns" | "--deny-build-mounts"))
-        {
+        if std::env::args().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--deny-build-netns" | "--deny-build-mounts" | "--deny-build-devpts"
+            )
+        }) {
             let deny_mounts = std::env::args().any(|arg| arg == "--deny-build-mounts");
+            let deny_devpts = std::env::args().any(|arg| arg == "--deny-build-devpts");
             assert!(
                 !std::env::args().any(|arg| arg == "--require-build-netns"),
                 "cannot both deny and require namespace setup"
@@ -416,13 +532,13 @@ mod native {
             // the child has already acquired its private namespaces.
             // This is not a production namespace policy or an escape filter.
             let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
-            let mut filters = [
+            let mut filters = vec![
                 instruction((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0, 0, 0),
                 instruction(
                     (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                     0,
                     1,
-                    if deny_mounts {
+                    if deny_mounts || deny_devpts {
                         libc::SYS_mount
                     } else {
                         libc::SYS_unshare
@@ -441,6 +557,28 @@ mod native {
                     libc::SECCOMP_RET_ALLOW,
                 ),
             ];
+            if deny_devpts {
+                // Match only the devpts mount, after scratch was already mounted
+                // and granted: seccomp_data.args[3] is mount's flags at offset 40.
+                filters[1].jf = 3;
+                filters.splice(
+                    2..2,
+                    [
+                        instruction(
+                            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                            0,
+                            0,
+                            40,
+                        ),
+                        instruction(
+                            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                            0,
+                            1,
+                            (libc::MS_NOSUID | libc::MS_NOEXEC) as u32,
+                        ),
+                    ],
+                );
+            }
             let program = libc::sock_fprog {
                 len: filters.len() as u16,
                 filter: filters.as_mut_ptr(),
@@ -460,7 +598,7 @@ mod native {
             assert_eq!(
                 unsafe {
                     libc::syscall(
-                        if deny_mounts {
+                        if deny_mounts || deny_devpts {
                             libc::SYS_mount
                         } else {
                             libc::SYS_unshare
@@ -468,7 +606,11 @@ mod native {
                         0,
                         0,
                         0,
-                        0,
+                        if deny_devpts {
+                            libc::MS_NOSUID | libc::MS_NOEXEC
+                        } else {
+                            0
+                        },
                         0,
                     )
                 },
@@ -480,7 +622,9 @@ mod native {
             );
             eprintln!(
                 "{}",
-                if deny_mounts {
+                if deny_devpts {
+                    "BUILD_DEVPTS_SETUP_FAILURE_INJECTED"
+                } else if deny_mounts {
                     "BUILD_MOUNT_SETUP_FAILURE_INJECTED"
                 } else {
                     "BUILD_NETNS_SETUP_FAILURE_INJECTED"
@@ -529,6 +673,7 @@ mod native {
             if selected("build_temp_fixtures_do_not_inherit_repository_identity") {
                 build_temp_fixtures_do_not_inherit_repository_identity(&root).await;
             }
+            #[cfg(target_os = "macos")]
             if selected("build_tests_can_use_a_private_pty") {
                 build_tests_can_use_a_private_pty(&root).await;
             }
@@ -548,6 +693,11 @@ mod native {
             }
             #[cfg(target_os = "linux")]
             for (name, probe, marker) in [
+                (
+                    "build_tests_can_use_a_private_pty",
+                    "--build-pty-probe",
+                    "BUILD_PTY_TEST_PASSED",
+                ),
                 (
                     "build_tests_external_connect_stays_denied",
                     "--build-external-connect-probe",
@@ -942,6 +1092,8 @@ mod native {
     /// capacity, caller ownership and mode, plus the mocked staging trust walk's
     /// rejection of writable children/ancestors. Round trips cannot observe or
     /// replace host sentinels or change host modes; fallback denies writes.
+    /// The PTY twin grounds terminal availability and isolation, including the
+    /// real master/slave transport, ioctl contract and per-instance allocation bound.
     /// `--require-build-netns` rejects fallback on every probe and both routes;
     /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
     #[cfg(target_os = "linux")]
@@ -952,6 +1104,29 @@ mod native {
 
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::fs::MetadataExt;
+        let host_pty = if probe == "--build-pty-probe" {
+            // Allocate our own host canary; never use the operator's terminal.
+            let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+            assert!(fd >= 0);
+            let master = unsafe { OwnedFd::from_raw_fd(fd) };
+            assert_eq!(unsafe { libc::grantpt(fd) }, 0);
+            assert_eq!(unsafe { libc::unlockpt(fd) }, 0);
+            let name = unsafe { libc::ptsname(fd) };
+            assert!(!name.is_null());
+            let name = unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let fd = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_DUPFD, 201) };
+            assert!(fd >= 201);
+            Some((
+                unsafe { OwnedFd::from_raw_fd(fd) },
+                name,
+                std::fs::metadata("/dev/pts").unwrap().dev(),
+            ))
+        } else {
+            None
+        };
         let scratch_canaries: Vec<_> = if probe == "--build-scratch-probe" {
             ["/tmp", "/dev/shm"]
                 .into_iter()
@@ -981,6 +1156,8 @@ mod native {
         );
         let probe = if probe.starts_with("--inherited-socket=") {
             format!("--inherited-socket={fd}")
+        } else if let Some((fd, path, device)) = &host_pty {
+            format!("{probe}={device}:{path}:{}", fd.as_raw_fd())
         } else if !scratch_canaries.is_empty() {
             format!(
                 "{probe}={}:{}:{}",
@@ -1046,10 +1223,13 @@ mod native {
             ("Brush", brush.as_str(), brush.as_str()),
         ] {
             let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK")
-                || output.contains("BUILD_SCRATCH_DENIED_FALLBACK");
+                || output.contains("BUILD_SCRATCH_DENIED_FALLBACK")
+                || output.contains("BUILD_PTY_DENIED_FALLBACK");
             assert!(
                 output.contains(marker)
-                    || ((name == "build_tests_loopback_roundtrip" || !scratch_canaries.is_empty())
+                    || ((name == "build_tests_loopback_roundtrip"
+                        || !scratch_canaries.is_empty()
+                        || host_pty.is_some())
                         && fallback),
                 "{name} ({route}): {output}\n{diagnostic}"
             );
@@ -1061,6 +1241,7 @@ mod native {
                 ("--require-build-netns", "private loopback only"),
                 ("--deny-build-netns", "deny-all fallback"),
                 ("--deny-build-mounts", "deny-all fallback"),
+                ("--deny-build-devpts", "deny-all fallback"),
             ] {
                 if std::env::args().any(|arg| arg == switch) {
                     assert!(
@@ -1091,6 +1272,77 @@ mod native {
             );
         }
         assert!(argv.success, "{stderr}");
+        if let Some((host, path, device)) = host_pty {
+            // The production routes use ABI 3. Exercise the configurable ABI 5
+            // mask too: private terminal ioctls need IOCTL_DEV there. An older
+            // kernel must fall back when the raw post-mount rule is unsupported.
+            let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, 0, 0, 1) };
+            assert!(abi >= 3);
+            let mut caveats = build_tool_caveats(&workspace);
+            if let Scope::Only(reads) = &mut caveats.fs_read {
+                reads.insert(executable.to_str().unwrap().to_owned());
+            }
+            let cx = agent_bridle::Gate::new(0)
+                .authorize(&agent_bridle::ShellTool::default(), &caveats)
+                .unwrap();
+            for terminal_stdio in [None, Some(0), Some(1), Some(2)] {
+                let policy = agent_bridle::SandboxPolicy {
+                    child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
+                    landlock_abi_floor: if terminal_stdio.is_some() { 3 } else { 5 },
+                    ..Default::default()
+                };
+                let mut command = agent_bridle::ConfinedCommand::new(executable.to_str().unwrap())
+                    .args([probe.as_str(), "--build-network-auto"])
+                    .current_dir(&workspace)
+                    .sandbox_policy(std::sync::Arc::new(policy))
+                    .stdin(agent_bridle::ConfinedStdio::Null)
+                    .stdout(agent_bridle::ConfinedStdio::Piped)
+                    .stderr(agent_bridle::ConfinedStdio::Piped);
+                if let Some(fd) = terminal_stdio {
+                    let terminal = std::process::Stdio::from(host.try_clone().unwrap());
+                    command = match fd {
+                        0 => command.stdin(terminal),
+                        1 => command.stdout(terminal),
+                        _ => command.stderr(terminal),
+                    };
+                }
+                let child = command.spawn(&cx);
+                if let Some(fd) = terminal_stdio {
+                    let error = child.expect_err("host terminal stdio must refuse before exec");
+                    assert!(error.to_string().contains("Permission denied"), "{error}");
+                    eprintln!("private build refuses host terminal on stdio {fd}");
+                } else {
+                    let output = child.unwrap().child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    let output = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        output.contains(marker) || output.contains("BUILD_PTY_DENIED_FALLBACK"),
+                        "{output}"
+                    );
+                    if abi < 5 {
+                        assert!(output.contains("BUILD_PTY_DENIED_FALLBACK"), "{output}");
+                    } else if std::env::args().any(|arg| arg == "--require-build-netns") {
+                        assert!(
+                            output.contains(marker),
+                            "ABI 5 must not fall back: {output}"
+                        );
+                    }
+                    eprintln!(
+                        "private PTY ABI 5 request on kernel ABI {abi}: {}",
+                        output.trim()
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::metadata(path).unwrap().dev(),
+                device,
+                "host PTY changed"
+            );
+        }
         for (file, before) in scratch_canaries.into_iter().zip(host_metadata) {
             let after = std::fs::metadata(file.path().parent().unwrap()).unwrap();
             assert_eq!(
@@ -1268,6 +1520,7 @@ mod native {
 
     /// Grounds terminal-test availability in the actual Build fence: a fresh
     /// PTY pair and a re-executed child, with ordinary sibling file denial.
+    #[cfg(target_os = "macos")]
     async fn build_tests_can_use_a_private_pty(root: &Path) {
         let (workspace, outside) = project(root, "pty-fixture");
         // Keep an independently allocated fixture terminal alive throughout

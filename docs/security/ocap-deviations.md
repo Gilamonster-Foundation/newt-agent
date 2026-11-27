@@ -216,7 +216,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves the child can send a payload to the
   pipe and cause the host deputy to relay over loopback. If a network-relaying local deputy is
   reachable (e.g. an exposed container-runtime socket or pipe), indirect egress is possible.
-- **Build-only exception (#3297, #3314):** deny-all Linux builds attempt private user/network/mount
+- **Build-only exception (#3297, #3314, #3320):** deny-all Linux builds attempt private user/network/mount
   namespaces before installing their fences. Success allows AF_INET/AF_INET6 within that namespace, initially
   containing only loopback, without a host interface or external route; AF_PACKET and io_uring stay
   denied. Host abstract Unix sockets are isolated too. Private tmpfs mounts hide host `/tmp` and
@@ -227,7 +227,14 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   existing memory cgroup rather than a namespace-specific budget. Their final namespace/mount
   references release the filesystems; Landlock prevents subsequent mounts. Environment paths stay
   unchanged, with covered runtime directories recreated empty. A covered workspace uses fallback.
-  The descriptor guard closes ambient inherited sockets in either mode. Failed namespace/mount setup
+  A private devpts mount supplies at most 64 terminal pairs, with `/dev/ptmx` bound to its allocator.
+  Post-mount handles grant read/write and, when the configured Landlock ABI handles it, IOCTL_DEV
+  only within that instance. The default ABI 3 does not gate device ioctls; ABI 5 does. Builds can
+  allocate their own terminals and use PTY allocation, window-size and termios ioctls. No host
+  terminal path is granted. Seccomp denies TIOCSTI and TIOCLINUX; terminal stdio is refused before
+  exec, and the descriptor guard closes ambient inherited terminals and sockets in either mode.
+  The devpts limit is per instance, also subject to the kernel's global PTY pool; it does not
+  reserve 64 pairs or impose an aggregate budget across builds. Failed namespace/mount setup
   retries in a fresh child with the original DenyDirect floor and its existing IPC limitations.
   This narrows the build route's abstract-socket surface; it does not close this deviation.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
