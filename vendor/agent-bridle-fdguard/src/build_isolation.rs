@@ -1,6 +1,13 @@
 //! Child-side private loopback, scratch, PTYs and identity, with the existing floor on error.
 //! Allocation happens before fork. Private-mount rules bind descriptors opened
 //! after mounting, before either fence. No host or parent namespace is changed.
+//!
+//! Opt-in private PID namespace (`docs/design/private-pid-namespace.md`): the
+//! hook's process stays in the host PID namespace as a relay that never execs.
+//! It forks an init (PID 1, also never exec'd) and then the payload (PID 2),
+//! which finishes the hook and is the process std execs. The relay mirrors the
+//! payload's wait status; the relay's death by any means ends init, and the
+//! kernel then kills every member of the namespace.
 
 use std::ffi::{CStr, CString};
 use std::io;
@@ -56,20 +63,23 @@ impl SameObjectBind {
 /// namespaces, with private tmpfs/devpts grants bound after mounting. Setup errors
 /// return RETRY_DENY_ALL before exec; the caller sets the returned flag and
 /// spawns a fresh child using both fallback mechanisms. Fence installation
-/// errors refuse exec entirely. `binds` are attached last, after the private
+/// errors refuse exec entirely. `binds` are attached before the PID step, after the private
 /// mounts and account files; one that cannot be attached exactly is a setup
 /// error like any other, and the fallback child has no namespace, so it sees
 /// no binding at all.
 /// `deny_inherited_fds` must also be installed by the confined spawn funnel.
+/// `pid_namespace` adds the private PID namespace as one more private step:
+/// its failure selects the same fresh-child fallback, never a partial view.
 pub fn confine(
     command: &mut Command,
     filesystem: OwnedFd,
     fallback_rules: OwnedFd,
-    deny: seccompiler::BpfProgram,
-    loopback: seccompiler::BpfProgram,
+    network_filters: [seccompiler::BpfProgram; 2],
     scratch_access: u64,
     binds: Vec<SameObjectBind>,
+    pid_namespace: bool,
 ) -> io::Result<Arc<AtomicBool>> {
+    let [deny, loopback] = network_filters;
     let mut empty_dirs = Vec::new();
     for (name, value) in command.get_envs() {
         if !name
@@ -161,6 +171,15 @@ pub fn confine(
                         private_identity(filesystem.as_raw_fd(), scratch_access, files)
                     })
                     .and_then(|()| binds.iter().try_for_each(bind_same_object))
+                    .and_then(|()| {
+                        if pid_namespace {
+                            // Returns only in the payload (PID 2), or with an
+                            // error while this process is still the only one.
+                            private_pids(&deny, fallback_rules.as_raw_fd())
+                        } else {
+                            Ok(())
+                        }
+                    })
                     .is_err()
             {
                 // A partial user namespace cannot be undone. Exit before exec;
@@ -442,6 +461,310 @@ fn grant_private_mount(ruleset: i32, access: u64, path: &CStr) -> io::Result<()>
     result
 }
 
+/// `struct clone_args` for `clone3(2)`. `SYS_clone` orders its arguments
+/// differently per architecture and `libc::fork` runs atfork handlers.
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+impl CloneArgs {
+    /// A plain fork: a copy-on-write child on the same stack, reaped by SIGCHLD.
+    fn fork() -> Self {
+        Self {
+            exit_signal: libc::SIGCHLD as u64,
+            ..Self::default()
+        }
+    }
+}
+
+/// What the relay does with the payload's wait status.
+#[derive(Debug, PartialEq, Eq)]
+enum Mirror {
+    Exit(i32),
+    Signal(i32),
+    /// The payload stopped. Without `WUNTRACED` only a ptrace stop is reported,
+    /// which means the payload made the relay its tracer: end it.
+    KillTraced,
+}
+
+fn mirror(status: i32) -> Mirror {
+    if libc::WIFEXITED(status) {
+        Mirror::Exit(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        Mirror::Signal(libc::WTERMSIG(status))
+    } else {
+        Mirror::KillTraced
+    }
+}
+
+/// Both sides continue from here. Only for the single-threaded fork child:
+/// the new process must keep to raw syscalls until it execs or exits.
+unsafe fn fork_raw() -> io::Result<libc::pid_t> {
+    let args = CloneArgs::fork();
+    // SAFETY: a live, correctly sized argument block. No CLONE_VM: the child
+    // has its own copy of this stack.
+    let pid = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
+    check(pid as i32)?;
+    Ok(pid as libc::pid_t)
+}
+
+/// The private PID namespace. Returns `Ok` only in the payload, which is PID 2
+/// with no visible parent. The calling process becomes the relay and never
+/// returns on success; an `Err` is returned in the caller with init discarded.
+fn private_pids(deny: &seccompiler::BpfProgram, rules: i32) -> io::Result<()> {
+    // SAFETY: raw syscalls on this fork child only. Every descriptor created
+    // here is CLOEXEC and is closed explicitly in the processes that must not
+    // hold it. No allocation, locks or Rust stdio.
+    unsafe {
+        // std applied `process_group(0)` before the hooks. Preserve exactly
+        // that for the payload: it leads its own group iff this process does.
+        let leader = libc::getpgid(0) == libc::getpid();
+        // A separate call from the combined unshare, so a kernel or filter
+        // that refuses only PID namespaces fails here and nowhere else.
+        check(libc::unshare(libc::CLONE_NEWPID))?;
+        let mut lifeline = [0; 2];
+        let mut ready = [0; 2];
+        check(libc::pipe2(lifeline.as_mut_ptr(), libc::O_CLOEXEC))?;
+        check(libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC))?;
+        let init = fork_raw()?;
+        if init == 0 {
+            init_main(lifeline[0], ready[1], deny, rules);
+        }
+        libc::close(lifeline[0]);
+        libc::close(ready[1]);
+        // One byte: init is hardened and waiting. EOF: init died in setup.
+        let mut byte = 0u8;
+        let started = loop {
+            let count = libc::read(ready[0], (&mut byte as *mut u8).cast(), 1);
+            if count < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break count == 1;
+        };
+        libc::close(ready[0]);
+        let payload = if started {
+            fork_raw()
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        };
+        match payload {
+            Ok(0) => {}
+            Ok(payload) => relay_main(init, payload, lifeline[1], deny, rules),
+            Err(error) => {
+                // No payload exists. Leave no namespace behind the error.
+                libc::close(lifeline[1]);
+                libc::kill(init, libc::SIGKILL);
+                reap(init);
+                return Err(error);
+            }
+        }
+        // The payload. The only lifeline writer must be the relay.
+        libc::close(lifeline[1]);
+        if leader {
+            // Without this, `kill(0, ...)` from the build reaches the relay.
+            check(libc::setpgid(0, 0))?;
+        }
+        Ok(())
+    }
+}
+
+/// PID 1 of the build's namespace: a sibling of the payload with no duties.
+/// It holds the namespace open until the relay is gone, then exits, and the
+/// kernel kills every remaining member. Never returns, never execs.
+unsafe fn init_main(lifeline: i32, ready: i32, deny: &seccompiler::BpfProgram, rules: i32) -> ! {
+    // SAFETY: raw syscalls only; `deny` and `rules` were prepared before fork.
+    unsafe {
+        let hardened = (|| {
+            // Second, independent trigger beside lifeline EOF.
+            // prctl is variadic: pass full-width arguments, as the kernel reads.
+            check(libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+            ))?;
+            check(libc::prctl(libc::PR_SET_NAME, c"build-init".as_ptr()))?;
+            harden(deny, rules)?;
+            // The kernel reaps init's children, adopted orphans included.
+            check(disposition(libc::SIGCHLD, libc::SIG_IGN))?;
+            close_all_except(lifeline.min(ready), lifeline.max(ready))
+        })();
+        if hardened.is_err() || libc::write(ready, b"R".as_ptr().cast(), 1) != 1 {
+            libc::_exit(1);
+        }
+        libc::close(ready);
+        let mut byte = 0u8;
+        loop {
+            let count = libc::read(lifeline, (&mut byte as *mut u8).cast(), 1);
+            if count == 0 {
+                libc::_exit(0);
+            }
+            if count < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                libc::_exit(1);
+            }
+        }
+    }
+}
+
+/// The payload's real parent, outside the namespace: wait for the payload,
+/// empty the namespace, then end exactly as the payload did. Never returns.
+unsafe fn relay_main(
+    init: libc::pid_t,
+    payload: libc::pid_t,
+    lifeline: i32,
+    deny: &seccompiler::BpfProgram,
+    rules: i32,
+) -> ! {
+    const UNCONFINED: &[u8] = b"Build supervisor could not be confined; build stopped.\n";
+    // SAFETY: raw syscalls only; `deny` and `rules` were prepared before fork.
+    unsafe {
+        if harden(deny, rules).is_err() {
+            // Exiting closes the lifeline: init exits and the payload with it.
+            libc::write(2, UNCONFINED.as_ptr().cast(), UNCONFINED.len());
+            libc::_exit(1);
+        }
+        // Drops std's exec-status pipe, so `spawn` returns at the payload's
+        // exec, and this process's copies of the delegated stdio.
+        if close_all_except(lifeline, lifeline).is_err() {
+            libc::_exit(1);
+        }
+        let mut status = 0;
+        let outcome = loop {
+            if libc::waitpid(payload, &mut status, 0) < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break Mirror::Exit(1);
+            }
+            match mirror(status) {
+                Mirror::KillTraced => {
+                    libc::kill(payload, libc::SIGKILL);
+                }
+                outcome => break outcome,
+            }
+        };
+        // Either trigger alone ends init. Reaping it returns only once the
+        // kernel has killed and released every other member.
+        libc::close(lifeline);
+        libc::kill(init, libc::SIGKILL);
+        reap(init);
+        match outcome {
+            Mirror::Signal(signal) => {
+                // Not `raise`: libc's cached thread id is stale after clone3.
+                libc::kill(libc::getpid(), signal);
+                libc::_exit(128 + signal)
+            }
+            Mirror::Exit(code) => libc::_exit(code),
+            Mirror::KillTraced => libc::_exit(1),
+        }
+    }
+}
+
+/// Shared by the two processes that keep the harness image: no core image,
+/// no inherited handlers, both fallback fences, and no capabilities.
+unsafe fn harden(deny: &seccompiler::BpfProgram, rules: i32) -> io::Result<()> {
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: i32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    // SAFETY: live local structs of the kernel's layouts; raw syscalls rather
+    // than libc wrappers that synchronise threads or take locks on musl.
+    unsafe {
+        check(libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong))?;
+        let no_core = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        check(libc::syscall(
+            libc::SYS_prlimit64,
+            0,
+            libc::RLIMIT_CORE,
+            &no_core,
+            std::ptr::null::<libc::rlimit64>(),
+        ) as i32)?;
+        // Handlers installed by the harness must not run in this image, and
+        // an inherited SIGCHLD ignore would lose the payload's wait status.
+        // SIGKILL and SIGSTOP refuse; that is their fixed disposition.
+        for signal in 1..=64 {
+            disposition(signal, libc::SIG_DFL);
+        }
+        seccompiler::apply_filter(deny).map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
+        restrict(rules)?;
+        let header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        // Version 3 carries two 32-bit sets of effective, permitted, inheritable.
+        let none = [0u32; 6];
+        check(libc::syscall(libc::SYS_capset, &header, &none) as i32)
+    }
+}
+
+/// Raw `rt_sigaction` with the kernel's layout and an empty mask. A kernel
+/// with another layout rejects the size, which init treats as a setup failure.
+unsafe fn disposition(signal: i32, handler: libc::sighandler_t) -> i32 {
+    #[repr(C)]
+    struct KernelSigaction {
+        handler: libc::sighandler_t,
+        flags: libc::c_ulong,
+        restorer: usize,
+        mask: u64,
+    }
+    let action = KernelSigaction {
+        handler,
+        flags: 0,
+        restorer: 0,
+        mask: 0,
+    };
+    // SAFETY: a live action block; no old action is requested.
+    unsafe {
+        libc::syscall(
+            libc::SYS_rt_sigaction,
+            signal,
+            &action,
+            std::ptr::null::<KernelSigaction>(),
+            std::mem::size_of::<u64>(),
+        ) as i32
+    }
+}
+
+/// Close every descriptor except `low` and `high` (`low <= high`).
+unsafe fn close_all_except(low: i32, high: i32) -> io::Result<()> {
+    let close = |first: i64, last: i64| {
+        if first > last {
+            return Ok(());
+        }
+        // SAFETY: closing descriptors of this never-exec'd process only.
+        check(
+            unsafe { libc::syscall(libc::SYS_close_range, first as u32, last as u32, 0u32) } as i32,
+        )
+    };
+    close(0, i64::from(low) - 1)?;
+    close(i64::from(low) + 1, i64::from(high) - 1)?;
+    close(i64::from(high) + 1, i64::from(u32::MAX))
+}
+
+unsafe fn reap(pid: libc::pid_t) {
+    // SAFETY: waits for a child of this process; no status is read.
+    unsafe {
+        while libc::waitpid(pid, std::ptr::null_mut(), 0) < 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
+    }
+}
+
 fn restrict(fd: i32) -> io::Result<()> {
     // SAFETY: fd is a live, prepared Landlock ruleset; flags are zero.
     check(unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0) } as i32)
@@ -583,6 +906,34 @@ fn reopen(path: &CStr, held: &OwnedFd) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The relay's whole decision, without a process: an exit code and a fatal
+    /// signal are mirrored; any other wait status is a ptrace stop to end.
+    #[test]
+    fn relay_mirrors_exit_and_signal_and_kills_a_traced_payload() {
+        assert_eq!(mirror(0), Mirror::Exit(0));
+        assert_eq!(mirror(7 << 8), Mirror::Exit(7));
+        assert_eq!(mirror(255 << 8), Mirror::Exit(255));
+        assert_eq!(mirror(libc::SIGKILL), Mirror::Signal(libc::SIGKILL));
+        // A core-dump flag does not change which signal is mirrored.
+        assert_eq!(mirror(libc::SIGSEGV | 0x80), Mirror::Signal(libc::SIGSEGV));
+        // Stopped by SIGTRAP (exec under PTRACE_TRACEME) and by SIGSTOP.
+        assert_eq!(mirror((libc::SIGTRAP << 8) | 0x7f), Mirror::KillTraced);
+        assert_eq!(mirror((libc::SIGSTOP << 8) | 0x7f), Mirror::KillTraced);
+        assert_eq!(mirror(0xffff), Mirror::KillTraced);
+    }
+
+    /// `clone3(2)` reads `struct clone_args` by size: 88 bytes is VER2. A
+    /// plain fork is every field zero except the exit signal.
+    #[test]
+    fn clone_args_is_the_kernel_layout() {
+        assert_eq!(std::mem::size_of::<CloneArgs>(), 88);
+        assert_eq!(std::mem::offset_of!(CloneArgs, exit_signal), 32);
+        let fork = CloneArgs::fork();
+        assert_eq!(fork.exit_signal, libc::SIGCHLD as u64);
+        let words: [u64; 11] = unsafe { std::mem::transmute(fork) };
+        assert_eq!(words.iter().filter(|word| **word != 0).count(), 1);
+    }
 
     #[test]
     fn account_line_preserves_fields_without_adding_records() {

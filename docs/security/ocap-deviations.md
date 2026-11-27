@@ -242,6 +242,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   reserve 64 pairs or impose an aggregate budget across builds. Failed namespace/mount setup
   retries in a fresh child with the original DenyDirect floor and its existing IPC limitations.
   This narrows the build route's abstract-socket surface; it does not close this deviation.
+  A private PID namespace for these builds is staged behind the opt-in
+  `SandboxPolicy::private_pid_namespace`
+  ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). No production
+  route sets it yet, so host process IDs remain visible and signalable from a build, as before.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
   denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable

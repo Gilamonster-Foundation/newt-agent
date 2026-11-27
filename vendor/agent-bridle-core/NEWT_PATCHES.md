@@ -345,3 +345,25 @@ file; a different object at the alias is still admitted only by the root-owned
 same-image rule. Visible effect: within a private build the alias path has the
 primary's inode. The host, the deny-all fallback and non-build spawns are
 unchanged. Retire with the upstream port of this mechanism.
+
+## Private PID namespace switch and reported build mode (#3321, stage 1)
+
+Design: `docs/design/private-pid-namespace.md`.
+
+`SandboxPolicy::private_pid_namespace` is a staging switch, default false and
+omitted from the serialized policy when false, so existing configuration and
+serialized policies are unchanged. `LandlockSandbox::apply_rules` passes it to
+fdguard's `build_isolation::confine`; it has no effect unless the child network
+policy is `PrivateBuild`, and none on other backends. No production caller sets
+it: with the switch on, a Brush worker reports its namespace-local PID and the
+existing bootstrap check refuses it ("worker hello PID mismatch"), which is the
+seam a later stage re-founds on kernel credentials. The serialized mechanism
+tag stays `private-build`.
+
+`BuildIsolation` (`Private` or `DenyAllFallback`) is new on `ConfinedChild` and
+`SandboxedWorkerChild` as `build_isolation: Option<BuildIsolation>`. The spawn
+funnel already decided the mode with its retry flag and then dropped it; it now
+carries it out. This is harness memory, not child output: a build can imitate
+the diagnostic line on stderr but not this field. It is `None` unless the child
+was spawned under `PrivateBuild` on Linux. `ManagedSpawn` and
+`ConfinedTokioChild` do not carry it yet.

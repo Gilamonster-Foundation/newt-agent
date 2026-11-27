@@ -145,3 +145,55 @@ and mount namespace. `mount_setattr` is not mediated by Landlock; it needs
 it cannot change which object the target names. The binding's guarantee is that
 identity, not the read-only flag: the file's own mode and the build's write
 rules already refuse writes.
+
+## Private PID namespace topology, opt-in (#3321, stage 1)
+
+Design: `docs/design/private-pid-namespace.md`. `confine` takes one more
+argument, `pid_namespace`. When false (every production caller today) the hook
+is unchanged. When true, after the account files and verified Git alias bindings are in place and before either
+fence, the hook calls `unshare(CLONE_NEWPID)` as a separate call and creates two
+processes with raw `clone3`:
+
+- **init** (PID 1): never execs. It sets `PR_SET_PDEATHSIG`, becomes
+  non-dumpable, resets every signal to its default and ignores `SIGCHLD` so the
+  kernel reaps adopted orphans, installs the deny seccomp filter and the
+  fallback Landlock ruleset, drops all capabilities, closes every descriptor
+  except a lifeline read end and a ready write end, writes one ready byte, and
+  blocks reading the lifeline. End-of-file means the relay is gone.
+- **payload** (PID 2, no visible parent): leads its own process group when the
+  hook's process did, then finishes the existing hook and is the process std
+  execs. Program, argv, environment and stdio are untouched.
+
+The hook's own process stays in the host PID namespace as the **relay**. It
+applies the same hardening, closes every descriptor except the lifeline write
+end (which drops std's exec-status pipe, so `spawn` still returns at the
+payload's exec), waits for the payload, kills a payload that reports a ptrace
+stop, then closes the lifeline, kills and reaps init, and ends with the
+payload's exit code or by the payload's signal. Reaping init returns only after
+the kernel has killed every member, so a normal exit leaves nothing behind.
+Killing the relay by any means ends init and therefore every member, including
+one that changed session.
+
+Any failure before the payload exists (the unshare, a pipe, either clone, init
+not reporting ready) returns the existing retry signal with init already
+killed and reaped; a failure in the payload returns it through std as before.
+The fresh fallback child never unshares. If the relay cannot fence itself it
+writes one line to stderr and exits 1, which ends the namespace.
+
+Everything after fork is raw syscalls on stack storage: `clone3`, `prlimit64`,
+`rt_sigaction`, `capset` and `close_range` use local kernel-layout structs
+rather than libc wrappers, because musl's `setrlimit` synchronises threads and
+its `sigaction` takes a lock for `SIGABRT`. An `strace -f` of the real probe
+shows the relay and init issuing only `unshare`, `pipe2`, `clone3`, `close`,
+`read`, `write`, `prctl`, `prlimit64`, `rt_sigaction`, `seccomp`,
+`landlock_restrict_self`, `capset`, `close_range`, `wait4`, `kill` and
+`exit_group`: no `mmap`, `brk` or `futex`.
+
+Not in this stage: the private procfs mount and init's argv zeroing (stage 8),
+host-side handles for init and the payload (stage 2). The relay and init are
+copy-on-write images of the harness for the build's lifetime; they are
+non-dumpable and hold no descriptors but the lifeline. The mocked tests cover
+the relay's status decision and the `clone_args` layout; the real-resource
+probe `--build-pid-probe` in `newt-core/tests/brush_build_pipeline.rs` grounds
+them on both spawn funnels, with fault injection at the PID unshare and at
+init's hardening.

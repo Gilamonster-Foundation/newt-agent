@@ -2180,11 +2180,12 @@ pub(crate) mod landlock_impl {
                 let fallback = agent_bridle_fdguard::build_isolation::confine(
                     command.expect("private build requires a command"),
                     require_fd(ruleset)?, require_fd(fallback_rules)?,
-                    seccomp_egress_program(false)?, seccomp_egress_program(true)?,
+                    [seccomp_egress_program(false)?, seccomp_egress_program(true)?],
                     scratch_access,
                     // Verified and held HERE, in the host namespace, before
                     // any child exists (#3318).
                     held_git_alias_binds(),
+                    self.policy.private_pid_namespace,
                 ).map_err(landlock_denied)?;
                 return Ok(Some(fallback));
             }
