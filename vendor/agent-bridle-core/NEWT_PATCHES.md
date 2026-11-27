@@ -345,3 +345,12 @@ file; a different object at the alias is still admitted only by the root-owned
 same-image rule. Visible effect: within a private build the alias path has the
 primary's inode. The host, the deny-all fallback and non-build spawns are
 unchanged. Retire with the upstream port of this mechanism.
+
+## Covered build inputs (#3337)
+
+Private-build selection now accounts for request read/write roots and directory
+environment values before fork. The existing worker bootstrap carries PATH and
+tool homes as well as temporary directories; loader and authentication controls
+remain excluded. Brush's existing PATH default is made explicit before bootstrap
+so inherited search directories participate in the same decision. No authority
+record, content identity, or caller grant changes.

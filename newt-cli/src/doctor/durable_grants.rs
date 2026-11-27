@@ -193,11 +193,28 @@ fn prune_with_backup_sync(
         }
     }
     let repaired = file.to_toml().map_err(anyhow::Error::msg)?;
+    let backup = save_backup(destination.as_path(), &current, sync_backup)
+        .context("backup could not be durably published; nothing pruned")?;
+    destination.atomic_write(repaired.as_bytes())?;
+    Ok(backup)
+}
+
+/// Retain exact prior operator bytes, privately and durably, before replacement.
+/// The date is only a backup locator; content identities decide what was approved.
+pub(super) fn save_backup(
+    destination: &Path,
+    current: &str,
+    sync_backup: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    let backup = destination.as_path().with_file_name(format!(
-        "approve.toml.backup-{}-{now}",
+    let backup = destination.with_file_name(format!(
+        "{}.backup-{}-{now}",
+        destination
+            .file_name()
+            .context("backup destination has no file name")?
+            .to_string_lossy(),
         newt_tui::probe::today_local_date()
     ));
     let mut options = std::fs::OpenOptions::new();
@@ -210,10 +227,9 @@ fn prune_with_backup_sync(
     let mut saved = options.open(&backup)?;
     saved.write_all(current.as_bytes())?;
     saved.sync_all()?;
-    // Persist the backup's name before replacement can commit the pruned store.
+    // Persist the backup's name before replacement can commit the new policy.
     // The injected operation is the same parent-sync primitive used by atomic_fs.
-    sync_backup(&backup).context("backup could not be durably published; nothing pruned")?;
-    destination.atomic_write(repaired.as_bytes())?;
+    sync_backup(&backup)?;
     Ok(backup)
 }
 

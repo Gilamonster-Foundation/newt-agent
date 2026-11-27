@@ -180,6 +180,8 @@ pub struct ExecRequest {
     net_grant: NetGrant,
     /// Only build_tool_request may select the private build-isolation mechanism.
     private_build_isolation: bool,
+    toolchains_pending: bool,
+    toolchains: Vec<crate::toolchains::Admission>,
     /// Explicit path to the `newt-net-guard` wrapper (tests set this; production
     /// resolves it next to the running executable). Only consulted for
     /// [`NetGrant::DenyAll`].
@@ -219,6 +221,8 @@ impl ExecRequest {
             timeout: None,
             net_grant: NetGrant::Unrestricted,
             private_build_isolation: false,
+            toolchains_pending: false,
+            toolchains: Vec::new(),
             net_guard_bin: None,
             scratch_dirs: Vec::new(),
             held_read_roots: Vec::new(),
@@ -237,6 +241,82 @@ impl ExecRequest {
     ) -> Self {
         self.held_read_roots.extend(roots);
         self
+    }
+
+    /// Admit the startup policy against ALL current model writes, in the host.
+    /// Neither the worker nor child environment participates in this decision.
+    pub fn with_operator_toolchains(
+        self,
+        model_writes: &Scope<String>,
+    ) -> Result<Self, ExecRefused> {
+        if !self.private_build_isolation {
+            return Err(ExecRefused::Authorize(
+                "toolchains require the build lane".into(),
+            ));
+        }
+        let writes = match (model_writes, &self.caveats.fs_write) {
+            (Scope::Only(session), Scope::Only(build)) => {
+                Scope::only(session.iter().chain(build).cloned())
+            }
+            _ => Scope::All,
+        };
+        let admitted = crate::toolchains::admit(&writes).map_err(|e| {
+            ExecRefused::Authorize(format!("toolchains refused before spawn: {e:#}"))
+        })?;
+        let (evidence, held) = admitted.into_iter().unzip();
+        self.install_toolchains(evidence, held)
+    }
+
+    pub(crate) fn install_toolchains(
+        mut self,
+        evidence: Vec<crate::toolchains::Admission>,
+        held: Vec<crate::sandbox_seam::HeldReadRoot>,
+    ) -> Result<Self, ExecRefused> {
+        if !evidence.is_empty() {
+            let old = self
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("");
+            let mut paths: Vec<PathBuf> = evidence
+                .iter()
+                .map(|entry| PathBuf::from(&entry.bin))
+                .collect();
+            for path in std::env::split_paths(old) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            let path =
+                std::env::join_paths(paths).map_err(|e| ExecRefused::Authorize(e.to_string()))?;
+            self.env.retain(|(key, _)| key != "PATH");
+            self.env
+                .push(("PATH".into(), path.to_string_lossy().into_owned()));
+            if let Scope::Only(reads) = &mut self.caveats.fs_read {
+                reads.extend(evidence.iter().map(|entry| entry.root.clone()));
+            }
+        }
+        self.held_read_roots.extend(held);
+        self.toolchains = evidence;
+        self.toolchains_pending = false;
+        Ok(self)
+    }
+
+    #[cfg(feature = "confine")]
+    pub(crate) fn require_toolchain_admission(&self) -> Result<(), ExecRefused> {
+        if self.toolchains_pending {
+            return Err(ExecRefused::Authorize(
+                "toolchains require host admission against session writes before spawn".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Immutable host evidence, never reconstructed from child output.
+    pub fn toolchains(&self) -> &[crate::toolchains::Admission] {
+        &self.toolchains
     }
 
     /// Add validated build metadata reads together with their held objects.
@@ -271,7 +351,20 @@ impl ExecRequest {
 
     #[cfg(feature = "confine")]
     pub(crate) fn build_held_read_roots(&self) -> Vec<crate::sandbox_seam::HeldReadRoot> {
-        self.held_read_roots.clone()
+        let roots = self.held_read_roots.clone();
+        // Retain the host handles in the request, but Seatbelt can only bind
+        // paths. The admission report discloses that existing platform limit.
+        #[cfg(target_os = "macos")]
+        let roots = roots
+            .into_iter()
+            .filter(|root| {
+                !self
+                    .toolchains
+                    .iter()
+                    .any(|entry| entry.root == root.provenance())
+            })
+            .collect();
+        roots
     }
 
     #[cfg(feature = "confine")]
@@ -422,6 +515,8 @@ pub(crate) fn require_backend() -> Result<(), ExecRefused> {
 /// over-claimed; [`crate::sandbox_seam::SandboxKind::None`] means advisory only).
 #[derive(Debug)]
 pub struct ConfinedOutput {
+    /// Host-verified configured runtime closures, separate from child output.
+    pub toolchains: Vec<crate::toolchains::Admission>,
     /// True iff the child exited with a success status.
     pub success: bool,
     /// The exit code, if the process exited with one.
@@ -674,6 +769,7 @@ pub fn build_tool_request(
     .net_grant(net_grant)
     .env("CARGO_NET_OFFLINE", "true");
     request.private_build_isolation = true;
+    request.toolchains_pending = crate::toolchains::requires_admission();
     request
 }
 
@@ -945,6 +1041,17 @@ fn selected_macos_sdk() -> Option<String> {
 #[must_use]
 pub fn build_tool_caveats(workspace: &Path) -> Caveats {
     build_tool_caveats_with_writes(workspace, &[])
+}
+
+/// The build footprint for frame/ceiling checks, including signed declarations.
+/// This is not session authority: dispatch must still admit the live roots.
+#[must_use]
+pub fn configured_build_caveats(workspace: &Path) -> Caveats {
+    let mut caveats = build_tool_caveats(workspace);
+    if let Scope::Only(reads) = &mut caveats.fs_read {
+        reads.extend(crate::toolchains::configured_roots());
+    }
+    caveats
 }
 
 /// [`build_tool_caveats`] plus additional writable roots — for a build tool that
