@@ -139,3 +139,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 [target.'cfg(windows)'.dependencies]
 brush-builtins = { package = "brush-ocap-builtins", version = "=0.3.0-rc.1" }
+
+# Explicit serial real-resource tier; nextest only discovers this entrypoint.
+[[test]]
+name = "toolchain_signing"
+path = "tests/toolchain_signing.rs"
+harness = false

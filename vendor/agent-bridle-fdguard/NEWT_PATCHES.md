@@ -27,7 +27,8 @@ at exec. The mode diagnostic is emitted only after the fence is installed.
 Setup order is stdio socket validation, combined user/network unshare, uid/gid
 mapping, loopback-up, seccomp (including no-new-privileges), then Landlock.
 Inherited descriptors >=3 are marked CLOEXEC by the existing earlier hook;
-internet sockets on stdio refuse execution. AF_UNIX remains available for the
+host terminals and non-AF_UNIX sockets on stdio refuse execution in both private
+and fallback modes. AF_UNIX remains available for the
 authenticated worker channel and local build IPC. Namespace capabilities can
 configure only owned network namespaces: raw IP sockets or new virtual devices
 do not provide a host interface or route. AF_PACKET and io_uring stay denied.
@@ -46,13 +47,13 @@ supplies the Landlock ABI layout, rather than duplicating it locally.
 
 Each private rule opens its directory after mounting. A failed mount or rule
 binding discards the entire child; the fresh fallback keeps its untouched rules
-and cannot write either host temporary root. The actual child cwd is checked
-before setup, so a workspace covered by either mount selects fallback rather
-than importing host contents. The diagnostic reports the effective combined mode.
+and adds no host temporary authority. Existing explicit grants still apply.
+Before fork, covered request paths select that fallback without attempting
+namespace setup. The diagnostic reports the effective combined mode.
 
-`HOME`, `TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR` are not rewritten. Any of
-their directories covered by the new mounts is recreated empty; no host files
-or bind mounts are imported. Data pages are allocated on demand and charged to
+`HOME`, `TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR` are not rewritten. A
+covered directory selects fallback; no host files or directories are imported.
+Data pages are allocated on demand and charged to
 the allocating build's existing memory cgroup; namespaces do not supply a new
 memory budget. Pages may use swap. Filesystem byte/inode bounds are per mount,
 not an aggregate memory limit across builds. Final namespace/mount-reference
@@ -69,7 +70,8 @@ is granted. They contain only read/write, directory traversal, and IOCTL_DEV
 when the prepared filesystem mask handles that right (Landlock ABI 5+).
 The default ABI 3 does not restrict device ioctls. The shared core seccomp filter
 denies TIOCSTI and TIOCLINUX while preserving allocation, termios and winsize.
-Terminal stdio refuses exec; the existing descriptor sweep closes higher fds.
+Terminal stdio refuses exec in both private and fallback modes; the existing
+descriptor sweep closes higher fds.
 
 The 64-pair limit bounds one build instance, still subject to the kernel's global
 PTY pool and reserve. It supplies no aggregate budget across concurrent builds.
@@ -145,6 +147,25 @@ and mount namespace. `mount_setattr` is not mediated by Landlock; it needs
 it cannot change which object the target names. The binding's guarantee is that
 identity, not the read-only flag: the file's own mode and the build's write
 rules already refuse writes.
+
+## Covered build inputs select fallback before fork (#3337)
+
+The common hook chooses fallback before the first fork when the working directory,
+any read/write grant root, PATH entry, tool home or temporary-directory environment
+value is covered by `/tmp` or `/dev/shm`. Resolution precedes comparison, including
+symlink targets and relative paths. A path that does not exist is judged by its
+nearest existing ancestor, so a stale PATH entry or an absent grant root does not
+cost the build its private mode; a missing working directory, any other resolution
+failure and `..` select fallback conservatively. Known account-lookup failures
+also select fallback before setup.
+Brush carries these directory values, including its default PATH, through the
+existing bootstrap seam, excluding loader and worker-authentication controls.
+
+Fallback uses the original deny-all network and filesystem rules with the host
+mount view. An explicitly granted temporary write remains on the host; an
+ungranted write remains denied. The default managed build scratch is under `/tmp`,
+so it selects fallback too. Private-mode acceptance fixtures explicitly place all
+required paths outside the covered roots. No persisted record or identity changes.
 
 ## Private PID namespace topology, opt-in (#3321, stage 1)
 

@@ -346,6 +346,15 @@ same-image rule. Visible effect: within a private build the alias path has the
 primary's inode. The host, the deny-all fallback and non-build spawns are
 unchanged. Retire with the upstream port of this mechanism.
 
+## Covered build inputs (#3337)
+
+Private-build selection now accounts for request read/write roots and directory
+environment values before fork. The existing worker bootstrap carries PATH and
+tool homes as well as temporary directories; loader and authentication controls
+remain excluded. Brush's existing PATH default is made explicit before bootstrap
+so inherited search directories participate in the same decision. No authority
+record, content identity, or caller grant changes.
+
 ## Private PID namespace switch and reported build mode (#3321, stage 1)
 
 Design: `docs/design/private-pid-namespace.md`.
@@ -362,8 +371,8 @@ tag stays `private-build`.
 
 `BuildIsolation` (`Private` or `DenyAllFallback`) is new on `ConfinedChild` and
 `SandboxedWorkerChild` as `build_isolation: Option<BuildIsolation>`. The spawn
-funnel already decided the mode with its retry flag and then dropped it; it now
-carries it out. This is harness memory, not child output: a build can imitate
+funnel's shared fallback flag covers both preselected fallback and a retry after
+private setup fails; the reported mode reads that flag after spawning. This is harness memory, not child output: a build can imitate
 the diagnostic line on stderr but not this field. It is `None` unless the child
 was spawned under `PrivateBuild` on Linux. `ManagedSpawn` and
 `ConfinedTokioChild` do not carry it yet.

@@ -200,7 +200,7 @@ impl CaveatInterceptor {
     }
 
     /// Start the real tool instead of a platform locator stub (#3156): see
-    /// [`launcher_image`]. The directory is host policy, never learned here.
+    /// `launcher_image`. The directory is host policy, never learned here.
     #[must_use]
     pub(crate) fn with_launcher_image_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
         self.launcher_image_dir = dir;
@@ -404,6 +404,7 @@ impl CaveatInterceptor {
 /// host policy, and the image must be a regular file that is neither the stub nor
 /// another launcher. `permitted` is the exec grant, so a session that did not
 /// admit the real tool keeps the stub and the ordinary denial, never a wider run.
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
 fn launcher_image(
     program: &Path,
     dir: &Path,
@@ -574,6 +575,7 @@ mod tests {
     /// trivial tool with default (`top`) requirements so `effective == granted`.
     /// #3156: a launcher stub is replaced by the same-named real tool in the host's
     /// directory, only when every condition holds; anything else keeps the stub.
+    #[cfg(unix)]
     #[test]
     fn launcher_image_replaces_only_a_recognised_stub_with_a_permitted_real_tool() {
         let root = std::env::temp_dir().join(format!("bridle-3156-launcher-{}", std::process::id()));

@@ -165,8 +165,9 @@ pub enum ChildNetworkPolicy {
     DenyDirect,
     /// Build-only isolation: private user/network/mount namespaces, loopback,
     /// bounded private temporary filesystems and a private PTY instance. Any
-    /// setup failure retains the existing DenyDirect floor and grants no host
-    /// temporary write or terminal access.
+    /// setup failure retains the existing DenyDirect floor without adding host
+    /// temporary write or terminal authority. Host terminals and non-AF_UNIX
+    /// sockets on stdio refuse exec in both private and fallback modes.
     /// The legacy tag is readable; serialization names the broader mechanism
     /// so its content-addressed fence identity cannot equal the network-only one.
     #[serde(alias = "private-loopback")]

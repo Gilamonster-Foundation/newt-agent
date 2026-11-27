@@ -13,6 +13,37 @@ fn main() {
     }
     newt_core::answer_nextest_listing("brush_build_pipeline");
     #[cfg(target_os = "linux")]
+    if let Some(path) = std::env::args().find_map(|arg| {
+        arg.strip_prefix("--build-granted-write-probe=")
+            .map(std::path::PathBuf::from)
+    }) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"granted host write").unwrap();
+        println!("BUILD_GRANTED_WRITE_COMPLETED");
+        use std::os::unix::fs::MetadataExt;
+        let expected = std::env::args()
+            .find_map(|arg| arg.strip_prefix("--host-mounts=").map(str::to_owned))
+            .unwrap();
+        let actual = [
+            "/proc/self/ns/mnt",
+            "/tmp",
+            "/dev/shm",
+            "/dev/pts",
+            "/dev/ptmx",
+            "/etc/passwd",
+            "/etc/group",
+        ]
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        })
+        .join(",");
+        if actual == expected {
+            println!("BUILD_HOST_MOUNTS_CONFIRMED");
+        }
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if let Some(probe) =
         std::env::args().find_map(|arg| arg.strip_prefix("--build-pid-probe=").map(str::to_owned))
     {
@@ -172,6 +203,13 @@ fn main() {
         println!("BUILD_PRIVATE_IDENTITY_CONFIRMED");
         return;
     }
+
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--toolchains-3327") {
+        toolchains::run();
+        return;
+    }
+
     #[cfg(target_os = "linux")]
     if let Some(names) = std::env::args().find_map(|arg| {
         arg.strip_prefix("--build-scratch-probe=")
@@ -704,7 +742,7 @@ mod native {
             let deny_devpts = std::env::args().any(|arg| arg == "--deny-build-devpts");
             let deny_identity = std::env::args().any(|arg| arg == "--deny-build-identity");
             // `move_mount` is used only to attach the same-object Git alias, the
-            // last setup step: scratch, terminals and account files exist by then.
+            // last mount setup step: scratch, terminals and account files exist by then.
             let deny_alias = std::env::args().any(|arg| arg == "--deny-build-alias-bind");
             // The PID step is its own unshare with exactly this argument, so
             // the combined user/network/mount unshare before it still succeeds.
@@ -900,6 +938,10 @@ mod native {
                 build_tests_can_bind_a_unix_socket_in_a_tempdir(&root).await;
             }
             #[cfg(target_os = "linux")]
+            if selected("build_tests_granted_temporary_root_remains_visible") {
+                build_tests_granted_temporary_root_remains_visible(&root).await;
+            }
+            #[cfg(target_os = "linux")]
             if selected("build_tests_temporary_workspace_retains_fallback") {
                 let covered = tempfile::tempdir_in("/tmp").unwrap();
                 build_network_probe(
@@ -1034,6 +1076,15 @@ mod native {
         let cargo_home = root.join("cargo-home");
         std::fs::create_dir_all(home.join(".newt")).unwrap();
         std::fs::create_dir(&cargo_home).unwrap();
+        for directory in ["bin", "registry", "git"] {
+            std::fs::create_dir(cargo_home.join(directory)).unwrap();
+        }
+        for config in ["config", "config.toml"] {
+            std::fs::write(cargo_home.join(config), "").unwrap();
+        }
+        let bin_home = home.join(".local/bin");
+        std::fs::create_dir_all(&bin_home).unwrap();
+        std::env::set_var("XDG_BIN_HOME", bin_home);
         std::env::set_var("HOME", &home);
         std::env::set_var("USER", "untrusted-build-user");
         std::env::set_var("LOGNAME", "untrusted-build-login");
@@ -1052,6 +1103,7 @@ mod native {
         let workspace = root.join(name);
         let outside = root.join(format!("{name}-outside"));
         std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::create_dir(workspace.join("target")).unwrap();
         std::fs::create_dir(&outside).unwrap();
         let secret = outside.join("secret");
         let forbidden = outside.join("write");
@@ -1332,10 +1384,118 @@ mod native {
         eprintln!("test cached_build_runs_the_original_pipeline_once ... ok");
     }
 
+    /// Grounds the mocked covered-path fallback decision and Build extra-write
+    /// grants and reported mode on the argv and Brush routes: successful writes must
+    /// survive on the host, rather than disappear with a private tmpfs.
+    #[cfg(target_os = "linux")]
+    async fn build_tests_granted_temporary_root_remains_visible(root: &Path) {
+        use newt_core::confined_exec::build_tool_caveats_with_writes;
+        let (workspace, _) = project(root, "granted-temporary-root");
+        let granted = tempfile::tempdir_in("/tmp").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut caveats = build_tool_caveats_with_writes(
+            &workspace,
+            &[granted.path().to_str().unwrap().to_owned()],
+        );
+        if let Scope::Only(reads) = &mut caveats.fs_read {
+            reads.insert(executable.to_str().unwrap().to_owned());
+        }
+        use agent_bridle::Tool;
+        let policy = std::sync::Arc::new(agent_bridle::SandboxPolicy {
+            child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
+            ..Default::default()
+        });
+        let brush = agent_bridle::BrushShellTool::new().with_sandbox_policy(policy.clone());
+        let cx = agent_bridle::Gate::new(0)
+            .authorize(&brush, &caveats)
+            .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let mounts = [
+            "/proc/self/ns/mnt",
+            "/tmp",
+            "/dev/shm",
+            "/dev/pts",
+            "/dev/ptmx",
+            "/etc/passwd",
+            "/etc/group",
+        ]
+        .map(|path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            format!("{}:{}", metadata.dev(), metadata.ino())
+        })
+        .join(",");
+        let mounts = format!("--host-mounts={mounts}");
+        let mut visible = Vec::new();
+        for route in ["argv", "Brush"] {
+            let path = granted.path().join(route);
+            let probe = format!("--build-granted-write-probe={}", path.display());
+            let output = if route == "argv" {
+                let output = agent_bridle::ConfinedCommand::new(executable.to_str().unwrap())
+                    .args([probe.as_str(), mounts.as_str()])
+                    .current_dir(&workspace)
+                    .sandbox_policy(policy.clone())
+                    .stdin(agent_bridle::ConfinedStdio::Null)
+                    .stdout(agent_bridle::ConfinedStdio::Piped)
+                    .stderr(agent_bridle::ConfinedStdio::Piped)
+                    .spawn(&cx)
+                    .unwrap();
+                assert_eq!(
+                    output.build_isolation,
+                    Some(agent_bridle::BuildIsolation::DenyAllFallback),
+                    "covered inputs select fallback before any retry"
+                );
+                let output = output.child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            } else {
+                // run_command deliberately rebuilds narrower Build grants. Use
+                // its existing Brush mechanism directly to retain this extra root.
+                let source = format!(
+                    "cargo --version && '{}' {probe} {mounts}",
+                    executable.display()
+                );
+                let output = brush
+                    .invoke(serde_json::json!({"cmd": source, "cwd": workspace, "env": {"HOME": workspace}}), &cx)
+                    .await
+                    .unwrap();
+                assert_eq!(output["exit_code"], 0, "{output}");
+                format!(
+                    "{}\n{}",
+                    output["stdout"].as_str().unwrap(),
+                    output["stderr"].as_str().unwrap()
+                )
+            };
+            assert!(output.contains("BUILD_GRANTED_WRITE_COMPLETED"), "{output}");
+            let persisted = std::fs::read(&path).is_ok_and(|bytes| bytes == b"granted host write");
+            let host_mounts = output.contains("BUILD_HOST_MOUNTS_CONFIRMED");
+            eprintln!("build_tests_granted_temporary_root_remains_visible ({route}): host write visible={persisted}; host mounts={host_mounts}");
+            visible.push(persisted && host_mounts && output.contains("deny-all fallback"));
+        }
+        assert!(
+            visible.into_iter().all(|persisted| persisted),
+            "both granted writes must survive on the host in fallback mode"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     fn assert_build_mode(diagnostic: &str, name: &str, route: &str) {
         for (switch, mode) in [
-            ("--require-build-netns", "private loopback only"),
+            (
+                "--require-build-netns",
+                if name == "build_tests_temporary_workspace_retains_fallback" {
+                    "deny-all fallback"
+                } else {
+                    "private loopback only"
+                },
+            ),
             ("--deny-build-netns", "deny-all fallback"),
             ("--deny-build-mounts", "deny-all fallback"),
             ("--deny-build-devpts", "deny-all fallback"),
@@ -1376,7 +1536,7 @@ mod native {
     }
 
     #[cfg(target_os = "linux")]
-    fn argv_build_probe(workspace: &Path, probe: &str) -> (bool, Vec<u8>, Vec<u8>) {
+    fn argv_build_probe(workspace: &Path, name: &str, probe: &str) -> (bool, Vec<u8>, Vec<u8>) {
         use newt_core::confined_exec::{build_tool_request, ConstrainedExecutor};
         let executable = std::env::current_exe().unwrap();
         let request = build_tool_request(
@@ -1432,7 +1592,14 @@ mod native {
         if std::env::args().any(|arg| arg.starts_with("--deny-build-")) {
             assert_eq!(isolation, agent_bridle::BuildIsolation::DenyAllFallback);
         } else if std::env::args().any(|arg| arg == "--require-build-netns") {
-            assert_eq!(isolation, agent_bridle::BuildIsolation::Private);
+            assert_eq!(
+                isolation,
+                if name == "build_tests_temporary_workspace_retains_fallback" {
+                    agent_bridle::BuildIsolation::DenyAllFallback
+                } else {
+                    agent_bridle::BuildIsolation::Private
+                }
+            );
         }
         let output = child.child.wait_with_output().unwrap();
         eprintln!("PIDNS_ARGV_STAGING_ON: {probe}: {isolation:?}");
@@ -1451,18 +1618,27 @@ mod native {
     /// real master/slave transport, ioctl contract and per-instance allocation bound.
     /// The identity twin grounds fdguard's mocked account-line validation in
     /// real NSS lookups, readonly object grants and unchanged host databases.
-    /// `--require-build-netns` rejects fallback on every probe and both routes;
-    /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
+    /// `--require-build-netns` rejects fallback except for the deliberately
+    /// covered workspace; `--deny-build-netns` forces setup to fail.
     /// `--deny-build-identity` forces a later failure at the account remount.
     /// The Git alias twin (`support/git_alias_bind.rs`) grounds the same-object
-    /// binding; `--deny-build-alias-bind` fails its attach, the last setup
-    /// step, and the retried child must then report no binding at all.
+    /// binding; `--deny-build-alias-bind` fails its attach before the PID step,
+    /// and the retried child must then report no binding at all.
     #[cfg(target_os = "linux")]
     async fn build_network_probe(root: &Path, name: &str, probe: &str, marker: &str) {
         use newt_core::confined_exec::build_tool_caveats;
 
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::fs::MetadataExt;
+        // Required-private probes need an uncovered scratch root. Keep its
+        // spelling short enough for the Unix socket probe's sockaddr_un.
+        let scratch_root = tempfile::Builder::new()
+            .prefix("")
+            .rand_bytes(3)
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
+        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", scratch_root.path());
         let host_pty = if probe == "--build-pty-probe" {
             // Allocate our own host canary; never use the operator's terminal.
             let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
@@ -1631,7 +1807,7 @@ mod native {
             .unwrap();
         }
         let executable = std::env::current_exe().unwrap();
-        let (argv_success, argv_stdout, argv_stderr) = argv_build_probe(&workspace, &probe);
+        let (argv_success, argv_stdout, argv_stderr) = argv_build_probe(&workspace, name, &probe);
         let source = format!(
             "cargo build --lib --offline && '{}' {probe} --build-network-auto",
             executable.display()
@@ -1738,6 +1914,9 @@ mod native {
             let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, 0, 0, 1) };
             assert!(abi >= 3);
             let mut caveats = build_tool_caveats(&workspace);
+            // The raw argv check below owns no executor scratch lease.
+            std::fs::create_dir_all(newt_core::confined_exec::build_scratch_root(&workspace))
+                .unwrap();
             if let Scope::Only(reads) = &mut caveats.fs_read {
                 reads.insert(executable.to_str().unwrap().to_owned());
             }
@@ -1820,6 +1999,10 @@ mod native {
             );
         }
         assert!(!outside.join("write").exists());
+        match previous_scratch {
+            Some(value) => std::env::set_var("NEWT_BUILD_SCRATCH_DIR", value),
+            None => std::env::remove_var("NEWT_BUILD_SCRATCH_DIR"),
+        }
         eprintln!(
             "test {name} ... ok ({})",
             if pidns_argv_enabled() {
@@ -1831,7 +2014,7 @@ mod native {
     }
 
     /// Grounds fdguard's mocked relay decision and `clone_args` layout, and
-    /// core's mocked retry-flag mode, in real processes on both spawn funnels
+    /// core's mocked fallback-flag mode, in real processes on both spawn funnels
     /// with the staging switch on (`docs/design/private-pid-namespace.md`).
     /// The payload is PID 2 with no visible parent and leads its own group;
     /// the harness is not nameable; `spawn` returns while the payload is still
@@ -1848,6 +2031,10 @@ mod native {
         use std::io::{BufRead, Read};
 
         let name = "build_tests_private_pid_namespace";
+        // Like the other private-mode probes, use an uncovered scratch root:
+        // main's covered-input decision must remain in force with PID staging on.
+        let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
+        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", root.join("private-pid-scratch"));
         let (workspace, _) = project(root, name);
         let executable = std::env::current_exe().unwrap();
         let mut caveats = newt_core::confined_exec::build_tool_caveats(&workspace);
@@ -2046,6 +2233,10 @@ mod native {
         drop(worker);
         eprintln!("{name} (Brush): killing the spawned child ended the worker");
         eprintln!("test {name} ... ok (argv and Brush funnels)");
+        match previous_scratch {
+            Some(value) => std::env::set_var("NEWT_BUILD_SCRATCH_DIR", value),
+            None => std::env::remove_var("NEWT_BUILD_SCRATCH_DIR"),
+        }
     }
 
     /// Grounds structural wrapper selection in the actual native timeout and
@@ -2074,7 +2265,14 @@ mod native {
                     "Build denial must precede the first source effect: {output}"
                 );
                 assert!(!workspace.join("build-count").exists(), "{output}");
-                assert!(!workspace.join("target").exists(), "{output}");
+                // The fixture creates `target` up front; denial leaves it empty.
+                assert!(
+                    std::fs::read_dir(workspace.join("target"))
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                    "{output}"
+                );
             } else {
                 assert!(
                     output.contains(MARKER),
@@ -2638,3 +2836,7 @@ mod native {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "common/toolchains.rs"]
+mod toolchains;

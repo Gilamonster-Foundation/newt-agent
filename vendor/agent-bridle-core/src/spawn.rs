@@ -55,22 +55,22 @@ use crate::effective_sandbox_kind;
 
 /// The build-only isolation actually in force around a `PrivateBuild` child.
 ///
-/// Harness memory, read from the spawn funnel's own retry flag. A child's
+/// Harness memory, read from the spawn funnel's shared fallback flag. A child's
 /// diagnostic line says the same thing but is child output, which a build can
 /// imitate; a caller that decides anything on the mode reads this instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildIsolation {
     /// Every private mechanism was installed before the program ran.
     Private,
-    /// Private setup failed before exec; a fresh child ran under both
+    /// Private setup was declined or failed before exec; the child ran under both
     /// deny-all floors and never entered a namespace.
     DenyAllFallback,
 }
 
 impl BuildIsolation {
     #[cfg(any(target_os = "linux", test))]
-    fn from_retry(retried: bool) -> Self {
-        if retried {
+    fn from_fallback(fallback: bool) -> Self {
+        if fallback {
             Self::DenyAllFallback
         } else {
             Self::Private
@@ -1104,7 +1104,9 @@ impl ConfinedCommand {
                 } else {
                     spawned
                 };
-                return Ok((child?, Some(BuildIsolation::from_retry(retry))));
+                return Ok((child?, Some(BuildIsolation::from_fallback(
+                    fallback.load(std::sync::atomic::Ordering::Relaxed),
+                ))));
             }
             #[cfg(not(target_os = "linux"))]
             let _ = isolation_fallback;
@@ -1253,7 +1255,7 @@ impl SandboxedWorker {
         }
     }
 
-    /// Carry only private-build directory variables into the existing pre-exec
+    /// Carry build directory controls (including PATH and tool homes) into pre-exec
     /// setup. The full environment remains in the authenticated worker payload;
     /// loader controls and the worker nonce cannot enter through this seam.
     #[must_use]
@@ -1261,9 +1263,9 @@ impl SandboxedWorker {
         self.temporary_env = {
             #[cfg(target_os = "linux")]
             {
-                agent_bridle_fdguard::build_isolation::TEMPORARY_ENV
-                    .into_iter()
-                    .filter_map(|name| env.get(name).map(|value| (name.to_owned(), value.clone())))
+                env.iter()
+                    .filter(|(name, _)| agent_bridle_fdguard::build_isolation::is_path_env(name.as_ref()))
+                    .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             }
             #[cfg(not(target_os = "linux"))]
@@ -2299,14 +2301,13 @@ mod tests {
     use crate::enforcement_report;
     use crate::{Gate, Tool};
 
-    /// The funnel's retry flag is the only source of the reported mode: no
-    /// retry means the private view was installed, a retry means the fresh
-    /// child ran under both deny-all floors.
+    /// The shared fallback flag is the only source of the reported mode. It
+    /// covers both a pre-fork decision and a retry after failed private setup.
     #[test]
-    fn build_isolation_is_read_from_the_retry_flag() {
-        assert_eq!(BuildIsolation::from_retry(false), BuildIsolation::Private);
+    fn build_isolation_is_read_from_the_fallback_flag() {
+        assert_eq!(BuildIsolation::from_fallback(false), BuildIsolation::Private);
         assert_eq!(
-            BuildIsolation::from_retry(true),
+            BuildIsolation::from_fallback(true),
             BuildIsolation::DenyAllFallback
         );
     }
@@ -2318,13 +2319,21 @@ mod tests {
             ("HOME", "/tmp/home"),
             ("TMPDIR", "/tmp/scratch"),
             ("XDG_RUNTIME_DIR", "/dev/shm/runtime"),
+            ("PATH", "/usr/bin:/tmp/bin"),
+            ("CARGO_HOME", "/tmp/cargo"),
+            ("RUSTUP_HOME", "/dev/shm/rustup"),
+            ("JAVA_HOME", "/tmp/java"),
             ("LD_PRELOAD", "/tmp/attacker.so"),
             ("BASH_ENV", "/tmp/attacker.sh"),
             ("AGENT_BRIDLE_WORKER_NONCE", "forged"),
         ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
         assert!(SandboxedWorker::brush().temporary_env.is_empty());
         assert_eq!(SandboxedWorker::brush().temporary_env(&env).temporary_env, vec![
+            ("CARGO_HOME".to_owned(), "/tmp/cargo".to_owned()),
             ("HOME".to_owned(), "/tmp/home".to_owned()),
+            ("JAVA_HOME".to_owned(), "/tmp/java".to_owned()),
+            ("PATH".to_owned(), "/usr/bin:/tmp/bin".to_owned()),
+            ("RUSTUP_HOME".to_owned(), "/dev/shm/rustup".to_owned()),
             ("TMPDIR".to_owned(), "/tmp/scratch".to_owned()),
             ("XDG_RUNTIME_DIR".to_owned(), "/dev/shm/runtime".to_owned()),
         ]);

@@ -173,7 +173,7 @@ seccomp(filter); landlock_restrict_self(ruleset); write(2, mode line); Ok(())   
   - failure in the relay before the second clone: the hook returns `RETRY_DENY_ALL`, std reports it, the relay exits, init sees lifeline EOF;
   - failure in the payload after the second clone (proc mount, grant): the payload returns `RETRY_DENY_ALL`, std in the payload writes the error and exits 1, the relay reaps it, kills and reaps init, exits; the harness's std reads the error and reaps the relay.
   In both, no program has run and the fresh child never unshares. Seccomp or Landlock install failure in the payload still refuses outright, as today.
-- **Mode, trusted.** The retry flag is currently dropped after the retry. Carry it out as `ConfinedChild::build_isolation: Option<BuildIsolation>` (`Private` or `DenyAllFallback`) and the same on `SandboxedWorkerChild`. This is harness memory, not child output, and both authentication and the diagnostic use it (4.5, 4.6).
+- **Mode, trusted.** Carry the shared fallback flag, including preselected fallback, out as `ConfinedChild::build_isolation: Option<BuildIsolation>` (`Private` or `DenyAllFallback`) and the same on `SandboxedWorkerChild`. This is harness memory, not child output, and both authentication and the diagnostic use it (4.5, 4.6).
 - **Stable handles** (stage 2). `confine()` creates one CLOEXEC pipe; the relay writes `[Hi, Hp]` (two `u32`, one 8-byte write) after init is ready and before the second clone. Since the payload cannot exist before that write, when `spawn()` returns `Ok` the bytes are already in the pipe: the harness does a non-blocking read and refuses the spawn (kill, error) if they are absent. The harness then:
   - opens `pidfd_open(Hi)` and `pidfd_open(Hp)` (rustix, safe);
   - verifies in its own `/proc` that both have ppid `C`. `C` is the un-reaped `Child`, so its PID cannot be recycled, and only the relay creates children of `C`, so a recycled `Hi` or `Hp` could not have parent `C`.
@@ -363,7 +363,7 @@ Each PR updates the relevant `NEWT_PATCHES.md` and, where behaviour changes, `do
 
 **PR 1. fdguard: private PID namespace topology, opt-in (about 500 lines).**
 - Change: the PID step, relay and init in `build_isolation.rs`; `SandboxPolicy::private_pid_namespace` (serde default false, a staging switch removed in PR 9); `BuildIsolation` on `ConfinedChild` and `SandboxedWorkerChild`.
-- Red-first unit tests (mocked, no processes): the relay's status decision as a pure function (exit code, signal, ptrace stop); `clone_args` layout is 88 bytes with `exit_signal` at offset 32; `BuildIsolation` from the retry flag.
+- Red-first unit tests (mocked, no processes): the relay's status decision as a pure function (exit code, signal, ptrace stop); `clone_args` layout is 88 bytes with `exit_signal` at offset 32; `BuildIsolation` from the shared fallback flag.
 - Real-resource proof in `brush_build_pipeline.rs`, new probe `--build-pid-probe`:
   - argv funnel (`ConfinedCommand` with the switch): payload prints PID 2, ppid 0, group leader; `kill(<harness pid>, 0)` is ESRCH; marker `BUILD_PRIVATE_PIDNS_CONFIRMED`.
   - `spawn()` returns while the payload is still blocked on a pipe the test holds (pins R8, replaces the 251 ms measurement with a causal assertion).
