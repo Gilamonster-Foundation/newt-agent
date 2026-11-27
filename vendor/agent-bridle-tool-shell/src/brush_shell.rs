@@ -287,7 +287,7 @@ impl Tool for BrushShellTool {
         // safe-subset engines. Before this, brush silently DROPPED `env` even
         // though the schema advertised it — losing HOME/USER/VIRTUAL_ENV and
         // re-opening the #783-class `~`-expansion bug under this engine.
-        let env: BTreeMap<String, String> = args
+        let mut env: BTreeMap<String, String> = args
             .get("env")
             .and_then(serde_json::Value::as_object)
             .map(|m| {
@@ -308,6 +308,9 @@ impl Tool for BrushShellTool {
             RESTRICTED_PATH.to_string()
         };
 
+        // Pre-exec must see the same effective search path as the shell below.
+        env.entry("PATH".to_string()).or_insert_with(|| path_value.clone());
+
         if let Some((root, argv)) = crate::named_host_root::select_named_host_root(
             self.named_host_roots && self.command_broker.is_none(),
             &cmd,
@@ -318,8 +321,6 @@ impl Tool for BrushShellTool {
             let mut request = agent_bridle_core::ExecutionRequest::new(root)
                 .args(argv)
                 .cwd(cwd);
-            let mut env = env;
-            env.entry("PATH".to_string()).or_insert(path_value);
             request.env = env.into_iter().collect();
             return crate::named_host_root_execution::invoke_named_host_root(
                 cx,

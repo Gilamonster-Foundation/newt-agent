@@ -1,7 +1,7 @@
 //! `newt caps` — the content identity of a vetted tool tree (#3034).
 //!
 //! `digest` names a directory by the root id of a
-//! [`dir_tree::snapshot`]: one CIDv1 over every file's bytes, name and place,
+//! [`content_addressable::structures::dir_tree::snapshot`]: one CIDv1 over every file's bytes, name and place,
 //! so an operator can approve exact bytes rather than a path. The id is minted
 //! by `content-addressable`; this module only refuses what the snapshot must
 //! not silently accept, and reports.
@@ -15,13 +15,11 @@
 //! node bytes are non-frozen upstream, which is why the workspace pins
 //! `content-addressable` exactly.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Subcommand;
-use content_addressable::structures::dir_tree::{self, DirNode, Link};
-use content_addressable::{ContentAddressable, MemoryStore, NodeStoreExt};
-use serde::Serialize;
+use newt_core::tool_tree::digest;
 
 #[derive(Subcommand, Debug)]
 pub enum CapsCmd {
@@ -37,15 +35,6 @@ pub enum CapsCmd {
     },
 }
 
-/// `size` is the total file bytes; `entries` counts every file and
-/// subdirectory below the root.
-#[derive(Debug, Serialize)]
-struct Digest {
-    cid: String,
-    size: u64,
-    entries: u64,
-}
-
 pub fn run(cmd: &CapsCmd) -> Result<()> {
     let CapsCmd::Digest { dir, json } = cmd;
     let d = digest(dir)?;
@@ -55,63 +44,6 @@ pub fn run(cmd: &CapsCmd) -> Result<()> {
         println!("{}", d.cid);
     }
     Ok(())
-}
-
-fn digest(dir: &Path) -> Result<Digest> {
-    refuse_hard_links(dir)?;
-    let mut store = MemoryStore::new();
-    let root = dir_tree::snapshot(&mut store, dir)?;
-    let (size, entries) = tally(&store, &root)?;
-    Ok(Digest {
-        cid: root.content_id()?.to_string(),
-        size,
-        entries,
-    })
-}
-
-/// Bytes and entries below `link`, read back from the nodes the snapshot
-/// stored, so the report describes exactly what was digested.
-fn tally(store: &MemoryStore, link: &Link) -> Result<(u64, u64)> {
-    match link {
-        Link::File { size, .. } => Ok((*size, 0)),
-        Link::Dir { id } => {
-            let node: DirNode = store.get_node(id)?;
-            node.entries().values().try_fold((0, 0), |(size, n), l| {
-                let (s, m) = tally(store, l)?;
-                Ok((size + s, n + m + 1))
-            })
-        }
-    }
-}
-
-/// Refuse a regular file with more than one link anywhere under `path`: it
-/// aliases bytes in the tree to a path outside it, which could change them
-/// after approval. The snapshot already refuses symlinks, fifos, sockets and
-/// devices with a named error; this walk adds only the link count it does not
-/// check, and never follows a symlink.
-#[cfg(unix)]
-fn refuse_hard_links(path: &Path) -> Result<()> {
-    use anyhow::Context;
-    use std::fs;
-    use std::os::unix::fs::MetadataExt;
-    let meta = fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
-    if meta.is_dir() {
-        let entries = fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?;
-        for entry in entries {
-            refuse_hard_links(&entry?.path())?;
-        }
-    } else if meta.is_file() && meta.nlink() > 1 {
-        bail!("hard link refused: {}", path.display());
-    }
-    Ok(())
-}
-
-/// Off unix std has no stable link count (`number_of_links` is unstable), so
-/// the check cannot run, and a digest that skipped it could silently accept an
-/// NTFS hard link. Fail closed.
-#[cfg(not(unix))]
-fn refuse_hard_links(_: &Path) -> Result<()> {
-    bail!("hard-link check unavailable on this platform; refusing to digest")
 }
 
 #[cfg(test)]
@@ -140,7 +72,7 @@ mod tests {
         let tmp = fixture();
         let d = digest(tmp.path()).unwrap();
         assert_eq!(
-            d.cid,
+            d.cid.to_string(),
             "bafyr4ie6bqltrjdtpotlrvwclem35wba46vxg62xhyuezx5fhu5dduje74"
         );
     }
