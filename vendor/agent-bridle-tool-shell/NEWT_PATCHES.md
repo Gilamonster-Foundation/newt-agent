@@ -27,7 +27,17 @@ Integration changes:
   captured stderr with the computed timeout in milliseconds, syscall phase,
   I/O error kind and raw errno; malformed-frame diagnostics omit decoder text
   that can echo peer-supplied fields. Pure injected-budget and diagnostic tests
-  cover this boundary; the hosted macOS close cause still needs native evidence.
+  cover this boundary. Native macOS stress reproduced the descriptor-in-flight
+  close race: retain the client's sent socket end without I/O until the server
+  hello and both kernel identity lookups succeed. Failures release it by RAII;
+  a server that dies before hello now reaches the existing finite read timeout.
+  Reply endpoints stay owned until the receiver acknowledges receipt on the RPC
+  socket. Worker bootstrap already retains its endpoint through its existing
+  authentication ACK (`send_payload_with_control_channel` in core); the borrowed
+  `delegated_control::send_control_endpoint` needs no protocol change. The two
+  manual sender fixtures also retain their copies until hello receipt. Mocked
+  lifetime/error tests and the explicit `broker_transport_real` harness ground
+  the ordering, timeout and repeated production handshake (including replies).
 
 - #3093: expose the existing static word parser through a source-bound
   single-argument helper. Broker arguments such as `owner/r` and `done` are

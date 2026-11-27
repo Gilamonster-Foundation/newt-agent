@@ -652,10 +652,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         agent_bridle_core::send_control_endpoint(&endpoint, &remote).unwrap();
-        drop(remote);
         // The server has accepted the socket and is waiting for client proof.
         let mut hello = [0; 44];
         stalled.read_exact(&mut hello).unwrap();
+        drop(remote);
         assert!(!dropped.load(Ordering::Acquire));
         cancelled.store(true, Ordering::Release);
         let start = Instant::now();

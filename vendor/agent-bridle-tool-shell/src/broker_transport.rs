@@ -89,27 +89,25 @@ impl BrokerClient {
                 "broker request exceeds its bounded payload budget",
             ));
         }
-        let (mut local, remote) = UnixStream::pair()
-            .map_err(|error| broker_io("create pair", error))?;
-        local.set_read_timeout(Some(timeout))
+        let (mut local, remote) =
+            UnixStream::pair().map_err(|error| broker_io("create pair", error))?;
+        local
+            .set_read_timeout(Some(timeout))
             .map_err(|error| broker_io("set read timeout", error))?;
-        local.set_write_timeout(Some(timeout))
+        local
+            .set_write_timeout(Some(timeout))
             .map_err(|error| broker_io("set write timeout", error))?;
         crate::private_control::prepare_broker_receiver(&local)?;
         send_control_endpoint(&self.endpoint, &remote).map_err(|error| {
-            ToolError::denied(format!("broker delegation socket send RPC endpoint: {error}"))
+            ToolError::denied(format!(
+                "broker delegation socket send RPC endpoint: {error}"
+            ))
         })?;
-        drop(remote);
-        // The server names itself in a kernel-attested message. Endpoint
-        // delegation, not this claimed PID, selected the server capability.
-        let mut hello = [0; 44];
-        let server_pid = crate::private_control::read_broker_peer(&local, &mut hello)
-            .map_err(|error| ToolError::denied(format!("broker server hello: {error}")))?;
-        if &hello[..8] != HELLO || hello[8..12] != server_pid.to_le_bytes() {
-            return Err(ToolError::denied("broker server hello identity mismatch"));
-        }
-        let challenge = hello[12..].to_vec();
-        local.write_all(&std::process::id().to_le_bytes())
+        let challenge = read_server_hello(remote, |hello| {
+            crate::private_control::read_broker_peer(&local, hello)
+        })?;
+        local
+            .write_all(&std::process::id().to_le_bytes())
             .map_err(|error| broker_io("write client PID", error))?;
         let request = make_frame(
             payload.to_vec(),
@@ -125,9 +123,13 @@ impl BrokerClient {
             return Err(ToolError::denied(error.clone()));
         }
         let endpoint = if response.node.payload().endpoint {
-            Some(receive_control_endpoint(&local).map_err(|error| {
+            let endpoint = receive_control_endpoint(&local).map_err(|error| {
                 ToolError::denied(format!("broker RPC socket receive reply endpoint: {error}"))
-            })?)
+            })?;
+            local
+                .write_all(&[1])
+                .map_err(|error| broker_io("acknowledge reply endpoint", error))?;
+            Some(endpoint)
         } else {
             None
         };
@@ -136,6 +138,26 @@ impl BrokerClient {
             endpoint,
         })
     }
+}
+
+fn read_server_hello(
+    remote: impl Sized,
+    read_peer: impl FnOnce(&mut [u8; 44]) -> ToolResult<u32>,
+) -> ToolResult<Vec<u8>> {
+    // The server names itself in a kernel-attested message. Endpoint
+    // delegation, not this claimed PID, selected the server capability.
+    let mut hello = [0; 44];
+    let server_pid = read_peer(&mut hello)
+        .map_err(|error| ToolError::denied(format!("broker server hello: {error}")))?;
+    if &hello[..8] != HELLO || hello[8..12] != server_pid.to_le_bytes() {
+        return Err(ToolError::denied("broker server hello identity mismatch"));
+    }
+    // macOS can lose peer identity if the transferred reference is closed
+    // before receipt. Keep it through the hello and BOTH kernel lookups, with
+    // no I/O on this copy. A missing hello uses the finite read timeout; RAII
+    // also closes the copy on every authentication or I/O failure.
+    drop(remote);
+    Ok(hello[12..].to_vec())
 }
 
 fn make_frame(
@@ -192,17 +214,22 @@ fn write_frame(stream: &mut impl Write, frame: &Frame) -> ToolResult<()> {
     if bytes.len() > MAX_FRAME {
         return Err(ToolError::denied("broker frame exceeds its bound"));
     }
-    stream.write_all(&(bytes.len() as u32).to_le_bytes())
+    stream
+        .write_all(&(bytes.len() as u32).to_le_bytes())
         .map_err(|error| broker_io("write frame length", error))?;
-    stream.write_all(&bytes)
+    stream
+        .write_all(&bytes)
         .map_err(|error| broker_io("write frame body", error))?;
-    stream.flush().map_err(|error| broker_io("flush frame", error))?;
+    stream
+        .flush()
+        .map_err(|error| broker_io("flush frame", error))?;
     Ok(())
 }
 
 fn read_frame(stream: &mut impl Read) -> ToolResult<Frame> {
     let mut length = [0; 4];
-    stream.read_exact(&mut length)
+    stream
+        .read_exact(&mut length)
         .map_err(|error| broker_io("read frame length", error))?;
     let length = u32::from_le_bytes(length) as usize;
     if length == 0 || length > MAX_FRAME {
@@ -211,7 +238,8 @@ fn read_frame(stream: &mut impl Read) -> ToolResult<Frame> {
         ));
     }
     let mut bytes = vec![0; length];
-    stream.read_exact(&mut bytes)
+    stream
+        .read_exact(&mut bytes)
         .map_err(|error| broker_io("read frame body", error))?;
     // Decoder errors can quote peer-supplied field names or values. This error
     // also reaches the server diagnostic stream, so retain only the phase.
@@ -263,9 +291,11 @@ fn serve_request_inner(
     timeout: Duration,
 ) -> ToolResult<()> {
     control.check()?;
-    stream.set_read_timeout(Some(timeout))
+    stream
+        .set_read_timeout(Some(timeout))
         .map_err(|error| broker_io("set read timeout", error))?;
-    stream.set_write_timeout(Some(timeout))
+    stream
+        .set_write_timeout(Some(timeout))
         .map_err(|error| broker_io("set write timeout", error))?;
     crate::private_control::prepare_broker_receiver(&stream)?;
     let mut challenge = [0; 32];
@@ -275,7 +305,8 @@ fn serve_request_inner(
     hello.extend_from_slice(&challenge);
     // Setup can consume the remaining budget; never announce an expired request.
     control.check()?;
-    stream.write_all(&hello)
+    stream
+        .write_all(&hello)
         .map_err(|error| broker_io("write server hello", error))?;
     let mut declared_pid = [0; 4];
     let peer_pid = crate::private_control::read_broker_peer(&stream, &mut declared_pid)
@@ -315,7 +346,22 @@ fn serve_request_inner(
         send_control_endpoint(&stream, &endpoint).map_err(|error| {
             ToolError::denied(format!("broker RPC socket send reply endpoint: {error}"))
         })?;
+        read_endpoint_ack(endpoint, &mut stream)?;
     }
+    Ok(())
+}
+
+fn read_endpoint_ack(endpoint: impl Sized, stream: &mut impl Read) -> ToolResult<()> {
+    // The bounded RPC socket carries receipt; never use the retained copy for
+    // I/O. Failed, missing or invalid acknowledgements release it by ownership.
+    let mut ack = [0];
+    stream
+        .read_exact(&mut ack)
+        .map_err(|error| broker_io("read reply endpoint acknowledgment", error))?;
+    if ack != [1] {
+        return Err(ToolError::denied("invalid reply endpoint acknowledgment"));
+    }
+    drop(endpoint);
     Ok(())
 }
 
@@ -390,6 +436,111 @@ pub(crate) fn process_parent_and_birth(pid: u32) -> ToolResult<(u32, u64)> {
 mod tests {
     use super::*;
 
+    struct Retained<'a>(&'a std::cell::Cell<bool>);
+
+    impl Drop for Retained<'_> {
+        fn drop(&mut self) {
+            assert!(!self.0.replace(true), "endpoint closed twice");
+        }
+    }
+
+    #[test]
+    fn transferred_endpoint_outlives_hello_and_both_identity_lookups() {
+        let closed = std::cell::Cell::new(false);
+        let challenge = read_server_hello(Retained(&closed), |hello| {
+            assert!(
+                !closed.get(),
+                "transferred endpoint closed before hello/identity lookup"
+            );
+            hello[..8].copy_from_slice(HELLO);
+            hello[8..12].copy_from_slice(&42_u32.to_le_bytes());
+            hello[12..].fill(7);
+            // The production closure reads the hello, LOCAL_PEERPID and
+            // LOCAL_PEERTOKEN before returning; the copy must outlive it all.
+            assert!(
+                !closed.get(),
+                "transferred endpoint closed before token lookup"
+            );
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(challenge, vec![7; 32]);
+        assert!(closed.get());
+    }
+
+    #[test]
+    fn transferred_endpoint_closes_on_every_hello_failure() {
+        for phase in [
+            "read peer handshake",
+            "LOCAL_PEERPID",
+            "LOCAL_PEERTOKEN",
+            "magic",
+            "pid",
+        ] {
+            let closed = std::cell::Cell::new(false);
+            let error = read_server_hello(Retained(&closed), |hello| {
+                assert!(!closed.get(), "transferred endpoint closed before {phase}");
+                hello[..8].copy_from_slice(HELLO);
+                hello[8..12].copy_from_slice(&42_u32.to_le_bytes());
+                match phase {
+                    "magic" => {
+                        hello[0] = 0;
+                        Ok(42)
+                    }
+                    "pid" => Ok(43),
+                    _ => Err(broker_io(phase, std::io::ErrorKind::TimedOut.into())),
+                }
+            })
+            .unwrap_err();
+            assert!(closed.get(), "endpoint leaked after {phase}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(if phase == "magic" || phase == "pid" {
+                        "identity mismatch"
+                    } else {
+                        phase
+                    }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn transferred_endpoint_reply_waits_for_receipt_and_closes_on_failure() {
+        struct Receipt<'a> {
+            closed: &'a std::cell::Cell<bool>,
+            read: bool,
+            result: std::io::Result<u8>,
+        }
+        impl Read for Receipt<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert!(!self.closed.get(), "reply endpoint closed before receipt");
+                self.read = true;
+                bytes[0] = std::mem::replace(&mut self.result, Ok(0))?;
+                Ok(1)
+            }
+        }
+        for result in [
+            Ok(1),
+            Ok(0),
+            Err(std::io::ErrorKind::TimedOut.into()),
+            Err(std::io::ErrorKind::UnexpectedEof.into()),
+        ] {
+            let success = matches!(&result, Ok(1));
+            let closed = std::cell::Cell::new(false);
+            let mut receipt = Receipt {
+                closed: &closed,
+                read: false,
+                result,
+            };
+            let result = read_endpoint_ack(Retained(&closed), &mut receipt);
+            assert!(receipt.read, "sender never waited for endpoint receipt");
+            assert_eq!(result.is_ok(), success);
+            assert!(closed.get(), "reply endpoint leaked");
+        }
+    }
+
     #[test]
     fn exhausted_broker_budget_never_starts_the_hello() {
         // Inject a clock at and past the invocation deadline after an earlier
@@ -399,7 +550,10 @@ mod tests {
             let mut hello_written = false;
             let error = with_request_timeout(deadline.saturating_sub(now), |_| {
                 hello_written = true;
-                Err(broker_io("read client PID", std::io::ErrorKind::TimedOut.into()))
+                Err(broker_io(
+                    "read client PID",
+                    std::io::ErrorKind::TimedOut.into(),
+                ))
             })
             .unwrap_err();
             assert!(
@@ -462,7 +616,8 @@ mod tests {
         for bytes in [
             canonical::to_canonical_dagcbor(&"private-payload-marker").unwrap(),
             canonical::to_canonical_dagcbor(&std::collections::BTreeMap::from([(
-                "private-payload-marker", 1,
+                "private-payload-marker",
+                1,
             )]))
             .unwrap(),
         ] {
@@ -474,7 +629,10 @@ mod tests {
             .unwrap_err();
             let message = error.to_string();
             assert!(!message.contains("private-payload-marker"), "{message}");
-            assert!(message.contains("invalid canonical broker frame"), "{message}");
+            assert!(
+                message.contains("invalid canonical broker frame"),
+                "{message}"
+            );
         }
     }
 
@@ -635,10 +793,10 @@ mod tests {
                 .unwrap();
             crate::private_control::prepare_broker_receiver(&local).unwrap();
             send_control_endpoint(&endpoint, &remote).unwrap();
-            drop(remote);
             let mut hello = [0; 44];
             let server = crate::private_control::read_broker_peer(&local, &mut hello).unwrap();
             assert_eq!(server, nix::unistd::getppid().as_raw() as u32);
+            drop(remote);
             // Claim the server's PID; kernel credentials still name this child.
             local.write_all(&server.to_le_bytes()).unwrap();
             let mut byte = [0];
