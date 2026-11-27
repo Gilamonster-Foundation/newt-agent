@@ -1,4 +1,4 @@
-//! Child-side private loopback, scratch and PTYs, with the existing floor on error.
+//! Child-side private loopback, scratch, PTYs and identity, with the existing floor on error.
 //! Allocation happens before fork. Private-mount rules bind descriptors opened
 //! after mounting, before either fence. No host or parent namespace is changed.
 
@@ -20,7 +20,7 @@ pub const RETRY_DENY_ALL: i32 = libc::ENONET;
 /// Loader controls and worker-authentication variables are never in this list.
 pub const TEMPORARY_ENV: [&str; 5] = ["HOME", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"];
 
-pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); external networking unavailable.\n";
+pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; external networking unavailable.\n";
 pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable. Local tests may fail because of this fence.\n";
 
 /// Install the prepared filesystem fence after new user, network and mount
@@ -74,6 +74,9 @@ pub fn confine(
     // uid 0. Kernel credentials continue to name the original host identity.
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
+    // NSS may allocate, load modules or contact a service: resolve only here,
+    // before fork. A failed lookup selects the same fresh-child fallback.
+    let identity = account_files(uid, gid);
     let uid_map = format!("{uid} {uid} 1\n").into_bytes();
     let gid_map = format!("{gid} {gid} 1\n").into_bytes();
     // SAFETY: the hook uses only raw syscalls, stack storage and preallocated
@@ -118,6 +121,12 @@ pub fn confine(
                     .and_then(|()| {
                         private_filesystems(filesystem.as_raw_fd(), scratch_access, &empty_dirs)
                     })
+                    .and_then(|()| {
+                        let files = identity
+                            .as_ref()
+                            .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
+                        private_identity(filesystem.as_raw_fd(), scratch_access, files)
+                    })
                     .is_err()
             {
                 // A partial user namespace cannot be undone. Exit before exec;
@@ -147,6 +156,150 @@ fn temporary_root(path: &std::path::Path) -> Option<&'static std::path::Path> {
     ]
     .into_iter()
     .find(|root| path.starts_with(root))
+}
+
+fn account_files(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<[Vec<u8>; 2]> {
+    // Bound NSS scratch storage; an oversized entry is a setup failure, never
+    // a reason to import the host databases or truncate an account field.
+    let mut buffer = vec![0; 65536];
+    let mut user: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut user_ptr = std::ptr::null_mut();
+    let mut group_ptr = std::ptr::null_mut();
+    // SAFETY: reentrant NSS writes into these live records and scratch storage.
+    // The owned line is completed before the buffer is reused for the group.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut user,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut user_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    if user_ptr.is_null()
+        || user.pw_uid != uid
+        || user.pw_gid != gid
+        || [user.pw_name, user.pw_dir, user.pw_shell]
+            .iter()
+            .any(|p| p.is_null())
+    {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let passwd = unsafe {
+        account_line(&[
+            CStr::from_ptr(user.pw_name).to_bytes(),
+            b"x",
+            uid.to_string().as_bytes(),
+            gid.to_string().as_bytes(),
+            b"",
+            CStr::from_ptr(user.pw_dir).to_bytes(),
+            CStr::from_ptr(user.pw_shell).to_bytes(),
+        ])?
+    };
+    let rc = unsafe {
+        libc::getgrgid_r(
+            gid,
+            &mut group,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut group_ptr,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    if group_ptr.is_null() || group.gr_gid != gid || group.gr_name.is_null() {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let group = unsafe {
+        account_line(&[
+            CStr::from_ptr(group.gr_name).to_bytes(),
+            b"x",
+            gid.to_string().as_bytes(),
+            b"",
+        ])?
+    };
+    Ok([passwd, group])
+}
+
+fn account_line(fields: &[&[u8]]) -> io::Result<Vec<u8>> {
+    if fields.first().is_none_or(|name| name.is_empty())
+        || fields.iter().any(|field| {
+            field
+                .iter()
+                .any(|byte| matches!(byte, b':' | b'\n' | b'\r' | 0))
+        })
+    {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut line = fields.join(&b':');
+    line.push(b'\n');
+    Ok(line)
+}
+
+fn private_identity(ruleset: i32, access: u64, files: &[Vec<u8>; 2]) -> io::Result<()> {
+    for ((source, target), bytes) in [
+        (c"/tmp/.newt-build-passwd", c"/etc/passwd"),
+        (c"/tmp/.newt-build-group", c"/etc/group"),
+    ]
+    .into_iter()
+    .zip(files)
+    {
+        // The source exists only in the freshly mounted private tmpfs. No build
+        // code runs until both readonly mounts and their object grants succeed.
+        let fd = unsafe {
+            libc::open(
+                source.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        check(fd)?;
+        let result = (|| {
+            let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if written != bytes.len() as isize {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            check(unsafe { libc::fchmod(fd, 0o444) })?;
+            check(unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            })?;
+            check(unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND
+                        | libc::MS_REMOUNT
+                        | libc::MS_RDONLY
+                        | libc::MS_NOSUID
+                        | libc::MS_NODEV
+                        | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                )
+            })?;
+            // Remove the writable-mount alias before granting the readonly one.
+            check(unsafe { libc::unlink(source.as_ptr()) })?;
+            let read = access & u64::from(linux_raw_sys::landlock::LANDLOCK_ACCESS_FS_READ_FILE);
+            if read != 0 {
+                grant_private_mount(ruleset, read, target)?;
+            }
+            Ok(())
+        })();
+        unsafe { libc::close(fd) };
+        result?;
+    }
+    Ok(())
 }
 
 fn private_filesystems(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Result<()> {
@@ -229,7 +382,7 @@ fn private_filesystems(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io:
 
 fn grant_private_mount(ruleset: i32, access: u64, path: &CStr) -> io::Result<()> {
     // SAFETY: the mount has succeeded in this child. The fd binds the private
-    // root, never the host mount covered by it. The generated kernel ABI type
+    // object, never the host mount covered by it. The generated kernel ABI type
     // avoids a second handwritten Landlock layout. Close the fd on every path.
     let fd = unsafe {
         libc::open(
@@ -318,4 +471,32 @@ fn namespace(uid: &[u8], gid: &[u8]) -> io::Result<()> {
     })();
     unsafe { libc::close(fd) };
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::account_line;
+
+    #[test]
+    fn account_line_preserves_fields_without_adding_records() {
+        assert_eq!(
+            account_line(&[b"builder", b"x", b"1000", b"1000", b"", b"/build", b"/bin/sh"])
+                .unwrap(),
+            b"builder:x:1000:1000::/build:/bin/sh\n"
+        );
+        assert_eq!(
+            account_line(&[b"builders", b"x", b"1000", b""]).unwrap(),
+            b"builders:x:1000:\n"
+        );
+        assert_eq!(account_line(&[b"\xff", b""]).unwrap(), b"\xff:\n");
+    }
+
+    #[test]
+    fn account_line_rejects_empty_names_and_injected_fields() {
+        assert!(account_line(&[]).is_err());
+        assert!(account_line(&[b"", b"x"]).is_err());
+        for field in [b"other:0".as_slice(), b"\nother", b"\rother", b"\0other"] {
+            assert!(account_line(&[b"builder", field]).is_err());
+        }
+    }
 }

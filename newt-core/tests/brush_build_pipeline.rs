@@ -13,6 +13,117 @@ fn main() {
     }
     newt_core::answer_nextest_listing("brush_build_pipeline");
     #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--build-identity-probe") {
+        let private = std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok();
+        let paths = ["/etc/passwd", "/etc/group"];
+        if !private {
+            for path in paths {
+                assert_eq!(
+                    std::fs::read(path).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+            println!("BUILD_IDENTITY_DENIED_FALLBACK");
+            return;
+        }
+        let (expected, other): ([Vec<Vec<u8>>; 2], libc::uid_t) =
+            serde_json::from_slice(&std::fs::read("identity-expected.json").unwrap()).unwrap();
+        for (path, fields) in paths.into_iter().zip(expected) {
+            let contents = std::fs::read(path).expect("private identity file must be readable");
+            let lines: Vec<_> = contents.split(|byte| *byte == b'\n').collect();
+            assert_eq!(lines.len(), 2, "exactly one terminated account entry");
+            assert!(lines[1].is_empty());
+            let observed: Vec<_> = lines[0].split(|byte| *byte == b':').collect();
+            assert!(
+                observed == fields,
+                "identity must match the harness NSS snapshot"
+            );
+            assert!(std::fs::OpenOptions::new().write(true).open(path).is_err());
+            assert!(std::fs::hard_link(path, "/tmp/identity-alias").is_err());
+        }
+        for path in ["/etc/shadow", "/etc/gshadow"] {
+            assert!(
+                std::fs::read(path).is_err(),
+                "password hashes must remain hidden"
+            );
+        }
+        for path in ["/tmp/.newt-build-passwd", "/tmp/.newt-build-group"] {
+            assert!(!std::path::Path::new(path).exists(), "no writable alias");
+        }
+        for path in [
+            "/run/systemd/userdb/io.systemd.Multiplexer",
+            "/var/lib/sss/pipes/nss",
+        ] {
+            assert!(std::os::unix::net::UnixStream::connect(path).is_err());
+        }
+        // Ground the normal NSS lookup, not just the compatibility file bytes.
+        let mut buffer = vec![0; 65536];
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            unsafe {
+                libc::getpwuid_r(
+                    uid,
+                    &mut entry,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut found,
+                )
+            },
+            0
+        );
+        assert!(!found.is_null());
+        assert_eq!(entry.pw_uid, uid);
+        // Some NSS modules synthesize root/nobody even when the host databases
+        // are denied. Those built-in defaults are not host account disclosure;
+        // the private files above must still contain exactly the mapped entry.
+        // The parent proved this other uid resolves to a real host account.
+        assert!(![uid, 0, 65534].contains(&other));
+        unsafe {
+            libc::getpwuid_r(
+                other,
+                &mut entry,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            );
+        }
+        assert!(
+            found.is_null(),
+            "the real host account must not be visible through NSS"
+        );
+        let gid = unsafe { libc::getegid() };
+        let mut group: libc::group = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                libc::getgrgid_r(
+                    gid,
+                    &mut group,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut found,
+                )
+            },
+            0
+        );
+        assert!(!found.is_null());
+        assert_eq!(group.gr_gid, gid);
+        unsafe {
+            libc::getgrgid_r(
+                if gid == 1 { 2 } else { 1 },
+                &mut group,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            );
+        }
+        assert!(found.is_null(), "another primary group must remain hidden");
+        println!("BUILD_PRIVATE_IDENTITY_CONFIRMED");
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if let Some(names) = std::env::args().find_map(|arg| {
         arg.strip_prefix("--build-scratch-probe=")
             .map(str::to_owned)
@@ -517,11 +628,29 @@ mod native {
         if std::env::args().any(|arg| {
             matches!(
                 arg.as_str(),
-                "--deny-build-netns" | "--deny-build-mounts" | "--deny-build-devpts"
+                "--deny-build-netns"
+                    | "--deny-build-mounts"
+                    | "--deny-build-devpts"
+                    | "--deny-build-identity"
             )
         }) {
             let deny_mounts = std::env::args().any(|arg| arg == "--deny-build-mounts");
             let deny_devpts = std::env::args().any(|arg| arg == "--deny-build-devpts");
+            let deny_identity = std::env::args().any(|arg| arg == "--deny-build-identity");
+            // The PTY allocator also uses MS_BIND. Target the account's
+            // readonly remount so scratch and terminal setup complete first.
+            let fault_flags = if deny_identity {
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV
+                    | libc::MS_NOEXEC
+            } else if deny_devpts {
+                libc::MS_NOSUID | libc::MS_NOEXEC
+            } else {
+                0
+            };
             assert!(
                 !std::env::args().any(|arg| arg == "--require-build-netns"),
                 "cannot both deny and require namespace setup"
@@ -529,7 +658,8 @@ mod native {
             // Test-only fault injection, before starting any runtime threads:
             // Descendants inherit EACCES for namespace or mount setup, even on
             // permissive hosts. A mount failure exercises partial setup after
-            // the child has already acquired its private namespaces.
+            // the child has already acquired its private namespaces. Identity
+            // injection denies the readonly account remount, after scratch and PTYs.
             // This is not a production namespace policy or an escape filter.
             let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
             let mut filters = vec![
@@ -538,7 +668,7 @@ mod native {
                     (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                     0,
                     1,
-                    if deny_mounts || deny_devpts {
+                    if deny_mounts || deny_devpts || deny_identity {
                         libc::SYS_mount
                     } else {
                         libc::SYS_unshare
@@ -557,9 +687,7 @@ mod native {
                     libc::SECCOMP_RET_ALLOW,
                 ),
             ];
-            if deny_devpts {
-                // Match only the devpts mount, after scratch was already mounted
-                // and granted: seccomp_data.args[3] is mount's flags at offset 40.
+            if deny_devpts || deny_identity {
                 filters[1].jf = 3;
                 filters.splice(
                     2..2,
@@ -568,13 +696,15 @@ mod native {
                             (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
                             0,
                             0,
-                            40,
+                            (std::mem::offset_of!(libc::seccomp_data, args)
+                                + 3 * std::mem::size_of::<u64>())
+                                as u32,
                         ),
                         instruction(
                             (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                             0,
                             1,
-                            (libc::MS_NOSUID | libc::MS_NOEXEC) as u32,
+                            fault_flags as u32,
                         ),
                     ],
                 );
@@ -598,7 +728,7 @@ mod native {
             assert_eq!(
                 unsafe {
                     libc::syscall(
-                        if deny_mounts || deny_devpts {
+                        if deny_mounts || deny_devpts || deny_identity {
                             libc::SYS_mount
                         } else {
                             libc::SYS_unshare
@@ -606,11 +736,7 @@ mod native {
                         0,
                         0,
                         0,
-                        if deny_devpts {
-                            libc::MS_NOSUID | libc::MS_NOEXEC
-                        } else {
-                            0
-                        },
+                        fault_flags,
                         0,
                     )
                 },
@@ -626,6 +752,8 @@ mod native {
                     "BUILD_DEVPTS_SETUP_FAILURE_INJECTED"
                 } else if deny_mounts {
                     "BUILD_MOUNT_SETUP_FAILURE_INJECTED"
+                } else if deny_identity {
+                    "BUILD_IDENTITY_SETUP_FAILURE_INJECTED"
                 } else {
                     "BUILD_NETNS_SETUP_FAILURE_INJECTED"
                 }
@@ -718,6 +846,11 @@ mod native {
                     "--build-scratch-probe",
                     "BUILD_PRIVATE_SCRATCH_CONFIRMED",
                 ),
+                (
+                    "build_tests_private_identity_isolated",
+                    "--build-identity-probe",
+                    "BUILD_PRIVATE_IDENTITY_CONFIRMED",
+                ),
             ] {
                 if selected(name) {
                     build_network_probe(&root, name, probe, marker).await;
@@ -789,6 +922,8 @@ mod native {
         std::fs::create_dir_all(home.join(".newt")).unwrap();
         std::fs::create_dir(&cargo_home).unwrap();
         std::env::set_var("HOME", &home);
+        std::env::set_var("USER", "untrusted-build-user");
+        std::env::set_var("LOGNAME", "untrusted-build-login");
         std::env::set_var("CARGO_HOME", &cargo_home);
         if let Some(rustup) = rustup.filter(|path| path.is_dir()) {
             std::env::set_var("RUSTUP_HOME", rustup);
@@ -1094,8 +1229,11 @@ mod native {
     /// replace host sentinels or change host modes; fallback denies writes.
     /// The PTY twin grounds terminal availability and isolation, including the
     /// real master/slave transport, ioctl contract and per-instance allocation bound.
+    /// The identity twin grounds fdguard's mocked account-line validation in
+    /// real NSS lookups, readonly object grants and unchanged host databases.
     /// `--require-build-netns` rejects fallback on every probe and both routes;
     /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
+    /// `--deny-build-identity` forces a later failure at the account remount.
     #[cfg(target_os = "linux")]
     async fn build_network_probe(root: &Path, name: &str, probe: &str, marker: &str) {
         use newt_core::confined_exec::{
@@ -1180,6 +1318,97 @@ mod native {
             probe.to_owned()
         };
         let (workspace, outside) = project(root, name);
+        let identity_paths = ["/etc/passwd", "/etc/group"];
+        let host_identity = (probe == "--build-identity-probe")
+            .then(|| identity_paths.map(|path| std::fs::read(path).unwrap()));
+        if probe == "--build-identity-probe" {
+            // Resolve before confinement, with HOME already poisoned by isolate().
+            // Compare without printing account names, home paths, or shell paths.
+            let mut buffer = vec![0; 65536];
+            let mut user: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut group: libc::group = unsafe { std::mem::zeroed() };
+            let mut user_ptr = std::ptr::null_mut();
+            let mut group_ptr = std::ptr::null_mut();
+            let uid = unsafe { libc::geteuid() };
+            let gid = unsafe { libc::getegid() };
+            assert_eq!(
+                unsafe {
+                    libc::getpwuid_r(
+                        uid,
+                        &mut user,
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        &mut user_ptr,
+                    )
+                },
+                0
+            );
+            assert!(!user_ptr.is_null());
+            let passwd = unsafe {
+                vec![
+                    std::ffi::CStr::from_ptr(user.pw_name).to_bytes().to_vec(),
+                    b"x".to_vec(),
+                    uid.to_string().into_bytes(),
+                    gid.to_string().into_bytes(),
+                    Vec::new(),
+                    std::ffi::CStr::from_ptr(user.pw_dir).to_bytes().to_vec(),
+                    std::ffi::CStr::from_ptr(user.pw_shell).to_bytes().to_vec(),
+                ]
+            };
+            assert_eq!(
+                unsafe {
+                    libc::getgrgid_r(
+                        gid,
+                        &mut group,
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        &mut group_ptr,
+                    )
+                },
+                0
+            );
+            assert!(!group_ptr.is_null());
+            let group = unsafe {
+                vec![
+                    std::ffi::CStr::from_ptr(group.gr_name).to_bytes().to_vec(),
+                    b"x".to_vec(),
+                    gid.to_string().into_bytes(),
+                    Vec::new(),
+                ]
+            };
+            // Pick from the host file, excluding the caller and NSS constants,
+            // and prove that the same uid lookup succeeds before confinement.
+            // Only its uid enters the fixture, never its account fields.
+            let other = host_identity.as_ref().unwrap()[0]
+                .split(|byte| *byte == b'\n')
+                .find_map(|line| {
+                    let candidate = std::str::from_utf8(line.split(|byte| *byte == b':').nth(2)?)
+                        .ok()?
+                        .parse::<libc::uid_t>()
+                        .ok()?;
+                    if [uid, 0, 65534].contains(&candidate) {
+                        return None;
+                    }
+                    let rc = unsafe {
+                        libc::getpwuid_r(
+                            candidate,
+                            &mut user,
+                            buffer.as_mut_ptr(),
+                            buffer.len(),
+                            &mut user_ptr,
+                        )
+                    };
+                    (rc == 0 && !user_ptr.is_null() && user.pw_uid == candidate)
+                        .then_some(candidate)
+                })
+                .expect("fixture requires another real host account outside NSS built-in uids");
+            eprintln!("HOST_ACCOUNT_LOOKUP_CONTROL_CONFIRMED");
+            std::fs::write(
+                workspace.join("identity-expected.json"),
+                serde_json::to_vec(&([passwd, group], other)).unwrap(),
+            )
+            .unwrap();
+        }
         let executable = std::env::current_exe().unwrap();
         let argv = ConstrainedExecutor::run(&build_tool_request(
             &workspace,
@@ -1224,12 +1453,14 @@ mod native {
         ] {
             let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK")
                 || output.contains("BUILD_SCRATCH_DENIED_FALLBACK")
-                || output.contains("BUILD_PTY_DENIED_FALLBACK");
+                || output.contains("BUILD_PTY_DENIED_FALLBACK")
+                || output.contains("BUILD_IDENTITY_DENIED_FALLBACK");
             assert!(
                 output.contains(marker)
                     || ((name == "build_tests_loopback_roundtrip"
                         || !scratch_canaries.is_empty()
-                        || host_pty.is_some())
+                        || host_pty.is_some()
+                        || name == "build_tests_private_identity_isolated")
                         && fallback),
                 "{name} ({route}): {output}\n{diagnostic}"
             );
@@ -1242,6 +1473,7 @@ mod native {
                 ("--deny-build-netns", "deny-all fallback"),
                 ("--deny-build-mounts", "deny-all fallback"),
                 ("--deny-build-devpts", "deny-all fallback"),
+                ("--deny-build-identity", "deny-all fallback"),
             ] {
                 if std::env::args().any(|arg| arg == switch) {
                     assert!(
@@ -1272,6 +1504,14 @@ mod native {
             );
         }
         assert!(argv.success, "{stderr}");
+        if let Some(before) = host_identity {
+            for (path, contents) in identity_paths.into_iter().zip(before) {
+                assert!(
+                    std::fs::read(path).unwrap() == contents,
+                    "host account database must be unchanged"
+                );
+            }
+        }
         if let Some((host, path, device)) = host_pty {
             // The production routes use ABI 3. Exercise the configurable ABI 5
             // mask too: private terminal ioctls need IOCTL_DEV there. An older

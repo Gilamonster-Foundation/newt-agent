@@ -39,7 +39,7 @@ Pathname Unix socket deputies remain outside this patch's direct-egress proof.
 
 The same pre-exec hook also unshares the mount namespace and makes every mount
 recursively private before mounting tmpfs: `/tmp` has a 2 GiB data limit and
-65,536 inodes; `/dev/shm` has 256 MiB and 16,384 inodes. Both use mode 1777,
+65,536 inodes; `/dev/shm` has 256 MiB and 16,384 inodes. Both use mode 0700,
 nosuid and nodev; execution remains available to build/test artifacts. All
 allocation precedes fork. The existing `linux-raw-sys` dependency in the graph
 supplies the Landlock ABI layout, rather than duplicating it locally.
@@ -82,3 +82,36 @@ allocation/transport/settings, forbidden injection and the pair limit.
 
 Kernel contracts: [devpts](https://docs.kernel.org/filesystems/devpts.html) and
 [Landlock device ioctls](https://docs.kernel.org/userspace-api/landlock.html#device-ioctl).
+
+## Private account files (#3319)
+
+Before fork, the harness resolves its effective uid and primary gid through
+reentrant NSS lookups, ignoring `HOME`, `USER` and `LOGNAME`. A bounded lookup
+failure, missing entry, mismatched primary gid or malformed field selects the
+existing fresh-child fallback. No NSS call or allocation runs in pre-exec.
+
+After private scratch and terminal setup, the child writes exactly one passwd
+record and one primary-group record on its private tmpfs and binds them over `/etc/passwd`
+and `/etc/group`. Both mounts are readonly, nosuid, nodev and noexec. The
+writable source aliases are unlinked and their descriptors closed before exec.
+Only READ_FILE is granted, using descriptors opened on the mounted objects;
+the fallback ruleset receives no account grant. Any setup failure discards the
+child before build code runs and retries with the original deny-all floor.
+
+The additional disclosure is the invoking account's name, numeric uid and gid,
+home, shell and primary-group name. Password fields contain `x`; GECOS and
+group membership lists are empty. No host account database, password hashes,
+systemd userdb socket or sssd access is granted. The private namespace owns
+the files' lifetime; no persistent identity format or new content id is minted.
+
+The libc/NSS built-in root and nobody entries remain visible. They are constants
+synthesized without reading host account data: their presence and fields reveal
+neither whether those accounts exist on the host nor their host attributes.
+The NSS dispatch configuration is unchanged; no private nsswitch view is needed.
+
+The real-resource probe retains exactly one record in each private file and
+checks normal own-user/group lookups. Before confinement it selects another real
+host account by uid, excluding the caller and built-in uids, and proves that
+lookup succeeds. The same lookup must fail inside each build route. It also
+forces failure at the account's readonly remount, after scratch and terminal
+setup, to prove the fresh fallback retains the original denials on argv and Brush.
