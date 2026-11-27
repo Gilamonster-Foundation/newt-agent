@@ -214,3 +214,15 @@ tool homes as well as temporary directories; loader and authentication controls
 remain excluded. Brush's existing PATH default is made explicit before bootstrap
 so inherited search directories participate in the same decision. No authority
 record, content identity, or caller grant changes.
+
+## Worker result-channel hardening (#3321)
+
+The core worker now supplies socketpair-backed stdout/stderr readers on
+Linux and macOS. Keep the existing framing, terminal EOF check, capped
+stderr diagnostics, output leases and kill-on-drop. Missing-reader errors
+now describe the reader rather than assuming a pipe.
+
+A pure fragmented-reader regression pins stdout, stderr, terminal status and
+EOF behavior without real resources. The Newt Brush build harness grounds
+it with both private and forced-fallback builds. Retire with the upstream
+port of the worker result-channel transport change.

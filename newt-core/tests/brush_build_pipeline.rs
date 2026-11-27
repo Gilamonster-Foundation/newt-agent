@@ -44,6 +44,27 @@ fn main() {
         return;
     }
     #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--worker-result-channel-probe") {
+        // SAFETY: getppid has no preconditions or memory effects.
+        let parent = unsafe { libc::getppid() };
+        for fd in [1, 2] {
+            let reopened = std::fs::OpenOptions::new()
+                .write(true)
+                .open(format!("/proc/{parent}/fd/{fd}"));
+            println!(
+                "WORKER_RESULT_FD{fd}_REOPEN={}",
+                if reopened.is_err() {
+                    "denied"
+                } else {
+                    "opened"
+                }
+            );
+        }
+        println!("WORKER_RESULT_STDOUT_INTACT");
+        eprintln!("WORKER_RESULT_STDERR_INTACT");
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--build-identity-probe") {
         let private = std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok();
         let paths = ["/etc/passwd", "/etc/group"];
@@ -933,6 +954,10 @@ mod native {
             if selected("cached_build_formats_with_native_cargo_subcommand") {
                 cached_build_formats_with_native_cargo_subcommand(&root).await;
             }
+            #[cfg(target_os = "linux")]
+            if selected("worker_result_channel_is_not_reopenable") {
+                worker_result_channel_is_not_reopenable(&root).await;
+            }
             if selected("cached_build_retains_output_beyond_64kib") {
                 cached_build_retains_output_beyond_64kib(&root).await;
             }
@@ -1427,7 +1452,19 @@ mod native {
         // Required-private probes must have no covered input. The managed
         // default scratch under /tmp now correctly selects host-view fallback.
         let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
-        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", root.join("private-build-scratch"));
+        // Unix socket paths must also fit SUN_LEN after adding the run lease.
+        let socket_scratch = (probe == "--build-unix-socket-probe").then(|| {
+            tempfile::Builder::new()
+                .prefix("")
+                .rand_bytes(4)
+                .tempdir_in("/var/tmp")
+                .unwrap()
+        });
+        let scratch_root = socket_scratch.as_ref().map_or_else(
+            || root.join("private-build-scratch"),
+            |scratch| scratch.path().to_path_buf(),
+        );
+        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", scratch_root);
         let host_pty = if probe == "--build-pty-probe" {
             // Allocate our own host canary; never use the operator's terminal.
             let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
@@ -1701,6 +1738,13 @@ mod native {
             );
         }
         assert!(argv.success, "{stderr}");
+        if probe == "--build-unix-socket-probe" {
+            let scratch = PathBuf::from(
+                std::fs::read_to_string(workspace.join("socket-scratch-path")).unwrap(),
+            );
+            assert!(!scratch.starts_with(&workspace));
+            assert!(!scratch.exists(), "normal completion must remove scratch");
+        }
         if let Some(before) = host_identity {
             for (path, contents) in identity_paths.into_iter().zip(before) {
                 assert!(
@@ -1932,6 +1976,14 @@ mod native {
             "short-path host control: {}",
             String::from_utf8_lossy(&control.stderr)
         );
+        #[cfg(target_os = "linux")]
+        build_network_probe(
+            root,
+            "build_tests_can_bind_a_unix_socket_in_a_tempdir",
+            "--build-unix-socket-probe",
+            "BUILD_UNIX_SOCKET_ROUNDTRIP_CONFIRMED",
+        )
+        .await;
         let mut gate = CachedBuildGate {
             workspace: workspace.to_string_lossy().into_owned(),
             allow: true,
@@ -2088,6 +2140,75 @@ mod native {
         assert!(!outside.join("write").exists());
         assert_eq!(gate.queries, 1, "one prepared Build admission: {output}");
         eprintln!("test cached_build_formats_with_native_cargo_subcommand ... ok");
+    }
+
+    /// Real kernel grounding for the framing reader's one authoritative result:
+    /// both output descriptors refuse pathname reopens, while the framed result
+    /// and bounded diagnostic mode copy still arrive in private and fallback mode.
+    #[cfg(target_os = "linux")]
+    async fn worker_result_channel_is_not_reopenable(root: &Path) {
+        use newt_core::confined_exec::build_tool_caveats;
+        let (workspace, _) = project(root, "worker-result-channel");
+        // Keep required-private inputs outside the roots replaced by private
+        // mounts; the default managed scratch correctly selects fallback.
+        let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
+        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", root.join("worker-result-scratch"));
+        let executable = std::env::current_exe().unwrap();
+        let source = format!(
+            "cargo build --lib --offline && '{}' --worker-result-channel-probe",
+            executable.display()
+        );
+        let brush = execute_tool(
+            "run_command",
+            &serde_json::json!({"command": source}),
+            workspace.to_str().unwrap(),
+            false,
+            100,
+            &build_tool_caveats(&workspace),
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        match previous_scratch {
+            Some(value) => std::env::set_var("NEWT_BUILD_SCRATCH_DIR", value),
+            None => std::env::remove_var("NEWT_BUILD_SCRATCH_DIR"),
+        }
+        assert!(brush.contains("WORKER_RESULT_STDOUT_INTACT"), "{brush}");
+        assert!(brush.contains("WORKER_RESULT_STDERR_INTACT"), "{brush}");
+        let private = brush.contains("Build isolation: private loopback only");
+        let fallback = brush.contains("Build isolation: deny-all fallback");
+        assert!(private || fallback, "missing build mode: {brush}");
+        if std::env::args().any(|arg| arg == "--require-build-netns") {
+            assert!(private, "{brush}");
+        }
+        if std::env::args().any(|arg| arg.starts_with("--deny-build-")) {
+            assert!(fallback, "{brush}");
+        }
+        let mode = if private {
+            "private loopback only"
+        } else {
+            "deny-all fallback"
+        };
+        eprintln!("worker result and mode intact: {mode}");
+        for fd in [1, 2] {
+            assert!(
+                brush.contains(&format!("WORKER_RESULT_FD{fd}_REOPEN=denied")),
+                "{brush}"
+            );
+        }
+        eprintln!("test worker_result_channel_is_not_reopenable ... ok");
     }
 
     async fn cached_build_retains_output_beyond_64kib(root: &Path) {

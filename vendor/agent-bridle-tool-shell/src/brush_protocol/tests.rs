@@ -517,3 +517,38 @@ impl Write for SharedSink {
         Ok(())
     }
 }
+
+/// Stream sockets, like pipes, may split every header and payload. Keep the
+/// framing contract independent of transport boundaries using only memory.
+#[test]
+fn fragmented_worker_output_preserves_frames_and_requires_terminal_eof() {
+    struct Fragmented<'a>(&'a [u8]);
+    impl Read for Fragmented<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let len = buf.len().min(3);
+            self.0.read(&mut buf[..len])
+        }
+    }
+    let mut bytes = frame(STARTED, 0, &[]);
+    bytes.extend(frame(STDOUT, 1, b"result"));
+    bytes.extend(frame(STDERR, 2, b"diagnostic"));
+    bytes.extend(frame(TERMINAL, 3, &terminal_payload(&ok_response())));
+    let mut seen = Vec::new();
+    let outcome = read_stream(Fragmented(&bytes), limits(), |stream, data| {
+        seen.push((stream, data.to_vec()));
+    })
+    .expect("fragmented stream with terminal and EOF");
+    assert_eq!(outcome.stdout, b"result");
+    assert_eq!(outcome.stderr, b"diagnostic");
+    assert_eq!(outcome.response.exit_code, 0);
+    assert_eq!(
+        seen,
+        vec![
+            (crate::ShellOutputStream::Stdout, b"result".to_vec()),
+            (crate::ShellOutputStream::Stderr, b"diagnostic".to_vec()),
+        ]
+    );
+    assert!(read_stream(Fragmented(&bytes[..bytes.len() - 1]), limits(), |_, _| {}).is_err());
+    bytes.push(0);
+    assert!(read_stream(Fragmented(&bytes), limits(), |_, _| {}).is_err());
+}

@@ -110,7 +110,7 @@ pub struct ManagedSpawn {
 /// trusted supervisor.
 #[derive(Debug)]
 pub struct SandboxedWorkerChild {
-    /// The spawned worker process.
+    /// The spawned worker process, with socket readers in `stdout` and `stderr`.
     pub child: Child,
     /// The OS-level sandbox actually applied to the worker.
     pub sandbox_kind: SandboxKind,
@@ -419,7 +419,8 @@ pub fn decode_trusted_worker_request<P: DeserializeOwned>(
 /// audit covers — a descriptor this process just minted, which cannot already
 /// be a connected endpoint. [`Self::WorkerControl`] is the trusted-worker's
 /// one-shot authenticated control channel — audited for a DIFFERENT reason;
-/// see its own doc. [`Self::Other`] is everything else (inherited, a
+/// see its own doc. [`Self::WorkerOutput`] carries only worker output to
+/// the host, which cannot send through it. [`Self::Other`] is everything else (inherited, a
 /// redirected file, an existing fd) and is a legitimate, supported shape
 /// (shell redirects) — it just does not qualify a Seatbelt `net:none` spawn
 /// for the Kernel witness; see [`ConfinementMechanism::with_stdio_posture`].
@@ -449,6 +450,13 @@ pub enum ConfinedStdio {
     /// claim this credit for an arbitrary fd.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     WorkerControl(WorkerControlHandle),
+    /// A fresh, one-way worker output socket. The host only drains bytes and
+    /// has its write direction shut down; this endpoint has reads shut down.
+    /// There is no host I/O service or request protocol on this channel.
+    /// Only this module's worker spawn can mint the opaque handle, so an
+    /// arbitrary connected descriptor cannot acquire audited stdio credit.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    WorkerOutput(WorkerOutputHandle),
     /// Any other descriptor: inherited, a redirected file, a raw or dup'd fd.
     Other(Stdio),
 }
@@ -468,6 +476,24 @@ impl WorkerControlHandle {
     }
 }
 
+/// Opaque owner of a fresh worker output endpoint. Socketpairs cannot be
+/// opened again by pathname; the only constructor also seals both endpoints'
+/// unused directions before either reaches the child.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+pub struct WorkerOutputHandle(std::os::fd::OwnedFd);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl WorkerOutputHandle {
+    fn pair() -> std::io::Result<(std::os::fd::OwnedFd, Self)> {
+        use std::net::Shutdown;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        reader.shutdown(Shutdown::Write)?;
+        writer.shutdown(Shutdown::Read)?;
+        Ok((reader.into(), Self(writer.into())))
+    }
+}
+
 impl ConfinedStdio {
     fn into_stdio(self) -> Stdio {
         match self {
@@ -475,17 +501,22 @@ impl ConfinedStdio {
             Self::Null => Stdio::null(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::WorkerControl(handle) => Stdio::from(handle.0),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::WorkerOutput(handle) => Stdio::from(handle.0),
             Self::Other(stdio) => stdio,
         }
     }
 
     /// `true` for [`Self::Piped`]/[`Self::Null`] (ADR 0015 amendment E6) and
-    /// [`Self::WorkerControl`] (ADR 0015 amendment E7) — the shapes the
-    /// Seatbelt audit covers.
+    /// [`Self::WorkerControl`] (ADR 0015 amendment E7), plus the sealed
+    /// one-way [`Self::WorkerOutput`] transport described above.
     fn is_audited(&self) -> bool {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            matches!(self, Self::Piped | Self::Null | Self::WorkerControl(_))
+            matches!(
+                self,
+                Self::Piped | Self::Null | Self::WorkerControl(_) | Self::WorkerOutput(_)
+            )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -752,7 +783,7 @@ impl ConfinedCommand {
         // (Landlock `net:none` = Kernel only under `DenyDirect`) cannot diverge
         // from the mechanism actually applied to the spawn.
         // The stdio shape ADR 0015 amendment E6's Seatbelt audit assumed —
-        // every one of stdin/stdout/stderr a pipe or `/dev/null` — checked
+        // pipes/null or the sealed worker control/output transports — checked
         // against what THIS spawn actually configured, not assumed
         // (agent-bridle#416 round-2 review, item 1). Unset defaults to the
         // same inherited-stdio behavior `std::process::Command` always had,
@@ -1267,7 +1298,7 @@ impl SandboxedWorker {
         self
     }
 
-    /// Spawn the fixed worker with empty ambient environment, piped output, and
+    /// Spawn the fixed worker with empty ambient environment, socketpair output, and
     /// a private authenticated-control transport in place of ordinary stdin.
     ///
     /// `nonce` binds the worker request carried over stdin to this launch. The
@@ -1326,6 +1357,13 @@ impl SandboxedWorker {
             ToolError::denied(format!("create worker control channel: {error}"))
         })?;
 
+        let (stdout, child_stdout) = WorkerOutputHandle::pair().map_err(|error| {
+            ToolError::denied(format!("create worker stdout channel: {error}"))
+        })?;
+        let (stderr, child_stderr) = WorkerOutputHandle::pair().map_err(|error| {
+            ToolError::denied(format!("create worker stderr channel: {error}"))
+        })?;
+
         let private_build = self.sandbox_policy.child_network == crate::ChildNetworkPolicy::PrivateBuild
             && crate::sandbox::net_fully_denied(cx.caveats());
         let mut command = ConfinedCommand::new(executable)
@@ -1336,8 +1374,8 @@ impl SandboxedWorker {
             .stdin(ConfinedStdio::WorkerControl(WorkerControlHandle::new(
                 std::os::fd::OwnedFd::from(child_control),
             )))
-            .stdout(ConfinedStdio::Piped)
-            .stderr(ConfinedStdio::Piped)
+            .stdout(ConfinedStdio::WorkerOutput(child_stdout))
+            .stderr(ConfinedStdio::WorkerOutput(child_stderr))
             .new_process_group()
             .sandbox_policy(self.sandbox_policy);
         if private_build {
@@ -1347,7 +1385,7 @@ impl SandboxedWorker {
         }
         command.worker_read_resources = worker_read_resources;
 
-        let confined = if crate::is_unbridled() {
+        let mut confined = if crate::is_unbridled() {
             command.spawn_authorized(cx, Caveats::top(), SpawnAuthority::TrustedWorker)
         } else {
             // No user-namespace precondition: a thread under a Landlock
@@ -1356,6 +1394,10 @@ impl SandboxedWorker {
             let effective = cx.caveats().clone();
             command.spawn_authorized(cx, effective, SpawnAuthority::TrustedWorker)
         }?;
+        // Keep the existing Child reader interface for framing, diagnostics,
+        // EOF and supervisor ownership; only the underlying transport changes.
+        confined.child.stdout = Some(std::process::ChildStdout::from(stdout));
+        confined.child.stderr = Some(std::process::ChildStderr::from(stderr));
         Ok(SandboxedWorkerChild {
             child: confined.child,
             sandbox_kind: confined.sandbox_kind,

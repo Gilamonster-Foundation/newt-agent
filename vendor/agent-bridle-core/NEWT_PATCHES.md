@@ -354,3 +354,16 @@ tool homes as well as temporary directories; loader and authentication controls
 remain excluded. Brush's existing PATH default is made explicit before bootstrap
 so inherited search directories participate in the same decision. No authority
 record, content identity, or caller grant changes.
+
+## Worker result-channel hardening (#3321)
+
+`SandboxedWorker` supplies stdout and stderr with fresh Unix socketpairs on
+Linux and macOS. The worker's stdout and stderr cannot be opened again by
+pathname. The unused direction of each endpoint is shut down before spawn.
+A sealed `ConfinedStdio::WorkerOutput` handle preserves audited stdio credit
+without admitting arbitrary descriptors or providing a host I/O service.
+
+The parent endpoints remain in `Child.stdout` and `Child.stderr`, preserving
+reader and supervisor ownership, including error paths. Ordinary argv stdio,
+the authenticated stdin channel and the framing protocol are unchanged.
+Retire with the upstream port of this transport change.

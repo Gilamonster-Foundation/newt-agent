@@ -514,13 +514,13 @@ fn supervise_worker(
             .child
             .stdout
             .take()
-            .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
+            .ok_or_else(|| ToolError::denied("brush worker stdout reader is missing"))?;
         let stderr = worker
             .confined
             .child
             .stderr
             .take()
-            .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+            .ok_or_else(|| ToolError::denied("brush worker stderr reader is missing"))?;
         let protocol_cap = max_output.saturating_mul(4).saturating_add(1024 * 1024);
         let stdout_reader = std::thread::spawn(move || read_capped(stdout, protocol_cap));
         let stderr_reader =
@@ -543,13 +543,13 @@ fn supervise_worker(
         .child
         .stdout
         .take()
-        .ok_or_else(|| ToolError::denied("brush worker stdout was not piped"))?;
+        .ok_or_else(|| ToolError::denied("brush worker stdout reader is missing"))?;
     let stderr = worker
         .confined
         .child
         .stderr
         .take()
-        .ok_or_else(|| ToolError::denied("brush worker stderr was not piped"))?;
+        .ok_or_else(|| ToolError::denied("brush worker stderr reader is missing"))?;
 
     let limits = stream_limits(max_output)?;
     let stdout_reader = std::thread::spawn(move || {
