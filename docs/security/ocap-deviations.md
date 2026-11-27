@@ -227,6 +227,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   existing memory cgroup rather than a namespace-specific budget. Their final namespace/mount
   references release the filesystems; Landlock prevents subsequent mounts. Environment paths stay
   unchanged, with covered runtime directories recreated empty. A covered workspace uses fallback.
+  The harness also verifies the system Git and its same-image exec-path alias in the host namespace
+  (root-owned, unwritable ancestry on held descriptors) and binds that Git read-only over the alias
+  in the build's mount namespace (#3318). A nested `git`-only fence then covers both names with its
+  one rule for the granted object; the root-ownership rule is not relaxed inside the user namespace,
+  and a different object at the alias stays refused. Fallback builds get no binding.
   A private devpts mount supplies at most 64 terminal pairs, with `/dev/ptmx` bound to its allocator.
   Post-mount handles grant read/write and, when the configured Landlock ABI handles it, IOCTL_DEV
   only within that instance. The default ABI 3 does not gate device ioctls; ABI 5 does. Builds can

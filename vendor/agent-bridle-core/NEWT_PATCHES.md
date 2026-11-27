@@ -315,3 +315,33 @@ fdguard restricts the new terminal rules to read/write and applicable ioctl righ
 The private-build seccomp filter denies TIOCSTI and TIOCLINUX, while preserving
 PTY allocation, terminal settings and window sizing. Ordinary execution retains
 its existing policy. See the fdguard patch note for setup, bounds and fallback.
+
+## Same-object Git alias in private builds (#3318)
+
+Inside a private build's user namespace, files owned by host root show as the
+overflow uid, so `git_exec_path_binaries` cannot establish that Git's exec-path
+alias is root-owned and a nested `git`-only fence refuses Git's own re-exec. The
+root-ownership rule is unchanged, and no uid is treated as root.
+
+`held_git_alias_binds` runs in the host namespace, in `apply_rules`, before the
+build child exists. For each `git` in `GIT_TRUSTED_DIRS` it takes the alias the
+existing rules admit and verifies it again on held descriptors: each path is
+walked from `/` through directories that stay open while the next component is
+opened beneath them with symlinks refused, every component is `fstat`ed for
+uid 0 and no group/other write, both ends must be regular files and different
+objects, and the bytes read from the two held descriptors must have one
+`RawContentId`. A verified pair goes to the fdguard hook, which attaches the
+primary read-only over the alias in the build's mount namespace (see the fdguard
+patch note). An alias claimed by two different Gits is bound to neither.
+Anything unverified stays unbound, which is the previous behaviour.
+
+Inside the build the alias and the primary are then one kernel object, so the
+nested fence's ordinary rule for the granted primary covers both names. The
+resolver gains one arm, `is_spelling_of_granted_object`: a candidate that is the
+same device and inode as the granted Git, with no group- or other-writable
+component on either path, is listed, so the projection names the spelling the
+kernel rule already admits. That arm adds no authority and judges no other
+file; a different object at the alias is still admitted only by the root-owned
+same-image rule. Visible effect: within a private build the alias path has the
+primary's inode. The host, the deny-all fallback and non-build spawns are
+unchanged. Retire with the upstream port of this mechanism.

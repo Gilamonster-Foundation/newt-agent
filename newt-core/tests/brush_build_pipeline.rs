@@ -223,6 +223,16 @@ fn main() {
         return;
     }
     #[cfg(target_os = "linux")]
+    if let Some(mode) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--git-alias-ground=").map(str::to_owned))
+    {
+        git_alias_bind::ground_child(&mode);
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--build-git-alias-probe") {
+        return git_alias_bind::route_child();
+    }
+    #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--build-loopback-probe") {
         use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
@@ -545,6 +555,10 @@ fn main() {
 #[path = "support/cleanup_authority.rs"]
 mod cleanup_authority;
 
+#[cfg(target_os = "linux")]
+#[path = "support/git_alias_bind.rs"]
+mod git_alias_bind;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "support/linked_build_shell.rs"]
 mod linked_build_shell;
@@ -632,11 +646,22 @@ mod native {
                     | "--deny-build-mounts"
                     | "--deny-build-devpts"
                     | "--deny-build-identity"
+                    | "--deny-build-alias-bind"
             )
         }) {
             let deny_mounts = std::env::args().any(|arg| arg == "--deny-build-mounts");
             let deny_devpts = std::env::args().any(|arg| arg == "--deny-build-devpts");
             let deny_identity = std::env::args().any(|arg| arg == "--deny-build-identity");
+            // `move_mount` is used only to attach the same-object Git alias, the
+            // last setup step: scratch, terminals and account files exist by then.
+            let deny_alias = std::env::args().any(|arg| arg == "--deny-build-alias-bind");
+            let denied = if deny_alias {
+                libc::SYS_move_mount
+            } else if deny_mounts || deny_devpts || deny_identity {
+                libc::SYS_mount
+            } else {
+                libc::SYS_unshare
+            };
             // The PTY allocator also uses MS_BIND. Target the account's
             // readonly remount so scratch and terminal setup complete first.
             let fault_flags = if deny_identity {
@@ -660,6 +685,7 @@ mod native {
             // permissive hosts. A mount failure exercises partial setup after
             // the child has already acquired its private namespaces. Identity
             // injection denies the readonly account remount, after scratch and PTYs.
+            // Alias injection denies the attach that follows all of them.
             // This is not a production namespace policy or an escape filter.
             let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
             let mut filters = vec![
@@ -668,11 +694,7 @@ mod native {
                     (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                     0,
                     1,
-                    if deny_mounts || deny_devpts || deny_identity {
-                        libc::SYS_mount
-                    } else {
-                        libc::SYS_unshare
-                    } as u32,
+                    denied as u32,
                 ),
                 instruction(
                     (libc::BPF_RET | libc::BPF_K) as u16,
@@ -722,24 +744,11 @@ mod native {
                     0
                 );
             }
-            // Neither unshare(0) nor mount with null operands can mutate the
-            // host. The control must observe the injected errno, independently
-            // of host namespace or mount permissions.
+            // None of unshare(0), mount or move_mount with null operands can
+            // mutate the host. The control must observe the injected errno,
+            // independently of host namespace or mount permissions.
             assert_eq!(
-                unsafe {
-                    libc::syscall(
-                        if deny_mounts || deny_devpts || deny_identity {
-                            libc::SYS_mount
-                        } else {
-                            libc::SYS_unshare
-                        },
-                        0,
-                        0,
-                        0,
-                        fault_flags,
-                        0,
-                    )
-                },
+                unsafe { libc::syscall(denied, 0, 0, 0, fault_flags, 0,) },
                 -1
             );
             assert_eq!(
@@ -754,6 +763,8 @@ mod native {
                     "BUILD_MOUNT_SETUP_FAILURE_INJECTED"
                 } else if deny_identity {
                     "BUILD_IDENTITY_SETUP_FAILURE_INJECTED"
+                } else if deny_alias {
+                    "BUILD_ALIAS_BIND_FAILURE_INJECTED"
                 } else {
                     "BUILD_NETNS_SETUP_FAILURE_INJECTED"
                 }
@@ -820,6 +831,20 @@ mod native {
                 .await;
             }
             #[cfg(target_os = "linux")]
+            if selected("build_tests_git_alias_is_the_granted_primary") {
+                use super::git_alias_bind::{object, pair};
+                let host = || pair().map(|(primary, alias)| (object(&primary), object(&alias)));
+                let before = host();
+                build_network_probe(
+                    &root,
+                    "build_tests_git_alias_is_the_granted_primary",
+                    "--build-git-alias-probe",
+                    "BUILD_GIT_ALIAS_IS_THE_GRANTED_PRIMARY",
+                )
+                .await;
+                assert_eq!(before, host(), "the host alias must be untouched");
+            }
+            #[cfg(target_os = "linux")]
             for (name, probe, marker) in [
                 (
                     "build_tests_can_use_a_private_pty",
@@ -855,6 +880,10 @@ mod native {
                 if selected(name) {
                     build_network_probe(&root, name, probe, marker).await;
                 }
+            }
+            #[cfg(target_os = "linux")]
+            if selected("git_alias_file_bind_carries_a_nested_exec_rule") {
+                super::git_alias_bind::ground(&root);
             }
             if selected("denied_build_runs_no_pipeline_stage_or_redirection") {
                 denied_build_runs_no_pipeline_stage_or_redirection(&root).await;
@@ -1234,6 +1263,9 @@ mod native {
     /// `--require-build-netns` rejects fallback on every probe and both routes;
     /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
     /// `--deny-build-identity` forces a later failure at the account remount.
+    /// The Git alias twin (`support/git_alias_bind.rs`) grounds the same-object
+    /// binding; `--deny-build-alias-bind` fails its attach, the last setup
+    /// step, and the retried child must then report no binding at all.
     #[cfg(target_os = "linux")]
     async fn build_network_probe(root: &Path, name: &str, probe: &str, marker: &str) {
         use newt_core::confined_exec::{
@@ -1451,16 +1483,19 @@ mod native {
             ("argv", stdout.as_ref(), stderr.as_ref()),
             ("Brush", brush.as_str(), brush.as_str()),
         ] {
+            let unbound = output.contains("BUILD_GIT_ALIAS_UNBOUND_FALLBACK");
             let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK")
                 || output.contains("BUILD_SCRATCH_DENIED_FALLBACK")
                 || output.contains("BUILD_PTY_DENIED_FALLBACK")
-                || output.contains("BUILD_IDENTITY_DENIED_FALLBACK");
+                || output.contains("BUILD_IDENTITY_DENIED_FALLBACK")
+                || unbound;
             assert!(
                 output.contains(marker)
                     || ((name == "build_tests_loopback_roundtrip"
                         || !scratch_canaries.is_empty()
                         || host_pty.is_some()
-                        || name == "build_tests_private_identity_isolated")
+                        || name == "build_tests_private_identity_isolated"
+                        || unbound)
                         && fallback),
                 "{name} ({route}): {output}\n{diagnostic}"
             );
@@ -1474,6 +1509,7 @@ mod native {
                 ("--deny-build-mounts", "deny-all fallback"),
                 ("--deny-build-devpts", "deny-all fallback"),
                 ("--deny-build-identity", "deny-all fallback"),
+                ("--deny-build-alias-bind", "deny-all fallback"),
             ] {
                 if std::env::args().any(|arg| arg == switch) {
                     assert!(
