@@ -207,6 +207,8 @@ const CORPUS: &[&str] = &[
 ];
 
 const WORDS: &[(&str, Option<&str>)] = &[
+    ("/usr/bin/@(env)", None),
+    ("/usr/bin/@(timeout)", None),
     ("@(a|b)", None),
     ("+(x)", None),
     ("!(x)", None),
@@ -242,6 +244,29 @@ const WORDS: &[(&str, Option<&str>)] = &[
     ("résumé", Some("résumé")),
 ];
 
+const REFUSED_TIMEOUTS: &[&str] = &[
+    "timeout 5 - git status",
+    "timeout 5 -- git status",
+    "timeout 5 -v git status",
+    "timeout 5 --foreground git status",
+    "timeout 5 -k git status",
+    "timeout 5 --signal=TERM git status",
+    "timeout 5 --unknown git status",
+    "timeout 5 '-v' git status",
+    r"timeout 5 \-v git status",
+    r"timeout 5 \-- git status",
+    "timeout 5 '--' git status",
+    r#"timeout 5 "--" git status"#,
+    "timeout -f 5 git status",
+    "timeout -p 5 git status",
+    "timeout -fp 5 git status",
+    "timeout -sTERM 5 git status",
+    "timeout -k1 5 git status",
+    "timeout --sig=TERM 5 git status",
+    "timeout --help 5 git status",
+    "timeout --version 5 git status",
+];
+
 fn extras() -> Vec<String> {
     let mut inputs: Vec<String> = ["", " ", "\n", "\0", "é ü $(echo é)"]
         .iter()
@@ -268,9 +293,12 @@ fn extras() -> Vec<String> {
     let body = "literal $(touch never) `touch neither` 'unmatched\n";
     inputs.push(format!("cat <<'EOF'\n{body}EOF\n"));
     inputs.push("echo $(touch '/tmp/newt-inspect-marker')".to_string());
+    inputs.extend(REFUSED_TIMEOUTS.iter().map(|s| (*s).to_string()));
+    inputs.push("timeout -- 5 git status".to_string());
     for (word, _) in WORDS {
         inputs.extend([
             (*word).to_string(),
+            format!("timeout 5 {word} status"),
             format!("printf {word} literal"),
             format!("find . -exec {word} \\;"),
             format!("find . -exec word-probe {word} \\;"),
@@ -320,6 +348,37 @@ fn the_copy_inspects_every_input_as_bridle_does() {
         accepted > 50 && refused > 20,
         "accepted {accepted}, refused {refused} of {}",
         inputs.len()
+    );
+}
+
+#[test]
+fn timeout_and_find_descendants_have_explicit_refusal_expectations() {
+    let sources = REFUSED_TIMEOUTS.iter().map(|s| (*s).to_string()).chain(
+        WORDS
+            .iter()
+            .filter(|(_, expected)| expected.is_none())
+            .flat_map(|(word, _)| {
+                [
+                    format!("timeout 5 {word} status"),
+                    format!(r"find . -exec {word} \;"),
+                ]
+            }),
+    );
+    for source in sources {
+        assert!(ours::inspect_shell(&source).is_err(), "newt: {source}");
+        assert!(
+            agent_bridle::inspect_shell(&source).is_err(),
+            "bridle: {source}"
+        );
+    }
+    let source = "timeout -- 5 git status";
+    assert_eq!(
+        ours::inspect_shell(source).unwrap().commands[0].descendant_execs[0].program,
+        "git"
+    );
+    assert_eq!(
+        agent_bridle::inspect_shell(source).unwrap().commands[0].descendant_execs[0].program,
+        "git"
     );
 }
 

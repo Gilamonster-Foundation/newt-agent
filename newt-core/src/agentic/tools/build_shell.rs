@@ -244,6 +244,44 @@ mod tests {
     use super::build_program;
 
     #[test]
+    fn refused_timeout_descendants_grant_no_build_or_broker_projection() {
+        use super::super::governed_command::GovernedCommand;
+        for prefix in [
+            "timeout -f 5",
+            "timeout -p 5",
+            "timeout 5 --",
+            "timeout 5 '-v'",
+            r"timeout 5 \-v",
+            "timeout 5 @(cargo)",
+            "timeout 5 {x}{cargo,}",
+            "timeout 5 a=(b c)",
+            r#"timeout 5 "$PROGRAM""#,
+        ] {
+            let source = format!("{prefix} cargo check");
+            assert!(
+                crate::shell_inspect::inspect_shell(&source).is_err(),
+                "{source}"
+            );
+            assert_eq!(build_program(&source), None, "{source}");
+            assert!(!super::has_build_work(&source), "{source}");
+            assert_eq!(
+                crate::agentic::routing::RouteTable::builtin().classify(
+                    &source,
+                    std::path::Path::new("."),
+                    &crate::Scope::All,
+                ),
+                crate::agentic::routing::RouteDecision::Exec,
+                "{source}",
+            );
+            assert!(GovernedCommand::parse(&source).is_err(), "{source}");
+        }
+        assert_eq!(
+            build_program("timeout -- 5 cargo check").as_deref(),
+            Some("cargo")
+        );
+    }
+
+    #[test]
     fn build_selection_uses_executables_not_text_or_pipeline_shapes() {
         for source in [
             "cargo build --lib 2>&1 | grep error",

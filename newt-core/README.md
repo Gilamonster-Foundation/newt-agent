@@ -240,6 +240,20 @@ override still narrows a build shell to the requested, capped budget.
 `build_exec` and `lifecycle` with `action=build` retain their own budgets. Permission and confinement checks
 are independent of time-budget selection.
 
+The pure shell inspector projects one literal `timeout` wrapper using a
+[bounded GNU coreutils 9.4 grammar](../vendor/agent-bridle-tool-shell/README.md):
+recognized options precede a finite, nonnegative duration and a static child
+program. `--` is supported before the duration; a child program beginning with
+`-` is refused even when quoted or escaped. Unsupported `-f`/`-p` options and
+runtime-dependent child program words are refused. Failed inspection selects no build
+projection and grants no commit-broker authority; ordinary confined execution
+still owns admission, and lexical refusal guards remain conservative tripwires.
+
+Without `--foreground`, GNU `timeout` gives its command a separate process group,
+so it can outlive Newt's own timeout or cancellation. The inspector reports this
+caveat. Projecting a descendant says nothing about its lifetime and does not
+make its native execution independently intercepted or brokered.
+
 ## Worktree adoption with ambient execution
 
 Verified task-worktree creation protects the original checkout in confined

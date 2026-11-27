@@ -186,3 +186,16 @@ The pure program/printf/find regression and the 33-word real-worker
 differential test travel with the fix. Newt's independent inspector carries
 the same predicates and explicit parity expectations. Downstream Git/gh
 policy checks refuse unresolved policy words before command routing.
+
+## Timeout descendant inspection
+
+Ports the same correction from agent-bridle. Both inspection copies refuse
+option-like descendant program words, including quoted or escaped forms, and
+the unsupported `-f`/`-p` options. `--` before the duration remains supported.
+The README documents the bounded GNU coreutils 9.4 grammar and the distinction
+between a descendant inventory and execution or broker authority.
+
+Non-foreground wrappers report that GNU timeout's separate process group can
+outlive the tool's timeout or cancellation. This change adds no lifetime bound.
+Parser regressions, explicit parity expectations and downstream build/broker
+tests cover refusals and runtime-dependent words without executing them.
