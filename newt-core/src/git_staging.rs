@@ -2806,6 +2806,7 @@ mod real_process_tests {
         /// `git config --global …` into this test's HOME, then 0600 it.
         fn global(&self, args: &[&str]) {
             let out = Command::new("/usr/bin/git")
+                .current_dir(self.home.path())
                 .args(["config", "--global"])
                 .args(args)
                 .env_clear()
@@ -2850,6 +2851,7 @@ mod real_process_tests {
 
     fn staged_values(staging: &StagingRepo, key: &str) -> Vec<String> {
         let out = Command::new("/usr/bin/git")
+            .current_dir(staging.path())
             .args(["config", "--file"])
             .arg(staging.config_path())
             .args(["--get-all", key])

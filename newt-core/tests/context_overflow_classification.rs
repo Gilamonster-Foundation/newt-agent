@@ -15,7 +15,7 @@ fn err(message: &str) -> anyhow::Error {
 #[tokio::test]
 async fn context_error_body_survives_a_subsequent_connection_drop() {
     use std::io::{Read, Write};
-    let listener = std::net::TcpListener::bind(("localhost", 0)).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let body = br#"{"error":{"message":"Context size has been exceeded."}}"#;
     let peer = std::thread::spawn(move || {
