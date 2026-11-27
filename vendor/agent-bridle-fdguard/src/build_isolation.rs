@@ -59,11 +59,25 @@ fn needs_fallback<'a, 'b>(
     }
     let mut hidden = |path: &Path| {
         let path = cwd.join(path);
-        path.components().any(|part| part == Component::ParentDir)
-            || canonicalize(&path).map_or(true, |resolved| {
-                // A covered spelling disappears even if its symlink points out.
-                temporary_root(&path).is_some() || temporary_root(&resolved).is_some()
-            })
+        if path.components().any(|part| part == Component::ParentDir) {
+            return true;
+        }
+        // A path that does not exist holds nothing a private mount could hide:
+        // judge it by its nearest existing ancestor. A stale `PATH` entry must
+        // not cost the build its private mode. Any other failure stays covered.
+        let mut existing = path.as_path();
+        let resolved = loop {
+            match canonicalize(existing) {
+                Ok(resolved) => break resolved,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => match existing.parent() {
+                    Some(parent) => existing = parent,
+                    None => return true,
+                },
+                Err(_) => return true,
+            }
+        };
+        // A covered spelling disappears even if its symlink points out.
+        temporary_root(&path).is_some() || temporary_root(&resolved).is_some()
     };
     roots.any(&mut hidden)
         || env
@@ -619,8 +633,16 @@ mod tests {
     fn covered_build_inputs_select_fallback_before_fork() {
         // Every path resolution is injected: no filesystem, NSS or process state.
         let resolve = |path: &std::path::Path| match path.to_str().unwrap() {
-            "/missing" => Err(io::Error::from_raw_os_error(libc::ENOENT)),
-            "/unreadable" => Err(io::Error::from_raw_os_error(libc::EACCES)),
+            "/missing"
+            | "/missing/deeper"
+            | "/missing/deeper/still"
+            | "/symlink/missing"
+            | "/tmp/missing"
+            | "/opt/stale/bin"
+            | "/opt/stale" => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            "/unreadable" | "/unreadable/missing" => {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            }
             "/symlink" => Ok(std::path::PathBuf::from("/tmp/tool")),
             "/tmp/outward" => Ok(std::path::PathBuf::from("/workspace/tool")),
             "/workspace/relative" => Ok(std::path::PathBuf::from("/dev/shm/tool")),
@@ -637,8 +659,12 @@ mod tests {
             (true, "/workspace", vec!["/tmp/write"], true),
             (true, "/workspace", vec!["/dev/shm/read"], true),
             (true, "/workspace", vec!["/symlink"], true),
-            (true, "/workspace", vec!["/missing"], true),
+            (true, "/workspace", vec!["/missing"], false),
+            (true, "/workspace", vec!["/missing/deeper/still"], false),
+            (true, "/workspace", vec!["/symlink/missing"], true),
+            (true, "/workspace", vec!["/tmp/missing"], true),
             (true, "/workspace", vec!["/unreadable"], true),
+            (true, "/workspace", vec!["/unreadable/missing"], true),
             (
                 true,
                 "/workspace",
@@ -669,7 +695,10 @@ mod tests {
             ("PYTHONHOME", "/tmp/python", true),
             ("DOTNET_ROOT", "/tmp/dotnet", true),
             ("HOME", "/tmp/../workspace", true),
-            ("TMPDIR", "/missing", true),
+            ("PATH", "/usr/bin:/opt/stale/bin", false),
+            ("PATH", "/usr/bin:/symlink/missing", true),
+            ("TMPDIR", "/missing", false),
+            ("TMPDIR", "/tmp/missing", true),
             ("TEMP", "/tmp/temp", true),
             ("TMP", "/dev/shm/temp", true),
             ("XDG_RUNTIME_DIR", "/tmp/runtime", true),
