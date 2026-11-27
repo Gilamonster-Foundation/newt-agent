@@ -1,3 +1,6 @@
+#[path = "../../../newt-core/tests/support/chat_ctx.rs"]
+mod fixture;
+
 use super::*;
 
 #[tokio::test]
@@ -1312,7 +1315,7 @@ impl newt_core::agentic::McpTools for RemoteTool {
 /// Responses strict mode. Its optional property must survive unchanged.
 #[tokio::test]
 async fn mcp_closed_schema_dispatches_on_responses_without_strict() {
-    use newt_core::agentic::{openai_responses_complete, ChatCtx, PromptDisposition};
+    use newt_core::agentic::{openai_responses_complete, ChatCtx};
     use newt_core::{BackendKind, MemMessage};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1355,98 +1358,13 @@ async fn mcp_closed_schema_dispatches_on_responses_without_strict() {
     let caveats = newt_policy::caveats::Caveats::top();
     let caveats = &caveats;
     let ctx = ChatCtx {
-        shell_dialect: newt_core::agentic::shell_dialect_sentence(false, false),
-        command_budget: Default::default(),
-        overflow_retry: Default::default(),
-        run_allowance: None,
-        verify_outcomes: false,
-        round_cap_hit: None,
-        smart_harness: None,
-        url,
         model: "tiny-context-model",
         kind,
         api_key: (kind == BackendKind::Openai).then_some("sk-test"),
-        messages,
         task,
-        workspace: ".",
-        default_command_cwd: None,
-        worktree_session: None,
-        color: false,
-        markdown: false,
-        tool_offload: false,
-        spill_store: None,
-        disclosure: None,
-        compaction_store: None,
-        scratchpad: false,
-        scratchpad_store: None,
-        code_search: None,
-        where_is: None,
-        nav: None,
-        exposure: Default::default(),
-        experience_store: None,
-        step_ledger: None,
-        caveats,
-        persona_tools: None,
-        cognition: None,
-        chat_completions_capability: Default::default(),
-        responses_capability: Default::default(),
-        openai_api: Default::default(),
-        output_allowance: None,
-        attempt_ledger: None,
-        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
-        emits_leading_reasoning: false,
         max_tool_rounds: 1,
-        narration_nudge_cap: 1,
-        action_nudges: true,
-        prompt_disposition: PromptDisposition::Act,
-        prompt_intake: None,
-        workflow_grace_rounds: 0,
-        tool_output_lines: 20,
-        debug: false,
-        trace: false,
-        num_ctx: None,
-        input_ceiling_pct: 80,
-        low_budget_pct: 15,
-        connect_timeout_secs: 5,
         inference_timeout_secs: 5,
-        mid_loop_trim_threshold: 40,
-        compaction_trigger_policy: newt_core::CompactionTriggerPolicy::HeadroomAware,
-        mid_loop_trim_tokens: None,
-        max_ok_input: None,
-        build_check_cmd: None,
-        safe_context: None,
-        output_ceiling: None,
-        recover_cw_400: None,
-        note_sink: None,
-        note_nudge: None,
-        recall_source: None,
-        memory_source: None,
-        summarizer: None,
-        compress_state: None,
-        tool_events: None,
-        phantom_reaches: None,
-        end_reason: None,
-        solve_obs: None,
-        permission_gate: None,
-        on_round_usage: None,
-        estimate_ratio: None,
-        estimation: newt_core::tokens::TokenEstimation::default(),
-        summary_input_cap_floor_chars: 8_192,
-        rewrites_history: true,
-        exec_floor: None,
-        write_ledger: None,
-        attribution: None,
-        cancel: None,
-        live_tool_output: None,
-        git_tool: None,
-        crew_runner: None,
-        operating_mode_control: None,
-        plan_mode_control: None,
-        plan_draft_sink: None,
-        steering: None,
-        report_sink: None,
-        completed_spill_renderer: None,
-        reader_source: None,
+        ..fixture::chat_ctx(url, messages, caveats)
     };
 
     let (reply, _, _, _) = openai_responses_complete(ctx, &mut remote)
