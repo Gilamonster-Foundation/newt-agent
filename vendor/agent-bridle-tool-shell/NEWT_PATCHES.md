@@ -199,3 +199,12 @@ Non-foreground wrappers report that GNU timeout's separate process group can
 outlive the tool's timeout or cancellation. This change adds no lifetime bound.
 Parser regressions, explicit parity expectations and downstream build/broker
 tests cover refusals and runtime-dependent words without executing them.
+
+## Covered build inputs (#3337)
+
+Private-build selection now accounts for request read/write roots and directory
+environment values before fork. The existing worker bootstrap carries PATH and
+tool homes as well as temporary directories; loader and authentication controls
+remain excluded. Brush's existing PATH default is made explicit before bootstrap
+so inherited search directories participate in the same decision. No authority
+record, content identity, or caller grant changes.
