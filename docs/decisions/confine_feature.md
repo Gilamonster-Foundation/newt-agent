@@ -1,7 +1,7 @@
 # Decision: newt-core's confinement dependencies are optional
 
 **Status:** Accepted — #3160, R1 (explicit runtime bypass).
-**Date:** 2026-11-24 (UTC)
+**Date:** 2026-11-24 (UTC); shared-leaf amendment accepted 2026-11-27.
 **Related:** [Confinement model](ocap_confinement_model.md),
 [deviation register](../security/ocap-deviations.md#confine-off-build).
 
@@ -9,10 +9,12 @@
 
 `newt-core` enables `markdown` and `confine` by default. `confine` activates
 three optional normal dependencies: `agent-bridle`, `agent-bridle-tool-shell`
-and `agent-bridle-tool-web`. Without it, the selected normal/build closure
-contains none of those packages, `agent-bridle-core`, or
-`agent-bridle-fdguard`. The default dependency tree and library test names
-are unchanged by this manifest flip. Both platform features,
+and `agent-bridle-tool-web`. The owner-approved rule is: **no
+agent-bridle-core, agent-bridle-tool-shell or the agent-bridle facade without
+`confine`**. Small leaf crates may be shared: the selected normal/build closure
+retains `agent-bridle-fdguard` for descriptor hygiene and held directory handles.
+This replaces the original prohibition on every `agent-bridle-*` package.
+Both platform features,
 `windows-appcontainer` and `macos-seatbelt`, still enable `confine` and
 forward the corresponding bridle feature.
 
@@ -40,7 +42,7 @@ routed built-ins and native operations retain their own boundaries.
 | Governed Git | Brokers and all their preflight refusals, data-loss confirmations and network-read prompts are absent. OCAP-on commits retain the no-broker refusal; other commands reaching the shell boundary refuse. Plain host publication and its existing bypass notice require the explicit runtime bypass and route conditions above. The off commit and quoted-commit tests pin refusal. |
 | Build lane and `move_from` | The build helper refuses before its execution line and permission request; earlier public tool presentation may still occur. `move_from` refuses before its transaction. The off lifecycle/move tests pin these helper/dispatch boundaries. |
 | Posture and dispatch | The executor verifier reports `Absent` with the missing-feature reason; `ocap_l3_backend` reports `(none, false)`. `maybe_dispatch` returns `None` (macOS alias initialization remains). The verifier, L3 and truth tests pin the posture. |
-| Core `web_fetch`, file tools and policy | Retained: the owned fetch implementation, newt-native file fence, shell inspection, durable signed policy, step-up policy and `newt-fdguard`. Runtime implicit sandbox roots are empty when no backend is compiled; the off root test pins that fact. |
+| Core `web_fetch`, file tools and policy | Retained: the owned fetch implementation, newt-native file fence, shell inspection, durable signed policy, step-up policy and `agent-bridle-fdguard`. Runtime implicit sandbox roots are empty when no backend is compiled; the off root test pins that fact. |
 
 The catalog can still advertise operations that this build refuses; catalog,
 alias and steering-text changes remain separate work. Default backend runtime
@@ -67,10 +69,11 @@ request core defaults until downstream threading changes that.
 
 The existing `closure_ledger` integration target invokes Cargo for both absence
 selections and a measured default positive control on each target below. The
-Linux and macOS controls name five bridle crates; Windows names four because
-`agent-bridle-fdguard` is Unix-only. The ledger also inspects metadata covering
-every direct normal/dev/build/target declaration and renamed local key. Its
-literal sample test is hermetic; the Cargo-backed tests are integration
+default controls name five bridle crates on every target, including the shared
+fdguard (whose descriptor sweep is a no-op on Windows). Off checks forbid only
+the three confinement backend packages named above. The ledger also inspects
+metadata covering every direct normal/dev/build/target declaration and renamed
+local key for those packages. Its literal sample test is hermetic; the Cargo-backed tests are integration
 evidence. Counts are cached by package **and feature selection**. The ordinary
 ledger target runs in CI and the hook; its off closure checks do not depend on
 the test executable itself having confine off.
@@ -110,10 +113,22 @@ cargo tree --color never -p newt-core --no-default-features --features markdown 
   -e normal,build --prefix none --target x86_64-unknown-linux-gnu
 ```
 
-Strip trailing ` (*)`, deduplicate, and count. The measured count is
-417; the ceiling is 430, from `((N + 14) / 10) * 10` with integer division
-(5–14 packages of headroom). A ceiling may only go down. The default count is
-526 with its existing ceiling 530. Measurement: 2026-11-24 UTC, `bc6d45582d43` with this manifest flip applied.
+Strip trailing ` (*)`, deduplicate, and count. Measurements on 2026-11-27:
+
+| Core selection | Before sharing fdguard | After |
+|---|---:|---:|
+| Defaults | 526 | 525 |
+| `--no-default-features` | 416 | 416 |
+| `--no-default-features --features markdown` | 417 | 417 |
+
+The default and markdown-only ceilings remain 530 and 430; a ceiling may only go down.
+
+The vendored Linux `build_isolation` module stays available without a new Cargo
+feature. Its `seccompiler` and `linux-raw-sys` package versions already occur in
+the off closure through `newt-policy` and `rustix`; sharing it adds no dependency
+package beyond replacing the descriptor guard itself. A new feature would not
+reduce this closure. Runtime build isolation still requires the confinement
+backend; importing the leaf installs no hooks by itself.
 
 ## Shared features and packaging limits
 
@@ -158,6 +173,10 @@ and library runs check the selected callers.
 The workspace's three bridle patches remain necessary for Newt-specific APIs.
 Making dependencies optional does not repair published-crate compilation
 (#3181/#3163), publish those patches, change `macos_private_ptys` or ApplyToken,
-or change publish order. The fdguard dev differential stays: consumer closure
-proofs use normal/build edges, while metadata rejects hidden direct bridle
-dev/build dependencies in core itself.
+or publish the removed descriptor-guard copy. That copy has no crates.io release;
+the shared leaf remains resolved through the existing vendor patch. Its former
+differential tests now use literal behavior expectations, real filesystem
+observations and an unguarded child control. The identical hostile-descriptor
+suite runs once in the shared crate; there is no byte-identity twin to maintain.
+Consumer closure proofs use normal/build edges, while metadata rejects hidden
+direct confinement-backend dev/build dependencies in core itself.

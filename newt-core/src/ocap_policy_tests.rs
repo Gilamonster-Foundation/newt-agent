@@ -1,5 +1,5 @@
 //! newt's own tests of `ocap_policy`: where the copy deliberately differs from
-//! agent-bridle-core's `policy` module (#3160). They name no bridle crate, so they stay when
+//! agent-bridle-core's `policy` module (#3160). They name no confinement backend, so they stay when
 //! the parity tests are gated with the dependency.
 
 use crate::ocap_policy::{hex_decode, Ed25519ApproveVerifier, PolicyFile};

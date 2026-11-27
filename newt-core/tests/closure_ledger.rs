@@ -60,7 +60,6 @@ const LEDGER: &[(&str, usize)] = &[
     ("newt-launch", 10),
     ("tests-pty", 10),
     ("newt-refactor-evidence", 10),
-    ("newt-fdguard", 10),
     ("newt-router", 20),
     ("newt-skills", 30),
     ("plugins-protocol", 40),
@@ -280,25 +279,27 @@ const BRIDLE_CRATES: [&str; 5] = [
     "agent-bridle-tool-shell",
     "agent-bridle-tool-web",
 ];
-/// Measured with default normal/build trees on 2026-11-24: fdguard is Unix-only.
+/// The shared fdguard is available on every target (descriptor hygiene is a no-op on Windows).
 const BRIDLE_TARGETS: &[(&str, &[&str])] = &[
     (TARGET, &BRIDLE_CRATES),
-    (
-        "x86_64-pc-windows-msvc",
-        &[
-            "agent-bridle",
-            "agent-bridle-core",
-            "agent-bridle-tool-shell",
-            "agent-bridle-tool-web",
-        ],
-    ),
+    ("x86_64-pc-windows-msvc", &BRIDLE_CRATES),
     ("aarch64-apple-darwin", &BRIDLE_CRATES),
 ];
-const DIRECT_BRIDLE: [&str; 3] = [
-    "agent-bridle",
+// Owner decision 2026-11-27: no agent-bridle-core, agent-bridle-tool-shell or
+// the agent-bridle facade without confine. Small leaf crates may be shared.
+const CONFINE_CRATES: [&str; 3] = [
+    "agent-bridle-core",
     "agent-bridle-tool-shell",
-    "agent-bridle-tool-web",
+    "agent-bridle",
 ];
+const DIRECT_BRIDLE: [&str; 2] = ["agent-bridle", "agent-bridle-tool-shell"];
+
+fn confine_names(tree: &BTreeSet<String>) -> BTreeSet<&str> {
+    bridle_names(tree)
+        .into_iter()
+        .filter(|name| CONFINE_CRATES.contains(name))
+        .collect()
+}
 
 fn is_bridle_crate(name: &str) -> bool {
     name == "agent-bridle" || name.starts_with("agent-bridle-")
@@ -351,7 +352,7 @@ fn bridle_manifest(meta: &serde_json::Value) -> Result<(), String> {
     let mut problems = Vec::new();
     for dep in deps {
         let name = dep["name"].as_str().ok_or("dependency has no name")?;
-        if !is_bridle_crate(name) {
+        if !CONFINE_CRATES.contains(&name) {
             continue;
         }
         names.insert(name);
@@ -396,7 +397,7 @@ fn bridle_manifest(meta: &serde_json::Value) -> Result<(), String> {
 /// Grounds the literal tree/name checks in Cargo output for both off selections
 /// on each target configuration. Resolution on Linux is not native compilation.
 #[test]
-fn the_confine_off_closure_names_no_bridle_crate() {
+fn the_confine_off_closure_names_no_confinement_backend() {
     let mut leaks = Vec::new();
     for &(target, _) in BRIDLE_TARGETS {
         for args in [
@@ -404,7 +405,7 @@ fn the_confine_off_closure_names_no_bridle_crate() {
             &["--no-default-features", "--features", "markdown"],
         ] {
             let tree = closure_with("newt-core", args, target);
-            let found = bridle_names(&tree);
+            let found = confine_names(&tree);
             if !found.is_empty() {
                 leaks.push(format!("{target} {args:?}: {found:?}"));
             }
@@ -412,7 +413,7 @@ fn the_confine_off_closure_names_no_bridle_crate() {
     }
     assert!(
         leaks.is_empty(),
-        "confine-off closure contains bridle:\n{}",
+        "confine-off closure contains a confinement backend:\n{}",
         leaks.join("\n")
     );
 }
@@ -432,7 +433,7 @@ fn the_default_closure_names_every_bridle_crate() {
 
 /// Cargo metadata integration evidence covers normal/dev/build and target rows.
 #[test]
-fn every_direct_bridle_dependency_is_optional_behind_confine() {
+fn every_direct_confinement_backend_is_optional_behind_confine() {
     let meta = serde_json::from_str(&cargo(&["metadata", "--no-deps", "--format-version", "1"]))
         .expect("cargo metadata prints JSON");
     assert_eq!(bridle_manifest(&meta), Ok(()));
@@ -458,6 +459,15 @@ fn the_bridle_checks_read_real_cargo_output() {
     let tree = parse_tree("newt-core", "newt-core v0.8.6 (/w/newt-core)\nagent-bridle v0.8.0-rc.7\nagent-bridle-core v0.8.0-rc.7 (/w/vendor/agent-bridle-core)\nagent-bridle-fdguard v0.8.0-rc.7\nagent-bridle-tool-shell v0.8.0-rc.7\nagent-bridle-tool-web v0.8.0-rc.7\nagent-bridle v0.8.0-rc.7 (*)\nserde_derive v1.0.0 (proc-macro)\nagent-bridled v1.0.0\nunrelated v1.0.0\n");
     assert_eq!(tree.len(), 9);
     assert_eq!(bridle_names(&tree), BTreeSet::from(BRIDLE_CRATES));
+    assert_eq!(confine_names(&tree), BTreeSet::from(CONFINE_CRATES));
+    for leaf in [
+        "agent-bridle-fdguard",
+        "agent-bridle-tool-web",
+        "agent-bridle-future-leaf",
+    ] {
+        let leaf_tree = parse_tree("newt-core", &format!("newt-core v0.8.6\n{leaf} v1.0.0\n"));
+        assert!(confine_names(&leaf_tree).is_empty());
+    }
     assert!(!is_bridle_crate("agent-bridled"));
     assert!(std::panic::catch_unwind(|| parse_tree("newt-core", "")).is_err());
     assert!(std::panic::catch_unwind(|| parse_tree("newt-core", "other v1.0.0")).is_err());
@@ -470,6 +480,15 @@ fn the_bridle_checks_read_real_cargo_output() {
         "windows-appcontainer": ["confine", "agent-bridle/windows-appcontainer"],
         "macos-seatbelt": ["confine", "agent-bridle/macos-seatbelt"]}}]});
     assert_eq!(bridle_manifest(&good), Ok(()));
+    let mut shared_leaf = good.clone();
+    shared_leaf["packages"][0]["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "agent-bridle-fdguard", "rename": null, "kind": null,
+            "optional": false, "target": null
+        }));
+    assert_eq!(bridle_manifest(&shared_leaf), Ok(()));
     for bad in [serde_json::json!({}), serde_json::json!({"packages": []})] {
         assert!(bridle_manifest(&bad).is_err());
     }

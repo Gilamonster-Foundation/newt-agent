@@ -218,8 +218,8 @@ agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "host-shell", "os-
 # See docs/decisions/confine_feature.md for the feature and packaging contract.
 agent-bridle-tool-web = { version = "0.8.0-rc.7", optional = true }
 agent-bridle-tool-shell = { version = "0.8.0-rc.7", features = ["brush"], optional = true }
-# The descriptor guard, newt's own copy of agent-bridle-fdguard (#3160).
-newt-fdguard.workspace = true
+# Shared descriptor hygiene is independent of the optional confinement backend.
+agent-bridle-fdguard.workspace = true
 # The shell parser behind `shell_inspect` (#3160): the version agent-bridle-tool-shell pins.
 brush-parser = { package = "brush-ocap-parser", version = "=0.5.0-rc.1" }
 # The resolver and the HTML-to-Markdown pair behind `web_fetch` (#3160): the versions

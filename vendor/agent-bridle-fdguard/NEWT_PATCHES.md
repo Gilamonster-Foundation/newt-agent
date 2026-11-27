@@ -145,3 +145,13 @@ and mount namespace. `mount_setattr` is not mediated by Landlock; it needs
 it cannot change which object the target names. The binding's guarantee is that
 identity, not the read-only flag: the file's own mode and the build's write
 rules already refuse writes.
+
+## Shared leaf and retained tests
+
+Newt core and MCP now use this crate directly, including without their `confine`
+feature; the separate unpublished copy is removed. The former differential
+suite lives in `tests/bridle_differential.rs`: literal errno/identity assertions,
+independent filesystem observations, and a guarded-versus-unguarded child probe.
+The upstream hostile-descriptor suite is retained here without a second copy.
+Linux `build_isolation` remains unchanged: its dependency versions are already
+in Newt's confine-off closure, so feature-gating it would remove no packages.

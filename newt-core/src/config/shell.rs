@@ -38,7 +38,7 @@ pub enum ShellEngine {
 
 /// Does this target provide the Brush engine's private worker transport? Linux and macOS
 /// do; elsewhere the safe-subset shell is selected instead. Copied from agent-bridle's
-/// tool-shell so the engine choice needs no bridle crate (#3160, the `confine` feature);
+/// tool-shell so the engine choice needs no confinement backend (#3160, the `confine` feature);
 /// `the_worker_transport_probe_is_the_one_bridle_reports` keeps the two equal.
 #[must_use]
 pub(crate) const fn brush_private_control_supported() -> bool {
@@ -403,7 +403,7 @@ mod shell_engine_tests {
     };
     use crate::config::Config;
 
-    /// #3160: the probe is bridle's own, copied so the engine choice needs no bridle crate;
+    /// #3160: the probe is bridle's own, copied so the engine choice needs no confinement backend;
     /// while bridle is a dependency the two must agree.
     #[cfg(feature = "confine")]
     #[test]

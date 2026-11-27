@@ -96,8 +96,9 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Invariant (ideal):** operations requiring confinement have a compiled backend
   and report only enforcement they can deliver.
 - **Practical caveat (now):** `newt-core` can be built without its default-on
-  `confine` feature. Its selected normal/build closure then contains no bridle
-  crate. This does not assert the runtime OCAP bypass (R1).
+  `confine` feature. Its selected normal/build closure contains no agent-bridle-core,
+  agent-bridle-tool-shell or the agent-bridle facade without `confine`; small leaf
+  crates such as agent-bridle-fdguard may be shared. This does not assert the runtime OCAP bypass (R1).
 - **Residual:** a deliberately selected optional build posture provides no
   confined executor or shell backend. Explicit OCAP-off host execution is
   unconfined; full access or selecting Host alone does not authorize it. Core's
@@ -1337,8 +1338,9 @@ resolved in a later release:
   the host route may run; otherwise the same shell refusal applies.
   Full-access alone does not authorize host execution. The shell's documented
   advisory fallback in builds with `confine` is unchanged. The selected core
-  closure now contains no bridle crate with `confine` off; repository consumers
-  still take core defaults, so this is not a bridle-free binary. See
+  closure contains no agent-bridle-core, agent-bridle-tool-shell or the agent-bridle
+  facade without `confine`; small leaf crates may be shared. Repository consumers
+  still take core defaults, so this is not a backend-free binary. See
   [confine-off-build](#confine-off-build).
 
 ### Native commit cancellation: lease shutdown is not tree completion (#2686)

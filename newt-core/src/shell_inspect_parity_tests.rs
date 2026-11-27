@@ -1,5 +1,5 @@
 //! #3160: `shell_inspect` is a copy of agent-bridle-tool-shell's inspector, so newt-core
-//! needs no bridle crate to read shell syntax. While bridle is a dependency the two must
+//! needs no confinement backend to read shell syntax. While bridle is a dependency the two must
 //! agree on every input: the same inspection (compared as JSON), the same refusal, the same
 //! literal word. The corpus is every string literal in the inherited tests, plus `extras`:
 //! the boundary inputs and the inputs those tests build at run time.

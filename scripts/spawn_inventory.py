@@ -34,9 +34,9 @@ ALLOWLIST = REPO / "docs" / "security" / "spawn-inventory.toml"
 SCAN_ROOTS = [
     "crates/newt-carried-tools/src",
     "newt-core/src",
-    # #3160: newt-core's descriptor guard, copied from agent-bridle-fdguard; a spawn added
-    # there is inventoried like one in newt-core.
-    "newt-fdguard/src",
+    # Shared descriptor guard: production seam and real-resource probes.
+    "vendor/agent-bridle-fdguard/src",
+    "vendor/agent-bridle-fdguard/tests",
     "newt-cli/src",
     "newt-tui/src",
     "newt-tools/src",
@@ -113,9 +113,9 @@ def self_test() -> None:
     # The descriptor guard's crate is scanned like newt-core (#3160).
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
-        (repo / "newt-fdguard" / "src").mkdir(parents=True)
-        (repo / "newt-fdguard" / "src" / "x.rs").write_text('fn f() { std::process::Command::new("x"); }')
-        assert scan(repo) == {"newt-fdguard/src/x.rs": 1}, scan(repo)
+        (repo / "vendor" / "agent-bridle-fdguard" / "src").mkdir(parents=True)
+        (repo / "vendor" / "agent-bridle-fdguard" / "src" / "x.rs").write_text('fn f() { std::process::Command::new("x"); }')
+        assert scan(repo) == {"vendor/agent-bridle-fdguard/src/x.rs": 1}, scan(repo)
     # Excess + new-file both flagged; equal/fewer are clean.
     v = check({"a/b.rs": 2}, {"a/b.rs": 3, "e/f.rs": 1})
     assert any("UNREVIEWED" in x for x in v) and any("NEW spawn" in x for x in v), v

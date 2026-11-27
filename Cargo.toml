@@ -19,7 +19,6 @@ members = [
     "newt-interaction",
     "newt-scheduler",
     "newt-git",
-    "newt-fdguard",
     "newt-flock",
     "crates/newt-launch",
     "crates/newt-carried-tools",
@@ -63,7 +62,6 @@ default-members = [
     "newt-interaction",
     "newt-scheduler",
     "newt-git",
-    "newt-fdguard",
     "crates/newt-launch",
     "crates/newt-carried-tools",
     "crates/newt-tuner",
@@ -419,7 +417,7 @@ newt-core         = { path = "newt-core",         version = "=0.8.6" }
 newt-policy       = { path = "newt-policy",       version = "=0.8.6" }
 newt-router       = { path = "newt-router",       version = "=0.8.6" }
 newt-data         = { path = "newt-data",         version = "=0.8.6" }
-newt-fdguard      = { path = "newt-fdguard",      version = "=0.8.6" }
+agent-bridle-fdguard = "=0.8.0-rc.7"
 newt-flock        = { path = "newt-flock",        version = "=0.8.6" }
 newt-git          = { path = "newt-git",          version = "=0.8.6" }
 newt-inference    = { path = "newt-inference",    version = "=0.8.6" }

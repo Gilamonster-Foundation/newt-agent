@@ -10,7 +10,7 @@ pub(super) struct CommitView {
     // filesystem errors, or a concurrent rename can leave the view behind.
     pub directory: tempfile::TempDir,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    admin: newt_fdguard::GrantedRoot,
+    admin: agent_bridle_fdguard::GrantedRoot,
 }
 
 impl CommitView {
@@ -97,13 +97,13 @@ pub(super) fn create(
     {
         return Err(denied("private commit view needs an independently confined admin directory; run standalone git commit from the task worktree"));
     }
-    let admin_root = newt_fdguard::GrantedRoot::acquire(admin).map_err(denied)?;
+    let admin_root = agent_bridle_fdguard::GrantedRoot::acquire(admin).map_err(denied)?;
     let directory = tempfile::Builder::new()
         .prefix(".newt-commit-view-")
         .tempdir_in(admin)
         .map_err(denied)?;
     let view = directory.path();
-    let view_root = newt_fdguard::GrantedRoot::acquire(view).map_err(denied)?;
+    let view_root = agent_bridle_fdguard::GrantedRoot::acquire(view).map_err(denied)?;
     seed(&view_root, common, head, packed.as_deref())?;
     // Have Git encode includes naming the original config files. Symlinking
     // config would resolve relative include.path entries against this view.
@@ -174,7 +174,7 @@ pub(super) fn create(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn seed(
-    view: &newt_fdguard::GrantedRoot,
+    view: &agent_bridle_fdguard::GrantedRoot,
     common: &Path,
     head: &str,
     packed: Option<&str>,
@@ -214,9 +214,10 @@ mod tests {
             let old = "1".repeat(40);
             let new = "2".repeat(40);
             std::fs::write(directory.path().join("HEAD"), &old).unwrap();
-            let admin =
-                newt_fdguard::GrantedRoot::acquire(&directory.path().canonicalize().unwrap())
-                    .unwrap();
+            let admin = agent_bridle_fdguard::GrantedRoot::acquire(
+                &directory.path().canonicalize().unwrap(),
+            )
+            .unwrap();
             let view = CommitView { directory, admin };
             let commit = format!("tree {}\nparent {old}\nauthor Fixture <fixture@example.test> 1 +0000\ncommitter Fixture <fixture@example.test> 1 +0000\n\n{message}\n", "3".repeat(40));
             let result = view.publish(&old, &new, commit.as_bytes());
@@ -247,7 +248,7 @@ mod tests {
         let outside = root.join("outside");
         std::fs::create_dir(&view).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        let held = newt_fdguard::GrantedRoot::acquire(&view).unwrap();
+        let held = agent_bridle_fdguard::GrantedRoot::acquire(&view).unwrap();
         std::fs::rename(&view, &held_path).unwrap();
         std::os::unix::fs::symlink(&outside, &view).unwrap();
         seed(

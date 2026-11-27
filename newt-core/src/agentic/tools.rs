@@ -425,7 +425,8 @@ pub(crate) fn validate_tool_call_batch(
 /// a statement about today's feature graph or published-crate buildability.
 ///
 /// Since #3160, `confine` controls the compiled backend. With it off, core's
-/// selected normal/build closure has no bridle crate, and commands reaching the
+/// selected normal/build closure has no agent-bridle-core, agent-bridle-tool-shell
+/// or agent-bridle facade; small leaf crates may be shared. Commands reaching the
 /// confined shell route return Unavailable. This does not assert the runtime
 /// bypass: host admission still requires it, no broker/lease, and a permitting
 /// execution floor. Full access alone is insufficient. See

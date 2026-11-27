@@ -1136,9 +1136,9 @@ impl StdioTransport {
             .kill_on_drop(true);
         // A descriptor the parent left open with close-on-exec cleared would reach the
         // child: an ambient capability. The confined spawn closes them (agent-bridle#319);
-        // with no bridle here, the guard does.
+        // without the confinement backend here, the shared guard does.
         #[cfg(unix)]
-        newt_fdguard::deny_inherited_fds(cmd.as_std_mut());
+        agent_bridle_fdguard::deny_inherited_fds(cmd.as_std_mut());
         let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning MCP server `{}` ({command})", entry.name))?;
