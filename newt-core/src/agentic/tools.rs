@@ -6706,7 +6706,7 @@ pub(crate) use shell::test_windows_ambient_dispatch;
 
 #[cfg(test)]
 #[path = "tools_tests/git_fixture.rs"]
-pub(super) mod git_fixture;
+pub(crate) mod git_fixture;
 
 #[cfg(test)]
 #[path = "tools_tests/command_shape_contract.rs"]

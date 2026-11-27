@@ -1,5 +1,6 @@
 //! #2748: real branch and commit writes through the adoption fence.
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 use crate::agentic::tools::tests::git_shell_grant::{hermetic_git, FixtureGitTool};
 use crate::{worktree_adoption::WorktreeSession, ExecOutcome, Scope};
 
@@ -90,7 +91,7 @@ async fn adoption_refs_real_checkout_and_commit_preserve_original() {
     .iter()
     .map(|p| (original.join(p), std::fs::read(original.join(p)).unwrap()))
     .collect();
-    let mut c = Caveats::top();
+    let mut c = read_caveats(&[temp.path()]);
     c.net = Scope::none();
     c.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let session = WorktreeSession::default();
@@ -374,7 +375,7 @@ async fn adoption_refs_external_destination_prompts_before_execution() {
         temp.path(),
         &["commit", "--allow-empty", "-qm", "initial"],
     );
-    let mut c = Caveats::top();
+    let mut c = read_caveats(&[temp.path()]);
     c.net = Scope::none();
     c.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
     let session = WorktreeSession::default();
@@ -451,7 +452,7 @@ async fn adoption_refs_approved_external_destination_is_adopted() {
         temp.path(),
         &["commit", "--allow-empty", "-qm", "initial"],
     );
-    let mut c = Caveats::top();
+    let mut c = read_caveats(&[temp.path(), external.path()]);
     c.net = Scope::none();
     c.fs_write = Scope::only([root.to_string_lossy().into_owned()]);
     for target in [
@@ -536,7 +537,7 @@ async fn worktree_notice_already_used_branch_gets_recovery_hint() {
     git(root, root, &["checkout", "-b", "step-x"]);
     let head = std::fs::read(root.join(".git/HEAD")).unwrap();
     let session = WorktreeSession::default();
-    let mut caveats = Caveats::top();
+    let mut caveats = read_caveats(&[temp.path()]);
     caveats.net = Scope::none();
     caveats.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let (text, outcome) = run(
@@ -641,7 +642,7 @@ async fn worktree_notice_dirty_original_reports_changes_and_recovery() {
     .map(|p| (root.join(p), std::fs::read(root.join(p)).unwrap()))
     .collect();
     let session = WorktreeSession::default();
-    let mut caveats = Caveats::top();
+    let mut caveats = read_caveats(&[temp.path()]);
     caveats.exec = Scope::only(["git".to_owned()]);
     caveats.net = Scope::none();
     caveats.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
@@ -711,7 +712,7 @@ async fn worktree_notice_unrelated_failure(source: &str) {
         ],
     );
     let session = WorktreeSession::default();
-    let mut caveats = Caveats::top();
+    let mut caveats = read_caveats(&[temp.path()]);
     caveats.net = Scope::none();
     caveats.fs_write = Scope::only([temp.path().to_string_lossy().into_owned()]);
     let (text, outcome) = run(source, root, root, &caveats, &session).await;

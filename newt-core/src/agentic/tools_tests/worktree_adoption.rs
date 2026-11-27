@@ -1,30 +1,31 @@
 use super::*;
+use crate::agentic::tools::git_fixture::read_caveats;
 use crate::worktree_adoption::{
     tests::{fixture, link},
     WorktreeSession,
 };
 use crate::Scope;
 
-struct BroadGate;
+struct BroadGate(Caveats);
 impl PermissionGate for BroadGate {
     fn ask_dependency_fetch(
         &mut self,
         _prepared: &newt_policy::caveats::Caveats,
         _request: &newt_policy::permissions::PermissionRequest,
     ) -> newt_policy::permissions::PermissionDecision {
-        newt_policy::permissions::PermissionDecision::Allow(Caveats::top())
+        newt_policy::permissions::PermissionDecision::Allow(self.0.clone())
     }
     fn ask(&mut self, _: &[PermissionRequest]) -> PermissionDecision {
-        PermissionDecision::Allow(Caveats::top())
+        PermissionDecision::Allow(self.0.clone())
     }
     fn refresh_caveats(&mut self, _: &Caveats) -> PermissionDecision {
-        PermissionDecision::Allow(Caveats::top())
+        PermissionDecision::Allow(self.0.clone())
     }
     fn apply_command_retry(&mut self, _: &str, _: &str, _: &Caveats) -> Caveats {
-        Caveats::top()
+        self.0.clone()
     }
     fn apply_pending_once(&mut self, _: DenialKind, _: &str, _: &Caveats) -> Caveats {
-        Caveats::top()
+        self.0.clone()
     }
     fn ask_question(&mut self, _: &str) -> HumanQuestionOutcome {
         HumanQuestionOutcome::Unavailable
@@ -36,7 +37,7 @@ impl PermissionGate for BroadGate {
 #[cfg(unix)]
 #[test]
 fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
-    let (_temp, policy, _) = fixture(false);
+    let (temp, policy, _) = fixture(false);
     let root = policy.worktree.parent().unwrap().join("main");
     let command = format!(
         "cd '{}' && git worktree add -b task '{}' 2>&1 | tail -5",
@@ -48,7 +49,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
         "run_command",
         &args,
         root.to_str().unwrap(),
-        &Caveats::top(),
+        &read_caveats(&[temp.path()]),
         Path::new("/fixture/git"),
     )
     .unwrap();
@@ -57,7 +58,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
         "run_command",
         &args,
         root.to_str().unwrap(),
-        &Caveats::top(),
+        &read_caveats(&[temp.path()]),
         Path::new("/fixture/git"),
     )
     .unwrap();
@@ -67,7 +68,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
         "run_command",
         &args,
         root.to_str().unwrap(),
-        &Caveats::top(),
+        &read_caveats(&[temp.path()]),
         Path::new("/fixture/git")
     )
     .is_none());
@@ -82,7 +83,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
                 "run_command",
                 &serde_json::json!({"command":cmd}),
                 root.to_str().unwrap(),
-                &Caveats::top(),
+                &read_caveats(&[temp.path()]),
                 Path::new("/fixture/git")
             )
             .is_none(),
@@ -96,7 +97,7 @@ fn worktree_adoption_creation_requires_the_command_and_verified_metadata() {
 fn worktree_adoption_clamps_refresh_retry_and_build_requests() {
     let (_temp, policy, _) = fixture(true);
     let original = policy.worktree.parent().unwrap().parent().unwrap();
-    let mut inner = BroadGate;
+    let mut inner = BroadGate(Caveats::top());
     let mut gate = Guard {
         policy: &policy,
         inner: Some(&mut inner),
@@ -141,7 +142,7 @@ fn worktree_adoption_clamps_refresh_retry_and_build_requests() {
 fn worktree_guard_forwards_the_dependency_fetch_prompt_and_attenuates_it() {
     let (_temp, policy, _) = fixture(true);
     let original = policy.worktree.parent().unwrap().parent().unwrap();
-    let mut inner = BroadGate;
+    let mut inner = BroadGate(Caveats::top());
     let mut gate = Guard {
         policy: &policy,
         inner: Some(&mut inner),
@@ -230,8 +231,8 @@ async fn call(
     session: &WorktreeSession,
 ) -> String {
     let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
-    let mut gate = BroadGate;
-    let mut c = Caveats::top();
+    let mut c = read_caveats(&[original.parent().unwrap()]);
+    let mut gate = BroadGate(c.clone());
     c.fs_write = Scope::only([original.to_string_lossy().into_owned()]);
     execute(
         &mut display,

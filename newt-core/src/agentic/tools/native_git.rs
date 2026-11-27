@@ -2681,27 +2681,19 @@ mod governed_push_tests {
     /// An unregistered, non-URL secret the fake helper prints on stderr.
     const CANARY: &str = "NEWT-2641-CANARY-4f9e1c";
 
-    /// Full authority except: net narrowed to github.com and fs_write
-    /// narrowed away from the fixtures (F1 refuses anything model-writable).
-    fn scoped_caveats() -> Caveats {
+    /// Fixture reads, a non-writable staging source, and the approved host.
+    fn read_only(roots: &[&Path]) -> Caveats {
         Caveats {
             fs_write: Scope::only([NO_WRITE_ROOT.to_string()]),
             net: Scope::only(["github.com".to_string()]),
-            ..Caveats::top()
+            ..super::super::git_fixture::read_caveats(roots)
         }
     }
 
-    fn with_net(net: Scope<String>) -> Caveats {
+    fn with_net(roots: &[&Path], net: Scope<String>) -> Caveats {
         Caveats {
             net,
-            ..scoped_caveats()
-        }
-    }
-
-    fn read_only(roots: &[&Path]) -> Caveats {
-        Caveats {
-            fs_read: Scope::only(roots.iter().map(|p| p.to_string_lossy().into_owned())),
-            ..scoped_caveats()
+            ..read_only(roots)
         }
     }
 
@@ -3180,7 +3172,7 @@ mod governed_push_tests {
             let plan = plan_push_test(
                 &source,
                 Path::new(cwd.as_deref().unwrap()),
-                &with_net(Scope::only([])),
+                &with_net(&[repo.path()], Scope::only([])),
                 &mut Some(&mut gate),
             )
             .unwrap();
@@ -3202,7 +3194,7 @@ mod governed_push_tests {
         let err = plan_push_test(
             "git push origin main:main",
             repo.path(),
-            &scoped_caveats(),
+            &read_only(&[repo.path()]),
             &mut None,
         )
         .unwrap_err();
@@ -3218,8 +3210,8 @@ mod governed_push_tests {
             "git push origin task:task --force-with-lease",
             "git push -f origin task:task",
         ] {
-            let err =
-                plan_push_test(source, repo.path(), &scoped_caveats(), &mut None).unwrap_err();
+            let err = plan_push_test(source, repo.path(), &read_only(&[repo.path()]), &mut None)
+                .unwrap_err();
             assert!(err.contains("no flags"), "{source}: {err}");
         }
     }
@@ -3233,7 +3225,7 @@ mod governed_push_tests {
             let err = plan_push_test(
                 "git push origin task:task",
                 repo.path(),
-                &scoped_caveats(),
+                &read_only(&[repo.path()]),
                 &mut None,
             )
             .unwrap_err();
@@ -3251,7 +3243,7 @@ mod governed_push_tests {
         let err = plan_push_test(
             "git push origin other:other",
             repo.path(),
-            &scoped_caveats(),
+            &read_only(&[repo.path()]),
             &mut None,
         )
         .unwrap_err();
@@ -3264,7 +3256,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let no_exec = Caveats {
             exec: Scope::only([]),
-            ..scoped_caveats()
+            ..read_only(&[repo.path()])
         };
         let err = plan_push_test("git push", repo.path(), &no_exec, &mut None).unwrap_err();
         assert!(err.contains("exec authority"), "{err}");
@@ -3338,7 +3330,7 @@ mod governed_push_tests {
         );
         let caveats = Caveats {
             fs_write: Scope::only([planted.path().to_string_lossy().into_owned()]),
-            ..scoped_caveats()
+            ..read_only(&[repo.path()])
         };
         let err = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap_err();
         assert!(err.contains("model-writable"), "{err}");
@@ -3372,7 +3364,7 @@ mod governed_push_tests {
         let plan = plan_push_test(
             "git push origin task:task",
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut gate),
         )
         .unwrap();
@@ -3389,7 +3381,13 @@ mod governed_push_tests {
             gate.requests
         );
 
-        let bare = plan_push_test("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        let bare = plan_push_test(
+            "git push",
+            repo.path(),
+            &read_only(&[repo.path()]),
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(bare, plan);
     }
 
@@ -3407,7 +3405,7 @@ mod governed_push_tests {
         let err = plan_push_test(
             "git push",
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut gate),
         )
         .unwrap_err();
@@ -3447,7 +3445,7 @@ mod governed_push_tests {
         let err = plan_push_test(
             "git push",
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut WrongHostGate),
         )
         .unwrap_err();
@@ -3472,10 +3470,16 @@ mod governed_push_tests {
         )
         .unwrap();
         // Plan phase now succeeds — type check moved to run phase (item 3).
-        let plan = plan_push_test("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        let plan = plan_push_test(
+            "git push",
+            repo.path(),
+            &read_only(&[repo.path()]),
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(plan.oid, blob, "plan pins the blob oid");
         // Run phase refuses at verify_commit_in_staging.
-        let err = run_push_test(&plan, &scoped_caveats())
+        let err = run_push_test(&plan, &read_only(&[repo.path()]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a commit"), "{err}");
@@ -3500,7 +3504,13 @@ mod governed_push_tests {
                 &format!("touch {}", sentinel.display()),
             ],
         );
-        let plan = plan_push_test("git push", repo.path(), &scoped_caveats(), &mut None).unwrap();
+        let plan = plan_push_test(
+            "git push",
+            repo.path(),
+            &read_only(&[repo.path()]),
+            &mut None,
+        )
+        .unwrap();
         assert_eq!(plan.url, "https://github.com/o/r.git");
         assert!(!sentinel.exists());
     }
@@ -3538,7 +3548,7 @@ mod governed_push_tests {
                 allow: true,
                 requests: vec![],
             };
-            let caveats = with_net(Scope::only([]));
+            let caveats = with_net(&[repo.path()], Scope::only([]));
             let mut plan = plan_push_test(&command, &wt, &caveats, &mut Some(&mut gate)).unwrap();
             assert_eq!(gate.requests.len(), 1);
             assert_eq!(plan.dry_run, dry_run);
@@ -3597,7 +3607,7 @@ mod governed_push_tests {
         );
         git(repo.path(), &["checkout", "-q", "task"]);
         let local_oid = commit(repo.path(), "local.txt", "new run\n");
-        let caveats = scoped_caveats();
+        let caveats = read_only(&[repo.path()]);
         let mut plan = plan_push_test(
             "git push origin",
             repo.path(),
@@ -3666,7 +3676,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let (port, endpoint) = receive_pack_endpoint(false);
         let approved = git(repo.path(), &["rev-parse", "task"]);
-        let plan = plan_for_endpoint(repo.path(), &scoped_caveats(), port);
+        let plan = plan_for_endpoint(repo.path(), &read_only(&[repo.path()]), port);
 
         let moved = commit(repo.path(), "f.txt", "three\n");
         assert_ne!(moved, approved);
@@ -3681,7 +3691,7 @@ mod governed_push_tests {
             &format!("'url.{decoy}.pushinsteadof'='http://127.0.0.1:{port}/'"),
         );
 
-        let outcome = run_push_test(&plan, &scoped_caveats());
+        let outcome = run_push_test(&plan, &read_only(&[repo.path()]));
         let seen = stop(port, endpoint);
         assert_eq!(
             seen.update.as_deref(),
@@ -3918,9 +3928,10 @@ mod governed_push_tests {
             &key,
             &format!("!{} auth git-credential", env.gh().display()),
         ]);
-        let plan = plan_for_endpoint(repo.path(), &scoped_caveats(), port);
-        let ((outcome, log), fd2) =
-            capture_fd2(|| capture_log(|| fixed_form(run_push_test(&plan, &scoped_caveats()))));
+        let plan = plan_for_endpoint(repo.path(), &read_only(&[repo.path()]), port);
+        let ((outcome, log), fd2) = capture_fd2(|| {
+            capture_log(|| fixed_form(run_push_test(&plan, &read_only(&[repo.path()]))))
+        });
         let seen = stop(port, endpoint);
         assert!(
             seen.requests.iter().any(|r| r.ends_with("auth=true")),
@@ -3943,8 +3954,13 @@ mod governed_push_tests {
         let env = BrokerEnv::new();
         env.global(&["credential.helper", &format!("!echo {CANARY}")]);
         let repo = repo_on_feature_branch();
-        let result =
-            execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None, None);
+        let result = execute_governed_push(
+            "git push",
+            repo.path(),
+            &read_only(&[repo.path()]),
+            &mut None,
+            None,
+        );
         assert!(
             result.starts_with("failed(refused_by_harness):"),
             "{result}"
@@ -4093,7 +4109,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let caveats = Caveats {
             exec: Scope::only(["git".to_string(), "head".to_string()]),
-            ..with_net(Scope::only([]))
+            ..with_net(&[repo.path()], Scope::only([]))
         };
         for allow in [true, false] {
             let (port, endpoint) = receive_pack_endpoint(false);
@@ -4350,7 +4366,7 @@ mod governed_push_tests {
         std::fs::write(refs_dir.join("locked.lock"), "independent writer").unwrap();
         let caveats = Caveats {
             fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
-            ..with_net(Scope::only(["forge.example".to_string()]))
+            ..with_net(&[repo.path()], Scope::only(["forge.example".to_string()]))
         };
         let result = fetch::execute_with("git fetch", repo.path(), &caveats, &mut None, |_| {
             Some("forge.example".into())
@@ -4395,7 +4411,7 @@ mod governed_push_tests {
         );
         let caveats = Caveats {
             fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
-            ..with_net(Scope::none())
+            ..with_net(&[repo.path()], Scope::none())
         };
         let verdict = |command: &str| {
             fetch::execute_with(command, repo.path(), &caveats, &mut None, |url| {
@@ -4461,7 +4477,7 @@ mod governed_push_tests {
         );
         let caveats = Caveats {
             fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
-            ..with_net(Scope::only(["forge.example".to_string()]))
+            ..with_net(&[repo.path()], Scope::only(["forge.example".to_string()]))
         };
         let fetch = |command: &str| {
             fetch::execute_with(command, repo.path(), &caveats, &mut None, |_| {
@@ -4527,7 +4543,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let caveats = Caveats {
             fs_write: Scope::only([repo.path().to_string_lossy().into_owned()]),
-            ..with_net(Scope::only(["lms.example.com".to_string()]))
+            ..with_net(&[repo.path()], Scope::only(["lms.example.com".to_string()]))
         };
         let before = refs(repo.path());
         let mut gate = Gate {
@@ -4576,7 +4592,7 @@ mod governed_push_tests {
             let (output, _) = dispatch_run_command_with_gate(
                 repo.path(),
                 &command,
-                &with_net(Scope::only([])),
+                &with_net(&[repo.path()], Scope::only([])),
                 Some(&mut gate),
             );
             assert_eq!(gate.requests.len(), 1, "{output}");
@@ -4608,7 +4624,7 @@ mod governed_push_tests {
             let output = execute_governed_push(
                 command,
                 repo.path(),
-                &with_net(Scope::only([])),
+                &with_net(&[repo.path()], Scope::only([])),
                 &mut Some(&mut gate),
                 None,
             );
@@ -4661,23 +4677,26 @@ mod governed_push_tests {
                 fs_write: Scope::only(
                     [repo.path(), dest.path()].map(|p| p.to_string_lossy().into_owned()),
                 ),
-                ..scoped_caveats()
+                ..read_only(&[repo.path()])
             }
         };
-        let error = plan_push_test(
-            "git push origin task:task",
-            repo.path(),
-            &caveats,
-            &mut None,
-        )
-        .unwrap_err();
-        assert!(error.contains("unsupported remote URL scheme"), "{error}");
-        let (result, _terminal) =
-            dispatch_run_command(repo.path(), "git push origin task:task", &caveats);
-        // No ref escaped the broker into either repository.
-        assert_eq!(refs(repo.path()), ws_before);
-        assert_eq!(refs(dest.path()), dest_before);
-        assert!(result.contains("failed(refused_by_harness)"), "{result}");
+        let view = super::super::git_fixture::read_caveats(&[repo.path(), dest.path()]).fs_read;
+        super::super::git_fixture::READ_VIEW.sync_scope(view, || {
+            let error = plan_push_test(
+                "git push origin task:task",
+                repo.path(),
+                &caveats,
+                &mut None,
+            )
+            .unwrap_err();
+            assert!(error.contains("unsupported remote URL scheme"), "{error}");
+            let (result, _terminal) =
+                dispatch_run_command(repo.path(), "git push origin task:task", &caveats);
+            // No ref escaped the broker into either repository.
+            assert_eq!(refs(repo.path()), ws_before);
+            assert_eq!(refs(dest.path()), dest_before);
+            assert!(result.contains("failed(refused_by_harness)"), "{result}");
+        });
     }
 
     /// F6 canary, PR side, through the REAL outer dispatch: gh prints an
@@ -4696,7 +4715,7 @@ mod governed_push_tests {
                 dispatch_run_command(
                     repo.path(),
                     "gh pr create --title t --body b",
-                    &scoped_caveats(),
+                    &read_only(&[repo.path()]),
                 )
             })
         });
@@ -4730,7 +4749,7 @@ mod governed_push_tests {
         let plan = plan_pr_create_test(
             "gh pr create --title 't' --body 'b'",
             repo.path(),
-            &with_net(Scope::only([])),
+            &with_net(&[repo.path()], Scope::only([])),
             &mut Some(&mut gate),
         )
         .unwrap();
@@ -4754,7 +4773,7 @@ mod governed_push_tests {
         let err = plan_pr_create_test(
             "gh pr create --title t --body b --repo other/repo",
             repo.path(),
-            &scoped_caveats(),
+            &read_only(&[repo.path()]),
             &mut None,
         )
         .unwrap_err();
@@ -4777,7 +4796,7 @@ mod governed_push_tests {
         let err = plan_pr_create_test(
             "gh pr create --title t --body b",
             repo.path(),
-            &scoped_caveats(),
+            &read_only(&[repo.path()]),
             &mut None,
         )
         .unwrap_err();
@@ -4800,7 +4819,7 @@ mod governed_push_tests {
         let plan = plan_pr_create_test(
             "gh pr create --title t --body b",
             repo.path(),
-            &scoped_caveats(),
+            &read_only(&[repo.path()]),
             &mut None,
         )
         .unwrap();
@@ -4813,7 +4832,7 @@ mod governed_push_tests {
         let repo = repo_on_feature_branch();
         let no_exec = Caveats {
             exec: Scope::only([]),
-            ..scoped_caveats()
+            ..read_only(&[repo.path()])
         };
         let err = plan_pr_create_test(
             "gh pr create --title t --body b",
@@ -4891,7 +4910,13 @@ mod governed_push_tests {
         )
         .unwrap();
         let (model, fd1) = capture_fd(1, || {
-            execute_governed_push("git push", repo.path(), &scoped_caveats(), &mut None, None)
+            execute_governed_push(
+                "git push",
+                repo.path(),
+                &read_only(&[repo.path()]),
+                &mut None,
+                None,
+            )
         });
         assert!(model.starts_with("failed(refused_by_harness):"), "{model}");
         assert!(!model.contains("sudoers"));
@@ -4906,46 +4931,54 @@ mod governed_push_tests {
     /// to observe the exact destination, commit and ref without publishing.
     #[test]
     fn scope_all_push_succeeds_at_the_approved_destination() {
-        push_succeeds_at_the_approved_destination(with_net(Scope::All));
+        push_succeeds_at_the_approved_destination(false);
     }
 
     /// #2720: exercise actual staging and receive-pack with ambient fs_write,
     /// rather than only an unrestricted network grant.
     #[test]
     fn full_access_push_succeeds_at_the_approved_destination() {
-        push_succeeds_at_the_approved_destination(Caveats::top());
+        push_succeeds_at_the_approved_destination(true);
     }
 
-    fn push_succeeds_at_the_approved_destination(caveats: Caveats) {
+    fn push_succeeds_at_the_approved_destination(full_access: bool) {
         if !fence() {
             return;
         }
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
-        let approved = git(repo.path(), &["rev-parse", "task"]);
-        let mut plan = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap();
-        assert_eq!(plan.url, "https://github.com/o/r.git");
-        // Same transport substitution as plan_for_endpoint: only the dial URL
-        // changes; planning and the confined staging/push path are real.
-        let (port, endpoint) = receive_pack_endpoint(false);
-        plan.url = format!("http://127.0.0.1:{port}/o/r.git");
-        let outcome = run_push_test(&plan, &caveats);
-        let seen = stop(port, endpoint);
-        assert_eq!(
-            seen.update.as_deref(),
-            Some(format!("{} {approved} refs/heads/task", "0".repeat(40)).as_str()),
-            "{seen:?} / {outcome:?}"
-        );
-        assert!(
-            seen.requests
-                .iter()
-                .any(|r| r.starts_with("POST /o/r.git/git-receive-pack ")),
-            "{seen:?}"
-        );
-        assert_eq!(
-            outcome.unwrap().to_string(),
-            format!("pushed {approved} → github.com/o/r:task")
-        );
+        let caveats = if full_access {
+            Caveats::top()
+        } else {
+            with_net(&[repo.path()], Scope::All)
+        };
+        let view = super::super::git_fixture::read_caveats(&[repo.path()]).fs_read;
+        super::super::git_fixture::READ_VIEW.sync_scope(view, || {
+            let approved = git(repo.path(), &["rev-parse", "task"]);
+            let mut plan = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap();
+            assert_eq!(plan.url, "https://github.com/o/r.git");
+            // Same transport substitution as plan_for_endpoint: only the dial URL
+            // changes; planning and the confined staging/push path are real.
+            let (port, endpoint) = receive_pack_endpoint(false);
+            plan.url = format!("http://127.0.0.1:{port}/o/r.git");
+            let outcome = run_push_test(&plan, &caveats);
+            let seen = stop(port, endpoint);
+            assert_eq!(
+                seen.update.as_deref(),
+                Some(format!("{} {approved} refs/heads/task", "0".repeat(40)).as_str()),
+                "{seen:?} / {outcome:?}"
+            );
+            assert!(
+                seen.requests
+                    .iter()
+                    .any(|r| r.starts_with("POST /o/r.git/git-receive-pack ")),
+                "{seen:?}"
+            );
+            assert_eq!(
+                outcome.unwrap().to_string(),
+                format!("pushed {approved} → github.com/o/r:task")
+            );
+        });
     }
 
     /// Regression for #2700: All must permit a successful PR-create through
@@ -4971,7 +5004,7 @@ mod governed_push_tests {
         let (result, _) = dispatch_run_command(
             repo.path(),
             "gh pr create --title t --body b",
-            &with_net(Scope::All),
+            &with_net(&[repo.path()], Scope::All),
         );
         assert!(
             result.contains("pr_created https://github.com/o/r/pull/7"),
@@ -4989,7 +5022,7 @@ mod governed_push_tests {
     fn restricted_net_still_refuses_push_and_pr_create() {
         let _env = BrokerEnv::new();
         let repo = repo_on_feature_branch();
-        let caveats = with_net(Scope::only(["other.example".to_string()]));
+        let caveats = with_net(&[repo.path()], Scope::only(["other.example".to_string()]));
         let push = plan_push_test("git push", repo.path(), &caveats, &mut None).unwrap_err();
         let pr = plan_pr_create_test(
             "gh pr create --title t --body b",

@@ -70,3 +70,83 @@ pub(in crate::agentic) fn hermetic_git(
     }
     cmd
 }
+
+/// #3315: fixture authority is limited to the trees a test supplies. The real
+/// worktree/broker cases ground this pure scope contract under confinement.
+pub(crate) fn read_caveats(roots: &[&std::path::Path]) -> crate::Caveats {
+    crate::Caveats {
+        fs_read: crate::Scope::only(roots.iter().map(|root| root.to_string_lossy().into_owned())),
+        ..crate::Caveats::top()
+    }
+}
+
+// Invocation-local filesystem view for tests of unrestricted authority. The
+// scope remains All; only these fixture objects exist at the read-binding seam.
+tokio::task_local! {
+    pub(crate) static READ_VIEW: crate::Scope<String>;
+}
+
+#[test]
+fn fixture_read_authority_excludes_unrelated_trees() {
+    use crate::{Caveats, Scope};
+    let root = std::path::Path::new("fixture");
+    let other = std::path::Path::new("other");
+    let caveats = read_caveats(&[root]);
+    assert!(newt_policy::caveats::permits_path(
+        &caveats.fs_read,
+        "fixture/repo/HEAD"
+    ));
+    assert!(!newt_policy::caveats::permits_path(
+        &caveats.fs_read,
+        "other/secret"
+    ));
+    assert_eq!(read_caveats(&[]).fs_read, Scope::none());
+    assert_eq!(
+        read_caveats(&[root, other]).fs_read,
+        Scope::only(["fixture".into(), "other".into()])
+    );
+    assert_eq!(
+        Caveats {
+            fs_read: Scope::All,
+            ..caveats
+        },
+        Caveats::top()
+    );
+}
+
+/// Grounds the pure fixture scope contract in real held descriptors. Full-read
+/// policy remains All while the injected view contains only the supplied tree.
+#[cfg(unix)]
+#[test]
+fn unrestricted_read_view_keeps_all_semantics_and_fixture_handles() {
+    let fixture = tempfile::tempdir().unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("marker"), "inside").unwrap();
+    std::fs::write(unrelated.path().join("marker"), "outside").unwrap();
+    let view = read_caveats(&[fixture.path()]).fs_read;
+    assert!(READ_VIEW.try_with(|_| ()).is_err());
+    READ_VIEW.sync_scope(view.clone(), || {
+        let held = crate::git_staging::HeldRoots::bind(&crate::Scope::All).unwrap();
+        assert_eq!(held.scope(), &crate::Scope::All);
+        assert_eq!(held.canonical(), &[fixture.path().canonicalize().unwrap()]);
+        held.verify_identities().unwrap();
+        let marker = std::path::Path::new("marker");
+        assert_eq!(
+            held.read_to_string(fixture.path(), marker)
+                .unwrap()
+                .as_deref(),
+            Some("inside")
+        );
+        assert!(held.read_to_string(unrelated.path(), marker).is_err());
+        let denied = crate::git_staging::HeldRoots::bind(&crate::Scope::none()).unwrap();
+        assert!(denied.canonical().is_empty());
+        READ_VIEW.sync_scope(crate::Scope::none(), || {
+            assert!(crate::git_staging::HeldRoots::bind(&crate::Scope::All)
+                .unwrap()
+                .canonical()
+                .is_empty());
+        });
+        assert_eq!(READ_VIEW.with(Clone::clone), view);
+    });
+    assert!(READ_VIEW.try_with(|_| ()).is_err());
+}

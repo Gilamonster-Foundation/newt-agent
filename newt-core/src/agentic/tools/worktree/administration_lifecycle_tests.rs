@@ -1,4 +1,5 @@
 //! #2836: lifecycle inspects retained source only after adoption is validated.
+use crate::agentic::tools::git_fixture::read_caveats;
 use crate::agentic::{
     display::ToolDisplay,
     tools::{
@@ -52,7 +53,7 @@ async fn lifecycle_retains_source_when_configuration_changes_after_resolution() 
         session.adopt(policy.clone());
         let caveats = Caveats {
             fs_write: Scope::only([temp.path().to_string_lossy().into_owned()]),
-            ..Caveats::top()
+            ..read_caveats(&[temp.path()])
         };
         let configuration = Rc::new(RefCell::new(initial.to_string()));
         let reads = Rc::new(Cell::new(0));

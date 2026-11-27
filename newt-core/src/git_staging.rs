@@ -403,6 +403,18 @@ impl HeldRoots {
     /// When an existing root cannot be resolved or its handle cannot be
     /// acquired (a symlink component at acquisition time included).
     pub fn bind(fs_read: &Scope<String>) -> Result<Self, Refusal> {
+        #[cfg(test)]
+        if matches!(fs_read, Scope::All) {
+            if let Ok(view) = crate::agentic::tools::git_fixture::READ_VIEW.try_with(Clone::clone) {
+                assert!(
+                    matches!(view, Scope::Only(_)),
+                    "fixture view must be bounded"
+                );
+                let mut held = Self::bind(&view)?;
+                held.scope = Scope::All;
+                return Ok(held);
+            }
+        }
         let canonical = bind_canonical_paths(fs_read)?;
         #[cfg(unix)]
         let handles = canonical

@@ -1,6 +1,8 @@
 //! #2780: task cwd routing through the actual dispatch boundary, portable to Windows.
 use super::*;
 use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+#[cfg(feature = "confine")]
+use crate::agentic::tools::git_fixture::read_caveats;
 use crate::worktree_adoption::{AdoptedWorktree, WorktreeSession};
 
 #[derive(Default)]
@@ -532,7 +534,7 @@ async fn shell_task_cwd_2780_build_routes_keep_authority() {
         let caveats = Caveats {
             exec: crate::Scope::none(),
             fs_write: crate::Scope::only([policy.worktree.to_string_lossy().into_owned()]),
-            ..Caveats::top()
+            ..read_caveats(&[temp.path()])
         };
         for (name, args) in [
             ("run_command", serde_json::json!({"command":"cargo check"})),

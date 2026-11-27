@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(unix)]
+use crate::agentic::tools::git_fixture::read_caveats;
 
 // Invocation-local metadata seam: None simulates invalidated reciprocal links.
 tokio::task_local! {
@@ -122,28 +124,48 @@ pub(crate) fn link(policy: &AdoptedWorktree) {
 #[cfg(unix)]
 #[test]
 fn verified_creation_requires_new_matching_git_metadata() {
-    let (_temp, policy, _) = fixture(false);
-    let candidate = Creation::before(&policy.original, &policy.worktree, &Caveats::top()).unwrap();
+    let (temp, policy, _) = fixture(false);
+    let candidate = Creation::before(
+        &policy.original,
+        &policy.worktree,
+        &read_caveats(&[temp.path()]),
+    )
+    .unwrap();
     assert!(candidate.verify().is_none());
-    let candidate = Creation::before(&policy.original, &policy.worktree, &Caveats::top()).unwrap();
+    let candidate = Creation::before(
+        &policy.original,
+        &policy.worktree,
+        &read_caveats(&[temp.path()]),
+    )
+    .unwrap();
     link(&policy);
     // #2766: use the linked checkout's branch, never the protected source branch.
     std::fs::write(policy.admin.join("HEAD"), "ref: refs/heads/task\n").unwrap();
     let verified = candidate.verify().unwrap();
     assert_eq!(verified.task_branch.as_deref(), Some("task"));
     assert_eq!(verified.worktree, policy.worktree);
-    assert!(Creation::before(&policy.original, &policy.worktree, &Caveats::top()).is_none());
-    assert!(verified.valid(&Caveats::top()));
+    assert!(Creation::before(
+        &policy.original,
+        &policy.worktree,
+        &read_caveats(&[temp.path()])
+    )
+    .is_none());
+    assert!(verified.valid(&read_caveats(&[temp.path()])));
     std::fs::write(policy.admin.join("commondir"), "/unrelated\n").unwrap();
-    assert!(!verified.valid(&Caveats::top()));
+    assert!(!verified.valid(&read_caveats(&[temp.path()])));
 }
 
 /// #2733: forged reverse links do not establish creation evidence.
 #[cfg(unix)]
 #[test]
 fn creation_rejects_wrong_reverse_link() {
-    let (_temp, policy, _) = fixture(false);
-    let candidate = Creation::before(&policy.original, &policy.worktree, &Caveats::top()).unwrap();
+    let (temp, policy, _) = fixture(false);
+    let candidate = Creation::before(
+        &policy.original,
+        &policy.worktree,
+        &read_caveats(&[temp.path()]),
+    )
+    .unwrap();
     link(&policy);
     std::fs::write(
         policy.admin.join("gitdir"),
@@ -205,7 +227,12 @@ fn adoption_preserves_deny_all_and_unrelated_only_authority() {
 #[test]
 fn creation_rejects_a_foreign_repository() {
     let (temp, policy, _) = fixture(false);
-    let candidate = Creation::before(&policy.original, &policy.worktree, &Caveats::top()).unwrap();
+    let candidate = Creation::before(
+        &policy.original,
+        &policy.worktree,
+        &read_caveats(&[temp.path()]),
+    )
+    .unwrap();
     let foreign = temp.path().join("foreign.git");
     std::fs::create_dir(&foreign).unwrap();
     link(&policy);
@@ -284,15 +311,19 @@ fn adoption_fences_common_metadata_outside_the_original_checkout() {
 #[cfg(unix)]
 #[test]
 fn adoption_2759_canonical_nested_destination() {
-    let (_temp, policy, _) = fixture(false);
+    let (temp, policy, _) = fixture(false);
     std::fs::create_dir(policy.original.join("sub")).unwrap();
     for (destination, expected) in [
         (policy.original.join(".worktrees/task"), true),
         (policy.original.join("sub/../task"), true),
         (policy.worktree.clone(), false),
     ] {
-        let candidate =
-            Creation::before(&policy.original.join("sub"), &destination, &Caveats::top()).unwrap();
+        let candidate = Creation::before(
+            &policy.original.join("sub"),
+            &destination,
+            &read_caveats(&[temp.path()]),
+        )
+        .unwrap();
         assert_eq!(candidate.nested_in_original(), expected, "{destination:?}");
     }
 }
