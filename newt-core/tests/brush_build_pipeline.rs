@@ -17,16 +17,41 @@ fn main() {
         arg.strip_prefix("--build-scratch-probe=")
             .map(str::to_owned)
     }) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
         let private = std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok();
         let names: Vec<_> = names.split(':').collect();
-        assert_eq!(names.len(), 2);
+        assert_eq!(names.len(), 3);
+        let caller_uid: u32 = names[2].parse().unwrap();
+        // SAFETY: geteuid has no preconditions or memory effects.
+        assert_eq!(unsafe { libc::geteuid() }, caller_uid);
         for (directory, name) in ["/tmp", "/dev/shm"].into_iter().zip(names) {
             let host = std::path::Path::new(directory).join(name);
             let child = host.with_extension("child");
             let write = std::fs::write(&child, b"private scratch");
             if private {
+                let metadata = std::fs::metadata(directory).unwrap();
+                assert_eq!(metadata.uid(), caller_uid, "{directory} owner");
+                assert_eq!(metadata.mode() & 0o7777, 0o700, "{directory} mode");
                 write.unwrap_or_else(|error| panic!("private scratch write {directory}: {error}"));
                 assert_eq!(std::fs::read(&child).unwrap(), b"private scratch");
+                // Grounds the mocked trust walk's mode checks: privacy never
+                // exempts a subsequently writable object or ancestor.
+                let trust =
+                    newt_core::git_staging::TrustContext::bind(&newt_core::Scope::none()).unwrap();
+                std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o600)).unwrap();
+                newt_core::git_staging::trust_check(&child, &trust).unwrap();
+                std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o660)).unwrap();
+                assert!(newt_core::git_staging::trust_check(&child, &trust).is_err());
+                std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o600)).unwrap();
+                for mode in [0o1777, 0o770] {
+                    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+                        .unwrap();
+                    assert!(newt_core::git_staging::trust_check(&child, &trust).is_err());
+                }
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                newt_core::git_staging::trust_check(&child, &trust).unwrap();
                 assert!(!host.exists(), "host scratch sentinel must be hidden");
                 std::fs::write(&host, b"private counterpart").unwrap();
                 assert_eq!(std::fs::read(&host).unwrap(), b"private counterpart");
@@ -539,7 +564,7 @@ mod native {
                     "BUILD_INHERITED_SOCKET_DENIED",
                 ),
                 (
-                    "build_tests_private_scratch_isolated",
+                    "build_tests_private_scratch_capacity_mode_and_isolation",
                     "--build-scratch-probe",
                     "BUILD_PRIVATE_SCRATCH_CONFIRMED",
                 ),
@@ -914,7 +939,9 @@ mod native {
     /// no external route; unavailable namespaces retain the socket-family deny.
     /// Also grounds the inherited-descriptor floor with a real host TCP socket.
     /// The scratch twin grounds the Build write-root contract: private tmpfs
-    /// round trips cannot observe or replace host sentinels; fallback denies writes.
+    /// capacity, caller ownership and mode, plus the mocked staging trust walk's
+    /// rejection of writable children/ancestors. Round trips cannot observe or
+    /// replace host sentinels or change host modes; fallback denies writes.
     /// `--require-build-netns` rejects fallback on every probe and both routes;
     /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
     #[cfg(target_os = "linux")]
@@ -924,6 +951,7 @@ mod native {
         };
 
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::fs::MetadataExt;
         let scratch_canaries: Vec<_> = if probe == "--build-scratch-probe" {
             ["/tmp", "/dev/shm"]
                 .into_iter()
@@ -937,6 +965,10 @@ mod native {
         } else {
             Vec::new()
         };
+        let host_metadata: Vec<_> = scratch_canaries
+            .iter()
+            .map(|file| std::fs::metadata(file.path().parent().unwrap()).unwrap())
+            .collect();
         let host_socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         // SAFETY: F_DUPFD returns a new owned fd without CLOEXEC. The fixture
         // reserves a high slot so neither stdio nor a transient pipe can mask it.
@@ -951,7 +983,7 @@ mod native {
             format!("--inherited-socket={fd}")
         } else if !scratch_canaries.is_empty() {
             format!(
-                "{probe}={}:{}",
+                "{probe}={}:{}:{}",
                 scratch_canaries[0]
                     .path()
                     .file_name()
@@ -963,7 +995,9 @@ mod native {
                     .file_name()
                     .unwrap()
                     .to_str()
-                    .unwrap()
+                    .unwrap(),
+                // SAFETY: geteuid has no preconditions or memory effects.
+                unsafe { libc::geteuid() }
             )
         } else {
             probe.to_owned()
@@ -1057,7 +1091,13 @@ mod native {
             );
         }
         assert!(argv.success, "{stderr}");
-        for file in scratch_canaries {
+        for (file, before) in scratch_canaries.into_iter().zip(host_metadata) {
+            let after = std::fs::metadata(file.path().parent().unwrap()).unwrap();
+            assert_eq!(
+                (after.uid(), after.gid(), after.mode()),
+                (before.uid(), before.gid(), before.mode()),
+                "private scratch must not change host ownership or mode"
+            );
             assert_eq!(
                 std::fs::read(file.path()).unwrap(),
                 b"host scratch sentinel"

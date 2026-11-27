@@ -177,23 +177,43 @@ mod tests {
         assert!(hints.iter().all(|h| h.chmod_arg == "g-w"));
     }
 
-    /// #2739: diagnostics must not invent repairs for a clean path.
+    /// #2739: diagnostics must not invent repairs for a clean path (the
+    /// root-owned rows). Diagnostics share enforcement: an owner-only scratch parent is clean,
+    /// but a caller-owned or unmapped sticky writable parent is not trusted.
     #[test]
-    fn clean_path_reports_none() {
+    fn scratch_parent_modes_retain_the_shared_trust_rule() {
         let ctx = TrustContext::bind(&Scope::none()).unwrap();
-        assert!(inspect(
-            Path::new("/usr/bin/git"),
-            &ctx,
-            1000,
-            |p| Ok(p.to_path_buf()),
-            |_| Ok(PathMetadata {
-                uid: 0,
-                mode: 0o755,
-                is_dir: true,
-                is_symlink: false
-            })
-        )
-        .unwrap()
-        .is_empty());
+        for (uid, mode, clean) in [
+            (0, 0o755, true),
+            (0, 0o1777, true),
+            (1000, 0o700, true),
+            (1000, 0o1777, false),
+            (65534, 0o1777, false),
+        ] {
+            let hints = inspect(
+                Path::new("/scratch/config"),
+                &ctx,
+                1000,
+                |p| Ok(p.to_path_buf()),
+                |p| {
+                    Ok(PathMetadata {
+                        uid: if p == Path::new("/scratch") {
+                            uid
+                        } else {
+                            1000
+                        },
+                        mode: if p == Path::new("/scratch") {
+                            mode
+                        } else {
+                            0o700
+                        },
+                        is_dir: p != Path::new("/scratch/config"),
+                        is_symlink: false,
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(hints.is_empty(), clean, "uid={uid} mode={mode:o}");
+        }
     }
 }

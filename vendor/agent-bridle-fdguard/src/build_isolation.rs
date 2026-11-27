@@ -155,8 +155,8 @@ fn private_scratch(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Res
     })?;
     for (path, options) in [
         // Four concurrent debug-executable copies exceeded 1 GiB in acceptance.
-        (c"/tmp", c"size=2g,nr_inodes=65536,mode=1777"),
-        (c"/dev/shm", c"size=256m,nr_inodes=16384,mode=1777"),
+        (c"/tmp", c"size=2g,nr_inodes=65536,mode=0700"),
+        (c"/dev/shm", c"size=256m,nr_inodes=16384,mode=0700"),
     ] {
         check(unsafe {
             libc::mount(
