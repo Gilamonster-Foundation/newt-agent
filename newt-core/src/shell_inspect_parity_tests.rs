@@ -206,6 +206,42 @@ const CORPUS: &[&str] = &[
     "warnings",
 ];
 
+const WORDS: &[(&str, Option<&str>)] = &[
+    ("@(a|b)", None),
+    ("+(x)", None),
+    ("!(x)", None),
+    ("?(x)", None),
+    ("*(x)", None),
+    ("a@(b)", None),
+    ("!()", None),
+    ("{a}{b,c}", None),
+    ("{}{1..2}", None),
+    ("'{a}'{b,c}", None),
+    ("x{a}{,}", None),
+    ("{a}{b,c}{d}", None),
+    ("a=(b c)", None),
+    ("*", None),
+    ("x.*", None),
+    ("[", None),
+    ("{a,b}", None),
+    ("{1..2}", None),
+    ("literal", Some("literal")),
+    ("owner/r", Some("owner/r")),
+    ("done", Some("done")),
+    ("a=~/x", Some("a=~/x")),
+    ("{a}b{c}", Some("{a}b{c}")),
+    ("''", Some("")),
+    ("'two words'", Some("two words")),
+    ("'!(x)'", Some("!(x)")),
+    (r#""@(a|b)""#, Some("@(a|b)")),
+    (r"a\(b", Some("a(b")),
+    (r"@\(a\|b\)", Some("@(a|b)")),
+    ("'a=(b c)'", Some("a=(b c)")),
+    (r"a=\(b\ c\)", Some("a=(b c)")),
+    ("'*.rs'", Some("*.rs")),
+    ("résumé", Some("résumé")),
+];
+
 fn extras() -> Vec<String> {
     let mut inputs: Vec<String> = ["", " ", "\n", "\0", "é ü $(echo é)"]
         .iter()
@@ -232,6 +268,14 @@ fn extras() -> Vec<String> {
     let body = "literal $(touch never) `touch neither` 'unmatched\n";
     inputs.push(format!("cat <<'EOF'\n{body}EOF\n"));
     inputs.push("echo $(touch '/tmp/newt-inspect-marker')".to_string());
+    for (word, _) in WORDS {
+        inputs.extend([
+            (*word).to_string(),
+            format!("printf {word} literal"),
+            format!("find . -exec {word} \\;"),
+            format!("find . -exec word-probe {word} \\;"),
+        ]);
+    }
     inputs
 }
 
@@ -277,4 +321,53 @@ fn the_copy_inspects_every_input_as_bridle_does() {
         "accepted {accepted}, refused {refused} of {}",
         inputs.len()
     );
+}
+
+#[test]
+fn static_word_corpus_has_explicit_runtime_expectations() {
+    for &(word, expected) in WORDS {
+        assert_eq!(
+            ours::literal_shell_word(word).ok().as_deref(),
+            expected,
+            "{word}"
+        );
+        assert_eq!(
+            agent_bridle_tool_shell::literal_shell_word(word)
+                .ok()
+                .as_deref(),
+            expected,
+            "{word}"
+        );
+        let find = format!("find . -exec word-probe {word} \\;");
+        match expected {
+            Some(value) => {
+                assert_eq!(
+                    ours::inspect_shell(&find).unwrap().commands[0].descendant_execs[0].argv[1],
+                    value
+                );
+                assert!(
+                    ours::inspect_shell(&format!("printf {word} literal")).is_ok(),
+                    "{word}"
+                );
+            }
+            None => {
+                assert!(ours::inspect_shell(&find).is_err(), "{word}");
+                assert!(
+                    ours::inspect_shell(&format!("printf {word} literal")).is_err(),
+                    "{word}"
+                );
+                assert!(
+                    ours::inspect_shell(&format!("find . -exec {word} \\;")).is_err(),
+                    "{word}"
+                );
+                assert!(
+                    ours::inspect_shell(word).map_or(true, |inspection| inspection
+                        .commands
+                        .iter()
+                        .all(|command| command.program.is_none())),
+                    "{word}"
+                );
+            }
+        }
+    }
 }

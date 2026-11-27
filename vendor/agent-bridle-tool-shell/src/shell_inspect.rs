@@ -957,7 +957,7 @@ pub(crate) fn static_shell_word(
 fn may_contain_brace_expansion(word: &str) -> bool {
     word.split_once('{').is_some_and(|(_, after_open)| {
         after_open
-            .split_once('}')
+            .rsplit_once('}')
             .is_some_and(|(inside, _)| inside.contains(',') || inside.contains(".."))
     })
 }
@@ -1001,7 +1001,7 @@ fn append_static_pieces(
 }
 
 fn has_pathname_expansion(text: &str) -> bool {
-    text.contains(['*', '?', '['])
+    text.contains(['*', '?', '[', '(', ')'])
 }
 
 /// Refuse Brush's assignment-producing `printf` mode. `assign_to_named_parameter`
@@ -1374,6 +1374,33 @@ mod tests {
     use super::*;
 
     const COMPOUND_EXAMPLE: &str = r#"ls -1 $(find . -name "*.rs" -type f -exec wc -l {} + 2>/dev/null | sort -nr | head -10)"#;
+
+    #[test]
+    fn runtime_expanding_program_words_are_not_static() {
+        assert!(inspect_shell("env").is_err());
+        for word in [
+            "@(a|b)", "+(x)", "!(x)", "?(x)", "*(x)", "{a}{b,c}", "a=(b c)",
+        ] {
+            let program = inspect_shell(word);
+            assert!(
+                program.is_err()
+                    || program
+                        .unwrap()
+                        .commands
+                        .iter()
+                        .all(|cmd| cmd.program.is_none()),
+                "runtime-dependent program: {word}"
+            );
+            assert!(
+                inspect_shell(&format!("find . -exec {word} \\;")).is_err(),
+                "{word}"
+            );
+            assert!(
+                inspect_shell(&format!("printf {word} literal")).is_err(),
+                "{word}"
+            );
+        }
+    }
 
     #[test]
     fn timeout_projects_a_literal_descendant_without_rewriting_source() {

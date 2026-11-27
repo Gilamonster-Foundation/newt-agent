@@ -127,6 +127,11 @@ fn run_platform() {
         "full_access_runs_dynamic_construct_and_captures",
         full_access_runs_dynamic_construct_and_captures,
     );
+    run_async_case(
+        &runtime,
+        "static_words_match_real_brush_argv",
+        static_words_match_real_brush_argv,
+    );
     #[cfg(unix)]
     run_async_case(
         &runtime,
@@ -1190,4 +1195,87 @@ async fn a_child_gets_the_seeded_path_and_the_seam_but_no_ambient_variable() {
         !stdout.contains("ambient-secret") && !has(AMBIENT),
         "an ambient variable that was not passed must NOT reach the child: {out}"
     );
+}
+
+/// Grounds the inspector's static-word promise in the real worker's expansion.
+/// The public find projection resolves each descendant argument through
+/// static_shell_word, so this needs no test-only classification API. The find
+/// source is inspected only; the worker runs a builtin argv-recording function.
+async fn static_words_match_real_brush_argv() {
+    use agent_bridle_tool_shell::inspect_shell;
+    let dir = unique_temp("static-words");
+    std::fs::create_dir(&dir).expect("create word-expansion fixture");
+    for name in ["a", "b", "x", "x.rs", "ab"] {
+        std::fs::write(dir.join(name), "").expect("write glob fixture");
+    }
+    let cases = [
+        ("@(a|b)", None),
+        ("+(x)", None),
+        ("!(x)", None),
+        ("?(x)", None),
+        ("*(x)", None),
+        ("a@(b)", None),
+        ("!()", None),
+        ("{a}{b,c}", None),
+        ("{}{1..2}", None),
+        ("'{a}'{b,c}", None),
+        ("x{a}{,}", None),
+        ("{a}{b,c}{d}", None),
+        ("a=(b c)", None),
+        ("*", None),
+        ("x.*", None),
+        ("[", None),
+        ("{a,b}", None),
+        ("{1..2}", None),
+        ("literal", Some("literal")),
+        ("owner/r", Some("owner/r")),
+        ("done", Some("done")),
+        ("a=~/x", Some("a=~/x")),
+        ("{a}b{c}", Some("{a}b{c}")),
+        ("''", Some("")),
+        ("'two words'", Some("two words")),
+        ("'!(x)'", Some("!(x)")),
+        (r#""@(a|b)""#, Some("@(a|b)")),
+        (r"a\(b", Some("a(b")),
+        (r"@\(a\|b\)", Some("@(a|b)")),
+        ("'a=(b c)'", Some("a=(b c)")),
+        (r"a=\(b\ c\)", Some("a=(b c)")),
+        ("'*.rs'", Some("*.rs")),
+        ("résumé", Some("résumé")),
+    ];
+    let mut mismatches = Vec::new();
+    for (source, expected) in cases {
+        let claim = inspect_shell(&format!("find . -exec word-probe {source} \\;"))
+            .ok()
+            .map(|inspection| {
+                let argv = &inspection.commands[0].descendant_execs[0].argv;
+                assert_eq!(argv.len(), 2, "one source word: {source:?}");
+                argv[1].clone()
+            });
+        let cmd =
+            format!("capture_argv() {{ printf '%s\\0' \"$#\" \"$@\"; }}; capture_argv {source}");
+        let out = tool()
+            .invoke(
+                serde_json::json!({ "cmd": cmd, "cwd": dir }),
+                &ctx(Caveats::top()),
+            )
+            .await
+            .expect("invoke word-expansion worker");
+        assert_eq!(out["exit_code"], 0, "word {source:?}: {out}");
+        let mut fields = out["stdout"].as_str().unwrap().split_terminator('\0');
+        let count: usize = fields.next().unwrap().parse().expect("argument count");
+        let actual: Vec<_> = fields.collect();
+        assert_eq!(actual.len(), count, "framed argv: {source:?}");
+        let agrees = claim.as_deref().is_none_or(|literal| actual == [literal]);
+        if !agrees || claim.as_deref() != expected {
+            mismatches.push(format!("{source:?}: static={claim:?}, Brush={actual:?}"));
+        }
+    }
+    std::fs::remove_dir_all(&dir).expect("remove word-expansion fixture");
+    eprintln!(
+        "static word differential: {} cases, {} mismatches",
+        cases.len(),
+        mismatches.len()
+    );
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }

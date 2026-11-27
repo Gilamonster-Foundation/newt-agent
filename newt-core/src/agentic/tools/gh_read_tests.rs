@@ -509,3 +509,22 @@ async fn gh_read_empty_failures_do_not_blame_credentials_and_large_failures_keep
         }
     }
 }
+
+#[tokio::test]
+async fn dynamic_policy_words_never_reach_shell() {
+    for word in ["@(a|b)", "+(x)", "!(x)", "{a}{b,c}", "a=(b c)"] {
+        for command in [
+            format!("git {word}"),
+            format!("git clean {word}"),
+            format!("gh {word} list"),
+            format!("gh pr {word}"),
+        ] {
+            let probe = Probe::default();
+            let mut gate = Gate::default();
+            let result = dispatch(&command, &crate::Caveats::top(), &probe, &mut gate).await;
+            assert!(result.contains("refused:"), "{command}: {result}");
+            assert_eq!(probe.host.load(Ordering::SeqCst), 0, "{command}");
+            assert_eq!(probe.confined.load(Ordering::SeqCst), 0, "{command}");
+        }
+    }
+}

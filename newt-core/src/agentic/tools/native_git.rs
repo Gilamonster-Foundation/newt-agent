@@ -11,6 +11,7 @@ use push_failure::classify_failure;
 
 use super::git_words::{
     bare_git_invocations, git_verb_in, invocation, is_gh, is_git, literal, unresolved,
+    NAME_IT_LITERALLY,
 };
 use super::governed_command::GovernedCommand;
 use super::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
@@ -44,6 +45,7 @@ pub(super) fn preflight(
         // supply one.
         Err(_) => return Ok(()),
     };
+    super::git_words::check_policy_words(&inspection)?;
     let caps = GitCaveats::from_session(caveats);
     let mut destroys = Vec::new();
     inspect_commands(
@@ -133,8 +135,11 @@ fn other_data_loss_op(verb: &str, args: &[String]) -> Option<&'static str> {
 /// tripwire, not a boundary: it reads the bare words of [`bare_git_invocations`],
 /// which says what that sees and what it does not.
 fn hides_git_delete(source: &str) -> bool {
-    bare_git_invocations(source).iter().any(|(verb, args)| {
-        other_data_loss_op(verb, args).is_some()
+    bare_git_invocations(source).iter().any(|argv| {
+        let Ok((verb, args)) = super::git_words::policy_invocation(argv) else {
+            return true;
+        };
+        other_data_loss_op(&verb, args).is_some()
             || match verb.as_str() {
                 "branch" => has_option(args, "dD", &["--delete"]),
                 "stash" => args
@@ -144,11 +149,6 @@ fn hides_git_delete(source: &str) -> bool {
             }
     })
 }
-
-/// What to do instead when a delete names what it destroys only at runtime.
-const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out \
-    literally, for example `git branch -D old-a old-b` or `git worktree remove ../old`; \
-    newt then asks the operator.";
 
 /// Git verbs that read from a remote. Pure data: a three-Cs candidate for the
 /// tooling packs once a second forge CLI needs the same prompt.
@@ -1124,14 +1124,7 @@ fn inspect_commands(
         if !command.program.as_deref().is_some_and(is_git) {
             continue;
         }
-        let Ok((raw_verb, args, _)) = invocation(&command.argv) else {
-            // Unknown CLI forms retain Git's own interpretation and the
-            // existing confined executor's authority checks.
-            continue;
-        };
-        let Some(verb) = literal(raw_verb) else {
-            continue;
-        };
+        let (verb, args) = super::git_words::policy_invocation(&command.argv)?;
         // #3145: work-destroying ops beyond a branch or stash delete are confirmed
         // the same way, and refused when newt cannot show what they run.
         if let Some(op) = other_data_loss_op(&verb, args) {
@@ -1360,6 +1353,79 @@ mod tests {
     };
     use super::*;
     use crate::agentic::{NoMcp, PromptDisposition};
+
+    /// Policy words must not disappear when static classification refuses them.
+    #[test]
+    fn dynamic_policy_words_are_refused() {
+        let mut admitted = Vec::new();
+        for word in ["@(a|b)", "+(x)", "!(x)", "{a}{b,c}", "a=(b c)"] {
+            for source in [
+                format!("git {word}"),
+                format!("git -C {word} status"),
+                format!("git reset {word}"),
+                format!("git clean {word}"),
+                format!("git checkout {word}"),
+                format!("git switch {word}"),
+                format!("git branch {word}"),
+                format!("git stash {word}"),
+                format!("git reflog {word}"),
+                format!("git symbolic-ref {word}"),
+                format!("git worktree {word}"),
+                format!("git worktree list {word}"),
+                format!("git merge --abort {word}"),
+                format!("gh {word} list"),
+                format!("gh pr {word}"),
+                format!("echo $(git {word})"),
+                format!("timeout 5 git {word}"),
+            ] {
+                if preflight(&source, Path::new("."), &Caveats::top(), &mut None, false).is_ok() {
+                    admitted.push(source);
+                }
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "dynamic policy words admitted: {admitted:?}"
+        );
+    }
+
+    #[test]
+    fn unresolved_policy_words_in_the_fallback_tripwire_are_refused() {
+        for source in [
+            "env git {a}{b,c}",
+            "env git clean {a}{b,c}",
+            "env git reset {a}{b,c}",
+            "env git worktree {a}{b,c}",
+            "env git -C {a}{b,c} status",
+            "env git -c {a}{b,c} status",
+        ] {
+            assert!(
+                preflight(source, Path::new("."), &Caveats::top(), &mut None, false).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_policy_words_preserve_literal_data_and_brokered_messages() {
+        for source in [
+            "git status --short",
+            "git 'status'",
+            "git '-C' 'two words' status",
+            "git log --format=\"$(printf literal)\"",
+            "git diff -- '*.rs'",
+            "git checkout 'a=(b c)'",
+            "git worktree list",
+            "gh pr list",
+            "git commit -m \"$(cat <<'EOF'\nLiteral message\nEOF\n)\"",
+        ] {
+            assert_eq!(
+                preflight(source, Path::new("."), &Caveats::top(), &mut None, true),
+                Ok(()),
+                "{source}"
+            );
+        }
+    }
 
     /// #3295: the hook's diagnostic must survive the actual result fold, even
     /// when the broker adds its generic refusal after the failing line.

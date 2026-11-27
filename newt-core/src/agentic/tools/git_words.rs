@@ -4,23 +4,21 @@
 //! as the brokers in `native_git`, so they live outside it (#3160).
 use crate::shell_inspect::{inspect_shell, ShellConstructKind, ShellInspection};
 
-/// Every `git` invocation `source` makes, as `(verb, arguments)`, read from its bare
-/// words without the shell inspector: segments split at shell punctuation, and `git` taken
+/// Every apparent `git` argv, retaining global options for policy validation, read
+/// from bare words without the shell inspector: segments split at shell punctuation, and `git` taken
 /// anywhere in a segment, so `then git commit -m x` and `xargs git branch -d` count.
 /// A tripwire, not a boundary. Words are split at white space and keep their quotes,
 /// so `'git fetch'` or `"git` is not git, but git text inside a longer quoted
 /// string, a comment or a here-document is read as an invocation wherever no quote
 /// touches the `git` or the verb. An obfuscated command stays the confined
 /// executor's.
-pub(super) fn bare_git_invocations(source: &str) -> Vec<(String, Vec<String>)> {
+pub(super) fn bare_git_invocations(source: &str) -> Vec<Vec<String>> {
     let mut found = Vec::new();
     for segment in source.split(['|', ';', '&', '\n', '(', ')', '`', '<', '>']) {
         let words: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
         for (at, word) in words.iter().enumerate() {
             if is_git(word) {
-                if let Ok((verb, args, _)) = invocation(&words[at..]) {
-                    found.push((verb.to_string(), args.to_vec()));
-                }
+                found.push(words[at..].to_vec());
             }
         }
     }
@@ -66,7 +64,11 @@ pub(super) fn git_verb_in(source: &str, verbs: &[&str]) -> Option<String> {
         // Read the bare words instead, as the delete tripwire does.
         Err(_) => bare_git_invocations(source)
             .into_iter()
-            .filter_map(|(verb, _)| literal(&verb))
+            .filter_map(|argv| {
+                invocation(&argv)
+                    .ok()
+                    .and_then(|(verb, _, _)| literal(verb))
+            })
             .find(|verb| verbs.contains(&verb.as_str())),
     }
 }
@@ -194,6 +196,86 @@ pub(super) fn is_git(program: &str) -> bool {
 /// a standalone command: e.g. an owner/repo ending in `/r` is not an interpreter.
 pub(super) fn literal(word: &str) -> Option<String> {
     crate::shell_inspect::literal_shell_word(word).ok()
+}
+
+/// What to do instead when a delete names what it destroys only at runtime.
+pub(super) const NAME_IT_LITERALLY: &str = "Retry with run_command writing the command out \
+    literally, for example `git branch -D old-a old-b` or `git worktree remove ../old`; \
+    newt then asks the operator.";
+
+/// Resolve policy selectors without dropping unknown words or interpreting
+/// quoted global options as verbs. Keep argument source for existing consumers.
+/// Commit message data is checked by the broker after expansion; read-command
+/// data is not a mutation selector. Every argument inspected by mutation guards
+/// must be static, since expansion can change both its value and argv position.
+pub(super) fn policy_invocation(argv: &[String]) -> Result<(String, &[String]), String> {
+    let resolved: Vec<_> = argv.iter().map(|word| literal(word)).collect();
+    let words: Vec<_> = resolved
+        .iter()
+        .zip(argv)
+        .map(|(value, source)| value.as_ref().unwrap_or(source).clone())
+        .collect();
+    let (verb, args, _) = invocation(&words)?;
+    let prefix = argv.len() - args.len();
+    let checked = if matches!(
+        verb,
+        "merge"
+            | "rebase"
+            | "cherry-pick"
+            | "revert"
+            | "checkout"
+            | "switch"
+            | "branch"
+            | "stash"
+            | "symbolic-ref"
+            | "reflog"
+            | "worktree"
+            | "reset"
+            | "clean"
+    ) {
+        argv.len()
+    } else {
+        prefix
+    };
+    if resolved[..checked].iter().any(Option::is_none) {
+        return Err(format!("refused: Git policy words must be literal; write out the verb, global options and mutation arguments. {NAME_IT_LITERALLY}"));
+    }
+    Ok((verb.to_string(), &argv[prefix..]))
+}
+
+/// Validate before loose broker selection can classify an unknown selector as
+/// ungoverned. Descendants and substitutions share the same policy-word rule.
+pub(super) fn check_policy_words(inspection: &ShellInspection) -> Result<(), String> {
+    for command in &inspection.commands {
+        for (program, argv) in
+            std::iter::once((command.program.as_deref(), command.argv.as_slice())).chain(
+                command
+                    .descendant_execs
+                    .iter()
+                    .map(|child| (Some(child.program.as_str()), child.argv.as_slice())),
+            )
+        {
+            if program.is_some_and(is_git) {
+                policy_invocation(argv)?;
+            } else if program.is_some_and(is_gh)
+                && argv
+                    .iter()
+                    .skip(1)
+                    .take(2)
+                    .any(|word| literal(word).is_none())
+            {
+                return Err("refused: gh policy words must be literal; write out the command and subcommand".into());
+            }
+        }
+    }
+    for nested in inspection
+        .constructs
+        .iter()
+        .filter_map(|construct| construct.inspection.as_deref())
+    {
+        check_policy_words(nested)?;
+    }
+    Ok(())
 }
 
 /// Find the native verb without translating argv. Repository/config selectors

@@ -2,7 +2,7 @@
 //! unverified Git verbs during adoption, not a security/preservation guarantee.
 //! Script files, runtime-generated commands, and ordinary task file deletion
 //! (`rm -rf`, `find -delete`, interpreters) remain possible under existing grants.
-use super::{invocation, literal, resembles_git};
+use super::{literal, resembles_git};
 
 pub(in crate::agentic::tools) const NOTICE: &str = "capability denied: adopted worktree administration accident guard refuses this destructive or unverified Git command (including aliases). Use an explicit supported Git built-in, or ask the operator for /permissions worktree-lift. This is not a preservation guarantee: script files, runtime-generated commands, and ordinary task file deletion (rm -rf, find -delete, interpreters) remain possible.";
 
@@ -36,15 +36,7 @@ pub(in crate::agentic::tools) fn destructive(source: &str) -> bool {
         if !program.is_some_and(resembles_git) {
             return false;
         }
-        let words: Vec<_> = argv
-            .iter()
-            .map(|word| literal(word).unwrap_or_else(|| word.clone()))
-            .collect();
-        let Ok((verb, args, _)) = invocation(&words) else {
-            // Unknown Git option syntax cannot prove a safe administration call.
-            return true;
-        };
-        let Some(verb) = literal(verb) else {
+        let Ok((verb, args)) = super::super::git_words::policy_invocation(argv) else {
             return true;
         };
         if verb != "worktree" {
@@ -56,7 +48,7 @@ pub(in crate::agentic::tools) fn destructive(source: &str) -> bool {
         // Only the non-destructive forms are admitted. Creation still passes
         // through the separate creation/adoption guard, never this predicate.
         !matches!(
-            args.first().map(String::as_str),
+            args.first().and_then(|word| literal(word)).as_deref(),
             Some("list" | "add" | "lock")
         )
     }
@@ -168,6 +160,19 @@ const BUILTIN_VERBS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_policy_words_are_destructive() {
+        for word in ["@(a|b)", "+(x)", "!(x)", "{a}{b,c}", "a=(b c)"] {
+            for source in [
+                format!("git {word}"),
+                format!("git worktree {word}"),
+                format!("git -C {word} status"),
+            ] {
+                assert!(destructive(&source), "{source}");
+            }
+        }
+    }
 
     /// Regression: the adopted-worktree guard refused a non-Git exploration pipeline.
     #[test]
