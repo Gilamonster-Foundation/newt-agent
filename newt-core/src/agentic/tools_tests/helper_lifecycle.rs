@@ -652,6 +652,7 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     assert!(request.reason.contains("Build isolation:"));
     if cfg!(target_os = "linux") {
         assert!(request.reason.contains("private loopback"));
+        assert!(request.reason.contains("64 private terminal pairs"));
         assert!(request
             .reason
             .contains("deny-all fallback, including loopback"));
@@ -756,8 +757,8 @@ fn cold_cache_recovery_is_visible_to_model_and_operator() {
         }
     }
     let recovery = "note: automatic locked fetch was declined by the operator";
-    let fallback = "Build isolation: deny-all fallback; loopback and private scratch unavailable";
-    let private = "Build isolation: private loopback only; private tmpfs /tmp (1 GiB) and /dev/shm (256 MiB); external networking unavailable.";
+    let fallback = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable";
+    let private = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); external networking unavailable.";
     for (fetch_note, stderr_note, note) in [
         (Some(recovery), "", recovery),
         (None, fallback, fallback),

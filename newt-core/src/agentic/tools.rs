@@ -1386,7 +1386,7 @@ fn build_isolation_description(network: &crate::Scope<String>) -> &'static str {
     match network {
         crate::Scope::All => "network allowed by the existing operator grant",
         crate::Scope::Only(hosts) if hosts.is_empty() && cfg!(target_os = "linux") =>
-            "private loopback and bounded private /tmp and /dev/shm when setup succeeds; otherwise network denied and no private temporary mounts (deny-all fallback, including loopback); effective mode reported at execution",
+            "private loopback, bounded private /tmp and /dev/shm, and up to 64 private terminal pairs when setup succeeds; otherwise network denied and private temporary filesystems and terminals unavailable (deny-all fallback, including loopback); effective mode reported at execution",
         crate::Scope::Only(hosts) if hosts.is_empty() => "network denied",
         crate::Scope::Only(_) => "network limited to the existing operator grant",
     }

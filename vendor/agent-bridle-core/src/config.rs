@@ -164,8 +164,9 @@ pub enum ChildNetworkPolicy {
     /// caller that *requires* it must fail closed via `backends.require_landlock`.
     DenyDirect,
     /// Build-only isolation: private user/network/mount namespaces, loopback,
-    /// and bounded private temporary filesystems. Any setup failure retains
-    /// the existing DenyDirect floor and grants no host temporary write access.
+    /// bounded private temporary filesystems and a private PTY instance. Any
+    /// setup failure retains the existing DenyDirect floor and grants no host
+    /// temporary write or terminal access.
     /// The legacy tag is readable; serialization names the broader mechanism
     /// so its content-addressed fence identity cannot equal the network-only one.
     #[serde(alias = "private-loopback")]

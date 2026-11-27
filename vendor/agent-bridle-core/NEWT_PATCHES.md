@@ -305,3 +305,13 @@ Namespace setup changes no cgroup membership and grants no host-namespace capabi
 Landlock prevents mounting after the fence, including in later namespaces.
 Temporary filesystems disappear when their final namespace/mount references are
 released. See the fdguard patch note for resource bounds and environment handling.
+
+## Private build PTYs (#3320)
+
+`PrivateBuild` also supplies bounded private devpts through the same fdguard
+setup. No new configuration field or host terminal grant is introduced. The
+prepared access mask carries IOCTL_DEV only when the configured ABI handles it;
+fdguard restricts the new terminal rules to read/write and applicable ioctl rights.
+The private-build seccomp filter denies TIOCSTI and TIOCLINUX, while preserving
+PTY allocation, terminal settings and window sizing. Ordinary execution retains
+its existing policy. See the fdguard patch note for setup, bounds and fallback.

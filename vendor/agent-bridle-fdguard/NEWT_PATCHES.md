@@ -58,3 +58,27 @@ memory budget. Pages may use swap. Filesystem byte/inode bounds are per mount,
 not an aggregate memory limit across builds. Final namespace/mount-reference
 release frees the temporary filesystems. The child has no capabilities in host
 namespaces and cannot mount after the Landlock fence.
+
+## Private build terminals (#3320)
+
+The same pre-fence mount namespace mounts devpts with
+`newinstance,ptmxmode=0666,mode=0600,max=64`, nosuid and noexec. Binding its `ptmx`
+onto `/dev/ptmx` supports both a host device node and a host symlink. The grants
+bind the private directory and allocator inode after mounting; no host terminal
+is granted. They contain only read/write, directory traversal, and IOCTL_DEV
+when the prepared filesystem mask handles that right (Landlock ABI 5+).
+The default ABI 3 does not restrict device ioctls. The shared core seccomp filter
+denies TIOCSTI and TIOCLINUX while preserving allocation, termios and winsize.
+Terminal stdio refuses exec; the existing descriptor sweep closes higher fds.
+
+The 64-pair limit bounds one build instance, still subject to the kernel's global
+PTY pool and reserve. It supplies no aggregate budget across concurrent builds.
+The instance disappears when its last mount/namespace references are released.
+Any setup failure discards the partially configured child and retries with the
+untouched fallback ruleset, where PTY allocation remains denied. The real build
+probe forces failure specifically at devpts mounting, after private scratch
+grants, and exercises argv and Brush routes, host canaries, terminal stdio,
+allocation/transport/settings, forbidden injection and the pair limit.
+
+Kernel contracts: [devpts](https://docs.kernel.org/filesystems/devpts.html) and
+[Landlock device ioctls](https://docs.kernel.org/userspace-api/landlock.html#device-ioctl).

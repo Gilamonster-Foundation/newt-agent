@@ -52,7 +52,7 @@ pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
     policy
 }
 
-/// The build-only network and scratch isolation, shared by argv and shell execution.
+/// The build-only network, scratch and PTY isolation, shared by argv and shell execution.
 /// A real network grant and every non-Linux backend retain existing behavior.
 pub(crate) fn build_sandbox_policy(network: &crate::Scope<String>) -> agent_bridle::SandboxPolicy {
     let mut policy = runtime_sandbox_policy();

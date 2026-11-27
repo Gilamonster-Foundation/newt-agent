@@ -1,4 +1,4 @@
-//! Child-side private loopback and scratch, with the existing floor on error.
+//! Child-side private loopback, scratch and PTYs, with the existing floor on error.
 //! Allocation happens before fork. Private-mount rules bind descriptors opened
 //! after mounting, before either fence. No host or parent namespace is changed.
 
@@ -20,11 +20,11 @@ pub const RETRY_DENY_ALL: i32 = libc::ENONET;
 /// Loader controls and worker-authentication variables are never in this list.
 pub const TEMPORARY_ENV: [&str; 5] = ["HOME", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"];
 
-pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); external networking unavailable.\n";
-pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback and private scratch unavailable. Local tests may fail because of this fence.\n";
+pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); external networking unavailable.\n";
+pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable. Local tests may fail because of this fence.\n";
 
 /// Install the prepared filesystem fence after new user, network and mount
-/// namespaces, with private tmpfs grants bound after mounting. Setup errors
+/// namespaces, with private tmpfs/devpts grants bound after mounting. Setup errors
 /// return RETRY_DENY_ALL before exec; the caller sets the returned flag and
 /// spawns a fresh child using both fallback mechanisms. Fence installation
 /// errors refuse exec entirely.
@@ -82,9 +82,17 @@ pub fn confine(
     unsafe {
         command.pre_exec(move || {
             // The common fd guard closes >=3 at exec. Stdio is delegated and
-            // survives, so refuse host network sockets there too. AF_UNIX is
-            // needed for the authenticated worker-control channel.
+            // survives, so refuse host terminals and network sockets there too.
+            // AF_UNIX is needed for the authenticated worker-control channel.
             for fd in 0..3 {
+                let mut terminal = std::mem::MaybeUninit::<libc::termios>::uninit();
+                if libc::tcgetattr(fd, terminal.as_mut_ptr()) == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EACCES));
+                }
+                let error = io::Error::last_os_error();
+                if !matches!(error.raw_os_error(), Some(libc::ENOTTY | libc::EBADF)) {
+                    return Err(error);
+                }
                 let mut domain = 0;
                 let mut size = std::mem::size_of_val(&domain) as libc::socklen_t;
                 let result = libc::getsockopt(
@@ -108,7 +116,7 @@ pub fn confine(
             if private
                 && namespace(&uid_map, &gid_map)
                     .and_then(|()| {
-                        private_scratch(filesystem.as_raw_fd(), scratch_access, &empty_dirs)
+                        private_filesystems(filesystem.as_raw_fd(), scratch_access, &empty_dirs)
                     })
                     .is_err()
             {
@@ -141,7 +149,7 @@ fn temporary_root(path: &std::path::Path) -> Option<&'static std::path::Path> {
     .find(|root| path.starts_with(root))
 }
 
-fn private_scratch(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Result<()> {
+fn private_filesystems(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Result<()> {
     // SAFETY: only the new mount namespace is affected; propagation is made
     // private recursively BEFORE the first mount, so no event reaches the host.
     check(unsafe {
@@ -169,6 +177,47 @@ fn private_scratch(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Res
         })?;
         grant_private_mount(ruleset, access, path)?;
     }
+    // A fresh instance has its own slave indices and allocation limit. It must
+    // permit device opens (no MS_NODEV), but neither set-id nor executable files.
+    check(unsafe {
+        libc::mount(
+            c"devpts".as_ptr(),
+            c"/dev/pts".as_ptr(),
+            c"devpts".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NOEXEC,
+            c"newinstance,ptmxmode=0666,mode=0600,max=64"
+                .as_ptr()
+                .cast(),
+        )
+    })?;
+    check(unsafe {
+        libc::mount(
+            c"/dev/pts/ptmx".as_ptr(),
+            c"/dev/ptmx".as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    })?;
+    use linux_raw_sys::landlock::{
+        LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE,
+        LANDLOCK_ACCESS_FS_WRITE_FILE,
+    };
+    // ABI 3/4 do not gate ioctls. If the prepared ruleset handles IOCTL_DEV
+    // (ABI >=5), allow it only on the new instance and its ptmx bind alias.
+    let terminal = access
+        & u64::from(
+            LANDLOCK_ACCESS_FS_READ_FILE
+                | LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_IOCTL_DEV,
+        );
+    grant_private_mount(
+        ruleset,
+        terminal | (access & u64::from(LANDLOCK_ACCESS_FS_READ_DIR)),
+        c"/dev/pts",
+    )?;
+    // Bind the source inode: /dev/ptmx can itself be a symlink on the host.
+    grant_private_mount(ruleset, terminal, c"/dev/pts/ptmx")?;
     for path in empty_dirs {
         let rc = unsafe { libc::mkdir(path.as_ptr(), 0o700) };
         if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
@@ -185,7 +234,7 @@ fn grant_private_mount(ruleset: i32, access: u64, path: &CStr) -> io::Result<()>
     let fd = unsafe {
         libc::open(
             path.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     check(fd)?;
