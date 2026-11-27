@@ -1354,6 +1354,27 @@ mod tests {
     use super::*;
     use crate::agentic::{NoMcp, PromptDisposition};
 
+    #[test]
+    fn refused_timeout_descendants_cannot_acquire_commit_broker_authority() {
+        for prefix in [
+            "timeout -f 5",
+            "timeout -p 5",
+            "timeout 5 --",
+            "timeout 5 '-v'",
+            r"timeout 5 \-v",
+            "timeout 5 @(git)",
+            "timeout 5 {x}{git,}",
+            "timeout 5 a=(b c)",
+            r#"timeout 5 "$PROGRAM""#,
+        ] {
+            let source = format!("{prefix} git commit -m message");
+            assert!(inspect_shell(&source).is_err(), "{source}");
+            assert!(commit_in_an_uninspectable_source(&source), "{source}");
+            assert!(!needs_commit_broker(&source), "{source}");
+            assert!(GovernedCommand::parse(&source).is_err(), "{source}");
+        }
+    }
+
     /// Policy words must not disappear when static classification refuses them.
     #[test]
     fn dynamic_policy_words_are_refused() {

@@ -97,6 +97,10 @@ pub enum RedirectOperation {
 }
 
 /// A command that an admitted external program can spawn outside Brush's interceptor.
+///
+/// This inventory makes no guarantee about the child's lifetime. GNU `timeout`
+/// without `--foreground` puts the wrapped command in its own process group,
+/// so it can outlive the tool's own timeout or cancellation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DescendantExec {
     /// Statically resolved child program name.
@@ -1156,7 +1160,10 @@ fn is_timeout_program(program: &str) -> bool {
 }
 
 /// Project one literal timeout wrapper, retaining the original command. This
-/// is an inventory, not a promise that Brush intercepts its native children.
+/// recognizes a bounded subset of GNU coreutils timeout 9.4. Without
+/// `--foreground`, the native wrapper creates its own process group; its child
+/// can outlive the tool's timeout or cancellation. Projection promises neither
+/// interception nor a lifetime bound.
 fn inspect_timeout_descendants(
     words: &[&Word],
     source: &str,
@@ -1182,6 +1189,7 @@ fn inspect_timeout_descendants(
     };
     let signal =
         |value: &str| !value.is_empty() && value.bytes().all(|c| c.is_ascii_alphanumeric());
+    let mut foreground = false;
     let mut index = 1;
     loop {
         let option = literal(index)?;
@@ -1190,7 +1198,11 @@ fn inspect_timeout_descendants(
                 index += 1;
                 break;
             }
-            "--foreground" | "--preserve-status" | "--verbose" | "-f" | "-p" | "-v" => {
+            "--foreground" => {
+                foreground = true;
+                index += 1;
+            }
+            "--preserve-status" | "--verbose" | "-v" => {
                 index += 1;
             }
             "-s" | "--signal" | "-k" | "--kill-after" => {
@@ -1226,7 +1238,9 @@ fn inspect_timeout_descendants(
     }
     let child_index = index + 1;
     let program = literal(child_index)?;
-    if program.is_empty() {
+    // GNU stops option parsing at the duration. Refuse option-like command
+    // names as other implementations may instead treat them as more options.
+    if program.is_empty() || program.starts_with('-') {
         return Err(invalid());
     }
     // Do not hide a second dispatcher below the one represented here. Find's
@@ -1236,9 +1250,14 @@ fn inspect_timeout_descendants(
             "`timeout` descendant `{program}` cannot be projected statically: {reason}"
         )));
     }
-    let reason = format!(
+    let mut reason = format!(
         "external `timeout` spawns `{program}` itself; Brush cannot independently intercept that descendant process"
     );
+    if !foreground {
+        reason.push_str(
+            "; without `--foreground`, GNU `timeout` puts the wrapped command in its own process group, so it can outlive the tool's timeout or cancellation",
+        );
+    }
     warnings.push(reason.clone());
     let mut children = vec![DescendantExec {
         program: program.clone(),
@@ -1543,6 +1562,117 @@ mod tests {
     }
 
     #[test]
+    fn timeout_refuses_option_like_descendant_programs() {
+        let mut accepted = Vec::new();
+        for program in [
+            "-",
+            "--",
+            "-v",
+            "--foreground",
+            "-k",
+            "--signal=TERM",
+            "--unknown",
+            "'-v'",
+            r"\-v",
+            r"\--",
+            "'--'",
+            r#""--""#,
+        ] {
+            let source = format!("timeout 5 {program} sh -c true");
+            if inspect_shell(&source).is_ok() {
+                accepted.push(source);
+            }
+        }
+        assert!(accepted.is_empty(), "incorrectly projected: {accepted:?}");
+        let inspected = inspect_shell("timeout -- 5 git status").unwrap();
+        assert_eq!(inspected.commands[0].descendant_execs[0].program, "git");
+    }
+
+    #[test]
+    fn timeout_refuses_options_outside_gnu_reference_subset() {
+        let mut accepted = Vec::new();
+        for options in [
+            "-f",
+            "-p",
+            "-fp",
+            "-sTERM",
+            "-k1",
+            "--sig=TERM",
+            "--help",
+            "--version",
+        ] {
+            let source = format!("timeout {options} 5 git status");
+            if inspect_shell(&source).is_ok() {
+                accepted.push(source);
+            }
+        }
+        assert!(accepted.is_empty(), "incorrectly projected: {accepted:?}");
+    }
+
+    #[test]
+    fn timeout_warns_when_its_process_group_can_outlive_tool_cancellation() {
+        for options in ["", "--preserve-status -v", "--signal=TERM --"] {
+            let inspected = inspect_shell(&format!("timeout {options} 5 git status")).unwrap();
+            let child = &inspected.commands[0].descendant_execs[0];
+            assert!(
+                child.reason.contains("own process group"),
+                "{}",
+                child.reason
+            );
+            assert!(child
+                .reason
+                .contains("outlive the tool's timeout or cancellation"));
+            assert!(inspected.warnings.contains(&child.reason));
+        }
+        let inspected = inspect_shell("timeout '--foreground' 5 git status").unwrap();
+        assert!(inspected
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("own process group")));
+        assert!(inspected.commands[0].descendant_execs[0]
+            .reason
+            .contains("cannot independently intercept"));
+    }
+
+    const DYNAMIC_DESCENDANT_WORDS: &[&str] = &[
+        "/usr/bin/@(env)",
+        "/usr/bin/@(timeout)",
+        "@(sh|env)",
+        "+(sh)",
+        "!(sh)",
+        "?(sh)",
+        "*(sh)",
+        "a@(b)",
+        "!()",
+        "{x}{printf,}",
+        "{}{1..2}",
+        "'{a}'{b,c}",
+        "x{a}{,}",
+        "{a}{b,c}{d}",
+        "a=(b c)",
+    ];
+
+    #[test]
+    fn timeout_refuses_runtime_expanding_descendants() {
+        let accepted: Vec<_> = DYNAMIC_DESCENDANT_WORDS
+            .iter()
+            .map(|program| format!("timeout 5 {program} sh -c true"))
+            .filter(|source| inspect_shell(source).is_ok())
+            .collect();
+        assert!(accepted.is_empty(), "incorrectly projected: {accepted:?}");
+    }
+
+    #[test]
+    fn find_refuses_runtime_expanding_descendants() {
+        let accepted: Vec<_> = DYNAMIC_DESCENDANT_WORDS
+            .iter()
+            .map(|program| format!(r"find . -exec {program} 5 sh -c true \;"))
+            .filter(|source| inspect_shell(source).is_ok())
+            .collect();
+        assert!(accepted.is_empty(), "incorrectly projected: {accepted:?}");
+    }
+
+    #[test]
     fn timeout_projects_a_literal_descendant_without_rewriting_source() {
         for prefix in [
             "timeout 120",
@@ -1560,6 +1690,45 @@ mod tests {
             assert!(child.source.contains(prefix));
             assert!(child.source.ends_with("'cargo' check --offline"));
             assert!(child.reason.contains("cannot independently intercept"));
+        }
+    }
+
+    #[test]
+    fn timeout_option_operands_and_duration_boundaries_are_checked() {
+        for options in [
+            "--foreground --preserve-status -v --signal TERM --kill-after 0.25s -- 0",
+            "-s 9 -k 0.1m 1d",
+            "--signal=KILL --kill-after=2h 1e2s",
+            "-- .5m",
+            "+1E-2s",
+            "1.d",
+        ] {
+            let source = format!("timeout {options} git status --short");
+            let inspected = inspect_shell(&source).unwrap();
+            assert_eq!(inspected.commands[0].descendant_execs[0].program, "git");
+        }
+        for options in [
+            "-s",
+            "-s '' 1 git",
+            "--signal= 1 git",
+            "--signal=TERM! 1 git",
+            "-k",
+            "--kill-after= 1 git",
+            "-k -1 1 git",
+            "--kill-after=inf 1 git",
+            "NaN git",
+            "inf git",
+            "1e999 git",
+            "-0.1 git",
+            "1ms git",
+            "1d2h git",
+            "0x1p0 git",
+            "1_0 git",
+            "'' git",
+            "2 ''",
+        ] {
+            let source = format!("timeout {options}");
+            assert!(inspect_shell(&source).is_err(), "{source}");
         }
     }
 
