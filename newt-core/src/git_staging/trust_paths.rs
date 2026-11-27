@@ -177,7 +177,8 @@ mod tests {
         assert!(hints.iter().all(|h| h.chmod_arg == "g-w"));
     }
 
-    /// Diagnostics share enforcement: an owner-only scratch parent is clean,
+    /// #2739: diagnostics must not invent repairs for a clean path (the
+    /// root-owned rows). Diagnostics share enforcement: an owner-only scratch parent is clean,
     /// but a caller-owned or unmapped sticky writable parent is not trusted.
     #[test]
     fn scratch_parent_modes_retain_the_shared_trust_rule() {
