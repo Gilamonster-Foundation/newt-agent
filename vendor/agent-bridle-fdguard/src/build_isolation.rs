@@ -2,11 +2,12 @@
 //! Allocation happens before fork. Private-mount rules bind descriptors opened
 //! after mounting, before either fence. No host or parent namespace is changed.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,9 +17,65 @@ use std::sync::{
 /// Private pre-exec signal: namespace setup failed before any program ran.
 pub const RETRY_DENY_ALL: i32 = libc::ENONET;
 
-/// Directory values needed before private mounts hide their host counterparts.
-/// Loader controls and worker-authentication variables are never in this list.
-pub const TEMPORARY_ENV: [&str; 5] = ["HOME", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"];
+/// Directory controls needed to decide whether private mounts hide build inputs.
+/// Shared with worker bootstrap; loader and authentication controls are excluded.
+pub fn is_path_env(name: &OsStr) -> bool {
+    name.as_bytes().ends_with(b"HOME")
+        || [
+            "HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "XDG_RUNTIME_DIR",
+            "PATH",
+            "CARGO_TARGET_DIR",
+            "VIRTUAL_ENV",
+            "SDKROOT",
+            "DOTNET_ROOT",
+            "GOPATH",
+            "GOROOT",
+        ]
+        .iter()
+        .any(|key| name == OsStr::new(key))
+}
+
+/// All I/O is injected so the pre-fork choice is tested without host state.
+fn needs_fallback<'a, 'b>(
+    identity_available: bool,
+    cwd: &Path,
+    mut roots: impl Iterator<Item = &'a Path>,
+    env: impl Iterator<Item = (&'b OsStr, &'b OsStr)>,
+    mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> bool {
+    if !identity_available || cwd.components().any(|part| part == Component::ParentDir) {
+        return true;
+    }
+    let spelling = cwd;
+    let Ok(cwd) = canonicalize(cwd) else {
+        return true;
+    };
+    if temporary_root(spelling).is_some() || temporary_root(&cwd).is_some() {
+        return true;
+    }
+    let mut hidden = |path: &Path| {
+        let path = cwd.join(path);
+        path.components().any(|part| part == Component::ParentDir)
+            || canonicalize(&path).map_or(true, |resolved| {
+                // A covered spelling disappears even if its symlink points out.
+                temporary_root(&path).is_some() || temporary_root(&resolved).is_some()
+            })
+    };
+    roots.any(&mut hidden)
+        || env
+            .filter(|(name, _)| is_path_env(name))
+            .any(|(name, value)| {
+                if name == "PATH" || name == "GOPATH" {
+                    std::env::split_paths(value).any(|path| hidden(&path))
+                } else {
+                    hidden(Path::new(value))
+                }
+            })
+}
 
 pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; external networking unavailable.\n";
 pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable. Local tests may fail because of this fence.\n";
@@ -56,53 +113,22 @@ impl SameObjectBind {
 /// namespaces, with private tmpfs/devpts grants bound after mounting. Setup errors
 /// return RETRY_DENY_ALL before exec; the caller sets the returned flag and
 /// spawns a fresh child using both fallback mechanisms. Fence installation
-/// errors refuse exec entirely. `binds` are attached last, after the private
-/// mounts and account files; one that cannot be attached exactly is a setup
+/// errors refuse exec entirely. Host terminals and non-AF_UNIX sockets on stdio
+/// refuse exec in both private and fallback modes. `binds` are attached after
+/// the private mounts and account files; one that cannot be attached exactly is a setup
 /// error like any other, and the fallback child has no namespace, so it sees
 /// no binding at all.
 /// `deny_inherited_fds` must also be installed by the confined spawn funnel.
-pub fn confine(
+pub fn confine<'a>(
     command: &mut Command,
-    filesystem: OwnedFd,
-    fallback_rules: OwnedFd,
+    filesystems: [OwnedFd; 2],
     deny: seccompiler::BpfProgram,
     loopback: seccompiler::BpfProgram,
     scratch_access: u64,
     binds: Vec<SameObjectBind>,
-) -> io::Result<Arc<AtomicBool>> {
-    let mut empty_dirs = Vec::new();
-    for (name, value) in command.get_envs() {
-        if !name
-            .to_str()
-            .is_some_and(|name| TEMPORARY_ENV.contains(&name))
-        {
-            continue;
-        }
-        let Some(path) = value.map(std::path::Path::new) else {
-            continue;
-        };
-        let Some(root) = temporary_root(path) else {
-            continue;
-        };
-        if path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        for parent in path.ancestors().take_while(|p| *p != root) {
-            empty_dirs.push(
-                CString::new(parent.as_os_str().as_bytes())
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
-            );
-        }
-    }
-    // Lexical ordering puts each parent before its children. These directories
-    // are newly created and empty; no host scratch contents are copied or bound.
-    empty_dirs.sort();
-    empty_dirs.dedup();
-    let fallback = Arc::new(AtomicBool::new(false));
-    let child_fallback = Arc::clone(&fallback);
+    roots: impl Iterator<Item = &'a Path>,
+) -> Arc<AtomicBool> {
+    let [filesystem, fallback_rules] = filesystems;
     // Map to the same numeric identity so build tools do not suddenly run as
     // uid 0. Kernel credentials continue to name the original host identity.
     let uid = unsafe { libc::geteuid() };
@@ -110,6 +136,19 @@ pub fn confine(
     // NSS may allocate, load modules or contact a service: resolve only here,
     // before fork. A failed lookup selects the same fresh-child fallback.
     let identity = account_files(uid, gid);
+    // The spawn funnel clears ambient env and supplies the effective values,
+    // including the worker's eventual directory controls. Decide before fork:
+    // a covered input must retain its host view and its original grant rules.
+    let fallback = Arc::new(AtomicBool::new(needs_fallback(
+        identity.is_ok(),
+        command.get_current_dir().unwrap_or(Path::new(".")),
+        roots,
+        command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value))),
+        |path| path.canonicalize(),
+    )));
+    let child_fallback = Arc::clone(&fallback);
     let uid_map = format!("{uid} {uid} 1\n").into_bytes();
     let gid_map = format!("{gid} {gid} 1\n").into_bytes();
     // SAFETY: the hook uses only raw syscalls, stack storage and preallocated
@@ -151,9 +190,7 @@ pub fn confine(
             let private = !child_fallback.load(Ordering::Relaxed);
             if private
                 && namespace(&uid_map, &gid_map)
-                    .and_then(|()| {
-                        private_filesystems(filesystem.as_raw_fd(), scratch_access, &empty_dirs)
-                    })
+                    .and_then(|()| private_filesystems(filesystem.as_raw_fd(), scratch_access))
                     .and_then(|()| {
                         let files = identity
                             .as_ref()
@@ -180,7 +217,7 @@ pub fn confine(
             Ok(())
         });
     }
-    Ok(fallback)
+    fallback
 }
 
 fn temporary_root(path: &std::path::Path) -> Option<&'static std::path::Path> {
@@ -336,7 +373,7 @@ fn private_identity(ruleset: i32, access: u64, files: &[Vec<u8>; 2]) -> io::Resu
     Ok(())
 }
 
-fn private_filesystems(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Result<()> {
+fn private_filesystems(ruleset: i32, access: u64) -> io::Result<()> {
     // SAFETY: only the new mount namespace is affected; propagation is made
     // private recursively BEFORE the first mount, so no event reaches the host.
     check(unsafe {
@@ -405,12 +442,6 @@ fn private_filesystems(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io:
     )?;
     // Bind the source inode: /dev/ptmx can itself be a symlink on the host.
     grant_private_mount(ruleset, terminal, c"/dev/pts/ptmx")?;
-    for path in empty_dirs {
-        let rc = unsafe { libc::mkdir(path.as_ptr(), 0o700) };
-        if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            check(rc)?;
-        }
-    }
     Ok(())
 }
 
@@ -583,6 +614,91 @@ fn reopen(path: &CStr, held: &OwnedFd) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn covered_build_inputs_select_fallback_before_fork() {
+        // Every path resolution is injected: no filesystem, NSS or process state.
+        let resolve = |path: &std::path::Path| match path.to_str().unwrap() {
+            "/missing" => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            "/unreadable" => Err(io::Error::from_raw_os_error(libc::EACCES)),
+            "/symlink" => Ok(std::path::PathBuf::from("/tmp/tool")),
+            "/tmp/outward" => Ok(std::path::PathBuf::from("/workspace/tool")),
+            "/workspace/relative" => Ok(std::path::PathBuf::from("/dev/shm/tool")),
+            _ => Ok(path.to_path_buf()),
+        };
+        for (identity, cwd, roots, expected) in [
+            (true, "/workspace", vec![], false),
+            (false, "/workspace", vec![], true),
+            (true, "/tmp", vec![], true),
+            (true, "/dev/shm/work", vec![], true),
+            (true, "/symlink", vec![], true),
+            (true, "/tmp/outward", vec![], true),
+            (true, "/missing", vec![], true),
+            (true, "/workspace", vec!["/tmp/write"], true),
+            (true, "/workspace", vec!["/dev/shm/read"], true),
+            (true, "/workspace", vec!["/symlink"], true),
+            (true, "/workspace", vec!["/missing"], true),
+            (true, "/workspace", vec!["/unreadable"], true),
+            (
+                true,
+                "/workspace",
+                vec!["/tmp-other", "/dev/shm-other"],
+                false,
+            ),
+        ] {
+            assert_eq!(
+                needs_fallback(
+                    identity,
+                    Path::new(cwd),
+                    roots.iter().map(Path::new),
+                    std::iter::empty(),
+                    resolve,
+                ),
+                expected,
+                "identity={identity}, cwd={cwd}, roots={roots:?}"
+            );
+        }
+        for (key, value, expected) in [
+            ("PATH", "/usr/bin:/tmp/bin", true),
+            ("PATH", "/usr/bin:relative", true),
+            ("PATH", ":/usr/bin:", false),
+            ("CARGO_HOME", "/symlink", true),
+            ("CARGO_HOME", "/tmp/outward", true),
+            ("RUSTUP_HOME", "/dev/shm/rust", true),
+            ("JAVA_HOME", "/tmp/java", true),
+            ("PYTHONHOME", "/tmp/python", true),
+            ("DOTNET_ROOT", "/tmp/dotnet", true),
+            ("HOME", "/tmp/../workspace", true),
+            ("TMPDIR", "/missing", true),
+            ("TEMP", "/tmp/temp", true),
+            ("TMP", "/dev/shm/temp", true),
+            ("XDG_RUNTIME_DIR", "/tmp/runtime", true),
+            ("CARGO_TARGET_DIR", "/tmp/target", true),
+            ("VIRTUAL_ENV", "/tmp/venv", true),
+            ("GOPATH", "/usr/go:/tmp/go", true),
+            ("SDKROOT", "/tmp/sdk", true),
+            ("UNRELATED", "/tmp/text", false),
+        ] {
+            assert_eq!(
+                needs_fallback(
+                    true,
+                    Path::new("/workspace"),
+                    std::iter::empty(),
+                    [(OsStr::new(key), OsStr::new(value))].into_iter(),
+                    resolve,
+                ),
+                expected,
+                "{key}={value}"
+            );
+        }
+        assert!(needs_fallback(
+            false,
+            Path::new("/workspace"),
+            std::iter::empty(),
+            std::iter::empty(),
+            |_| panic!("a known account failure must select fallback immediately"),
+        ));
+    }
 
     #[test]
     fn account_line_preserves_fields_without_adding_records() {
