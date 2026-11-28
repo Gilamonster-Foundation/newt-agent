@@ -270,8 +270,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   these AF_UNIX sockets while refusing terminals and other socket families.
   A private PID namespace for these builds is staged behind the opt-in
   `SandboxPolicy::private_pid_namespace`
-  ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). No production
-  route sets it yet, so host process IDs remain visible and signalable from a build, as before.
+  ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). Linux
+  private argv builds enable it: their payload is PID 2 and cannot name host
+  processes through PID syscalls. Brush builds keep the switch off pending
+  namespace-aware worker/broker authentication. A PID setup failure takes the
+  existing fresh-child deny-all fallback; the diagnostic names host process
+  IDs as still visible and signalable. Private procfs remains a later stage.
   When opted in, creation-time pidfds arrive over a harness-created report socketpair;
   only the never-exec'd relay sends, before restricting itself. Init and payload close
   its sender immediately after creation. The receiver requires one complete message,

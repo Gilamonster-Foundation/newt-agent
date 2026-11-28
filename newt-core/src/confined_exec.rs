@@ -391,7 +391,15 @@ impl ExecRequest {
     #[cfg(feature = "confine")]
     pub(crate) fn sandbox_policy(&self) -> agent_bridle::SandboxPolicy {
         if self.private_build_isolation && self.net_grant == NetGrant::DenyAll {
-            sandbox_policy::build_sandbox_policy(&self.caveats.net)
+            let mut policy = sandbox_policy::build_sandbox_policy(&self.caveats.net);
+            // Enable only this argv route. The shared Brush policy stays off
+            // until its worker and broker authenticate namespace coordinates.
+            if cfg!(target_os = "linux")
+                && policy.child_network == agent_bridle::ChildNetworkPolicy::PrivateBuild
+            {
+                policy.private_pid_namespace = true;
+            }
+            policy
         } else {
             runtime_sandbox_policy()
         }

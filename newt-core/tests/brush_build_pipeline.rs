@@ -1693,27 +1693,26 @@ mod native {
                 "--deny-build-pidns" | "--deny-build-pidns-init"
             )
         }) {
-            let mode = if pidns_argv_enabled()
-                || name == "build_tests_temporary_workspace_retains_fallback"
-            {
-                "deny-all fallback"
-            } else {
-                "private loopback only"
-            };
+            let mode =
+                if route == "argv" || name == "build_tests_temporary_workspace_retains_fallback" {
+                    "deny-all fallback"
+                } else {
+                    "private loopback only"
+                };
             assert!(diagnostic.contains(mode), "{name} ({route}): {diagnostic}");
             eprintln!("{name} ({route}): required {mode} measured");
         }
     }
 
-    // Test-only opt-in: production request policy remains unchanged. The argv
-    // funnel can exercise every existing probe before enabling PID isolation.
+    // Retain the argv-only probe selector; production argv requests now select
+    // PID isolation themselves, while the shared Brush policy remains off.
     #[cfg(target_os = "linux")]
-    fn pidns_argv_enabled() -> bool {
+    fn argv_probes_only() -> bool {
         std::env::args().any(|arg| arg == "--test-private-pidns-argv")
     }
 
     #[cfg(target_os = "linux")]
-    fn argv_build_probe(workspace: &Path, name: &str, probe: &str) -> (bool, Vec<u8>, Vec<u8>) {
+    fn argv_build_probe(workspace: &Path, probe: &str) -> (bool, Vec<u8>, Vec<u8>) {
         use newt_core::confined_exec::{build_tool_request, ConstrainedExecutor};
         let executable = std::env::current_exe().unwrap();
         let request = build_tool_request(
@@ -1723,79 +1722,8 @@ mod native {
             [probe, "--build-network-auto"],
             &Scope::none(),
         );
-        if !pidns_argv_enabled() {
-            let output = ConstrainedExecutor::run(&request).unwrap();
-            return (output.success, output.stdout, output.stderr);
-        }
-        // This test-only PID route owns its own short-path run. Replace the
-        // production request's unacquired run grant, then carry the owned path
-        // explicitly so the same empty-scratch mechanism also grounds PID mode.
-        let scratch = tempfile::tempdir_in("/tmp").unwrap();
-        let mut caveats = request.caveats().clone();
-        let planned = request
-            .env_grants()
-            .iter()
-            .find(|(key, _)| key == "TMPDIR")
-            .unwrap()
-            .1
-            .as_str();
-        for scope in [&mut caveats.fs_read, &mut caveats.fs_write] {
-            if let Scope::Only(paths) = scope {
-                paths.remove(planned);
-                paths.remove(Path::new(planned).parent().unwrap().to_str().unwrap());
-            }
-        }
-        // Match the existing PID probe's exact executable-image read grant;
-        // ConstrainedExecutor normally adds this while resolving its guard.
-        if let Scope::Only(reads) = &mut caveats.fs_read {
-            reads.insert(executable.to_str().unwrap().to_owned());
-            reads.insert(scratch.path().to_str().unwrap().to_owned());
-        }
-        if let Scope::Only(writes) = &mut caveats.fs_write {
-            writes.insert(scratch.path().to_str().unwrap().to_owned());
-        }
-        let cx = agent_bridle::Gate::new(0)
-            .authorize(&agent_bridle::ShellTool::default(), &caveats)
-            .unwrap();
-        let policy = agent_bridle::SandboxPolicy {
-            child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
-            private_pid_namespace: true,
-            ..Default::default()
-        };
-        let mut command = agent_bridle::ConfinedCommand::new(executable.to_str().unwrap())
-            .private_build_scratch(vec![scratch.path().to_owned()])
-            .args([probe, "--build-network-auto"])
-            .current_dir(workspace)
-            .sandbox_policy(std::sync::Arc::new(policy))
-            .new_process_group()
-            .stdin(agent_bridle::ConfinedStdio::Null)
-            .stdout(agent_bridle::ConfinedStdio::Piped)
-            .stderr(agent_bridle::ConfinedStdio::Piped);
-        for (key, value) in request.env_grants() {
-            command = command.env(key, value);
-        }
-        for name in ["HOME", "TMPDIR", "TMP", "TEMP"] {
-            command = command.env(name, scratch.path());
-        }
-        let child = command.spawn(&cx).unwrap();
-        let isolation = child
-            .build_isolation
-            .expect("private build reports its mode");
-        if std::env::args().any(|arg| arg.starts_with("--deny-build-")) {
-            assert_eq!(isolation, agent_bridle::BuildIsolation::DenyAllFallback);
-        } else if std::env::args().any(|arg| arg == "--require-build-netns") {
-            assert_eq!(
-                isolation,
-                if name == "build_tests_temporary_workspace_retains_fallback" {
-                    agent_bridle::BuildIsolation::DenyAllFallback
-                } else {
-                    agent_bridle::BuildIsolation::Private
-                }
-            );
-        }
-        let output = child.child.wait_with_output().unwrap();
-        eprintln!("PIDNS_ARGV_STAGING_ON: {probe}: {isolation:?}");
-        (output.status.success(), output.stdout, output.stderr)
+        let output = ConstrainedExecutor::run(&request).unwrap();
+        (output.success, output.stdout, output.stderr)
     }
 
     /// Grounds the mocked build-network scope contract in real socket calls
@@ -2012,12 +1940,12 @@ mod native {
             .unwrap();
         }
         let executable = std::env::current_exe().unwrap();
-        let (argv_success, argv_stdout, argv_stderr) = argv_build_probe(&workspace, name, &probe);
+        let (argv_success, argv_stdout, argv_stderr) = argv_build_probe(&workspace, &probe);
         let source = format!(
             "cargo build --lib --offline && '{}' {probe} --build-network-auto",
             executable.display()
         );
-        let brush = if pidns_argv_enabled() {
+        let brush = if argv_probes_only() {
             None
         } else {
             Some(
@@ -2131,7 +2059,7 @@ mod native {
             for terminal_stdio in [None, Some(0), Some(1), Some(2)] {
                 let policy = agent_bridle::SandboxPolicy {
                     child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
-                    private_pid_namespace: pidns_argv_enabled(),
+                    private_pid_namespace: true,
                     landlock_abi_floor: if terminal_stdio.is_some() { 3 } else { 5 },
                     ..Default::default()
                 };
@@ -2210,8 +2138,8 @@ mod native {
         }
         eprintln!(
             "test {name} ... ok ({})",
-            if pidns_argv_enabled() {
-                "argv; PID staging on"
+            if argv_probes_only() {
+                "argv only"
             } else {
                 "argv and Brush"
             }
@@ -2221,6 +2149,7 @@ mod native {
     /// Grounds fdguard's mocked relay decision and `clone_args` layout, and
     /// core's mocked fallback-flag mode, in real processes on both spawn funnels
     /// with the staging switch on (`docs/design/private-pid-namespace.md`).
+    /// Also grounds the production argv request policy through ConstrainedExecutor.
     /// Grounds the injected creator-report predicates and bounded teardown:
     /// live/reaped handles, exact status, adopted zombies and detached children.
     /// The payload is PID 2 with no visible parent and leads its own group;
@@ -2290,6 +2219,38 @@ mod native {
                 .new_process_group()
         };
         let probe = format!("--build-pid-probe={}", std::process::id());
+
+        // Ground the prepared-request policy through the production argv route.
+        // The raw funnel below remains a separate topology/handle proof.
+        let request = newt_core::confined_exec::build_tool_request(
+            &workspace,
+            &workspace,
+            executable.to_str().unwrap(),
+            [probe.as_str()],
+            &Scope::none(),
+        );
+        let output = newt_core::confined_exec::ConstrainedExecutor::run(&request).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.success,
+            "production argv PID probe: {stdout}\n{stderr}"
+        );
+        let mode = if stderr.contains("deny-all fallback") {
+            BuildIsolation::DenyAllFallback
+        } else {
+            BuildIsolation::Private
+        };
+        expect(Some(mode), &stdout, &stderr);
+        assert!(
+            stderr.contains(if mode == BuildIsolation::Private {
+                "private process IDs"
+            } else {
+                "host process IDs remain visible and signalable"
+            }),
+            "{stderr}"
+        );
+        eprintln!("{name} (ConstrainedExecutor): {mode:?}: {}", stdout.trim());
 
         // argv funnel, normal exit: the relay mirrors the payload's status.
         let confined = command(std::slice::from_ref(&probe)).spawn(&cx).unwrap();
@@ -2677,7 +2638,7 @@ mod native {
                 "BUILD_UNIX_SOCKET_ROUNDTRIP_CONFIRMED",
             )
             .await;
-            if pidns_argv_enabled() {
+            if argv_probes_only() {
                 return;
             }
         }

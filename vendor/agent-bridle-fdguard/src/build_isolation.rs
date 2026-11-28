@@ -114,6 +114,9 @@ fn needs_fallback<'a, 'b>(
 
 pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; external networking unavailable.\n";
 pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable. Local tests may fail because of this fence.\n";
+/// PID-enabled argv mode; private procfs is a separate stage.
+pub const PRIVATE_PIDNS: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; private process IDs; external networking unavailable.\n";
+pub const FALLBACK_PIDNS: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable; host process IDs remain visible and signalable. Local tests may fail because of this fence.\n";
 
 /// One regular file a private build must reach under a second name: `source`
 /// is attached read-only over `target` in the child's own mount namespace,
@@ -280,7 +283,12 @@ pub fn confine<'a>(
             } else {
                 fallback_rules.as_raw_fd()
             })?;
-            let message = if private { PRIVATE } else { FALLBACK };
+            let message = match (private, pid_namespace) {
+                (true, true) => PRIVATE_PIDNS,
+                (true, false) => PRIVATE,
+                (false, true) => FALLBACK_PIDNS,
+                (false, false) => FALLBACK,
+            };
             libc::write(2, message.as_ptr().cast(), message.len());
             Ok(())
         });
