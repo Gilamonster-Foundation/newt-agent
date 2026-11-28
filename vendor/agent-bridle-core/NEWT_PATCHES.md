@@ -376,3 +376,20 @@ private setup fails; the reported mode reads that flag after spawning. This is h
 the diagnostic line on stderr but not this field. It is `None` unless the child
 was spawned under `PrivateBuild` on Linux. `ManagedSpawn` and
 `ConfinedTokioChild` do not carry it yet.
+
+## Worker result-channel hardening (#3321)
+
+`SandboxedWorker` supplies stdout and stderr with fresh Unix socketpairs on
+Linux and macOS. The worker's stdout and stderr cannot be opened again by
+pathname. A single parent write shutdown before spawn also gives the child's
+unused read side EOF on the fresh pair. This avoids a redundant read shutdown
+that can return ENOTCONN on macOS; errors from the required shutdown still
+propagate. A Unix constructor test checks both forbidden directions, result
+delivery and EOF. A sealed `ConfinedStdio::WorkerOutput` handle preserves
+audited stdio credit without admitting arbitrary descriptors or providing a
+host I/O service.
+
+The parent endpoints remain in `Child.stdout` and `Child.stderr`, preserving
+reader and supervisor ownership, including error paths. Ordinary argv stdio,
+the authenticated stdin channel and the framing protocol are unchanged.
+Retire with the upstream port of this transport change.

@@ -247,6 +247,11 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   reserve 64 pairs or impose an aggregate budget across builds. Failed namespace/mount setup
   retries in a fresh child with the original DenyDirect floor and its existing IPC limitations.
   This narrows the build route's abstract-socket surface; it does not close this deviation.
+  The Brush worker's stdout and stderr are one-way socketpairs on Linux and macOS
+  (#3321), which cannot be opened again by pathname. The host only drains output;
+  this channel provides no I/O service. Framing, bounded stderr diagnostics and
+  supervisor lifetime are unchanged. The private-build stdio check already permits
+  these AF_UNIX sockets while refusing terminals and other socket families.
   A private PID namespace for these builds is staged behind the opt-in
   `SandboxPolicy::private_pid_namespace`
   ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). No production
@@ -348,6 +353,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `run_command`-via-Brush now ALSO reaches this entry's `net: none` zero-floor promotion — closing a
   gap this entry did not previously name. Does not change this entry's residual (loopback/host-grant
   net is still unaffected on either route); does not change its Status.
+  The worker's output channels now use sealed `ConfinedStdio::WorkerOutput` handles
+  (#3321): fresh socketpairs with the host's write direction and the child's read
+  direction shut down. Only the worker spawn can mint these handles; arbitrary
+  `Other` stdio remains unaudited. The output channel has no host request protocol.
 
 ### windows-inheritable-handle-leak
 - **Invariant (ideal):** an attacker-exec child receives only explicitly granted capabilities; arbitrary
