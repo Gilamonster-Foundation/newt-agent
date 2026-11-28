@@ -44,6 +44,55 @@ fn main() {
         return;
     }
     #[cfg(target_os = "linux")]
+    if let Some(probe) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--build-pid-probe=").map(str::to_owned))
+    {
+        let (harness, hold) = match probe.strip_suffix(":hold") {
+            Some(harness) => (harness, true),
+            None => (probe.as_str(), false),
+        };
+        let harness: libc::pid_t = harness.parse().unwrap();
+        // SAFETY: these calls have no preconditions; signal 0 delivers nothing.
+        let (pid, parent, group, signal) = unsafe {
+            (
+                libc::getpid(),
+                libc::getppid(),
+                libc::getpgrp(),
+                libc::kill(harness, 0),
+            )
+        };
+        let unreachable = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!(group, pid, "the payload leads its own process group");
+        if std::net::TcpListener::bind(("127.0.0.1", 0)).is_err() {
+            // The fresh fallback child never entered a namespace: it is the
+            // harness's direct child and host processes stay signalable.
+            assert_eq!((parent, signal), (harness, 0));
+            println!("BUILD_PIDNS_DENIED_FALLBACK");
+        } else {
+            assert_eq!((pid, parent), (2, 0), "payload identity");
+            assert_eq!(
+                (signal, unreachable),
+                (-1, Some(libc::ESRCH)),
+                "the harness must not be nameable"
+            );
+            println!("BUILD_PRIVATE_PIDNS_CONFIRMED pid={pid} ppid={parent} pgrp={group}");
+        }
+        if hold {
+            use std::io::{Read, Write};
+            // A descendant in its own session. Only the namespace reaches it,
+            // so it is created only where a namespace exists.
+            // SAFETY: single-threaded here; the child only reads and exits.
+            if parent == 0 && unsafe { libc::fork() } == 0 {
+                assert_eq!(unsafe { libc::setsid() }, unsafe { libc::getpid() });
+                println!("BUILD_PIDNS_DESCENDANT_DETACHED");
+            }
+            std::io::stdout().flush().unwrap();
+            // The test never writes and never closes its end before the kill.
+            let _ = std::io::stdin().read(&mut [0]);
+        }
+        return;
+    }
+    #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--build-identity-probe") {
         let private = std::net::TcpListener::bind(("127.0.0.1", 0)).is_ok();
         let paths = ["/etc/passwd", "/etc/group"];
@@ -685,21 +734,22 @@ mod native {
                     | "--deny-build-devpts"
                     | "--deny-build-identity"
                     | "--deny-build-alias-bind"
+                    | "--deny-build-pidns"
+                    | "--deny-build-pidns-init"
             )
         }) {
             let deny_mounts = std::env::args().any(|arg| arg == "--deny-build-mounts");
             let deny_devpts = std::env::args().any(|arg| arg == "--deny-build-devpts");
             let deny_identity = std::env::args().any(|arg| arg == "--deny-build-identity");
             // `move_mount` is used only to attach the same-object Git alias, the
-            // last setup step: scratch, terminals and account files exist by then.
+            // last mount setup step: scratch, terminals and account files exist by then.
             let deny_alias = std::env::args().any(|arg| arg == "--deny-build-alias-bind");
-            let denied = if deny_alias {
-                libc::SYS_move_mount
-            } else if deny_mounts || deny_devpts || deny_identity {
-                libc::SYS_mount
-            } else {
-                libc::SYS_unshare
-            };
+            // The PID step is its own unshare with exactly this argument, so
+            // the combined user/network/mount unshare before it still succeeds.
+            let deny_pidns = std::env::args().any(|arg| arg == "--deny-build-pidns");
+            // A later failure: the namespace exists and its init cannot finish
+            // hardening, so it never reports ready and the relay discards it.
+            let deny_init = std::env::args().any(|arg| arg == "--deny-build-pidns-init");
             // The PTY allocator also uses MS_BIND. Target the account's
             // readonly remount so scratch and terminal setup complete first.
             let fault_flags = if deny_identity {
@@ -713,6 +763,21 @@ mod native {
                 libc::MS_NOSUID | libc::MS_NOEXEC
             } else {
                 0
+            };
+            let fault_syscall = if deny_alias {
+                libc::SYS_move_mount
+            } else if deny_mounts || deny_devpts || deny_identity {
+                libc::SYS_mount
+            } else if deny_init {
+                libc::SYS_capset
+            } else {
+                libc::SYS_unshare
+            };
+            // The compared syscall argument: mount's flags, or unshare's.
+            let (fault_argument, fault_value) = if deny_pidns {
+                (0, libc::CLONE_NEWPID as libc::c_ulong)
+            } else {
+                (3, fault_flags)
             };
             assert!(
                 !std::env::args().any(|arg| arg == "--require-build-netns"),
@@ -732,7 +797,7 @@ mod native {
                     (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                     0,
                     1,
-                    denied as u32,
+                    fault_syscall as u32,
                 ),
                 instruction(
                     (libc::BPF_RET | libc::BPF_K) as u16,
@@ -747,7 +812,7 @@ mod native {
                     libc::SECCOMP_RET_ALLOW,
                 ),
             ];
-            if deny_devpts || deny_identity {
+            if deny_devpts || deny_identity || deny_pidns {
                 filters[1].jf = 3;
                 filters.splice(
                     2..2,
@@ -757,14 +822,14 @@ mod native {
                             0,
                             0,
                             (std::mem::offset_of!(libc::seccomp_data, args)
-                                + 3 * std::mem::size_of::<u64>())
+                                + fault_argument * std::mem::size_of::<u64>())
                                 as u32,
                         ),
                         instruction(
                             (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
                             0,
                             1,
-                            fault_flags as u32,
+                            fault_value as u32,
                         ),
                     ],
                 );
@@ -782,11 +847,22 @@ mod native {
                     0
                 );
             }
-            // None of unshare(0), mount or move_mount with null operands can
-            // mutate the host. The control must observe the injected errno,
-            // independently of host namespace or mount permissions.
+            // Neither unshare(0), mount, move_mount nor capset with null operands can
+            // mutate the host, and the filter answers unshare(CLONE_NEWPID)
+            // before the kernel acts on it. The control must observe the
+            // injected errno, independently of host namespace or mount
+            // permissions.
             assert_eq!(
-                unsafe { libc::syscall(denied, 0, 0, 0, fault_flags, 0,) },
+                unsafe {
+                    libc::syscall(
+                        fault_syscall,
+                        if deny_pidns { fault_value } else { 0 },
+                        0,
+                        0,
+                        fault_flags,
+                        0,
+                    )
+                },
                 -1
             );
             assert_eq!(
@@ -803,6 +879,10 @@ mod native {
                     "BUILD_IDENTITY_SETUP_FAILURE_INJECTED"
                 } else if deny_alias {
                     "BUILD_ALIAS_BIND_FAILURE_INJECTED"
+                } else if deny_pidns {
+                    "BUILD_PIDNS_SETUP_FAILURE_INJECTED"
+                } else if deny_init {
+                    "BUILD_PIDNS_INIT_SETUP_FAILURE_INJECTED"
                 } else {
                     "BUILD_NETNS_SETUP_FAILURE_INJECTED"
                 }
@@ -926,6 +1006,10 @@ mod native {
             #[cfg(target_os = "linux")]
             if selected("git_alias_file_bind_carries_a_nested_exec_rule") {
                 super::git_alias_bind::ground(&root);
+            }
+            #[cfg(target_os = "linux")]
+            if selected("build_tests_private_pid_namespace") {
+                build_tests_private_pid_namespace(&root);
             }
             if selected("denied_build_runs_no_pipeline_stage_or_redirection") {
                 denied_build_runs_no_pipeline_stage_or_redirection(&root).await;
@@ -1301,7 +1385,7 @@ mod native {
     }
 
     /// Grounds the mocked covered-path fallback decision and Build extra-write
-    /// grants on both the confined argv and Brush routes: successful writes must
+    /// grants and reported mode on the argv and Brush routes: successful writes must
     /// survive on the host, rather than disappear with a private tmpfs.
     #[cfg(target_os = "linux")]
     async fn build_tests_granted_temporary_root_remains_visible(root: &Path) {
@@ -1354,10 +1438,13 @@ mod native {
                     .stdout(agent_bridle::ConfinedStdio::Piped)
                     .stderr(agent_bridle::ConfinedStdio::Piped)
                     .spawn(&cx)
-                    .unwrap()
-                    .child
-                    .wait_with_output()
                     .unwrap();
+                assert_eq!(
+                    output.build_isolation,
+                    Some(agent_bridle::BuildIsolation::DenyAllFallback),
+                    "covered inputs select fallback before any retry"
+                );
+                let output = output.child.wait_with_output().unwrap();
                 assert!(
                     output.status.success(),
                     "{}",
@@ -1398,6 +1485,127 @@ mod native {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    fn assert_build_mode(diagnostic: &str, name: &str, route: &str) {
+        for (switch, mode) in [
+            (
+                "--require-build-netns",
+                if name == "build_tests_temporary_workspace_retains_fallback" {
+                    "deny-all fallback"
+                } else {
+                    "private loopback only"
+                },
+            ),
+            ("--deny-build-netns", "deny-all fallback"),
+            ("--deny-build-mounts", "deny-all fallback"),
+            ("--deny-build-devpts", "deny-all fallback"),
+            ("--deny-build-identity", "deny-all fallback"),
+            ("--deny-build-alias-bind", "deny-all fallback"),
+        ] {
+            if std::env::args().any(|arg| arg == switch) {
+                assert!(
+                    diagnostic.contains(mode),
+                    "{name} ({route}) requires {mode}: {diagnostic}"
+                );
+                eprintln!("{name} ({route}): required {mode} measured");
+            }
+        }
+        if std::env::args().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--deny-build-pidns" | "--deny-build-pidns-init"
+            )
+        }) {
+            let mode = if pidns_argv_enabled()
+                || name == "build_tests_temporary_workspace_retains_fallback"
+            {
+                "deny-all fallback"
+            } else {
+                "private loopback only"
+            };
+            assert!(diagnostic.contains(mode), "{name} ({route}): {diagnostic}");
+            eprintln!("{name} ({route}): required {mode} measured");
+        }
+    }
+
+    // Test-only opt-in: production request policy remains unchanged. The argv
+    // funnel can exercise every existing probe before enabling PID isolation.
+    #[cfg(target_os = "linux")]
+    fn pidns_argv_enabled() -> bool {
+        std::env::args().any(|arg| arg == "--test-private-pidns-argv")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn argv_build_probe(workspace: &Path, name: &str, probe: &str) -> (bool, Vec<u8>, Vec<u8>) {
+        use newt_core::confined_exec::{build_tool_request, ConstrainedExecutor};
+        let executable = std::env::current_exe().unwrap();
+        let request = build_tool_request(
+            workspace,
+            workspace,
+            executable.to_str().unwrap(),
+            [probe, "--build-network-auto"],
+            &Scope::none(),
+        );
+        if !pidns_argv_enabled() {
+            let output = ConstrainedExecutor::run(&request).unwrap();
+            return (output.success, output.stdout, output.stderr);
+        }
+        // Owned short-path scratch survives private /tmp, including fallback.
+        // The existing probe still checks that its run directory is removed.
+        let scratch = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut caveats = request.caveats().clone();
+        // Match the existing PID probe's exact executable-image read grant;
+        // ConstrainedExecutor normally adds this while resolving its guard.
+        if let Scope::Only(reads) = &mut caveats.fs_read {
+            reads.insert(executable.to_str().unwrap().to_owned());
+            reads.insert(scratch.path().to_str().unwrap().to_owned());
+        }
+        if let Scope::Only(writes) = &mut caveats.fs_write {
+            writes.insert(scratch.path().to_str().unwrap().to_owned());
+        }
+        let cx = agent_bridle::Gate::new(0)
+            .authorize(&agent_bridle::ShellTool::default(), &caveats)
+            .unwrap();
+        let policy = agent_bridle::SandboxPolicy {
+            child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
+            private_pid_namespace: true,
+            ..Default::default()
+        };
+        let mut command = agent_bridle::ConfinedCommand::new(executable.to_str().unwrap())
+            .args([probe, "--build-network-auto"])
+            .current_dir(workspace)
+            .sandbox_policy(std::sync::Arc::new(policy))
+            .new_process_group()
+            .stdin(agent_bridle::ConfinedStdio::Null)
+            .stdout(agent_bridle::ConfinedStdio::Piped)
+            .stderr(agent_bridle::ConfinedStdio::Piped);
+        for (key, value) in request.env_grants() {
+            command = command.env(key, value);
+        }
+        for name in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+            command = command.env(name, scratch.path());
+        }
+        let child = command.spawn(&cx).unwrap();
+        let isolation = child
+            .build_isolation
+            .expect("private build reports its mode");
+        if std::env::args().any(|arg| arg.starts_with("--deny-build-")) {
+            assert_eq!(isolation, agent_bridle::BuildIsolation::DenyAllFallback);
+        } else if std::env::args().any(|arg| arg == "--require-build-netns") {
+            assert_eq!(
+                isolation,
+                if name == "build_tests_temporary_workspace_retains_fallback" {
+                    agent_bridle::BuildIsolation::DenyAllFallback
+                } else {
+                    agent_bridle::BuildIsolation::Private
+                }
+            );
+        }
+        let output = child.child.wait_with_output().unwrap();
+        eprintln!("PIDNS_ARGV_STAGING_ON: {probe}: {isolation:?}");
+        (output.status.success(), output.stdout, output.stderr)
+    }
+
     /// Grounds the mocked build-network scope contract in real socket calls
     /// through both build routes: a private namespace supports loopback with
     /// no external route; unavailable namespaces retain the socket-family deny.
@@ -1410,24 +1618,27 @@ mod native {
     /// real master/slave transport, ioctl contract and per-instance allocation bound.
     /// The identity twin grounds fdguard's mocked account-line validation in
     /// real NSS lookups, readonly object grants and unchanged host databases.
-    /// `--require-build-netns` rejects fallback on every probe and both routes;
-    /// `--deny-build-netns` grounds retry selection by forcing setup to fail.
+    /// `--require-build-netns` rejects fallback except for the deliberately
+    /// covered workspace; `--deny-build-netns` forces setup to fail.
     /// `--deny-build-identity` forces a later failure at the account remount.
     /// The Git alias twin (`support/git_alias_bind.rs`) grounds the same-object
-    /// binding; `--deny-build-alias-bind` fails its attach, the last setup
-    /// step, and the retried child must then report no binding at all.
+    /// binding; `--deny-build-alias-bind` fails its attach before the PID step,
+    /// and the retried child must then report no binding at all.
     #[cfg(target_os = "linux")]
     async fn build_network_probe(root: &Path, name: &str, probe: &str, marker: &str) {
-        use newt_core::confined_exec::{
-            build_tool_caveats, build_tool_request, ConstrainedExecutor,
-        };
+        use newt_core::confined_exec::build_tool_caveats;
 
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::fs::MetadataExt;
-        // Required-private probes must have no covered input. The managed
-        // default scratch under /tmp now correctly selects host-view fallback.
+        // Required-private probes need an uncovered scratch root. Keep its
+        // spelling short enough for the Unix socket probe's sockaddr_un.
+        let scratch_root = tempfile::Builder::new()
+            .prefix("")
+            .rand_bytes(3)
+            .tempdir_in("/var/tmp")
+            .unwrap();
         let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
-        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", root.join("private-build-scratch"));
+        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", scratch_root.path());
         let host_pty = if probe == "--build-pty-probe" {
             // Allocate our own host canary; never use the operator's terminal.
             let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
@@ -1596,47 +1807,48 @@ mod native {
             .unwrap();
         }
         let executable = std::env::current_exe().unwrap();
-        let argv = ConstrainedExecutor::run(&build_tool_request(
-            &workspace,
-            &workspace,
-            executable.to_str().unwrap(),
-            [probe.as_str(), "--build-network-auto"],
-            &Scope::none(),
-        ))
-        .unwrap();
+        let (argv_success, argv_stdout, argv_stderr) = argv_build_probe(&workspace, name, &probe);
         let source = format!(
             "cargo build --lib --offline && '{}' {probe} --build-network-auto",
             executable.display()
         );
-        let brush = execute_tool(
-            "run_command",
-            &serde_json::json!({"command": source}),
-            workspace.to_str().unwrap(),
-            false,
-            100,
-            &build_tool_caveats(&workspace),
-            &mut NoMcp,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await;
-        let stdout = String::from_utf8_lossy(&argv.stdout);
-        let stderr = String::from_utf8_lossy(&argv.stderr);
-        for (route, output, diagnostic) in [
-            ("argv", stdout.as_ref(), stderr.as_ref()),
-            ("Brush", brush.as_str(), brush.as_str()),
-        ] {
+        let brush = if pidns_argv_enabled() {
+            None
+        } else {
+            Some(
+                execute_tool(
+                    "run_command",
+                    &serde_json::json!({"command": source}),
+                    workspace.to_str().unwrap(),
+                    false,
+                    100,
+                    &build_tool_caveats(&workspace),
+                    &mut NoMcp,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await,
+            )
+        };
+        let stdout = String::from_utf8_lossy(&argv_stdout);
+        let stderr = String::from_utf8_lossy(&argv_stderr);
+        let routes = std::iter::once(("argv", stdout.as_ref(), stderr.as_ref())).chain(
+            brush
+                .as_ref()
+                .map(|text| ("Brush", text.as_str(), text.as_str())),
+        );
+        for (route, output, diagnostic) in routes {
             let unbound = output.contains("BUILD_GIT_ALIAS_UNBOUND_FALLBACK");
             let fallback = output.contains("BUILD_LOOPBACK_DENIED_FALLBACK")
                 || output.contains("BUILD_SCRATCH_DENIED_FALLBACK")
@@ -1657,29 +1869,7 @@ mod native {
                 diagnostic.contains("Build isolation:"),
                 "missing effective network mode ({route}): {diagnostic}"
             );
-            for (switch, mode) in [
-                (
-                    "--require-build-netns",
-                    if name == "build_tests_temporary_workspace_retains_fallback" {
-                        "deny-all fallback"
-                    } else {
-                        "private loopback only"
-                    },
-                ),
-                ("--deny-build-netns", "deny-all fallback"),
-                ("--deny-build-mounts", "deny-all fallback"),
-                ("--deny-build-devpts", "deny-all fallback"),
-                ("--deny-build-identity", "deny-all fallback"),
-                ("--deny-build-alias-bind", "deny-all fallback"),
-            ] {
-                if std::env::args().any(|arg| arg == switch) {
-                    assert!(
-                        diagnostic.contains(mode),
-                        "{name} ({route}) requires {mode}: {diagnostic}"
-                    );
-                    eprintln!("{name} ({route}): required {mode} measured");
-                }
-            }
+            assert_build_mode(diagnostic, name, route);
             if fallback {
                 assert!(diagnostic.contains("deny-all fallback"), "{diagnostic}");
             } else if name == "build_tests_loopback_roundtrip" {
@@ -1700,7 +1890,15 @@ mod native {
                 }
             );
         }
-        assert!(argv.success, "{stderr}");
+        assert!(argv_success, "{stderr}");
+        if probe == "--build-unix-socket-probe" {
+            let scratch = PathBuf::from(
+                std::fs::read_to_string(workspace.join("socket-scratch-path")).unwrap(),
+            );
+            assert!(!scratch.starts_with(&workspace));
+            assert!(!scratch.exists(), "normal completion must remove scratch");
+        }
+
         if let Some(before) = host_identity {
             for (path, contents) in identity_paths.into_iter().zip(before) {
                 assert!(
@@ -1728,6 +1926,7 @@ mod native {
             for terminal_stdio in [None, Some(0), Some(1), Some(2)] {
                 let policy = agent_bridle::SandboxPolicy {
                     child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
+                    private_pid_namespace: pidns_argv_enabled(),
                     landlock_abi_floor: if terminal_stdio.is_some() { 3 } else { 5 },
                     ..Default::default()
                 };
@@ -1800,7 +1999,240 @@ mod native {
             );
         }
         assert!(!outside.join("write").exists());
-        eprintln!("test {name} ... ok (argv and Brush)");
+        match previous_scratch {
+            Some(value) => std::env::set_var("NEWT_BUILD_SCRATCH_DIR", value),
+            None => std::env::remove_var("NEWT_BUILD_SCRATCH_DIR"),
+        }
+        eprintln!(
+            "test {name} ... ok ({})",
+            if pidns_argv_enabled() {
+                "argv; PID staging on"
+            } else {
+                "argv and Brush"
+            }
+        );
+    }
+
+    /// Grounds fdguard's mocked relay decision and `clone_args` layout, and
+    /// core's mocked fallback-flag mode, in real processes on both spawn funnels
+    /// with the staging switch on (`docs/design/private-pid-namespace.md`).
+    /// The payload is PID 2 with no visible parent and leads its own group;
+    /// the harness is not nameable; `spawn` returns while the payload is still
+    /// blocked on a pipe this test holds; killing only the spawned child ends
+    /// every member, including one in its own session. The Brush worker starts
+    /// under the same funnel and its bootstrap is refused on the reported PID
+    /// until authentication is namespace-aware. `--deny-build-pidns` fails the
+    /// PID step alone and `--deny-build-pidns-init` fails init's hardening
+    /// inside the new namespace; each must select the deny-all fallback on
+    /// both funnels.
+    #[cfg(target_os = "linux")]
+    fn build_tests_private_pid_namespace(root: &Path) {
+        use agent_bridle::{BuildIsolation, ConfinedCommand, ConfinedStdio, SandboxedWorker};
+        use std::io::{BufRead, Read};
+
+        let name = "build_tests_private_pid_namespace";
+        // Like the other private-mode probes, use an uncovered scratch root:
+        // main's covered-input decision must remain in force with PID staging on.
+        let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
+        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", root.join("private-pid-scratch"));
+        let (workspace, _) = project(root, name);
+        let executable = std::env::current_exe().unwrap();
+        let mut caveats = newt_core::confined_exec::build_tool_caveats(&workspace);
+        if let Scope::Only(reads) = &mut caveats.fs_read {
+            reads.insert(executable.to_str().unwrap().to_owned());
+        }
+        let cx = agent_bridle::Gate::new(0)
+            .authorize(&agent_bridle::ShellTool::default(), &caveats)
+            .unwrap();
+        let policy = std::sync::Arc::new(agent_bridle::SandboxPolicy {
+            child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
+            private_pid_namespace: true,
+            ..Default::default()
+        });
+        let switch = |switch: &str| std::env::args().any(|arg| arg == switch);
+        // The trusted record must agree with what the child measured and with
+        // the mode line. Any injected setup failure means fallback; otherwise
+        // `--require-build-netns` rejects one.
+        let expect = |isolation: Option<BuildIsolation>, stdout: &str, stderr: &str| {
+            let isolation = isolation.expect("a private build reports its mode");
+            if std::env::args().any(|arg| arg.starts_with("--deny-build-")) {
+                assert_eq!(isolation, BuildIsolation::DenyAllFallback);
+            } else if switch("--require-build-netns") {
+                assert_eq!(isolation, BuildIsolation::Private, "{stderr}");
+            }
+            let (marker, mode) = match isolation {
+                BuildIsolation::Private => {
+                    ("BUILD_PRIVATE_PIDNS_CONFIRMED", "private loopback only")
+                }
+                BuildIsolation::DenyAllFallback => {
+                    ("BUILD_PIDNS_DENIED_FALLBACK", "deny-all fallback")
+                }
+            };
+            assert!(stdout.contains(marker), "{isolation:?}: {stdout}\n{stderr}");
+            assert!(stderr.contains(mode), "{isolation:?}: {stderr}");
+            isolation
+        };
+        let command = |arguments: &[String]| {
+            ConfinedCommand::new(executable.to_str().unwrap())
+                .args(arguments)
+                .current_dir(&workspace)
+                .sandbox_policy(policy.clone())
+                .stdin(ConfinedStdio::Null)
+                .stdout(ConfinedStdio::Piped)
+                .stderr(ConfinedStdio::Piped)
+                .new_process_group()
+        };
+        let probe = format!("--build-pid-probe={}", std::process::id());
+
+        // argv funnel, normal exit: the relay mirrors the payload's status.
+        let confined = command(std::slice::from_ref(&probe)).spawn(&cx).unwrap();
+        let output = confined.child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        let isolation = expect(confined.build_isolation, &stdout, &stderr);
+        eprintln!("{name} (argv): {isolation:?}: {}", stdout.trim());
+
+        // The private mechanisms installed before the PID step still hold
+        // for a payload that is PID 2.
+        for (existing, marker) in [
+            (
+                "--build-loopback-probe",
+                "BUILD_LOOPBACK_ROUNDTRIP_CONFIRMED",
+            ),
+            (
+                "--build-external-connect-probe",
+                "BUILD_EXTERNAL_CONNECT_DENIED",
+            ),
+        ] {
+            let confined = command(&[existing.to_owned(), "--build-network-auto".to_owned()])
+                .spawn(&cx)
+                .unwrap();
+            let output = confined.child.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && (stdout.contains(marker)
+                        || stdout.contains("BUILD_LOOPBACK_DENIED_FALLBACK")),
+                "{existing}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(confined.build_isolation, Some(isolation));
+            eprintln!("{name} (argv): {existing} under {isolation:?} ... ok");
+        }
+
+        // `spawn` returns at the payload's exec, not at its exit: this test
+        // holds the only write end of the payload's stdin and has not closed
+        // it. A relay that kept std's exec-status pipe open would hang here.
+        let (gate, held_open) = std::io::pipe().unwrap();
+        let mut confined = command(&[format!("{probe}:hold")])
+            .stdin(std::process::Stdio::from(gate))
+            .spawn(&cx)
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(confined.child.stdout.take().unwrap());
+        let mut reported = String::new();
+        let lines = if confined.build_isolation == Some(BuildIsolation::Private) {
+            2
+        } else {
+            1
+        };
+        for _ in 0..lines {
+            stdout.read_line(&mut reported).unwrap();
+        }
+        assert!(
+            confined.child.try_wait().unwrap().is_none(),
+            "the payload is blocked on a pipe this test still holds"
+        );
+        eprintln!("{name} (argv): spawn returned while the payload is blocked");
+        // Signal only the spawned child. In a namespace that is the relay; the
+        // payload and its detached descendant hold stdout and are still
+        // blocked, so end-of-file can only come from the namespace ending.
+        confined.child.kill().unwrap();
+        let status = confined.child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+        stdout.read_to_string(&mut reported).unwrap();
+        let mut stderr = String::new();
+        confined
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(
+            reported.contains("BUILD_PIDNS_DESCENDANT_DETACHED"),
+            expect(confined.build_isolation, &reported, &stderr) == BuildIsolation::Private,
+            "{reported}"
+        );
+        drop(held_open);
+        eprintln!("{name} (argv): killing the spawned child ended every member");
+
+        // Brush launch, same funnel. First: the bootstrap.
+        let mut worker = SandboxedWorker::brush()
+            .sandbox_policy(policy.clone())
+            .spawn(&cx, "pid-namespace-probe", &workspace)
+            .unwrap();
+        let refusal = worker
+            .send_payload(&serde_json::json!({}), Duration::from_secs(30))
+            .expect_err("an empty payload is never a Brush request")
+            .to_string();
+        let _ = worker.child.kill();
+        let mut stderr = String::new();
+        worker
+            .child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        worker.child.wait().unwrap();
+        let isolation = worker.build_isolation.expect("worker mode");
+        // The worker reports the PID it sees: 2 inside the namespace, while
+        // the spawned child is the relay. PR 4 of the design replaces this
+        // refusal with kernel-credential authentication.
+        let mismatch = format!(
+            "worker hello PID mismatch: spawned {}, reported 2",
+            worker.child.id()
+        );
+        assert_eq!(
+            (
+                refusal.contains(&mismatch),
+                refusal.contains("PID mismatch")
+            ),
+            (
+                isolation == BuildIsolation::Private,
+                isolation == BuildIsolation::Private
+            ),
+            "{isolation:?}: {refusal}"
+        );
+        let marker = match isolation {
+            BuildIsolation::Private => "BUILD_PRIVATE_PIDNS_CONFIRMED",
+            BuildIsolation::DenyAllFallback => "BUILD_PIDNS_DENIED_FALLBACK",
+        };
+        expect(Some(isolation), marker, &stderr);
+        eprintln!("{name} (Brush): {isolation:?}: {refusal}");
+
+        // Second: a worker still waiting for its bootstrap. This test keeps
+        // the control channel open, so the worker cannot end on its own.
+        let mut worker = SandboxedWorker::brush()
+            .sandbox_policy(policy.clone())
+            .spawn(&cx, "pid-namespace-probe", &workspace)
+            .unwrap();
+        let mut stdout = worker.child.stdout.take().unwrap();
+        worker.child.kill().unwrap();
+        let status = worker.child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+        stdout.read_to_end(&mut Vec::new()).unwrap();
+        assert_eq!(worker.build_isolation, Some(isolation));
+        drop(worker);
+        eprintln!("{name} (Brush): killing the spawned child ended the worker");
+        eprintln!("test {name} ... ok (argv and Brush funnels)");
         match previous_scratch {
             Some(value) => std::env::set_var("NEWT_BUILD_SCRATCH_DIR", value),
             None => std::env::remove_var("NEWT_BUILD_SCRATCH_DIR"),
@@ -1939,6 +2371,21 @@ mod native {
             "short-path host control: {}",
             String::from_utf8_lossy(&control.stderr)
         );
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the unrestricted-network permission case below intact and
+            // separately exercise private/fallback mode on both build routes.
+            build_network_probe(
+                root,
+                "build_tests_can_bind_a_unix_socket_in_a_tempdir",
+                "--build-unix-socket-probe",
+                "BUILD_UNIX_SOCKET_ROUNDTRIP_CONFIRMED",
+            )
+            .await;
+            if pidns_argv_enabled() {
+                return;
+            }
+        }
         let mut gate = CachedBuildGate {
             workspace: workspace.to_string_lossy().into_owned(),
             allow: true,
