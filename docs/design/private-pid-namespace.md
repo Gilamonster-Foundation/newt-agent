@@ -294,8 +294,8 @@ Rules, then each check.
 
 | Crate | What goes there | Why |
 |---|---|---|
-| `vendor/agent-bridle-fdguard` | The PID step, relay, init, proc mount and grant, the startup report socketpair: all in `build_isolation.rs` | It is the single unsafe seam; the whole mechanism is one file and upstreamable as one patch |
-| `vendor/agent-bridle-core` | `BuildIsolation` and `BuildNamespace` on the child structs; kernel-credential hello in `TrustedWorkerControl::send_with_channel`; a descriptor-generic send and `receive_process_handle` beside `receive_control_endpoint` in `delegated_control.rs`; a pass-through in `sandbox.rs` | Funnel outputs and the control protocol already live here; core stays `forbid(unsafe_code)` (rustix only) |
+| `vendor/agent-bridle-fdguard` | The PID step, relay, init, proc mount and grant, and startup report socketpair in `build_isolation.rs`; namespace-safe rights receipt in `lib.rs` | It is the single unsafe seam; the PID setup stays together and descriptor receipt uses the existing leaf |
+| `vendor/agent-bridle-core` | `BuildIsolation` and `BuildNamespace` on the child structs; kernel-credential hello in `TrustedWorkerControl::send_with_channel`; a descriptor-generic send and `receive_process_handle` beside `receive_control_endpoint` in `delegated_control.rs`; a pass-through in `sandbox.rs` | Funnel outputs and the control protocol already live here; core stays `forbid(unsafe_code)` (rustix plus the safe fdguard rights receiver; see PR 5 As built) |
 | `vendor/agent-bridle-tool-shell` | Check 2 in `private_control.rs`; checks 3 and 5 in `broker_transport.rs`; checks 4 and 6 in `broker_runtime.rs`; plumbing in `brush_shell.rs`; socket stdio for the worker | The checks live here today |
 | `newt-core` | `liveness.rs` (boot time, namespace coordinate); the staging switch in `ExecRequest::sandbox_policy`; description text; probes in `tests/brush_build_pipeline.rs`; `docs/security/ocap-deviations.md` | Product and policy, not mechanism |
 
@@ -411,6 +411,32 @@ acceptance results remain unchanged.
 - Red-first: translation parser; request with an attachment that is not a pidfd, is not a child of the worker, or has the wrong image is refused; requests before binding are refused.
 - Real-resource: a native Git commit through the broker with the switch on (the existing broker pipeline plus a `brush_build_pipeline.rs` case), and unchanged with it off.
 - Acceptance: unchanged eight.
+
+**As built in PR 5.** M8 confirmed namespace-local PID 2/3 translating to
+host coordinates, the transferred child's pidfd `Pid:` field, and the initial
+versus private namespace inode distinction. The existing canonical frame's
+attachment bit carries the Linux child pidfd; no wire schema or hash changes.
+The host checks the handle before and after parent/image/translation reads and
+retains it with the session. A zero worker binding is refused before listening.
+
+Two implementation details extend the plan. First, rustix 1.1.4's UCred cannot
+represent ancestor PID zero. Draining and ignoring it still constructs that
+invalid value. A measured overlapping-receiver case also rules out temporarily
+disabling SO_PASSCRED. Linux descriptor receipt therefore uses a narrow raw
+receiver in the existing fdguard unsafe seam, owning rights and skipping
+credential bytes without changing socket options. Core remains unsafe-free;
+credential authentication stays in the signed-PID private-control receiver.
+Second, the shared peer snapshot used to reopen even the worker's parent image.
+The real private commit measured EACCES on the non-dumpable relay's executable.
+Only the bootstrap-bound translated worker omits that image lookup; own image,
+birth, parent and parent birth are still checked twice. Flat worker snapshots
+and all helper parent/image/birth checks remain intact.
+
+The real Brush fixture uses the existing NativeGitBroker with an explicit
+trusted CommitPolicy through its public constructor. It checks policy attribution,
+HEAD advancement and protected branch refs with staging on/off and all forced
+fallbacks. This is an embedding API, not a model-facing tool or production
+switch change. No pre-exec code changes in this stage.
 
 **PR 6. Liveness: boot time and namespace coordinate (newt-core only; about 120 lines; independent, can land first).**
 - Change: `pid_start_unix_nanos` uses the two clocks; `current_host_boot` appends the PID-namespace link when it is not the initial one.

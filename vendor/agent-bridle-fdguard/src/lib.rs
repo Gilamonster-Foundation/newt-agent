@@ -313,6 +313,98 @@ pub fn duplicate_control_socket(
     Ok(socket)
 }
 
+/// Receive one Linux descriptor-transfer fragment with atomic close-on-exec.
+///
+/// This transports rights, not authority: the enclosing protocol authenticates
+/// the peer and validates descriptor roles. Credential ancillary data is skipped
+/// as bytes, including PID zero for an ancestor outside a PID namespace. No
+/// socket option is changed, so overlapping users cannot re-enable a decoder
+/// whose PID type cannot represent that kernel value. All received rights are
+/// owned before malformed/truncated/unknown ancillary data is refused.
+#[cfg(target_os = "linux")]
+pub fn receive_control_rights(
+    channel: std::os::fd::BorrowedFd<'_>,
+    bytes: &mut [u8],
+) -> std::io::Result<(usize, Vec<std::os::fd::OwnedFd>)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Linux allows at most 253 rights per message. This aligned buffer exceeds
+    // the full rights record plus credentials on both 32- and 64-bit ABIs.
+    let mut control = [0usize; 512];
+    let mut vector = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: msghdr is a plain kernel ABI record; every pointer/length below
+    // refers to live writable storage for the complete recvmsg call.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = std::mem::size_of_val(&control) as _;
+    // SAFETY: the borrowed socket stays live and both buffers have their stated
+    // lengths. The kernel creates fresh owned descriptors, atomically CLOEXEC.
+    let received =
+        unsafe { libc::recvmsg(channel.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    if received < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptors = Vec::new();
+    let mut invalid = message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0;
+    // SAFETY: libc's cursor helpers operate on the kernel-filled control area.
+    // Before reading any payload, validate the complete header's byte extent.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        let item = unsafe { &*header };
+        let prefix = unsafe { libc::CMSG_LEN(0) } as usize;
+        let start = header as usize - control.as_ptr() as usize;
+        let length = item.cmsg_len as usize;
+        if length < prefix
+            || start
+                .checked_add(length)
+                .is_none_or(|end| end > message.msg_controllen as usize)
+        {
+            invalid = true;
+            break;
+        }
+        let payload_len = length - prefix;
+        match (item.cmsg_level, item.cmsg_type) {
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
+                let width = std::mem::size_of::<libc::c_int>();
+                invalid |= !payload_len.is_multiple_of(width);
+                for index in 0..payload_len / width {
+                    // SAFETY: extent checked above. Kernel SCM_RIGHTS payloads
+                    // contain fresh descriptor numbers, each transferred once.
+                    let fd = unsafe {
+                        libc::CMSG_DATA(header)
+                            .cast::<libc::c_int>()
+                            .add(index)
+                            .read_unaligned()
+                    };
+                    if fd < 0 {
+                        invalid = true;
+                    } else {
+                        descriptors.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                    }
+                }
+            }
+            (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
+                // Do not materialize a credential type with a nonzero PID.
+                invalid |= payload_len != std::mem::size_of::<libc::ucred>();
+            }
+            _ => invalid = true,
+        }
+        // Keep draining even after refusal so every installed right is owned.
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+    }
+    if invalid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid descriptor-transfer ancillary data",
+        ));
+    }
+    Ok((received as usize, descriptors))
+}
+
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod delegated_control_tests {
     use super::duplicate_control_socket;

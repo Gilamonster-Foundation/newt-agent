@@ -114,7 +114,8 @@ fn run() {
                     stream,
                     &control,
                     Some(std::process::id()),
-                    |_, payload| {
+                    |_, payload, process| {
+                        assert!(process.is_none());
                         assert_eq!(payload, b"request");
                         Ok(RpcReply {
                             payload: b"reply".to_vec(),

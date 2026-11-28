@@ -458,16 +458,55 @@ fn process_field<'a>(status: &'a str, name: &str) -> ToolResult<&'a str> {
 }
 
 #[cfg(target_os = "linux")]
-fn live_worker_payload(namespace: &BuildNamespace) -> ToolResult<u32> {
+fn pid_namespace_ids(status: &str) -> ToolResult<Vec<u32>> {
+    let ids = process_field(status, "NSpid:")?
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ToolError::denied("invalid worker PID namespace translation"))?;
+    if ids.is_empty() || ids.contains(&0) {
+        return Err(ToolError::denied(
+            "invalid worker PID namespace translation",
+        ));
+    }
+    Ok(ids)
+}
+
+/// Parse the innermost PID from kernel status read in the caller's namespace.
+/// This translates a kernel-attested process; it does not authenticate a report.
+#[cfg(target_os = "linux")]
+pub fn nspid_innermost(status: &str) -> ToolResult<u32> {
+    pid_namespace_ids(status)?
+        .last()
+        .copied()
+        .ok_or_else(|| ToolError::denied("empty PID namespace translation"))
+}
+
+/// Read a live process handle's coordinate from the caller's own procfs.
+/// A non-pidfd, invisible process or reaped handle is refused. Keep the handle
+/// owned and recheck it around process metadata reads to detect intervening reap.
+#[cfg(target_os = "linux")]
+pub fn process_handle_pid(handle: std::os::fd::BorrowedFd<'_>) -> ToolResult<u32> {
     use std::os::fd::AsRawFd;
-    let info = std::fs::read_to_string(format!(
-        "/proc/self/fdinfo/{}",
-        namespace.payload_handle().as_raw_fd()
-    ))?;
-    let pid = process_field(&info, "Pid:")?
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", handle.as_raw_fd()))?;
+    live_pid_from_info(&info)
+}
+
+#[cfg(target_os = "linux")]
+fn live_pid_from_info(info: &str) -> ToolResult<u32> {
+    let pid = process_field(info, "Pid:")?
         .parse::<u32>()
-        .map_err(|_| ToolError::denied("worker payload handle is no longer live"))?;
-    if pid == 0 || pid != namespace.payload_pid {
+        .map_err(|_| ToolError::denied("process handle is no longer live"))?;
+    if pid == 0 {
+        return Err(ToolError::denied("process handle is not visible"));
+    }
+    Ok(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn live_worker_payload(namespace: &BuildNamespace) -> ToolResult<u32> {
+    let pid = process_handle_pid(namespace.payload_handle())?;
+    if pid != namespace.payload_pid {
         return Err(ToolError::denied(
             "worker payload handle does not match startup report",
         ));
@@ -485,11 +524,7 @@ fn verify_worker_hello(
     image_matches: bool,
     own_uid: u32,
 ) -> ToolResult<u32> {
-    let ids = process_field(status, "NSpid:")?
-        .split_whitespace()
-        .map(str::parse::<u32>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| ToolError::denied("invalid worker PID namespace translation"))?;
+    let ids = pid_namespace_ids(status)?;
     let parent = process_field(status, "PPid:")?
         .parse::<u32>()
         .map_err(|_| ToolError::denied("invalid worker parent coordinate"))?;
@@ -500,7 +535,6 @@ fn verify_worker_hello(
     if !ancestry
         || credentials.1 != own_uid
         || !image_matches
-        || ids.contains(&0)
         || ids.first() != Some(&credentials.0)
         || ids.last() != Some(&reported_pid)
     {
@@ -2677,6 +2711,42 @@ mod tests {
                 ("XDG_RUNTIME_DIR".to_owned(), "/dev/shm/runtime".to_owned()),
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidns_translation_parses_only_complete_positive_coordinates() {
+        assert_eq!(nspid_innermost("NSpid: 42\n").unwrap(), 42);
+        assert_eq!(nspid_innermost("Name: worker\nNSpid:\t42\t2\n").unwrap(), 2);
+        for status in [
+            "",
+            "NSpid:",
+            "NSpid: 42 0",
+            "NSpid: 0 2",
+            "NSpid: -1",
+            "NSpid: wrong 2",
+            "NSpid: 42\nNSpid: 2",
+        ] {
+            assert!(nspid_innermost(status).is_err(), "{status:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidns_process_handle_requires_live_kernel_pid_metadata() {
+        assert_eq!(
+            live_pid_from_info("pos: 0\nPid: 43\nNSpid: 43 3").unwrap(),
+            43
+        );
+        for info in [
+            "pos: 0\nflags: 02000002",
+            "Pid: -1",
+            "Pid: 0",
+            "Pid: nope",
+            "Pid: 43\nPid: 44",
+        ] {
+            assert!(live_pid_from_info(info).is_err(), "{info:?}");
+        }
     }
 
     /// Injected kernel facts; the private PID Brush probe grounds these checks.

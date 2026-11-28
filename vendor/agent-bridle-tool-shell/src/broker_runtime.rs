@@ -7,6 +7,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::net::Shutdown;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -70,11 +72,17 @@ fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> ToolResul
     canonical::from_canonical_dagcbor_checked(bytes).map_err(error)
 }
 
+struct RegisteredProcess {
+    process: BrokerProcess,
+    #[cfg(target_os = "linux")]
+    _handle: OwnedFd,
+}
+
 struct Session {
     policy: Arc<dyn BrokerSession>,
     program: std::path::PathBuf,
     expected_image: std::path::PathBuf,
-    registered: Mutex<Option<BrokerProcess>>,
+    registered: Mutex<Option<RegisteredProcess>>,
     ready: Condvar,
 }
 
@@ -189,9 +197,17 @@ impl State {
                         stream,
                         &request_state.control,
                         expected,
-                        |peer, payload| {
+                        |peer, payload, process_handle| {
                             request_state.check()?;
                             if let Some(session) = request_session {
+                                let broker_transport::RequestPeer::Helper(peer) = peer else {
+                                    return Err(error("helper request requires a helper identity"));
+                                };
+                                if process_handle.is_some() {
+                                    return Err(error(
+                                        "helper requests cannot attach a process handle",
+                                    ));
+                                }
                                 let mut registered = session.registered.lock().unwrap();
                                 while registered.is_none() {
                                     request_state.check()?;
@@ -201,7 +217,7 @@ impl State {
                                         .unwrap()
                                         .0;
                                 }
-                                let process = registered.as_ref().unwrap();
+                                let process = &registered.as_ref().unwrap().process;
                                 if peer.parent_process_id != process.process_id
                                     || peer.parent_birth != process.birth
                                     || peer.parent_executable != session.expected_image
@@ -221,7 +237,7 @@ impl State {
                                     endpoint: None,
                                 })
                             } else {
-                                request_state.worker_request(payload)
+                                request_state.worker_request(payload, process_handle)
                             }
                         },
                     ) {
@@ -238,9 +254,16 @@ impl State {
         Ok(())
     }
 
-    fn worker_request(self: &Arc<Self>, bytes: &[u8]) -> ToolResult<RpcReply> {
+    fn worker_request(
+        self: &Arc<Self>,
+        bytes: &[u8],
+        process_handle: Option<OwnedFd>,
+    ) -> ToolResult<RpcReply> {
         match decode(bytes)? {
             Request::Prepare(command) => {
+                if process_handle.is_some() {
+                    return Err(error("prepare requests cannot attach a process handle"));
+                }
                 let prepared = self
                     .broker
                     .prepare(&command, &self.context, &self.control)?;
@@ -302,14 +325,33 @@ impl State {
                 if registered.is_some() {
                     return Err(error("broker native process already registered"));
                 }
-                let (parent, birth) = broker_transport::process_parent_and_birth(pid)?;
-                let executable = broker_transport::executable_path(pid)?;
-                if parent != self.worker_pid
-                    || (executable != session.program && executable != session.expected_image)
+                #[cfg(target_os = "linux")]
+                let kernel_pid = agent_bridle_core::process_handle_pid(
+                    process_handle
+                        .as_ref()
+                        .ok_or_else(|| error("native spawn requires a process handle"))?
+                        .as_fd(),
+                )?;
+                #[cfg(target_os = "macos")]
+                let kernel_pid = pid;
+                // The declared inside PID is only compared with translation;
+                // every host lookup starts from the received kernel handle.
+                let (parent, birth) = broker_transport::process_parent_and_birth(kernel_pid)?;
+                let executable = broker_transport::executable_path(kernel_pid)?;
+                let translated = broker_transport::process_innermost_pid(kernel_pid)?;
+                let pid = verify_spawn_identity(
+                    self.worker_pid,
+                    pid,
+                    process_handle.as_ref().map(|_| kernel_pid),
+                    parent,
+                    translated,
+                    executable == session.program || executable == session.expected_image,
+                )?;
+                #[cfg(target_os = "linux")]
+                if agent_bridle_core::process_handle_pid(process_handle.as_ref().unwrap().as_fd())?
+                    != pid
                 {
-                    return Err(error(
-                        "native spawn does not match the admitted worker command",
-                    ));
+                    return Err(error("native process changed during registration"));
                 }
                 let process = BrokerProcess {
                     process_id: pid,
@@ -318,7 +360,11 @@ impl State {
                 };
                 session.policy.on_spawn(&process, &self.control)?;
                 self.check()?;
-                *registered = Some(process);
+                *registered = Some(RegisteredProcess {
+                    process,
+                    #[cfg(target_os = "linux")]
+                    _handle: process_handle.expect("validated native process handle"),
+                });
                 session.ready.notify_all();
                 Ok(RpcReply {
                     payload: encode(&Reply::Spawned)?,
@@ -327,6 +373,36 @@ impl State {
             }
         }
     }
+}
+
+fn bound_worker_pid(pid: u32) -> ToolResult<u32> {
+    if pid == 0 {
+        return Err(error("broker worker is not authenticated"));
+    }
+    Ok(pid)
+}
+
+fn verify_spawn_identity(
+    worker: u32,
+    declared: u32,
+    handle_pid: Option<u32>,
+    parent: u32,
+    translated: u32,
+    image_matches: bool,
+) -> ToolResult<u32> {
+    bound_worker_pid(worker)?;
+    #[cfg(target_os = "linux")]
+    let pid = handle_pid
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| error("native spawn requires a live process handle"))?;
+    #[cfg(target_os = "macos")]
+    let pid = handle_pid.unwrap_or(declared);
+    if parent != worker || !image_matches || declared == 0 || translated != declared {
+        return Err(error(
+            "native spawn does not match the admitted worker command",
+        ));
+    }
+    Ok(pid)
 }
 
 /// Dropped only after the owning worker has stopped and been reaped.
@@ -342,6 +418,7 @@ impl BrokerRuntime {
         cancelled: Arc<AtomicBool>,
         deadline: Instant,
     ) -> ToolResult<(Self, UnixStream)> {
+        let worker_pid = bound_worker_pid(worker_pid)?;
         let state = Arc::new(State {
             broker,
             context,
@@ -480,14 +557,27 @@ impl WorkerBroker {
             let (id, _) = prepared
                 .get(&fd.source().as_raw_fd())
                 .ok_or_else(|| error("unknown broker descriptor at spawn"))?;
-            let reply = self.client.request_inner(
+            let pid =
+                pid.ok_or_else(|| error("platform cannot identify the spawned broker command"))?;
+            #[cfg(target_os = "linux")]
+            let process_handle = {
+                let pid = i32::try_from(pid)
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw)
+                    .ok_or_else(|| error("invalid spawned process ID"))?;
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                    .map_err(std::io::Error::from)?
+            };
+            let reply = self.client.request_with_process(
                 &encode(&Request::Spawn {
                     invocation: *id,
-                    pid: pid.ok_or_else(|| {
-                        error("platform cannot identify the spawned broker command")
-                    })?,
+                    pid,
                 })?,
                 Duration::from_secs(30),
+                #[cfg(target_os = "linux")]
+                Some(process_handle.as_fd()),
+                #[cfg(target_os = "macos")]
+                None,
             )?;
             if !matches!(decode::<Reply>(&reply.payload)?, Reply::Spawned)
                 || reply.endpoint.is_some()
@@ -533,6 +623,31 @@ mod tests {
     use super::*;
     use agent_bridle_core::{Caveats, Gate, Tool};
     use std::io::Read;
+
+    #[test]
+    fn pidns_broker_cannot_start_before_worker_binding() {
+        assert_eq!(bound_worker_pid(42).unwrap(), 42);
+        assert!(bound_worker_pid(0).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidns_spawn_uses_only_a_matching_child_handle() {
+        assert_eq!(
+            verify_spawn_identity(42, 3, Some(43), 42, 3, true).unwrap(),
+            43
+        );
+        for (handle, parent, inner, image) in [
+            (None, 42, 3, true),
+            (Some(0), 42, 3, true),
+            (Some(43), 41, 3, true),
+            (Some(43), 42, 4, true),
+            (Some(43), 42, 3, false),
+        ] {
+            assert!(verify_spawn_identity(42, 3, handle, parent, inner, image).is_err());
+        }
+        assert!(verify_spawn_identity(0, 3, Some(43), 0, 3, true).is_err());
+    }
 
     struct ContextTool;
     #[async_trait::async_trait]

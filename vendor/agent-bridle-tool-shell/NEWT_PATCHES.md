@@ -253,3 +253,21 @@ Brush creates the broker runtime only after this handshake returns the
 authenticated host PID, and binds it to that PID rather than the relay.
 The cancellation watcher covers authentication and endpoint creation.
 Retire with the upstream namespace-aware worker authentication change.
+
+## Broker authentication across PID namespaces (#3321, PR 5)
+
+Broker hellos compare the sender's kernel PID with its innermost NSpid. Only a
+client in a non-initial PID namespace accepts the same-uid ancestor coordinate
+zero; endpoint delegation still selects the server. Runtime startup refuses an
+unbound worker. Linux spawn registration carries a pidfd in the existing
+content-addressed attachment field, resolves its host coordinate from fdinfo,
+checks worker parentage, admitted image and namespace translation, and retains
+the handle with the registered birth identity until session teardown. Requests
+with attachments in other roles fail closed. macOS retains numeric registration.
+
+Worker snapshots retain image, birth and parent/birth checks. Only the
+bootstrap-bound translated worker omits the relay image lookup, because the
+relay is non-dumpable; flat workers keep it. Helper snapshots and all helper
+parent/image/birth comparisons are unchanged. The production Brush PID switch stays
+off; argv remains enabled. The real staged Git commit and all forced fallbacks
+ground these checks.

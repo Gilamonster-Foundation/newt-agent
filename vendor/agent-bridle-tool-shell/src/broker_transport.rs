@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ use agent_bridle_core::{receive_control_endpoint, send_control_endpoint, ToolErr
 use content_addressable::{canonical, ContentId, MerkleNode};
 use serde::{Deserialize, Serialize};
 
-use crate::command_broker::{BrokerControl, BrokerPeer};
+use crate::command_broker::{BrokerControl, BrokerPeer, BrokerProcess};
 
 const MAX_FRAME: usize = 1024 * 1024;
 const HELLO: &[u8; 8] = b"ABBR-H1\0";
@@ -84,6 +84,15 @@ impl BrokerClient {
     }
 
     pub(crate) fn request_inner(&self, payload: &[u8], timeout: Duration) -> ToolResult<RpcReply> {
+        self.request_with_process(payload, timeout, None)
+    }
+
+    pub(crate) fn request_with_process(
+        &self,
+        payload: &[u8],
+        timeout: Duration,
+        process: Option<BorrowedFd<'_>>,
+    ) -> ToolResult<RpcReply> {
         if payload.len() > MAX_FRAME / 2 {
             return Err(ToolError::denied(
                 "broker request exceeds its bounded payload budget",
@@ -114,9 +123,12 @@ impl BrokerClient {
             challenge.clone(),
             BTreeSet::new(),
             None,
-            false,
+            process.is_some(),
         )?;
         write_frame(&mut local, &request)?;
+        if let Some(process) = process {
+            agent_bridle_core::send_descriptor(&local, process)?;
+        }
         let response = read_frame(&mut local)?;
         verify_frame(&response, &challenge, [request.id].into_iter().collect())?;
         if let Some(error) = response.node.payload().error.as_ref() {
@@ -149,7 +161,25 @@ fn read_server_hello(
     let mut hello = [0; 44];
     let server_pid = read_peer(&mut hello)
         .map_err(|error| ToolError::denied(format!("broker server hello: {error}")))?;
-    if &hello[..8] != HELLO || hello[8..12] != server_pid.to_le_bytes() {
+    #[cfg(target_os = "linux")]
+    let namespace = if server_pid == 0 {
+        Some(
+            std::fs::read_link("/proc/self/ns/pid")?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let namespace: Option<String> = None;
+    if &hello[..8] != HELLO
+        || !server_pid_matches(
+            u32::from_le_bytes(hello[8..12].try_into().unwrap()),
+            server_pid,
+            namespace.as_deref(),
+        )
+    {
         return Err(ToolError::denied("broker server hello identity mismatch"));
     }
     // macOS can lose peer identity if the transferred reference is closed
@@ -158,6 +188,31 @@ fn read_server_hello(
     // also closes the copy on every authentication or I/O failure.
     drop(remote);
     Ok(hello[12..].to_vec())
+}
+
+fn server_pid_matches(declared: u32, credential: u32, namespace: Option<&str>) -> bool {
+    const INITIAL_PID_NAMESPACE: u64 = 4026531836;
+    let ancestor = credential == 0
+        && namespace
+            .and_then(|link| link.strip_prefix("pid:[")?.strip_suffix(']'))
+            .and_then(|inode| inode.parse::<u64>().ok())
+            .is_some_and(|inode| inode != 0 && inode != INITIAL_PID_NAMESPACE);
+    declared != 0 && (declared == credential || ancestor)
+}
+
+fn client_pid_matches(credential: u32, declared: u32, translated: u32) -> bool {
+    credential != 0 && declared != 0 && translated == declared
+}
+
+pub(crate) fn process_innermost_pid(pid: u32) -> ToolResult<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        agent_bridle_core::nspid_innermost(&std::fs::read_to_string(format!("/proc/{pid}/status"))?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(pid)
+    }
 }
 
 fn make_frame(
@@ -251,7 +306,7 @@ pub(crate) fn serve_request(
     stream: UnixStream,
     control: &BrokerControl,
     expected_peer: Option<u32>,
-    callback: impl FnOnce(&BrokerPeer, &[u8]) -> ToolResult<RpcReply>,
+    callback: impl FnOnce(&RequestPeer, &[u8], Option<OwnedFd>) -> ToolResult<RpcReply>,
 ) -> ToolResult<()> {
     with_request_timeout(
         control
@@ -287,7 +342,7 @@ fn serve_request_inner(
     mut stream: UnixStream,
     control: &BrokerControl,
     expected_peer: Option<u32>,
-    callback: impl FnOnce(&BrokerPeer, &[u8]) -> ToolResult<RpcReply>,
+    callback: impl FnOnce(&RequestPeer, &[u8], Option<OwnedFd>) -> ToolResult<RpcReply>,
     timeout: Duration,
 ) -> ToolResult<()> {
     control.check()?;
@@ -311,24 +366,41 @@ fn serve_request_inner(
     let mut declared_pid = [0; 4];
     let peer_pid = crate::private_control::read_broker_peer(&stream, &mut declared_pid)
         .map_err(|error| ToolError::denied(format!("broker client identity: {error}")))?;
-    if peer_pid != u32::from_le_bytes(declared_pid)
-        || expected_peer.is_some_and(|pid| pid != peer_pid)
+    if !client_pid_matches(
+        peer_pid,
+        u32::from_le_bytes(declared_pid),
+        process_innermost_pid(peer_pid)?,
+    ) || expected_peer.is_some_and(|pid| pid != peer_pid)
     {
         return Err(ToolError::denied(
             "broker request peer is not the registered process",
         ));
     }
-    let peer = peer_identity(peer_pid)?;
+    let peer = request_identity(peer_pid, expected_peer.is_some())?;
     let request = read_frame(&mut stream)?;
     verify_frame(&request, &challenge, BTreeSet::new())?;
-    if request.node.payload().error.is_some() || request.node.payload().endpoint {
+    if request.node.payload().error.is_some() {
         return Err(ToolError::denied("invalid broker request role"));
     }
-    if peer_identity(peer_pid)? != peer {
+    let process = if request.node.payload().endpoint {
+        #[cfg(target_os = "linux")]
+        {
+            Some(agent_bridle_core::receive_process_handle(&stream)?)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(ToolError::denied(
+                "process handle delegation is unavailable on this platform",
+            ));
+        }
+    } else {
+        None
+    };
+    if request_identity(peer_pid, expected_peer.is_some())? != peer {
         return Err(ToolError::denied("broker peer changed during request"));
     }
     control.check()?;
-    let result = callback(&peer, &request.node.payload().payload);
+    let result = callback(&peer, &request.node.payload().payload, process);
     control.check()?;
     let (payload, error, endpoint) = match result {
         Ok(reply) => (reply.payload, None, reply.endpoint),
@@ -365,7 +437,20 @@ fn read_endpoint_ack(endpoint: impl Sized, stream: &mut impl Read) -> ToolResult
     Ok(())
 }
 
-pub(crate) fn peer_identity(pid: u32) -> ToolResult<BrokerPeer> {
+// Bootstrap pins the worker's parent relationship before binding its PID.
+// Its private relay is non-dumpable; only helper requests need a parent image.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RequestPeer {
+    Worker {
+        process: BrokerProcess,
+        parent: u32,
+        parent_birth: u64,
+        parent_image: Option<PathBuf>,
+    },
+    Helper(BrokerPeer),
+}
+
+fn request_identity(pid: u32, bound_worker: bool) -> ToolResult<RequestPeer> {
     let (parent, process_birth) = process_parent_and_birth(pid)?;
     let (_, parent_birth) = process_parent_and_birth(parent)?;
     let executable = executable_path(pid)?;
@@ -376,14 +461,33 @@ pub(crate) fn peer_identity(pid: u32) -> ToolResult<BrokerPeer> {
             "broker helper is not the harness executable image",
         ));
     }
-    Ok(BrokerPeer {
-        process_id: pid,
-        process_birth,
-        parent_process_id: parent,
-        executable,
-        parent_executable: executable_path(parent)?,
-        parent_birth,
-    })
+    if bound_worker {
+        Ok(RequestPeer::Worker {
+            process: BrokerProcess {
+                process_id: pid,
+                birth: process_birth,
+                executable,
+            },
+            parent,
+            parent_birth,
+            // Preserve the flat check; only a translated, bootstrap-bound
+            // worker has the non-dumpable namespace relay as its parent.
+            parent_image: if process_innermost_pid(pid)? == pid {
+                Some(executable_path(parent)?)
+            } else {
+                None
+            },
+        })
+    } else {
+        Ok(RequestPeer::Helper(BrokerPeer {
+            process_id: pid,
+            process_birth,
+            parent_process_id: parent,
+            executable,
+            parent_executable: executable_path(parent)?,
+            parent_birth,
+        }))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -435,6 +539,29 @@ pub(crate) fn process_parent_and_birth(pid: u32) -> ToolResult<(u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pidns_server_hello_accepts_only_the_explicit_ancestor_coordinate() {
+        assert!(server_pid_matches(42, 42, None));
+        assert!(server_pid_matches(42, 0, Some("pid:[4026533000]")));
+        for (declared, peer, namespace) in [
+            (42, 0, None),
+            (42, 0, Some("pid:[4026531836]")),
+            (0, 0, Some("pid:[4026533000]")),
+            (42, 43, Some("pid:[4026533000]")),
+            (42, 0, Some("not a PID namespace")),
+        ] {
+            assert!(!server_pid_matches(declared, peer, namespace));
+        }
+    }
+
+    #[test]
+    fn pidns_client_hello_uses_kernel_translation() {
+        assert!(client_pid_matches(42, 42, 42));
+        assert!(client_pid_matches(42, 2, 2));
+        assert!(!client_pid_matches(42, 42, 2));
+        assert!(!client_pid_matches(0, 0, 0));
+    }
 
     struct Retained<'a>(&'a std::cell::Cell<bool>);
 
@@ -743,10 +870,24 @@ mod tests {
                 deadline: std::time::Instant::now() + Duration::from_secs(10),
             };
             let called = std::cell::Cell::new(false);
-            let served = serve_request(socket, &control, Some(pid), |peer, bytes| {
+            let served = serve_request(socket, &control, Some(pid), |peer, bytes, process| {
+                assert!(process.is_none());
                 called.set(true);
-                assert_eq!(peer.process_id, pid);
-                assert_eq!(peer.parent_process_id, std::process::id());
+                let RequestPeer::Worker {
+                    process,
+                    parent,
+                    parent_image,
+                    ..
+                } = peer
+                else {
+                    panic!("bound worker must have a worker snapshot");
+                };
+                assert_eq!(process.process_id, pid);
+                assert_eq!(*parent, std::process::id());
+                assert_eq!(
+                    parent_image.as_ref(),
+                    Some(&std::env::current_exe().unwrap())
+                );
                 assert_eq!(bytes, b"bound request");
                 Ok(RpcReply {
                     payload: b"bound reply".to_vec(),

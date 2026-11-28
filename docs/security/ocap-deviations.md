@@ -294,9 +294,17 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   namespace, an outside launcher is accepted only when both parent/peer PIDs and
   the frame's kernel sender PID are zero with the same uid and stable snapshots;
   its image cannot be named there. Flat launcher image checks remain in place.
-  The no-broker bootstrap works with the switch on; broker transport across the
-  PID boundary remains a separate stage, and the Brush production route still
-  leaves it off. The argv route remains enabled as described above.
+  Broker transport now translates the kernel sender's PID and accepts an
+  ancestor's zero coordinate only inside a non-initial PID namespace, retaining
+  the same-uid check. Native spawn registration transfers a pidfd, checks its
+  host parent/image and namespace translation, and retains it through the
+  session. A bootstrap-bound private worker's non-dumpable relay image is not
+  reopened; its parent/birth and own image/birth are checked on both snapshots.
+  Flat worker and helper image checks remain. Linux rights receipt skips raw
+  credential bytes in fdguard, avoiding rustix's nonzero-only PID representation
+  without changing SO_PASSCRED. No new authority or wire identity is introduced.
+  The real native commit works with staging on and off. Production Brush keeps
+  the switch off; the argv route remains enabled as described above.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
   denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable

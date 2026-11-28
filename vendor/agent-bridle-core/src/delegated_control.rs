@@ -6,14 +6,15 @@
 
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use rustix::io::{IoSlice, IoSliceMut};
-use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags,
-};
+use rustix::io::IoSlice;
+#[cfg(any(test, target_os = "macos"))]
+use rustix::io::IoSliceMut;
+#[cfg(any(test, target_os = "macos"))]
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 
 use crate::{ToolError, ToolResult};
 
@@ -29,7 +30,7 @@ const MARKER: [u8; 8] = *b"ABTC-F1\0";
 const RECEIVE_CONTROL_SPACE: usize = rustix::cmsg_space!(ScmRights(512));
 // Linux SCM_MAX_FD, plus credentials requested by the authenticated bootstrap.
 // cmsg_space! also includes the padding needed to align the byte buffer.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 const RECEIVE_CONTROL_SPACE: usize = rustix::cmsg_space!(ScmRights(253), ScmCredentials(1));
 
 /// Send exactly one separate Unix stream endpoint over an authenticated channel.
@@ -37,7 +38,13 @@ const RECEIVE_CONTROL_SPACE: usize = rustix::cmsg_space!(ScmRights(253), ScmCred
 /// Ownership stays with the caller; the receiver obtains a new owned reference.
 /// No filesystem path is opened and no filesystem/network grant is changed.
 pub fn send_control_endpoint(channel: &UnixStream, endpoint: &UnixStream) -> ToolResult<()> {
-    let descriptors = [endpoint.as_fd()];
+    send_descriptor(channel, endpoint.as_fd())
+}
+
+/// Send one owned-by-the-caller descriptor using the existing bounded marker.
+/// The enclosing authenticated frame determines its role and required checks.
+pub fn send_descriptor(channel: &UnixStream, descriptor: BorrowedFd<'_>) -> ToolResult<()> {
+    let descriptors = [descriptor];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     if !ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)) {
@@ -67,59 +74,7 @@ pub fn send_control_endpoint(channel: &UnixStream, endpoint: &UnixStream) -> Too
 /// truncated control data, missing/extra descriptors, non-sockets and other
 /// socket families are rejected. Rejected descriptors are closed by ownership.
 pub fn receive_control_endpoint(channel: &UnixStream) -> ToolResult<UnixStream> {
-    let mut marker = [0; MARKER.len()];
-    let mut space = [MaybeUninit::uninit(); RECEIVE_CONTROL_SPACE];
-    let mut descriptors = Vec::new();
-    let mut offset = 0;
-    while offset < marker.len() {
-        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-        let received = rustix::net::recvmsg(
-            channel,
-            &mut [IoSliceMut::new(&mut marker[offset..])],
-            &mut ancillary,
-            // Linux makes the received descriptors CLOEXEC atomically, avoiding
-            // a concurrent fork/exec inheritance window. macOS has no equivalent;
-            // its confined spawn funnel additionally scrubs all ambient fds.
-            #[cfg(target_os = "linux")]
-            RecvFlags::CMSG_CLOEXEC,
-            #[cfg(not(target_os = "linux"))]
-            RecvFlags::empty(),
-        )
-        .map_err(std::io::Error::from)?;
-        for item in ancillary.drain() {
-            match item {
-                RecvAncillaryMessage::ScmRights(fds) => descriptors.extend(fds),
-                #[cfg(target_os = "linux")]
-                RecvAncillaryMessage::ScmCredentials(_) => {}
-                _ => {
-                    return Err(ToolError::denied(
-                        "unexpected control endpoint ancillary data",
-                    ))
-                }
-            }
-        }
-        if received.bytes == 0
-            || received.bytes > marker.len() - offset
-            || received.flags.contains(ReturnFlags::CTRUNC)
-            || received.flags.contains(ReturnFlags::TRUNC)
-            || descriptors.len() != 1
-        {
-            return Err(ToolError::denied(
-                "control transfer requires exactly one complete endpoint",
-            ));
-        }
-        // Every fragment must use recvmsg: a plain read could discard an extra
-        // rights message attached to the marker's tail without owning its fds.
-        offset += received.bytes;
-    }
-    if marker != MARKER {
-        return Err(ToolError::denied(
-            "invalid control endpoint transfer marker",
-        ));
-    }
-    let endpoint = descriptors.pop().expect("exactly one descriptor checked");
-    rustix::io::fcntl_setfd(&endpoint, rustix::io::FdFlags::CLOEXEC)
-        .map_err(std::io::Error::from)?;
+    let endpoint = receive_descriptor(channel)?;
     if rustix::net::sockopt::socket_type(&endpoint).map_err(std::io::Error::from)?
         != rustix::net::SocketType::STREAM
         || rustix::net::getsockname(&endpoint)
@@ -136,6 +91,81 @@ pub fn receive_control_endpoint(channel: &UnixStream) -> ToolResult<UnixStream> 
     Ok(endpoint)
 }
 
+/// Receive one live pidfd using the same bounded owned-descriptor transport.
+/// This attests only the kernel handle; callers still check parent/image/birth
+/// and compare its namespace translation with the declared child coordinate.
+#[cfg(target_os = "linux")]
+pub fn receive_process_handle(channel: &UnixStream) -> ToolResult<OwnedFd> {
+    let descriptor = receive_descriptor(channel)?;
+    crate::process_handle_pid(descriptor.as_fd())?;
+    Ok(descriptor)
+}
+
+// Linux credentials may carry ancestor PID zero. The existing unsafe leaf
+// receives rights without constructing rustix::UCred or mutating SO_PASSCRED;
+// credential authentication remains in the enclosing signed-PID protocol.
+fn receive_descriptor(channel: &UnixStream) -> ToolResult<OwnedFd> {
+    let mut marker = [0; MARKER.len()];
+    #[cfg(target_os = "macos")]
+    let mut space = [MaybeUninit::uninit(); RECEIVE_CONTROL_SPACE];
+    let mut descriptors = Vec::new();
+    let mut offset = 0;
+    while offset < marker.len() {
+        #[cfg(target_os = "linux")]
+        let (count, rights) =
+            agent_bridle_fdguard::receive_control_rights(channel.as_fd(), &mut marker[offset..])?;
+        #[cfg(target_os = "macos")]
+        let (count, rights) = {
+            let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+            let received = rustix::net::recvmsg(
+                channel,
+                &mut [IoSliceMut::new(&mut marker[offset..])],
+                &mut ancillary,
+                RecvFlags::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let mut rights = Vec::new();
+            for item in ancillary.drain() {
+                match item {
+                    RecvAncillaryMessage::ScmRights(fds) => rights.extend(fds),
+                    _ => {
+                        return Err(ToolError::denied(
+                            "unexpected control endpoint ancillary data",
+                        ))
+                    }
+                }
+            }
+            if received
+                .flags
+                .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC)
+            {
+                return Err(ToolError::denied(
+                    "truncated control endpoint ancillary data",
+                ));
+            }
+            (received.bytes, rights)
+        };
+        descriptors.extend(rights);
+        if count == 0 || count > marker.len() - offset || descriptors.len() != 1 {
+            return Err(ToolError::denied(
+                "control transfer requires exactly one complete endpoint",
+            ));
+        }
+        // Every fragment must use recvmsg: a plain read could discard an extra
+        // rights message attached to the marker's tail without owning its fds.
+        offset += count;
+    }
+    if marker != MARKER {
+        return Err(ToolError::denied(
+            "invalid control endpoint transfer marker",
+        ));
+    }
+    let endpoint = descriptors.pop().expect("exactly one descriptor checked");
+    rustix::io::fcntl_setfd(&endpoint, rustix::io::FdFlags::CLOEXEC)
+        .map_err(std::io::Error::from)?;
+    Ok(endpoint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,8 +175,12 @@ mod tests {
     fn separate_endpoint_is_usable_and_close_on_exec() {
         let (parent, child) = UnixStream::pair().unwrap();
         let (endpoint, mut peer) = UnixStream::pair().unwrap();
+        #[cfg(target_os = "linux")]
+        rustix::net::sockopt::set_socket_passcred(&child, true).unwrap();
         send_control_endpoint(&parent, &endpoint).unwrap();
         let mut received = receive_control_endpoint(&child).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(rustix::net::sockopt::socket_passcred(&child).unwrap());
         assert!(rustix::io::fcntl_getfd(&received)
             .unwrap()
             .contains(rustix::io::FdFlags::CLOEXEC));
@@ -165,8 +199,12 @@ mod tests {
     #[test]
     fn missing_or_duplicate_endpoints_are_refused() {
         let (parent, child) = UnixStream::pair().unwrap();
+        #[cfg(target_os = "linux")]
+        rustix::net::sockopt::set_socket_passcred(&child, true).unwrap();
         (&parent).write_all(&MARKER).unwrap();
         assert!(receive_control_endpoint(&child).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(rustix::net::sockopt::socket_passcred(&child).unwrap());
         let (one, _peer) = UnixStream::pair().unwrap();
         let (two, _peer) = UnixStream::pair().unwrap();
         let descriptors = [one.as_fd(), two.as_fd()];

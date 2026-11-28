@@ -160,7 +160,8 @@
 #     private mode on both routes, including default managed scratch (#3361)
 #     and build_tests_private_pid_namespace (credentialed startup, fast exits,
 #     orphan reaping, bounded teardown and authenticated Brush bootstrap),
-#     then runs netns/mounts/devpts/identity/alias-bind and the opt-in PID
+#     plus build_tests_private_pid_broker (native Git commit with PID staging
+#     on and off), then runs netns/mounts/devpts/identity/alias-bind and the opt-in PID
 #     namespace/init deny switches (PID isolation is on for argv, off for Brush). The temporary
 #     workspace probe always requires fallback. CI-only like the Git broker tier.
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
