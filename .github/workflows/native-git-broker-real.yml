@@ -111,7 +111,8 @@ jobs:
             build_tests_inherited_host_socket_denied \
             build_tests_private_scratch_capacity_mode_and_isolation \
             build_tests_default_managed_scratch_is_private \
-            build_tests_private_identity_isolated
+            build_tests_private_identity_isolated \
+            build_tests_private_pid_namespace
           # A workspace beneath a covered temporary mount deliberately falls
           # back even on namespace-capable hosts; never require private mode.
           cargo test -p newt-core --test brush_build_pipeline -- --ignored \

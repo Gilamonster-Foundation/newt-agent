@@ -122,18 +122,35 @@ impl ConstrainedExecutor {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
-        struct CancelOnDrop(Arc<AtomicBool>);
+        struct CancelOnDrop(Arc<AtomicBool>, std::sync::mpsc::Receiver<()>, bool);
         impl Drop for CancelOnDrop {
             fn drop(&mut self) {
                 self.0.store(true, Ordering::Release);
+                let _ = (&self.1, self.2);
+                #[cfg(target_os = "linux")]
+                if self.2
+                    && matches!(
+                        self.1.recv_timeout(agent_bridle::BUILD_TEARDOWN_BOUND),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    )
+                {
+                    eprintln!("confined cancellation cleanup did not finish within its budget");
+                }
             }
         }
-        let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let cancel = CancelOnDrop(
+            Arc::new(AtomicBool::new(false)),
+            done_rx,
+            req.sandbox_policy().private_pid_namespace,
+        );
         let flag = Arc::clone(&cancel.0);
-        let result =
-            tokio::task::spawn_blocking(move || Self::run_until_cancelled(&req, Some(&flag)))
-                .await
-                .map_err(|error| ExecRefused::Spawn(std::io::Error::other(error)))?;
+        let result = tokio::task::spawn_blocking(move || {
+            let _done = done_tx;
+            Self::run_until_cancelled(&req, Some(&flag))
+        })
+        .await
+        .map_err(|error| ExecRefused::Spawn(std::io::Error::other(error)))?;
         drop(cancel);
         result
     }
@@ -261,8 +278,24 @@ impl ConstrainedExecutor {
         #[cfg(target_os = "windows")]
         kill_child_tree(&mut child.child, pgid, windows_job.as_ref());
         #[cfg(not(target_os = "windows"))]
-        kill_child_tree(&mut child.child, pgid);
+        {
+            #[cfg(target_os = "linux")]
+            let group_cleanup = child.build_namespace.is_none();
+            #[cfg(not(target_os = "linux"))]
+            let group_cleanup = true;
+            // A private relay is already reaped here. Its namespace handle,
+            // not a possibly recycled numeric process-group ID, owns cleanup.
+            if group_cleanup {
+                kill_child_tree(&mut child.child, pgid);
+            }
+        }
 
+        #[cfg(target_os = "linux")]
+        if let Some(namespace) = &child.build_namespace {
+            namespace
+                .wait_gone(agent_bridle::BUILD_TEARDOWN_BOUND)
+                .map_err(ExecRefused::Spawn)?;
+        }
         let stdout = out_thread.join().unwrap_or_default();
         let stderr = err_thread.join().unwrap_or_default();
 

@@ -34,6 +34,15 @@
 //! [`Sandbox::command_prefix`] (Seatbelt/AppContainer); a spawn site honors both,
 //! so the mechanism is uniform at the call site.
 
+/// Parent-side preparation for the build-only pre-exec hook.
+/// Kernel handles and the shared fallback decision, never child output.
+pub struct BuildPreparation {
+    #[cfg(target_os = "linux")]
+    pub(crate) fallback: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_os = "linux")]
+    pub(crate) report: Option<std::os::fd::OwnedFd>,
+}
+
 use crate::{Caveats, SandboxPolicy, ToolError, ToolResult};
 use std::sync::Arc;
 
@@ -211,7 +220,7 @@ pub trait Sandbox: Send + Sync {
         worker: Option<(&str, &std::fs::File)>,
         held: &[HeldReadRoot],
         _private_scratch: &[std::path::PathBuf],
-    ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+    ) -> ToolResult<Option<BuildPreparation>> {
         match worker {
             Some((program, image)) => self.apply_with_worker(effective, program, image, held),
             None => self.apply_with_held_roots(effective, held),
@@ -2164,7 +2173,7 @@ pub(crate) mod landlock_impl {
             held: &[super::HeldReadRoot],
             command: Option<&mut std::process::Command>,
             private_scratch: &[std::path::PathBuf],
-        ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+        ) -> ToolResult<Option<super::BuildPreparation>> {
             let confine_net = super::net_fully_denied(effective);
             let private_build = confine_net
                 && self.policy.child_network == ChildNetworkPolicy::PrivateBuild
@@ -2186,7 +2195,7 @@ pub(crate) mod landlock_impl {
                         Scope::Only(paths) => Some(paths.iter()),
                         Scope::All => None,
                     }).flatten().map(std::path::Path::new);
-                let fallback = agent_bridle_fdguard::build_isolation::confine(
+                let (fallback, report) = agent_bridle_fdguard::build_isolation::confine(
                     command.expect("private build requires a command"),
                     [require_fd(ruleset)?, require_fd(fallback_rules)?],
                     [seccomp_egress_program(false)?, seccomp_egress_program(true)?],
@@ -2196,8 +2205,8 @@ pub(crate) mod landlock_impl {
                     held_git_alias_binds(),
                     roots,
                     self.policy.private_pid_namespace,
-                );
-                return Ok(Some(fallback));
+                )?;
+                return Ok(Some(super::BuildPreparation { fallback, report }));
             }
             let status = ruleset.restrict_self().map_err(landlock_denied)?;
 
@@ -2260,7 +2269,7 @@ pub(crate) mod landlock_impl {
             worker: Option<(&str, &std::fs::File)>,
             held: &[super::HeldReadRoot],
             private_scratch: &[std::path::PathBuf],
-        ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
+        ) -> ToolResult<Option<super::BuildPreparation>> {
             self.apply_rules(effective, worker, held, Some(command), private_scratch)
         }
 

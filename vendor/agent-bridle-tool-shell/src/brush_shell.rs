@@ -638,6 +638,10 @@ impl OwnedWorker {
         crate::kill_child_tree(&mut self.confined.child);
         self.confined.child.wait().map_err(ToolError::from)?;
         self.reaped = true;
+        #[cfg(target_os = "linux")]
+        if let Some(namespace) = &self.confined.build_namespace {
+            namespace.wait_gone(agent_bridle_core::BUILD_TEARDOWN_BOUND)?;
+        }
         Ok(())
     }
 

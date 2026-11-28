@@ -174,10 +174,9 @@ seccomp(filter); landlock_restrict_self(ruleset); write(2, mode line); Ok(())   
   - failure in the payload after the second clone (proc mount, grant): the payload returns `RETRY_DENY_ALL`, std in the payload writes the error and exits 1, the relay reaps it, kills and reaps init, exits; the harness's std reads the error and reaps the relay.
   In both, no program has run and the fresh child never unshares. Seccomp or Landlock install failure in the payload still refuses outright, as today.
 - **Mode, trusted.** Carry the shared fallback flag, including preselected fallback, out as `ConfinedChild::build_isolation: Option<BuildIsolation>` (`Private` or `DenyAllFallback`) and the same on `SandboxedWorkerChild`. This is harness memory, not child output, and both authentication and the diagnostic use it (4.5, 4.6).
-- **Stable handles** (stage 2). `confine()` creates one CLOEXEC pipe; the relay writes `[Hi, Hp]` (two `u32`, one 8-byte write) after init is ready and before the second clone. Since the payload cannot exist before that write, when `spawn()` returns `Ok` the bytes are already in the pipe: the harness does a non-blocking read and refuses the spawn (kill, error) if they are absent. The harness then:
-  - opens `pidfd_open(Hi)` and `pidfd_open(Hp)` (rustix, safe);
-  - verifies in its own `/proc` that both have ppid `C`. `C` is the un-reaped `Child`, so its PID cannot be recycled, and only the relay creates children of `C`, so a recycled `Hi` or `Hp` could not have parent `C`.
-  The handles are `BuildNamespace { init: OwnedFd, payload: OwnedFd, payload_pid: u32 }` on the child struct. Nothing here polls: the read is immediate and the validation is synchronous.
+- **Stable handles — As built in PR 2.** Before spawn the harness creates a close-on-exec `SOCK_SEQPACKET` socketpair and enables `SO_PASSCRED` on its receiver. Both `clone3` calls use `CLONE_PIDFD`: the kernel creates each handle atomically with its process. Init and payload close the sender as their first post-clone syscall. The never-exec'd relay sends one fixed report (marker and host init/payload coordinates) and both pidfds in one raw `sendmsg(SCM_RIGHTS)`, **after the second clone and before the relay installs its fences**. It then closes the sender before dropping its copy of std's exec-status pipe. There is no payload exec gate and no post-spawn PID lookup.
+- **Report validation.** After spawn the harness drops its captured sender and receives exactly one complete message, then requires EOF. Truncated bytes or control data, extra/missing descriptors, missing/duplicate/wrong credentials, a second message, or an open sender refuse the launch. Kernel `SCM_CREDENTIALS` must name the spawned relay and the harness's uid/gid. Each received descriptor must expose a `Pid` field in its own fdinfo. For unreaped handles the host PID must match the report and any `NSpid` list must begin with that PID and end in 1 (init) or 2 (payload). The harness never reopens a process by its reported number.
+- **Reaped handles.** Linux 6.8 reports `Pid: -1` and `NSpid: -1` after reap and has no `PIDFD_GET_INFO` ioctl (measured). Such handles are accepted on creator-channel provenance and kernel sender credentials; their discarded per-process metadata cannot attest their individual role (R13). They remain pollable and already count as gone. The delayed-reader measurement delivered two valid handles and exit 7 in 10/10 fast-exit interleavings; a live role mismatch was refused. `BuildNamespace` owns both handles through every child conversion and retains the reported payload coordinate for later authentication stages.
 
 ### 4.3 Signals, timeout, cancellation
 
@@ -188,7 +187,7 @@ seccomp(filter); landlock_restrict_self(ruleset); write(2, mode line); Ok(())   
 - **Init's dispositions.** Everything `SIG_DFL` except `SIGCHLD = SIG_IGN`. As PID 1 with default dispositions the kernel drops every signal sent from inside the namespace, including SIGKILL and SIGSTOP (measured-here). Only an ancestor's SIGKILL/SIGSTOP are delivered.
 - **Orphan reaping.** `SIGCHLD = SIG_IGN` makes the kernel reap init's children, including adopted orphans, with no reaping loop (believed for adopted zombies; M3).
 - **Exit status.** The relay exits with the payload's code or dies by the payload's signal, so `status.code()` and `success()` are what callers see today. Core-dumping signals do not dump the harness image (`RLIMIT_CORE = 0`, non-dumpable).
-- **Precise completion.** Normal exit: the relay only exits after `wait4(init)`, so when the harness reaps the relay the namespace is already empty (measured-here). Kill path: teardown is asynchronous by about a millisecond (measured-here); `BuildNamespace::wait_gone(bound)` polls the init pidfd, which becomes readable after the kernel has killed and reaped every member (believed; M2b). The bound is the lane's remaining budget, used as an upper bound and reported as an error if it expires; it does not coordinate anything.
+- **Precise completion.** Normal exit: the relay only exits after `wait4(init)`, so when the harness reaps the relay the namespace is already empty (measured-here). Kill path: teardown is asynchronous by about a millisecond (measured-here); `BuildNamespace::wait_gone(bound)` polls the init pidfd, which becomes readable after the kernel has killed and reaped every member (measured, including an uninterruptible FUSE read; M2b). As built in PR 2, timeout/cancellation/drop have a separate 500 ms cleanup allowance, since the execution budget is already exhausted on timeout. Expiry reports incomplete teardown (a member may still be blocked in kernel I/O), never successful completion. Managed execution uses its existing reap grace. A timer only bounds waiting; it does not establish completion.
 - **Harness crash.** The relay is deliberately not tied to the harness with PDEATHSIG: that signal fires when the creating thread exits, and the funnel spawns from a throwaway thread (`spawn.rs:978`). A crashed harness leaves the build running, as today.
 
 ### 4.4 procfs
@@ -293,7 +292,7 @@ Rules, then each check.
 
 | Crate | What goes there | Why |
 |---|---|---|
-| `vendor/agent-bridle-fdguard` | The PID step, relay, init, proc mount and grant, the startup report pipe: all in `build_isolation.rs` | It is the single unsafe seam; the whole mechanism is one file and upstreamable as one patch |
+| `vendor/agent-bridle-fdguard` | The PID step, relay, init, proc mount and grant, the startup report socketpair: all in `build_isolation.rs` | It is the single unsafe seam; the whole mechanism is one file and upstreamable as one patch |
 | `vendor/agent-bridle-core` | `BuildIsolation` and `BuildNamespace` on the child structs; kernel-credential hello in `TrustedWorkerControl::send_with_channel`; a descriptor-generic send and `receive_process_handle` beside `receive_control_endpoint` in `delegated_control.rs`; a pass-through in `sandbox.rs` | Funnel outputs and the control protocol already live here; core stays `forbid(unsafe_code)` (rustix only) |
 | `vendor/agent-bridle-tool-shell` | Check 2 in `private_control.rs`; checks 3 and 5 in `broker_transport.rs`; checks 4 and 6 in `broker_runtime.rs`; plumbing in `brush_shell.rs`; socket stdio for the worker | The checks live here today |
 | `newt-core` | `liveness.rs` (boot time, namespace coordinate); the staging switch in `ExecRequest::sandbox_policy`; description text; probes in `tests/brush_build_pipeline.rs`; `docs/security/ocap-deviations.md` | Product and policy, not mechanism |
@@ -354,6 +353,7 @@ All seven were taken as recommended.
 - **R10. Environments that refuse a fresh procfs** (masked `/proc` in containers) lose the entire private mode under D2.
 - **R11. Yama scope 0 hosts**: same-domain ptrace inside a build, including of the worker. Pre-existing.
 - **R12. Another procfs mount** at a path other than `/proc` in the host's mount table would let a build learn its own host PIDs by `readlink`. No authority follows from that.
+- **R13. Reaped-handle provenance.** A reaped pidfd no longer exposes per-process identity. Its role is attested by the harness-created channel, the kernel credentials of the never-exec'd creator, and the creator's fixed clone/transfer code, not by per-descriptor metadata. A defect in that trusted creator substituting another reaped pidfd cannot be detected from those discarded facts. Live exposed facts must still match.
 
 ## 8. Staged pull requests
 
@@ -373,8 +373,8 @@ Each PR updates the relevant `NEWT_PATCHES.md` and, where behaviour changes, `do
 - Acceptance: unchanged eight; production is untouched (switch off).
 
 **PR 2. Startup report and teardown handle (about 400 lines).**
-- Change: report pipe; `BuildNamespace` with pidfds; `wait_gone`; both supervisors call it after a kill (`executor.rs` kill path, `OwnedWorker::terminate`).
-- Red-first: report parsing and validation against injected process facts (wrong parent, missing bytes, short read all refuse).
+- Change: credentialed report socketpair and creation-time pidfds; `BuildNamespace`; `wait_gone`; both supervisors call it after a kill (`executor.rs` kill path, `OwnedWorker::terminate`).
+- Red-first: report parsing against injected kernel facts: incomplete/malformed messages, truncation, a second message, wrong/missing credentials or descriptors, non-pidfds and live PID/namespace-role mismatches all refuse; reaped handles are accepted on creator provenance.
 - Real-resource: a setsid double-forked descendant is dead when the call returns, on timeout, cancellation and drop, on the argv funnel; payload exit code 7 and death by SIGSEGV and SIGKILL are observed unchanged; an orphaned zombie is reaped by init.
 - Acceptance: unchanged eight.
 

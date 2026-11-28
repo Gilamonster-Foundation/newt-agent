@@ -164,7 +164,21 @@ pub fn confine<'a>(
     binds: Vec<SameObjectBind>,
     roots: impl Iterator<Item = &'a Path>,
     pid_namespace: bool,
-) -> Arc<AtomicBool> {
+) -> io::Result<(Arc<AtomicBool>, Option<OwnedFd>)> {
+    // The private creator channel exists before fork. No payload may inherit
+    // its sender; the receiver requests kernel credentials before any send.
+    let (report, sender) = if pid_namespace {
+        use std::os::fd::FromRawFd;
+        let mut pair = [-1; 2];
+        // SAFETY: valid output storage; immediately adopt both successful fds.
+        check(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, pair.as_mut_ptr()) })?;
+        let receiver = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let sender = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        let enabled = 1i32;
+        check(unsafe { libc::setsockopt(receiver.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PASSCRED,
+            (&enabled as *const i32).cast(), std::mem::size_of_val(&enabled) as libc::socklen_t) })?;
+        (Some(receiver), Some(sender))
+    } else { (None, None) };
     let [filesystem, fallback_rules] = filesystems;
     let [deny, loopback] = network_filters;
     // Map to the same numeric identity so build tools do not suddenly run as
@@ -247,7 +261,7 @@ pub fn confine<'a>(
                         if pid_namespace {
                             // Returns only in the payload (PID 2), or with an
                             // error while this process is still the only one.
-                            private_pids(&deny, fallback_rules.as_raw_fd())
+                            private_pids(&deny, fallback_rules.as_raw_fd(), sender.as_ref().map_or(-1, AsRawFd::as_raw_fd))
                         } else {
                             Ok(())
                         }
@@ -271,7 +285,7 @@ pub fn confine<'a>(
             Ok(())
         });
     }
-    fallback
+    Ok((fallback, report))
 }
 
 fn temporary_root(path: &std::path::Path) -> Option<&'static std::path::Path> {
@@ -606,8 +620,10 @@ fn mirror(status: i32) -> Mirror {
 
 /// Both sides continue from here. Only for the single-threaded fork child:
 /// the new process must keep to raw syscalls until it execs or exits.
-unsafe fn fork_raw() -> io::Result<libc::pid_t> {
-    let args = CloneArgs::fork();
+unsafe fn fork_raw(pidfd: &mut i32) -> io::Result<libc::pid_t> {
+    let mut args = CloneArgs::fork();
+    args.flags = libc::CLONE_PIDFD as u64;
+    args.pidfd = (pidfd as *mut i32) as u64;
     // SAFETY: a live, correctly sized argument block. No CLONE_VM: the child
     // has its own copy of this stack.
     let pid = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
@@ -618,7 +634,7 @@ unsafe fn fork_raw() -> io::Result<libc::pid_t> {
 /// The private PID namespace. Returns `Ok` only in the payload, which is PID 2
 /// with no visible parent. The calling process becomes the relay and never
 /// returns on success; an `Err` is returned in the caller with init discarded.
-fn private_pids(deny: &seccompiler::BpfProgram, rules: i32) -> io::Result<()> {
+fn private_pids(deny: &seccompiler::BpfProgram, rules: i32, report: i32) -> io::Result<()> {
     // SAFETY: raw syscalls on this fork child only. Every descriptor created
     // here is CLOEXEC and is closed explicitly in the processes that must not
     // hold it. No allocation, locks or Rust stdio.
@@ -633,8 +649,10 @@ fn private_pids(deny: &seccompiler::BpfProgram, rules: i32) -> io::Result<()> {
         let mut ready = [0; 2];
         check(libc::pipe2(lifeline.as_mut_ptr(), libc::O_CLOEXEC))?;
         check(libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC))?;
-        let init = fork_raw()?;
+        let mut initfd = -1;
+        let init = fork_raw(&mut initfd)?;
         if init == 0 {
+            libc::close(report); // First post-clone syscall: init can never report.
             init_main(lifeline[0], ready[1], deny, rules);
         }
         libc::close(lifeline[0]);
@@ -649,15 +667,32 @@ fn private_pids(deny: &seccompiler::BpfProgram, rules: i32) -> io::Result<()> {
             break count == 1;
         };
         libc::close(ready[0]);
+        let mut payloadfd = -1;
         let payload = if started {
-            fork_raw()
+            fork_raw(&mut payloadfd)
         } else {
             Err(io::Error::from_raw_os_error(libc::EIO))
         };
         match payload {
-            Ok(0) => {}
-            Ok(payload) => relay_main(init, payload, lifeline[1], deny, rules),
+            Ok(0) => {
+                libc::close(report); // First post-clone syscall, before payload setup.
+                libc::close(initfd);
+            }
+            Ok(payload) => {
+                // One credentialed record, before relay_main installs either
+                // fence. The payload may already have exec'd/exited; pidfds
+                // were acquired atomically at creation and remain valid.
+                let sent = send_startup(report, [init, payload], [initfd, payloadfd]);
+                libc::close(report);
+                libc::close(initfd);
+                libc::close(payloadfd);
+                if sent.is_err() {
+                    libc::close(lifeline[1]); libc::kill(init, libc::SIGKILL); reap(init); libc::_exit(1);
+                }
+                relay_main(init, payload, lifeline[1], deny, rules)
+            },
             Err(error) => {
+                libc::close(initfd);
                 // No payload exists. Leave no namespace behind the error.
                 libc::close(lifeline[1]);
                 libc::kill(init, libc::SIGKILL);
@@ -672,6 +707,38 @@ fn private_pids(deny: &seccompiler::BpfProgram, rules: i32) -> io::Result<()> {
             check(libc::setpgid(0, 0))?;
         }
         Ok(())
+    }
+}
+
+/// Fixed native kernel coordinates and two atomically acquired handles.
+/// Only the never-exec'd relay calls this; stack storage and raw syscalls only.
+unsafe fn send_startup(channel: i32, pids: [i32; 2], descriptors: [i32; 2]) -> io::Result<()> {
+    unsafe {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(b"ABPID1\0\0");
+        bytes[8..12].copy_from_slice(&(pids[0] as u32).to_ne_bytes());
+        bytes[12..].copy_from_slice(&(pids[1] as u32).to_ne_bytes());
+        let mut iov = libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() };
+        // usize alignment suffices for cmsghdr on supported Linux ABIs.
+        let mut control = [0usize; 6];
+        let mut message: libc::msghdr = std::mem::zeroed();
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        // musl uses socklen_t where glibc uses size_t for these lengths.
+        message.msg_controllen = libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as u32) as _;
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as u32) as _;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast::<i32>(), 2);
+        loop {
+            let count = libc::syscall(libc::SYS_sendmsg, channel, &message, libc::MSG_NOSIGNAL);
+            if count == bytes.len() as libc::c_long { return Ok(()); }
+            let error = io::Error::last_os_error();
+            if count < 0 && error.raw_os_error() == Some(libc::EINTR) { continue; }
+            return Err(if count < 0 { error } else { io::Error::from_raw_os_error(libc::EIO) });
+        }
     }
 }
 

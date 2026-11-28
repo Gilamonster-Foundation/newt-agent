@@ -169,7 +169,7 @@ path = "../agent-bridle-fdguard"
 
 [target."cfg(unix)".dependencies.rustix]
 version = "1"
-features = ["process", "net", "fs"]
+features = ["process", "net", "fs", "event"]
 
 [lints.rust]
 unsafe_code = "forbid"

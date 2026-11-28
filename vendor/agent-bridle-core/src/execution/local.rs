@@ -197,6 +197,8 @@ impl LocalExecutionBackend {
         control: &Arc<LocalControl>,
     ) -> ToolResult<()> {
         let ManagedSpawn {
+            #[cfg(target_os = "linux")]
+            build_namespace,
             mut child,
             sandbox_kind,
             fence_id,
@@ -271,6 +273,8 @@ impl LocalExecutionBackend {
             reap(
                 &mut child,
                 Reaping {
+                    #[cfg(target_os = "linux")]
+                    build_namespace,
                     sink,
                     control: reaper_control,
                     proxy,
@@ -290,6 +294,8 @@ impl LocalExecutionBackend {
 
 /// Everything the reaper thread needs to reach a quiescent terminal.
 struct Reaping {
+    #[cfg(target_os = "linux")]
+    build_namespace: Option<crate::BuildNamespace>,
     sink: ExecutionEventSink,
     control: Arc<LocalControl>,
     proxy: Option<crate::net_proxy::ProxyHandle>,
@@ -371,6 +377,18 @@ fn reap(child: &mut Child, mut ctx: Reaping) {
         control: Arc::clone(&ctx.control),
     };
     let status = child.wait();
+    #[cfg(target_os = "linux")]
+    if let Some(namespace) = &ctx.build_namespace {
+        if let Err(error) = namespace.wait_gone(ctx.limits.reap_grace()) {
+            ctx.control.leader_reaped();
+            let _ = ctx.control.publish(&ctx.sink, ExecutionTerminal::Failed {
+                message: error.to_string(),
+            });
+            // Incomplete teardown is already the terminal. Never turn its
+            // bounded wait into an unbounded pipe/drainer join.
+            return;
+        }
+    }
     // The leader is reaped: no later signal may target this pid as a group id.
     ctx.control.leader_reaped();
 
