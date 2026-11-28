@@ -5,7 +5,17 @@
 //! `cargo test -p newt-core --test brush_build_pipeline -- --ignored`
 //! No inference service, installed Newt, or operator configuration is used.
 
+#[cfg(target_os = "linux")]
+#[path = "support/private_proc.rs"]
+mod private_proc;
+
 fn main() {
+    // The fixed worker-image proc probe runs before its control bootstrap;
+    // authentication is a separate stage, not part of this mount proof.
+    #[cfg(target_os = "linux")]
+    if private_proc::dispatch() {
+        return;
+    }
     // This MUST precede fixture setup: a confined worker cannot initialize an
     // ambient test runner or mint its own fixture authority.
     if let Some(code) = newt_core::maybe_dispatch() {
@@ -861,8 +871,10 @@ mod native {
                     | "--deny-build-alias-bind"
                     | "--deny-build-pidns"
                     | "--deny-build-pidns-init"
+                    | "--deny-build-proc"
             )
         }) {
+            let deny_proc = std::env::args().any(|arg| arg == "--deny-build-proc");
             let deny_mounts = std::env::args().any(|arg| arg == "--deny-build-mounts");
             let deny_devpts = std::env::args().any(|arg| arg == "--deny-build-devpts");
             let deny_identity = std::env::args().any(|arg| arg == "--deny-build-identity");
@@ -877,7 +889,9 @@ mod native {
             let deny_init = std::env::args().any(|arg| arg == "--deny-build-pidns-init");
             // The PTY allocator also uses MS_BIND. Target the account's
             // readonly remount so scratch and terminal setup complete first.
-            let fault_flags = if deny_identity {
+            let fault_flags = if deny_proc {
+                libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC
+            } else if deny_identity {
                 libc::MS_BIND
                     | libc::MS_REMOUNT
                     | libc::MS_RDONLY
@@ -891,7 +905,7 @@ mod native {
             };
             let fault_syscall = if deny_alias {
                 libc::SYS_move_mount
-            } else if deny_mounts || deny_devpts || deny_identity {
+            } else if deny_mounts || deny_devpts || deny_identity || deny_proc {
                 libc::SYS_mount
             } else if deny_init {
                 libc::SYS_capset
@@ -937,7 +951,7 @@ mod native {
                     libc::SECCOMP_RET_ALLOW,
                 ),
             ];
-            if deny_devpts || deny_identity || deny_pidns {
+            if deny_devpts || deny_identity || deny_pidns || deny_proc {
                 filters[1].jf = 3;
                 filters.splice(
                     2..2,
@@ -996,7 +1010,9 @@ mod native {
             );
             eprintln!(
                 "{}",
-                if deny_devpts {
+                if deny_proc {
+                    "BUILD_PROC_SETUP_FAILURE_INJECTED"
+                } else if deny_devpts {
                     "BUILD_DEVPTS_SETUP_FAILURE_INJECTED"
                 } else if deny_mounts {
                     "BUILD_MOUNT_SETUP_FAILURE_INJECTED"
@@ -1145,6 +1161,10 @@ mod native {
             #[cfg(target_os = "linux")]
             if selected("git_alias_file_bind_carries_a_nested_exec_rule") {
                 super::git_alias_bind::ground(&root);
+            }
+            #[cfg(target_os = "linux")]
+            if selected("build_tests_private_procfs") {
+                super::private_proc::run(&root);
             }
             #[cfg(target_os = "linux")]
             if selected("build_tests_private_pid_namespace") {
@@ -1694,7 +1714,7 @@ mod native {
         if std::env::args().any(|arg| {
             matches!(
                 arg.as_str(),
-                "--deny-build-pidns" | "--deny-build-pidns-init"
+                "--deny-build-pidns" | "--deny-build-pidns-init" | "--deny-build-proc"
             )
         }) {
             let mode =

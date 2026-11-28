@@ -113,7 +113,8 @@ jobs:
             build_tests_default_managed_scratch_is_private \
             build_tests_private_identity_isolated \
             build_tests_private_pid_namespace \
-            build_tests_private_pid_broker
+            build_tests_private_pid_broker \
+            build_tests_private_procfs
           # A workspace beneath a covered temporary mount deliberately falls
           # back even on namespace-capable hosts; never require private mode.
           cargo test -p newt-core --test brush_build_pipeline -- --ignored \
@@ -121,7 +122,7 @@ jobs:
 
       - name: Require each private-build setup failure to fall back safely
         run: |
-          for failure in netns mounts devpts identity alias-bind pidns pidns-init; do
+          for failure in netns mounts devpts identity alias-bind pidns pidns-init proc; do
             cargo test -p newt-core --test brush_build_pipeline -- --ignored \
               build_tests_ "--deny-build-$failure"
           done

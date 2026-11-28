@@ -263,7 +263,7 @@ The opt-in PID topology acquires both child pidfds atomically with CLONE_PIDFD. 
 
 ## Argv PID isolation diagnostics (#3321)
 
-PID-enabled private builds disclose private process IDs; their deny-all fallback explicitly discloses that host process IDs remain visible and signalable. Switch-off messages are unchanged. The argv policy now selects this existing mechanism; Brush remains opt-in until its authentication changes. Neither message claims private procfs, which is a later stage.
+PID-enabled private builds disclose private process IDs; their deny-all fallback explicitly discloses that host process IDs remain visible and signalable. Switch-off messages are unchanged. The argv policy now selects this existing mechanism; Brush remains opt-in until its authentication changes. At this stage neither message claimed private procfs; stage 8 adds that private-mode diagnostic.
 
 ## Namespace-safe descriptor receipt (#3321, PR 5)
 
@@ -275,3 +275,25 @@ Changing SO_PASSCRED around receipt is unsafe with overlapping users, so the
 receiver never changes socket options. The enclosing authenticated protocol
 still validates sender identity and descriptor roles. This runs after exec;
 no relay/init/payload pre-exec hook changes. macOS keeps the rustix receiver.
+
+## Private procfs for the opt-in PID namespace (#3321, stage 8)
+
+After the PID step returns in the payload, mount read-only `subset=pid` procfs
+with nosuid/nodev/noexec, then reuse `grant_private_mount` to grant only handled
+READ_FILE/READ_DIR access against the new mount object. A mount or rule failure
+returns the existing fresh-child deny-all retry; no partial private mode execs.
+The staging switch remains unchanged, and its off path does not read argv
+coordinates, mount procfs, or change its mode line.
+
+Before fork, read the kernel's arg_start/arg_end from the harness's own stat.
+Malformed, empty, reversed, or unavailable coordinates select fallback. Init
+clears those inherited bytes in its own copy-on-write image after hardening,
+before reporting ready. Its cmdline contains only NUL bytes; the harness and
+payload argv remain untouched. The added child-side work is static-string
+mount/open/Landlock/close syscalls and a memory clear, without allocation or
+locks. The private PID mode line names the private process and proc view.
+
+Pure tests cover options, the read-only access mask, and argv-range parsing;
+`brush_build_pipeline`'s `--build-proc-probe` grounds them through both fixed
+spawn funnels, including `--deny-build-proc` at mount flags 15. The worker test
+image probes before its separately staged control authentication.
