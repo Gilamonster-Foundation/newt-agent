@@ -264,3 +264,14 @@ The opt-in PID topology acquires both child pidfds atomically with CLONE_PIDFD. 
 ## Argv PID isolation diagnostics (#3321)
 
 PID-enabled private builds disclose private process IDs; their deny-all fallback explicitly discloses that host process IDs remain visible and signalable. Switch-off messages are unchanged. The argv policy now selects this existing mechanism; Brush remains opt-in until its authentication changes. Neither message claims private procfs, which is a later stage.
+
+## Namespace-safe descriptor receipt (#3321, PR 5)
+
+Linux `receive_control_rights` receives SCM_RIGHTS with MSG_CMSG_CLOEXEC and
+owns all installed descriptors before refusing unknown/truncated ancillary
+data. It skips credential payload bytes: an ancestor's PID is zero inside a
+PID namespace, which rustix 1.1.4's NonZeroI32-backed UCred cannot represent.
+Changing SO_PASSCRED around receipt is unsafe with overlapping users, so the
+receiver never changes socket options. The enclosing authenticated protocol
+still validates sender identity and descriptor roles. This runs after exec;
+no relay/init/payload pre-exec hook changes. macOS keeps the rustix receiver.

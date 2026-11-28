@@ -41,6 +41,8 @@ pub mod ffi_surface;
 pub mod flight_recorder;
 #[cfg(feature = "confine")]
 mod native_git_broker;
+#[cfg(feature = "confine")]
+pub use native_git_broker::NativeGitBroker;
 pub mod owned_hosts;
 pub mod permission_journal;
 pub mod workspace_protection;

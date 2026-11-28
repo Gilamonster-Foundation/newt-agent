@@ -173,7 +173,7 @@ fn denied(error: impl std::fmt::Display) -> ToolError {
 /// One shell invocation's owned policy and immutable mechanism resources.
 /// No repository is opened, and no session authority changes, on construction.
 #[derive(Clone)]
-pub(crate) struct NativeGitBroker {
+pub struct NativeGitBroker {
     purpose: Purpose,
     helper_dir: Arc<tempfile::TempDir>,
     executable: PathBuf,
@@ -188,7 +188,8 @@ enum Purpose {
 }
 
 impl NativeGitBroker {
-    pub(crate) fn new(policy: Arc<dyn CommitPolicy>) -> Result<Arc<Self>, String> {
+    /// Create the existing native commit broker for a trusted shell embedding.
+    pub fn new(policy: Arc<dyn CommitPolicy>) -> Result<Arc<Self>, String> {
         Self::create(Purpose::Commit(policy))
     }
 

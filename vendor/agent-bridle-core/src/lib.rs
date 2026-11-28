@@ -28,8 +28,10 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod delegated_control;
+#[cfg(target_os = "linux")]
+pub use delegated_control::receive_process_handle;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use delegated_control::{receive_control_endpoint, send_control_endpoint};
+pub use delegated_control::{receive_control_endpoint, send_control_endpoint, send_descriptor};
 
 mod config;
 mod context;
@@ -108,7 +110,7 @@ pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSand
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
 #[cfg(target_os = "linux")]
-pub use spawn::{BuildNamespace, BUILD_TEARDOWN_BOUND};
+pub use spawn::{nspid_innermost, process_handle_pid, BuildNamespace, BUILD_TEARDOWN_BOUND};
 pub use spawn::{
     confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,

@@ -1150,6 +1150,10 @@ mod native {
             if selected("build_tests_private_pid_namespace") {
                 build_tests_private_pid_namespace(&root);
             }
+            #[cfg(target_os = "linux")]
+            if selected("build_tests_private_pid_broker") {
+                build_tests_private_pid_broker(&root).await;
+            }
             if selected("denied_build_runs_no_pipeline_stage_or_redirection") {
                 denied_build_runs_no_pipeline_stage_or_redirection(&root).await;
             }
@@ -2144,6 +2148,138 @@ mod native {
                 "argv and Brush"
             }
         );
+    }
+
+    /// Grounds the injected broker translation, binding and child-handle
+    /// predicates with a real native Git commit and policy trailer. Both the
+    /// staged PID namespace and the unchanged flat route must complete it.
+    #[cfg(target_os = "linux")]
+    async fn build_tests_private_pid_broker(root: &Path) {
+        use agent_bridle::Tool;
+        use agent_toolchain::native_git::CommitPolicy;
+        use std::sync::Arc;
+        const TRAILER: &str = "Pidns-Broker-Proof: authenticated-native-commit";
+        struct Policy;
+        impl CommitPolicy for Policy {
+            fn finalize_message(&self, message: &str) -> Result<String, String> {
+                Ok(if message.contains(TRAILER) {
+                    message.to_owned()
+                } else {
+                    format!("{message}\n\n{TRAILER}\n")
+                })
+            }
+            fn signing_required(&self) -> bool {
+                false
+            }
+            fn sign_commit(&self, _: &[u8]) -> Result<String, String> {
+                Err("this fixture proves attribution, not signing".into())
+            }
+            fn committed(&self) {}
+        }
+        let mechanism = root.join("pid-broker-mechanism");
+        std::fs::create_dir(&mechanism).unwrap();
+        let previous_tmp = std::env::var_os("TMPDIR");
+        // Keep trusted hook images outside the private mounts and write grants.
+        std::env::set_var("TMPDIR", &mechanism);
+        let env: std::collections::BTreeMap<_, _> = newt_core::git_hardening::sandbox_git_env(
+            ("PID namespace fixture", "fixture@example.invalid"),
+            &Default::default(),
+        )
+        .into_iter()
+        .collect();
+        for private_pid_namespace in [false, true] {
+            let main = root.join(format!("pid-broker-main-{private_pid_namespace}"));
+            let workspace = root.join(format!("pid-broker-worktree-{private_pid_namespace}"));
+            std::fs::create_dir(&main).unwrap();
+            let git = |cwd: &Path, args: &[&str]| {
+                let output = newt_core::git_hardening::hardened_git(cwd, args)
+                    .unwrap()
+                    .envs(&env)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            git(&main, &["init", "-q"]);
+            git(&main, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    workspace.to_str().unwrap(),
+                    "-b",
+                    "pid-broker-task",
+                ],
+            );
+            let own = newt_core::git_hardening::own_gitdir_grants(&workspace);
+            // Match the production detached-commit boundary: the worker may
+            // write its admin directory and objects, never the branch refs.
+            git(&workspace, &["checkout", "-q", "--detach"]);
+            let old = git(&workspace, &["rev-parse", "HEAD"]);
+            let caveats = agent_bridle::Caveats {
+                fs_read: Scope::only(
+                    std::iter::once(workspace.to_string_lossy().into_owned()).chain(own.read),
+                ),
+                fs_write: Scope::only(
+                    std::iter::once(workspace.to_string_lossy().into_owned()).chain(own.write),
+                ),
+                exec: Scope::only(["git".to_owned()]),
+                net: Scope::none(),
+                ..Default::default()
+            };
+            let brush = agent_bridle::BrushShellTool::new()
+                .with_sandbox_policy(Arc::new(agent_bridle::SandboxPolicy {
+                    child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
+                    private_pid_namespace,
+                    ..Default::default()
+                }))
+                .with_command_broker(newt_core::NativeGitBroker::new(Arc::new(Policy)).unwrap());
+            let cx = agent_bridle::Gate::new(0)
+                .authorize(&brush, &caveats)
+                .unwrap();
+            let output = brush.invoke(serde_json::json!({
+                "cmd": "printf '%s' \"$$\" > broker-worker-pid; git commit -q --allow-empty -m 'namespace broker fixture'",
+                "cwd": workspace,
+                "env": env,
+            }), &cx).await.unwrap();
+            assert_eq!(
+                output["exit_code"], 0,
+                "private_pid_namespace={private_pid_namespace}: {output}"
+            );
+            let pid: u32 = std::fs::read_to_string(workspace.join("broker-worker-pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if private_pid_namespace && std::env::args().any(|arg| arg.starts_with("--deny-build-"))
+            {
+                assert_ne!(pid, 2, "forced failure must use flat fallback");
+            } else if private_pid_namespace
+                && std::env::args().any(|arg| arg == "--require-build-netns")
+            {
+                assert_eq!(pid, 2, "required private broker must not fall back");
+            } else if !private_pid_namespace {
+                assert_ne!(pid, 2, "the staging switch is off");
+            }
+            assert_ne!(git(&workspace, &["rev-parse", "HEAD"]), old);
+            assert!(git(&workspace, &["log", "-1", "--format=%B"]).contains(TRAILER));
+            assert_eq!(
+                git(&main, &["rev-parse", "refs/heads/pid-broker-task"]),
+                old,
+                "the fixture must not publish the detached commit to a protected ref"
+            );
+            eprintln!("BUILD_PIDNS_BROKER_CONFIRMED private_pid_namespace={private_pid_namespace} worker_pid={pid}");
+        }
+        match previous_tmp {
+            Some(value) => std::env::set_var("TMPDIR", value),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        eprintln!("test build_tests_private_pid_broker ... ok (staged and flat)");
     }
 
     /// Grounds fdguard's mocked relay decision and `clone_args` layout, and

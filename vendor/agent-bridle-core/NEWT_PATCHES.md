@@ -423,3 +423,15 @@ the channel. Wire bytes, authority capture and take-once behavior are unchanged.
 Pure injected-fact tests cover identity refusal; the private PID build probe
 grounds the successful no-broker command on real processes. Retire with the
 upstream namespace-aware bootstrap implementation.
+
+## Broker process handles across PID namespaces (#3321, PR 5)
+
+The existing descriptor marker and ownership checks now serve both connected
+control sockets and live process handles. `send_descriptor` is the shared
+sender; Linux `receive_process_handle` validates a pidfd through its kernel
+fdinfo. Shared strict parsers reject empty, duplicate, zero and malformed PID
+fields. Bootstrap still rechecks its live payload handle around identity reads.
+Linux rights receipt delegates to the existing fdguard unsafe seam to avoid
+constructing rustix credentials with an unrepresentable ancestor PID zero.
+Core remains `forbid(unsafe_code)`; role checks, descriptor count, framing and
+close-on-exec ownership remain in the safe layer. macOS behavior is unchanged.
