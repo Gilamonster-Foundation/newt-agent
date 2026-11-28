@@ -394,13 +394,12 @@ jobs:
           -p newt-tui --features rich-tui --lib cockpit::presenter::tests::a_real_terminal_
           -- --ignored --test-threads=1
 
-      # #3160: newt-fdguard's real-resource tests: the copied agent-bridle-fdguard
-      # suite (real files, descriptors and child processes, #[ignore]d in the
-      # per-PR unit tier) and the differential's grounds against bridle's crate.
+      # Shared descriptor-guard real-resource tests (files, descriptors and child
+      # processes), including the former differential suite's independent controls.
       # One run per test binary, each required to list a named test. A sweep
       # fixture that finds no free descriptor above the table skips with an
       # `ok`; BRIDLE_REQUIRE_FD_FIXTURES turns that skip into a failure.
-      - name: Run newt-fdguard real-resource tests
+      - name: Run shared fdguard real-resource tests
         if: runner.os != 'Windows'
         shell: bash
         env:
@@ -408,11 +407,11 @@ jobs:
         run: |
           nonempty=.github/scripts/cargo-test-nonempty.sh
           bash "$nonempty" --require-test the_enumeration_leg_sees_a_descriptor_high_in_the_table \
-            -p newt-fdguard --lib -- --ignored --test-threads=1
-          bash "$nonempty" --require-test deny_inherited_fds_agrees_with_bridles \
-            -p newt-fdguard --test bridle_differential -- --ignored --test-threads=1
+            --manifest-path vendor/agent-bridle-fdguard/Cargo.toml --lib -- --include-ignored --test-threads=1
+          bash "$nonempty" --require-test deny_inherited_fds_matches_the_unguarded_control \
+            --manifest-path vendor/agent-bridle-fdguard/Cargo.toml --test bridle_differential -- --include-ignored --test-threads=1
           bash "$nonempty" --require-test an_ambient_file_descriptor_is_closed_in_the_confined_child \
-            -p newt-fdguard --test hostile_fds -- --ignored --test-threads=1
+            --manifest-path vendor/agent-bridle-fdguard/Cargo.toml --test hostile_fds -- --include-ignored --test-threads=1
 
       # PR #3108: keep host-wide AppContainer preparation last so the preceding
       # Windows grounds retain their unprepared host and run even if launcher

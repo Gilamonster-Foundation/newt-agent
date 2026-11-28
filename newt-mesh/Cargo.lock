@@ -4071,6 +4071,7 @@ version = "0.8.6"
 dependencies = [
  "age",
  "agent-bridle",
+ "agent-bridle-fdguard",
  "agent-bridle-tool-shell",
  "agent-bridle-tool-web",
  "agent-mesh-protocol 0.7.1",
@@ -4096,7 +4097,6 @@ dependencies = [
  "httparse",
  "ignore",
  "libc",
- "newt-fdguard",
  "newt-harness",
  "newt-interaction",
  "newt-policy",
@@ -4124,13 +4124,6 @@ dependencies = [
  "unicode-width 0.2.2",
  "uuid",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "newt-fdguard"
-version = "0.8.6"
-dependencies = [
- "libc",
 ]
 
 [[package]]

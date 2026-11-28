@@ -17,7 +17,7 @@ on:
       - "newt-core/**"
       - "newt-policy/**"
       - "newt-router/**"
-      - "newt-fdguard/**"
+      - "vendor/agent-bridle-fdguard/**"
       - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
   push:
@@ -27,7 +27,7 @@ on:
       - "newt-core/**"
       - "newt-policy/**"
       - "newt-router/**"
-      - "newt-fdguard/**"
+      - "vendor/agent-bridle-fdguard/**"
       - "newt-mesh/**"
       - ".github/workflows/newt-web.yml"
   workflow_dispatch:

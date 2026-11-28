@@ -81,9 +81,10 @@
 #     under the macOS kernel sandbox), the macOS Seatbelt adversarial suite
 #     (newt-core --features macos-seatbelt --test macos_seatbelt_adversarial), and
 #     #2730's host-scoped build ground (--test build_network_macos).
-#   - newt-fdguard's real-resource tests, mcp-import-real.yml (weekly + release,
-#     Linux/macOS, #3160): the copied agent-bridle-fdguard suite, #[ignore]d in
-#     the unit tier, and bridle_differential.rs's grounds, --ignored --test-threads=1.
+#   - shared fdguard real-resource tests, mcp-import-real.yml (weekly + release,
+#     Linux/macOS): the vendored suite and bridle_differential.rs's independent
+#     controls, --include-ignored --test-threads=1. The hermetic differential
+#     contract runs in ci.yml via the vendored manifest on every PR.
 #   - newt-mcp-client's confine-off stdio grounds, mcp-import-real.yml (weekly + release,
 #     Linux/macOS, #3160): `env_isolation_tests::` under --no-default-features with
 #     --ignored --test-threads=1: the advisory spawn scrubs the environment

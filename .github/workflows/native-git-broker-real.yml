@@ -43,7 +43,6 @@ on:
       - "newt-core/**"
       - "newt-policy/**"
       - "agent-toolchain/**"
-      - "newt-fdguard/**"
       - "vendor/agent-bridle*/**"
       - "Cargo.lock"
       - ".github/workflows/native-git-broker-real.yml"

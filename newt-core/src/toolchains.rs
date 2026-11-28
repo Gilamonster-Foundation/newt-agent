@@ -416,7 +416,7 @@ fn admit_root(
         ensure!(!home.starts_with(path), "whole home toolchain refused");
     }
     trusted_path(path, ctx)?;
-    let held = newt_fdguard::GrantedRoot::acquire(path)?;
+    let held = agent_bridle_fdguard::GrantedRoot::acquire(path)?;
     ensure!(
         std::fs::symlink_metadata(path.join("bin"))?.is_dir(),
         "toolchain bin/ must be a directory"

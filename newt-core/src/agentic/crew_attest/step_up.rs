@@ -2,7 +2,7 @@
 //! selector rules where the longest match wins.
 //!
 //! Copied from agent-bridle-core 0.8.0-rc.7 (`vendor/agent-bridle-core/src/step_up.rs`) so the
-//! crew decision needs no bridle crate (#3160, the `confine` feature). The items and both tests
+//! crew decision needs no confinement backend (#3160, the `confine` feature). The items and both tests
 //! in `tests` are bridle's lines; the only edits are three doc links to items left behind, now
 //! plain code spans. Left in bridle because nothing here calls them: the discharge, challenge,
 //! attestation and verifier types; `CallRequest::unspecified` and `content_id` (with `ContentId`

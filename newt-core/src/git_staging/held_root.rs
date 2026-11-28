@@ -1,6 +1,6 @@
 //! Object-bound read grants. File grants retain only the file descriptor;
 //! acquiring its parent for a no-follow open never grants the parent tree.
-use newt_fdguard::{GrantedRoot, RootIdentity};
+use agent_bridle_fdguard::{GrantedRoot, RootIdentity};
 use std::fs::File;
 use std::io;
 #[cfg(feature = "confine")]

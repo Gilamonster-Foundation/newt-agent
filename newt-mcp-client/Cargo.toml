@@ -33,7 +33,7 @@ reqwest.workspace = true
 # loopback egress proxy for HTTP ones, both behind `confine` (#3160): `spawn-tokio` = the
 # tokio-native confined spawn; `os-sandbox` = the real OS sandbox backends
 # (Landlock/Seatbelt/AppContainer) so the leash actually kernel-enforces regardless of
-# build scope, not just advisory. Without `confine` this crate names no bridle crate:
+# build scope, not just advisory. Without `confine` this crate names no agent-bridle facade:
 # stdio servers spawn advisory and HTTP uses the DNS-pinned client alone.
 # One line, `version` first: scripts/build_agent_stack.py and
 # scripts/relax_agent_stack_versions.py rewrite the version by regex.
@@ -44,7 +44,7 @@ async-trait = { workspace = true, optional = true }
 # The advisory stdio spawn closes the descriptors the parent left inheritable, as the
 # confined spawn does (#3160). newt-core depends on it already: no new package.
 [target.'cfg(unix)'.dependencies]
-newt-fdguard.workspace = true
+agent-bridle-fdguard.workspace = true
 
 [features]
 default = ["confine"]

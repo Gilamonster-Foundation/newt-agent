@@ -1,5 +1,5 @@
 //! #3160: `step_up` is a copy of the part of agent-bridle-core's step-up module that the crew
-//! `attest` decision reads, so that decision needs no bridle crate. While bridle is a dependency
+//! `attest` decision reads, so that decision needs no confinement backend. While bridle is a dependency
 //! the two must agree on what the decision and a policy file rest on: the presence ladder (its
 //! order, Debug text and wire form), how a requirement is built and judged, which rule a policy
 //! picks for a request, and the JSON a policy crosses in. The crew policy and `crew_authz` are

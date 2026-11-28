@@ -307,6 +307,19 @@ jobs:
         # HOOK PARITY: native Git/kernel-fence proof, CI-only in .githooks/pre-push.
         # Injects a regular system-gitconfig fixture even when /etc/gitconfig is absent.
         run: cargo test -p newt-core --test native_git_broker_pipeline -- --file-read-root
+      - name: test (shared fdguard contract)
+        run: |
+          cargo test --manifest-path vendor/agent-bridle-fdguard/Cargo.toml --test bridle_differential
+          for test in \
+            relative_root_is_refused \
+            the_sweep_bound_covers_both_the_allocation_limit_and_the_open_table \
+            the_old_clamped_bound_swept_below_a_live_descriptor_where_this_one_refuses \
+            an_unknowable_descriptor_universe_refuses_instead_of_guessing \
+            a_required_range_wider_than_the_cap_refuses_instead_of_clamping \
+            every_refusal_reason_has_a_distinct_errno; do
+            bash .github/scripts/cargo-test-nonempty.sh --require-test "$test" \
+              --manifest-path vendor/agent-bridle-fdguard/Cargo.toml --lib "$test" --
+          done
       - name: held file grant keeps inode authority (Landlock)
         # HOOK PARITY: explicit real-kernel vendor proof, CI-only in .githooks/pre-push.
         run: cargo test --manifest-path vendor/agent-bridle-core/Cargo.toml --target-dir target/vendor-core --features linux-landlock --lib held_regular_file_root
@@ -460,7 +473,7 @@ jobs:
       #
       # #3160: `confine`, newt-mcp-server's confinement layer, is that crate's one default
       # feature, so `--no-default-features` turns it off. The crate then names no
-      # agent-bridle crate, and the server lists and dispatches neither `shell_run` nor
+      # agent-bridle facade, and the server lists and dispatches neither `shell_run` nor
       # `web_fetch`. `-p newt-mcp-server` ALONE, one invocation per step: features are
       # additive, so a second package that depends on the crate with its defaults turns
       # `confine` back on. newt-mcp-client and newt-core still come in with their default
@@ -508,7 +521,7 @@ jobs:
       #
       # #3160: `confine`, newt-mcp-client's confinement layer, is that crate's one default
       # feature, so `--no-default-features` turns it off. The crate then names no
-      # agent-bridle crate: stdio servers spawn advisory and HTTP uses the DNS-pinned
+      # agent-bridle facade: stdio servers spawn advisory and HTTP uses the DNS-pinned
       # client alone. `-p newt-mcp-client` ALONE, one invocation per step: features are
       # additive, so a second package that depends on the crate with its defaults turns
       # `confine` back on and the step passes on a build that is not confine-off.

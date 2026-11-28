@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// Supply a portable `which` to a POSIX interpreter without an external utility: the
 /// shell's own `command -v`, including its current `PATH`. Apply only at a POSIX
 /// interpreter boundary, after inspecting the user command. Copied from agent-bridle's
-/// tool-shell so the host route needs no bridle crate (#3160, the `confine` feature);
+/// tool-shell so the host route needs no confinement backend (#3160, the `confine` feature);
 /// `the_which_shim_is_the_one_bridle_supplies` keeps the two equal.
 pub(crate) fn with_posix_command_discovery(command: &str) -> String {
     format!("which() {{ command -v -- \"$@\"; }}\n{command}")
@@ -177,7 +177,7 @@ pub fn strip_interactive_noise(stderr: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// #3160: the shim is bridle's own, copied so the host route needs no bridle crate;
+    /// #3160: the shim is bridle's own, copied so the host route needs no confinement backend;
     /// while bridle is a dependency the two must agree, byte for byte.
     #[cfg(feature = "confine")]
     #[test]

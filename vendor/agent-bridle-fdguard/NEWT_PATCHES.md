@@ -218,3 +218,13 @@ the relay's status decision and the `clone_args` layout; the real-resource
 probe `--build-pid-probe` in `newt-core/tests/brush_build_pipeline.rs` grounds
 them on both spawn funnels, with fault injection at the PID unshare and at
 init's hardening.
+
+## Shared leaf and retained tests
+
+Newt core and MCP now use this crate directly, including without their `confine`
+feature; the separate unpublished copy is removed. The former differential
+suite lives in `tests/bridle_differential.rs`: literal errno/identity assertions,
+independent filesystem observations, and a guarded-versus-unguarded child probe.
+The upstream hostile-descriptor suite is retained here without a second copy.
+Linux `build_isolation` remains unchanged: its dependency versions are already
+in Newt's confine-off closure, so feature-gating it would remove no packages.

@@ -10,7 +10,7 @@ fn private_commit_head_publication_is_cas_and_descriptor_bound() {
     let old = "1".repeat(40);
     let new = "2".repeat(40);
     std::fs::write(admin.join("HEAD"), format!("{old}\n")).unwrap();
-    let held = newt_fdguard::GrantedRoot::acquire(&admin).unwrap();
+    let held = agent_bridle_fdguard::GrantedRoot::acquire(&admin).unwrap();
     publish_detached_head(&held, &old, &new, "verified first\n").unwrap();
     assert!(publish_detached_head(&held, &old, &old, "must not append\n").is_err());
     assert_eq!(
@@ -55,7 +55,7 @@ fn private_commit_reflog_refuses_escape_before_publishing_head() {
     let old = "1".repeat(40);
     let new = "2".repeat(40);
     std::fs::write(admin.join("HEAD"), &old).unwrap();
-    let held = newt_fdguard::GrantedRoot::acquire(&admin).unwrap();
+    let held = agent_bridle_fdguard::GrantedRoot::acquire(&admin).unwrap();
     let error = publish_detached_head(&held, &old, &new, "verified entry\n").unwrap_err();
     assert!(
         error.contains("cannot append worktree HEAD reflog"),
@@ -80,7 +80,7 @@ fn private_commit_reflog_refuses_fifo_without_blocking() {
     let old = "1".repeat(40);
     let new = "2".repeat(40);
     std::fs::write(admin.join("HEAD"), &old).unwrap();
-    let held = newt_fdguard::GrantedRoot::acquire(&admin).unwrap();
+    let held = agent_bridle_fdguard::GrantedRoot::acquire(&admin).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
         let result = publish_detached_head(&held, &"1".repeat(40), &new, "verified entry\n");
@@ -122,7 +122,8 @@ fn private_commit_reflog_accepts_regular_file_but_never_writes_fifo() {
     let log = temp.path().join("logs/HEAD");
     let old = "1".repeat(40);
     let new = "2".repeat(40);
-    let held = newt_fdguard::GrantedRoot::acquire(&temp.path().canonicalize().unwrap()).unwrap();
+    let held =
+        agent_bridle_fdguard::GrantedRoot::acquire(&temp.path().canonicalize().unwrap()).unwrap();
     std::fs::write(temp.path().join("HEAD"), &old).unwrap();
     std::fs::write(&log, "existing\n").unwrap();
     publish_detached_head(&held, &old, &new, "verified entry\n").unwrap();

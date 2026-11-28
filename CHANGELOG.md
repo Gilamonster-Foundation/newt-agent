@@ -12,13 +12,14 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 ### Changed
 
 - `newt-core`'s three agent-bridle dependencies are optional behind its default-on
-  `confine` feature (#3160). Core's selected normal/build closure contains no bridle
-  crate with the feature off. External `default-features = false` consumers must
+  `confine` feature (#3160). Without it, core's selected normal/build closure contains
+  no agent-bridle-core, agent-bridle-tool-shell or agent-bridle facade; small leaf
+  crates may be shared. External `default-features = false` consumers must
   enable `confine` explicitly to retain the backend. Repository consumers still
   take core defaults; this does not make a bridle-free `newt` binary.
 
 - `newt-mcp-client` has a `confine` feature, on by default (#3160). Without it the crate names
-  no agent-bridle crate: stdio servers are spawned advisory (environment scrubbed, inherited
+  no direct agent-bridle facade dependency: stdio servers are spawned advisory (environment scrubbed, inherited
   descriptors denied on Unix, no OS sandbox, `SandboxKind::None`, refused for a
   workspace-protected session) and HTTP uses the DNS-pinned client alone, so no loopback
   egress proxy is started. A default build behaves as before; only the wording of the
@@ -43,7 +44,7 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   with no alias (#3160). Convert a launcher's policy with `SandboxRoots::from(&policy)`.
 - The policy layer is its own crate, `newt-policy` (#3160). `newt_core::{caveats, danger, fs_aliases, netguard, paths, permission_challenge, permissions, posture}` are gone, with no re-export, and so are the crate-root names taken from `caveats` and `permissions` (`PermissionGate`, `DenialKind`, `CaveatsExt`, `permits_path` and the rest); import them from `newt_policy`, which supersedes the `newt_core::permissions` and `newt_core::caveats` paths named in the entries below. `CaveatProfile`, `ScopeSpec`, `ScopeKeyword` and `NamedPermissionPreset` moved from `newt_core::role_profile` to `newt_policy::preset`, and `ModeConfig` from `newt_core::config` to `newt_policy::posture`. `posture::build_posture` takes the `[modes]` and `[permission_presets]` tables instead of `&Config`, and its skill loader may return any `Display` error. `git_caveats` and `redact` stay in `newt-core`.
 - The tier router is its own crate, `newt-router`. `newt_core::router` (with `router::Classification`), `newt_core::Router` and `newt_core::Tier` are gone, with no re-export; import them from `newt_router` (#2234).
-- The descriptor guard is its own crate, `newt-fdguard` (#3160): a copy of agent-bridle-fdguard 0.8.0-rc.7 that newt owns. newt-core no longer depends on agent-bridle-fdguard directly, and `newt_core::fs_cap::WorkspaceDir::from_granted_root` now takes a `newt_fdguard::GrantedRoot`. Nothing else it exposes changes.
+- The descriptor guard shares `agent-bridle-fdguard` 0.8.0-rc.7 through the existing vendor patch. The unpublished local copy is removed; `newt_core::fs_cap::WorkspaceDir::from_granted_root` takes `agent_bridle_fdguard::GrantedRoot`. Without `confine`, no agent-bridle-core, agent-bridle-tool-shell or agent-bridle facade is allowed; small leaf crates may be shared (owner decision 2026-11-27).
 - The confined steps of the staging broker are a child module, `newt_core::git_staging::confined`
   (#3160): `newt_core::git_staging::{confined_fetch, confined_git, run_confined_git}` are gone,
   with no re-export; use `newt_core::git_staging::confined::` instead. They behave as before.

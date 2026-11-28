@@ -385,9 +385,9 @@ pub struct BoundGitIdentity {
     /// (#2686 review round 5, P2: "gate the native implementation to
     /// Linux/macOS, where fs_cap exists").
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    common_root: newt_fdguard::GrantedRoot,
+    common_root: agent_bridle_fdguard::GrantedRoot,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    git_root: newt_fdguard::GrantedRoot,
+    git_root: agent_bridle_fdguard::GrantedRoot,
     /// The SAME two directory OBJECTS as `common_root`/`git_root` — never a
     /// second, independent open of the intended pathname (#2686 review
     /// round 5, P1: a round-4 draft opened these via
@@ -422,7 +422,7 @@ impl BoundGitIdentity {
 
     /// [`Self::bind`] plus a test-only seam: `between_acquire_and_derive`
     /// fires, for each of the two directories, right after
-    /// [`newt_fdguard::GrantedRoot::acquire`] has resolved the
+    /// [`agent_bridle_fdguard::GrantedRoot::acquire`] has resolved the
     /// pathname and right before [`crate::fs_cap::WorkspaceDir::from_granted_root`]
     /// derives the write handle from that SAME held fd — proving there is no
     /// surviving window in which the two could end up bound to different
@@ -436,13 +436,13 @@ impl BoundGitIdentity {
         git_dir: PathBuf,
         between_acquire_and_derive: &dyn Fn(),
     ) -> Result<Self, String> {
-        let common_root = newt_fdguard::GrantedRoot::acquire(&common_dir).map_err(|e| {
+        let common_root = agent_bridle_fdguard::GrantedRoot::acquire(&common_dir).map_err(|e| {
             format!(
                 "refused: cannot bind the common git dir '{}' ({e})",
                 common_dir.display()
             )
         })?;
-        let git_root = newt_fdguard::GrantedRoot::acquire(&git_dir).map_err(|e| {
+        let git_root = agent_bridle_fdguard::GrantedRoot::acquire(&git_dir).map_err(|e| {
             format!(
                 "refused: cannot bind the worktree admin dir '{}' ({e})",
                 git_dir.display()
@@ -775,7 +775,7 @@ fn write_lockfile_natively(
 #[cfg(feature = "confine")]
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn publish_detached_head(
-    admin: &newt_fdguard::GrantedRoot,
+    admin: &agent_bridle_fdguard::GrantedRoot,
     old: &str,
     new: &str,
     verified_reflog_entry: &str,

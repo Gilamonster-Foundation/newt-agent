@@ -41,6 +41,10 @@ name = "agent_bridle_fdguard"
 path = "src/lib.rs"
 
 [[test]]
+name = "bridle_differential"
+path = "tests/bridle_differential.rs"
+
+[[test]]
 name = "hostile_fds"
 path = "tests/hostile_fds.rs"
 

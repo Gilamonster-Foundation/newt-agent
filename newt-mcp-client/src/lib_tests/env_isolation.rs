@@ -134,10 +134,10 @@ async fn stdio_timezone_preserves_parent_and_server_override() {
 /// close-on-exec cleared is inherited across exec by a plain spawn, and an inherited descriptor
 /// is a capability the child was never granted (agent-bridle#319). The confined spawn closes it;
 /// without `confine` there is no bridle to do that, so the advisory spawn calls
-/// `newt_fdguard::deny_inherited_fds`, and this test fails when that call is missing.
+/// `agent_bridle_fdguard::deny_inherited_fds`, and this test fails when that call is missing.
 ///
 /// The oracle is the child's own descriptor table, listed by `ls`, never a shell redirection:
-/// a shell answers `>&N` from descriptors of its own (newt-fdguard's `tests/hostile_fds.rs`
+/// a shell answers `>&N` from descriptors of its own (agent-bridle-fdguard's `tests/hostile_fds.rs`
 /// says why). The descriptor sits above everything this process holds, so the child opens no
 /// descriptor with its number. Needs a kernel with `close_range` (Linux 5.11), as the confined
 /// spawn does.

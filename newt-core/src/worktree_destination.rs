@@ -6,7 +6,7 @@
 //! refuses other owners, nonempty directories and modes other than 0700.
 //! Explicit failure cleanup removes only our still-empty, identity-checked leaf
 //! through the held parent. Drop retains it: cancellation is not proof of failure.
-use newt_fdguard::GrantedRoot;
+use agent_bridle_fdguard::GrantedRoot;
 use rustix::fs::{fstat, mkdirat, openat, Mode, OFlags};
 use std::path::{Path, PathBuf};
 

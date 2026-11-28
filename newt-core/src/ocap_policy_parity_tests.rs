@@ -1,5 +1,5 @@
 //! #3160: `ocap_policy` is a copy of agent-bridle-core's durable-policy contract, so newt-core
-//! needs no bridle crate to load and evaluate it. While bridle is a dependency the two must
+//! needs no confinement backend to load and evaluate it. While bridle is a dependency the two must
 //! agree on everything a store writes or reads: the parse and its refusals, the serialized form,
 //! the signing payload (a signature minted by one must verify under the other), which entries
 //! survive verification and why the rest are dropped, and the precedence law.
