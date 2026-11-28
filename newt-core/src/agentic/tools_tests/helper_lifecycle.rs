@@ -659,6 +659,10 @@ fn lifecycle_build_authority_is_explicit_and_does_not_widen_shell_grants() {
     if cfg!(target_os = "linux") {
         assert!(request.reason.contains("private loopback"));
         assert!(request.reason.contains("64 private terminal pairs"));
+        assert!(request.reason.contains("private process IDs"));
+        assert!(request
+            .reason
+            .contains("host process IDs remain visible and signalable"));
         assert!(request
             .reason
             .contains("deny-all fallback, including loopback"));

@@ -260,3 +260,7 @@ in Newt's confine-off closure, so feature-gating it would remove no packages.
 ## Private PID startup report and teardown (#3321)
 
 The opt-in PID topology acquires both child pidfds atomically with CLONE_PIDFD. A harness-created SOCK_SEQPACKET pair enables SO_PASSCRED before spawn. Init and payload close its sender as their first post-clone syscall. The relay sends one fixed record and two SCM_RIGHTS handles with a stack-only raw sendmsg before harden installs either fence, then closes the sender before closing std's exec-status pipe. No payload exec gate or post-spawn PID lookup is used. Setup fallback remains fresh-child and unchanged when the switch is off.
+
+## Argv PID isolation diagnostics (#3321)
+
+PID-enabled private builds disclose private process IDs; their deny-all fallback explicitly discloses that host process IDs remain visible and signalable. Switch-off messages are unchanged. The argv policy now selects this existing mechanism; Brush remains opt-in until its authentication changes. Neither message claims private procfs, which is a later stage.

@@ -1,9 +1,10 @@
 # Private PID namespace for confined builds: design and staged plan (#3321)
 
 **Status.** Staged. Section 8 lists nine pull requests; PR 1 (the topology,
-behind the opt-in `SandboxPolicy::private_pid_namespace`) has landed. No
-production route sets the switch, so confined builds behave as before until
-PR 3 (argv route) and PR 9 (Brush route). The owner took every decision in
+behind the opt-in `SandboxPolicy::private_pid_namespace`) has landed. PR 2
+builds the authenticated startup/teardown protocol; as built in PR 3, Linux
+private argv builds set the switch. The Brush production route stays off
+until PR 9. The owner took every decision in
 section 5 as recommended. Line references are to the tree the design was
 written against and drift as the stages land.
 
@@ -265,6 +266,7 @@ Rules, then each check.
 - **Disclosure.**
   - Trusted record: `ConfinedChild::build_isolation` / `SandboxedWorkerChild::build_isolation`. The harness should print the mode from this, not rediscover it from child stderr, which a payload can imitate on the argv route today.
   - Child-written line (kept; the existing tests match on substrings that stay): `PRIVATE` gains "private process IDs and /proc (this build's processes only)"; `FALLBACK` gains "host process IDs remain visible and signalable".
+  - As built in PR 3, the argv mode line and permission prompt name private process IDs only. Private procfs is not implemented until PR 8. PID-enabled fallback explicitly names host process IDs as visible and signalable; switch-off messages stay unchanged.
   - Permission prompt: `build_isolation_description` (`newt-core/src/agentic/tools.rs:1385`) gains the same clause.
   - Enforcement report: `ChildNetworkPolicy::PrivateBuild` stays the mechanism tag (D5). The effective mode is execution evidence, as it is for the tmpfs, devpts and account-file mechanisms.
 - **Nested builds** are unchanged: an inner hook under an outer Landlock domain fails at its first `mount` (before the new PID step) and takes the deny-all retry, exactly as today.
@@ -378,7 +380,7 @@ Each PR updates the relevant `NEWT_PATCHES.md` and, where behaviour changes, `do
 - Real-resource: a setsid double-forked descendant is dead when the call returns, on timeout, cancellation and drop, on the argv funnel; payload exit code 7 and death by SIGSEGV and SIGKILL are observed unchanged; an orphaned zombie is reaped by init.
 - Acceptance: unchanged eight.
 
-**PR 3. Enable on the argv route (about 120 lines; D6).**
+**PR 3. Enable on the argv route (about 120 lines; D6) — As built.**
 - Change: `ExecRequest::sandbox_policy` (`newt-core/src/confined_exec.rs:279`) sets the switch for private builds; `PRIVATE` text variant; `build_isolation_description`.
 - Red-first: the pure policy test in `confined_exec/sandbox_policy.rs` gains the switch expectation.
 - Real-resource: `--build-pid-probe` through `ConstrainedExecutor::run(build_tool_request(...))` in required and forced-fallback modes; every existing argv probe (loopback, scratch, PTY, identity) still passes in required mode.

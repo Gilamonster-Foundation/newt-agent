@@ -95,6 +95,7 @@ mod tests {
                 DenyDirect,
                 "ordinary shell/git requests"
             );
+            assert!(!request.sandbox_policy().private_pid_namespace);
             request.private_build_isolation = true;
             assert_eq!(
                 request.sandbox_policy().child_network,
@@ -105,12 +106,17 @@ mod tests {
                 }
             );
             assert_eq!(
-                request
-                    .net_grant(NetGrant::Unrestricted)
-                    .sandbox_policy()
-                    .child_network,
-                DenyDirect
+                request.sandbox_policy().private_pid_namespace,
+                network != Scope::All,
+                "only private argv builds enable PID isolation"
             );
+            assert!(
+                !build_sandbox_policy(&request.caveats.net).private_pid_namespace,
+                "the shared Brush policy stays off"
+            );
+            let request = request.net_grant(NetGrant::Unrestricted);
+            assert!(!request.sandbox_policy().private_pid_namespace);
+            assert_eq!(request.sandbox_policy().child_network, DenyDirect);
         }
         assert_eq!(runtime_sandbox_policy().child_network, DenyDirect);
     }
