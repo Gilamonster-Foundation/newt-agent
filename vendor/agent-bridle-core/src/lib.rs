@@ -107,6 +107,8 @@ pub use sandbox::{
 pub use sandbox::{landlock_is_supported, landlock_net_is_supported, LandlockSandbox};
 #[cfg(all(target_os = "macos", feature = "macos-seatbelt"))]
 pub use sandbox::{seatbelt_is_supported, SeatbeltSandbox};
+#[cfg(target_os = "linux")]
+pub use spawn::{BuildNamespace, BUILD_TEARDOWN_BOUND};
 pub use spawn::{
     confinement_unenforceable, decode_trusted_worker_frame_header, decode_trusted_worker_hello,
     decode_trusted_worker_request, encode_trusted_worker_frame_header, encode_trusted_worker_hello,

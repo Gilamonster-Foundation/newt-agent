@@ -65,6 +65,87 @@ fn main() {
         return;
     }
     #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--build-pid-orphan") {
+        if unsafe { libc::getppid() } != 0 {
+            println!("BUILD_ORPHAN_FALLBACK");
+            return;
+        }
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        // Single-threaded probe. The intermediate deliberately leaves an
+        // observed zombie for PID 1; its post-fork path is raw syscalls only.
+        let middle = unsafe { libc::fork() };
+        assert!(middle >= 0);
+        if middle == 0 {
+            unsafe {
+                let orphan = libc::fork();
+                if orphan == 0 {
+                    libc::_exit(0);
+                }
+                if orphan < 0 {
+                    libc::_exit(90);
+                }
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                if libc::waitid(
+                    libc::P_PID,
+                    orphan as u32,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                ) != 0
+                {
+                    libc::_exit(91);
+                }
+                libc::write(writer.as_raw_fd(), (&orphan as *const i32).cast(), 4);
+                libc::_exit(0);
+            }
+        }
+        drop(writer);
+        let mut bytes = [0u8; 4];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(
+            unsafe { libc::waitpid(middle, std::ptr::null_mut(), 0) },
+            middle
+        );
+        let orphan = i32::from_ne_bytes(bytes);
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { libc::kill(orphan, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < bound,
+                "PID 1 did not reap the adopted zombie"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        println!("BUILD_ORPHAN_ZOMBIE_REAPED");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(code) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--build-pid-exit=").map(str::to_owned))
+    {
+        let code: i32 = code.parse().unwrap();
+        if code < 0 {
+            // No core artifacts; the relay must preserve the kernel signal status.
+            unsafe {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::setrlimit(libc::RLIMIT_CORE, &limit);
+                // Rust installs a SIGSEGV handler; measure the default fatal
+                // disposition, not that runtime handler's return path.
+                libc::signal(-code, libc::SIG_DFL);
+                libc::kill(libc::getpid(), -code);
+                libc::_exit(99);
+            }
+        }
+        std::process::exit(code);
+    }
+    #[cfg(target_os = "linux")]
     if let Some(probe) =
         std::env::args().find_map(|arg| arg.strip_prefix("--build-pid-probe=").map(str::to_owned))
     {
@@ -73,6 +154,24 @@ fn main() {
             None => (probe.as_str(), false),
         };
         let harness: libc::pid_t = harness.parse().unwrap();
+        for fd in 3..1024 {
+            let mut kind = 0i32;
+            let mut size = std::mem::size_of_val(&kind) as libc::socklen_t;
+            let socket = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut kind as *mut i32).cast(),
+                    &mut size,
+                )
+            };
+            assert!(
+                socket != 0 || kind != libc::SOCK_SEQPACKET,
+                "payload retained a report endpoint"
+            );
+        }
+
         // SAFETY: these calls have no preconditions; signal 0 delivers nothing.
         let (pid, parent, group, signal) = unsafe {
             (
@@ -105,6 +204,11 @@ fn main() {
             // SAFETY: single-threaded here; the child only reads and exits.
             if parent == 0 && unsafe { libc::fork() } == 0 {
                 assert_eq!(unsafe { libc::setsid() }, unsafe { libc::getpid() });
+                if unsafe { libc::fork() } != 0 {
+                    unsafe {
+                        libc::_exit(0);
+                    }
+                }
                 println!("BUILD_PIDNS_DESCENDANT_DETACHED");
             }
             std::io::stdout().flush().unwrap();
@@ -2117,6 +2221,8 @@ mod native {
     /// Grounds fdguard's mocked relay decision and `clone_args` layout, and
     /// core's mocked fallback-flag mode, in real processes on both spawn funnels
     /// with the staging switch on (`docs/design/private-pid-namespace.md`).
+    /// Grounds the injected creator-report predicates and bounded teardown:
+    /// live/reaped handles, exact status, adopted zombies and detached children.
     /// The payload is PID 2 with no visible parent and leads its own group;
     /// the harness is not nameable; `spawn` returns while the payload is still
     /// blocked on a pipe this test holds; killing only the spawned child ends
@@ -2192,7 +2298,51 @@ mod native {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
         let isolation = expect(confined.build_isolation, &stdout, &stderr);
+        assert_eq!(
+            confined.build_namespace.is_some(),
+            isolation == BuildIsolation::Private,
+            "a private PID build must return its teardown handles"
+        );
         eprintln!("{name} (argv): {isolation:?}: {}", stdout.trim());
+        for code in [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, -libc::SIGSEGV, -libc::SIGKILL] {
+            let mut completed = command(&[format!("--build-pid-exit={code}")])
+                .spawn(&cx)
+                .unwrap();
+            assert_eq!(completed.build_isolation, Some(isolation));
+            assert_eq!(
+                completed.build_namespace.is_some(),
+                isolation == BuildIsolation::Private
+            );
+            let status = completed.child.wait().unwrap();
+            if code >= 0 {
+                assert_eq!(status.code(), Some(code));
+            } else {
+                assert_eq!(
+                    std::os::unix::process::ExitStatusExt::signal(&status),
+                    Some(-code)
+                );
+            }
+            if let Some(namespace) = &completed.build_namespace {
+                namespace.wait_gone(Duration::ZERO).unwrap();
+            }
+        }
+        eprintln!("{name} (argv): 10 fast exits preserve 7; SIGSEGV and SIGKILL preserved");
+        let orphan = command(&["--build-pid-orphan".to_owned()])
+            .spawn(&cx)
+            .unwrap();
+        let output = orphan.child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker = if isolation == BuildIsolation::Private {
+            "BUILD_ORPHAN_ZOMBIE_REAPED"
+        } else {
+            "BUILD_ORPHAN_FALLBACK"
+        };
+        assert!(String::from_utf8_lossy(&output.stdout).contains(marker));
+        eprintln!("{name} (argv): {marker}");
 
         // The private mechanisms installed before the PID step still hold
         // for a payload that is PID 2.
@@ -2248,12 +2398,23 @@ mod native {
         // Signal only the spawned child. In a namespace that is the relay; the
         // payload and its detached descendant hold stdout and are still
         // blocked, so end-of-file can only come from the namespace ending.
+        let deadline = std::time::Instant::now() + Duration::from_millis(20);
+        while std::time::Instant::now() < deadline {
+            assert!(confined.child.try_wait().unwrap().is_none());
+            std::thread::yield_now();
+        }
         confined.child.kill().unwrap();
         let status = confined.child.wait().unwrap();
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),
             Some(libc::SIGKILL)
         );
+        if let Some(namespace) = &confined.build_namespace {
+            namespace
+                .wait_gone(agent_bridle::BUILD_TEARDOWN_BOUND)
+                .unwrap();
+            rustix::fs::fcntl_setfl(stdout.get_ref(), rustix::fs::OFlags::NONBLOCK).unwrap();
+        }
         stdout.read_to_string(&mut reported).unwrap();
         let mut stderr = String::new();
         confined
@@ -2269,7 +2430,40 @@ mod native {
             "{reported}"
         );
         drop(held_open);
-        eprintln!("{name} (argv): killing the spawned child ended every member");
+        eprintln!(
+            "{name} (argv): timeout killed the spawned child and ended every member before return"
+        );
+
+        for action in ["cancellation", "drop"] {
+            if isolation != BuildIsolation::Private {
+                break;
+            }
+            let (gate, held_open) = std::io::pipe().unwrap();
+            let mut dropped = command(&[format!("{probe}:hold")])
+                .stdin(std::process::Stdio::from(gate))
+                .spawn(&cx)
+                .unwrap();
+            let mut stdout = std::io::BufReader::new(dropped.child.stdout.take().unwrap());
+            let mut ready = String::new();
+            for _ in 0..2 {
+                stdout.read_line(&mut ready).unwrap();
+            }
+            if action == "cancellation" {
+                dropped
+                    .build_namespace
+                    .as_ref()
+                    .unwrap()
+                    .terminate(agent_bridle::BUILD_TEARDOWN_BOUND)
+                    .unwrap();
+            } else {
+                drop(dropped.build_namespace.take());
+            }
+            rustix::fs::fcntl_setfl(stdout.get_ref(), rustix::fs::OFlags::NONBLOCK).unwrap();
+            stdout.read_to_string(&mut ready).unwrap();
+            dropped.child.wait().unwrap();
+            drop(held_open);
+            eprintln!("{name} (argv): {action} ended detached descendants before return");
+        }
 
         // Brush launch, same funnel. First: the bootstrap.
         let mut worker = SandboxedWorker::brush()

@@ -41,6 +41,11 @@ use crate::{
     ConfinementMechanism, EnforcementFloor, RuntimeClosure, SandboxKind, SandboxPolicy, Scope,
     ToolContext, ToolError, ToolResult,
 };
+#[cfg(target_os = "linux")]
+mod build_namespace;
+#[cfg(target_os = "linux")]
+pub use build_namespace::{BuildNamespace, BUILD_TEARDOWN_BOUND};
+
 mod worker_image;
 use worker_image::WorkerImage;
 
@@ -102,6 +107,9 @@ pub struct ConfinedChild {
     /// The effective build isolation; `None` unless the child was spawned
     /// under `ChildNetworkPolicy::PrivateBuild` on Linux.
     pub build_isolation: Option<BuildIsolation>,
+    /// Owned private PID namespace handles, absent on fallback.
+    #[cfg(target_os = "linux")]
+    pub build_namespace: Option<BuildNamespace>,
 }
 
 /// A confined child together with **every** fence whose lifetime brackets it.
@@ -127,6 +135,9 @@ pub struct ManagedSpawn {
     /// engaged one. The receiver owns it and **must** finalize it with
     /// [`crate::ProxyHandle::shutdown_and_join`] before publishing a terminal.
     pub proxy: Option<crate::net_proxy::ProxyHandle>,
+    /// Owned build namespace; retain it until execution is quiescent.
+    #[cfg(target_os = "linux")]
+    pub build_namespace: Option<BuildNamespace>,
 }
 
 /// A fixed internal worker together with its take-once parent control channel.
@@ -144,6 +155,9 @@ pub struct SandboxedWorkerChild {
     pub sandbox_kind: SandboxKind,
     /// The worker's effective build isolation, as on [`ConfinedChild`].
     pub build_isolation: Option<BuildIsolation>,
+    /// Owned private PID namespace handles, absent on fallback.
+    #[cfg(target_os = "linux")]
+    pub build_namespace: Option<BuildNamespace>,
     control: Option<TrustedWorkerControl>,
 }
 
@@ -1051,7 +1065,7 @@ impl ConfinedCommand {
         } = self;
 
         let apply_admitted = admitted.clone();
-        let spawned = std::thread::spawn(move || -> ToolResult<(Child, Option<BuildIsolation>)> {
+        let spawned = std::thread::spawn(move || -> ToolResult<ConfinedChild> {
             // Prepare the exact Command operand first. NamedRoot currently
             // supports only Landlock (no wrapper), so the actual program operand
             // is the root; unsupported wrappers refuse rather than guessing at
@@ -1140,7 +1154,8 @@ impl ConfinedCommand {
             after_apply();
             let spawned = cmd.spawn();
             #[cfg(target_os = "linux")]
-            if let Some(fallback) = isolation_fallback {
+            if let Some(prepared) = isolation_fallback {
+                let fallback = prepared.fallback;
                 // The first child failed in namespace setup BEFORE exec.
                 // Retry only that failure, once, with both deny-all floors.
                 let retry = matches!(&spawned, Err(error) if error.raw_os_error()
@@ -1151,27 +1166,30 @@ impl ConfinedCommand {
                 } else {
                     spawned
                 };
-                return Ok((child?, Some(BuildIsolation::from_fallback(
-                    fallback.load(std::sync::atomic::Ordering::Relaxed),
-                ))));
+                let mut child = child?;
+                drop(cmd); // Close the harness's captured sender before requiring EOF.
+                let build_isolation = BuildIsolation::from_fallback(fallback.load(std::sync::atomic::Ordering::Relaxed));
+                let build_namespace = if build_isolation == BuildIsolation::Private {
+                    match prepared.report.map(|report| BuildNamespace::receive(report, child.id())).transpose() {
+                        Ok(namespace) => namespace,
+                        Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error.into()); }
+                    }
+                } else { None };
+                return Ok(ConfinedChild { child, build_isolation: Some(build_isolation), build_namespace,
+                    sandbox_kind: reported_kind, fence_id: apply_admitted.fence_id().clone(),
+                    admitted: apply_admitted.admitted_body().cloned() });
             }
             #[cfg(not(target_os = "linux"))]
             let _ = isolation_fallback;
-            Ok((spawned?, None))
+            Ok(ConfinedChild { child: spawned?, build_isolation: None,
+                #[cfg(target_os = "linux")]
+                build_namespace: None,
+                sandbox_kind: reported_kind, fence_id: apply_admitted.fence_id().clone(),
+                admitted: apply_admitted.admitted_body().cloned() })
         })
         .join()
         .map_err(|_| ToolError::denied("confined-spawn thread panicked before exec"))?;
-        let (child, build_isolation) = spawned?;
-
-        Ok(ConfinedChild {
-            child,
-            build_isolation,
-            sandbox_kind: reported_kind,
-            // The identity of the object admission produced and `verify_applied`
-            // confirmed above — copied out, never recomputed downstream.
-            fence_id: admitted.fence_id().clone(),
-            admitted: admitted.admitted_body().cloned(),
-        })
+        spawned
     }
 
     /// Admission-check, confine, spawn, **and hand back every fence that
@@ -1233,9 +1251,13 @@ impl ConfinedCommand {
             fence_id,
             admitted,
             build_isolation: _,
+            #[cfg(target_os = "linux")]
+            build_namespace,
         } = self.spawn_authorized(cx, effective, authority)?;
 
         Ok(ManagedSpawn {
+            #[cfg(target_os = "linux")]
+            build_namespace,
             child,
             sandbox_kind,
             fence_id,
@@ -1469,6 +1491,8 @@ impl SandboxedWorker {
             child: confined.child,
             sandbox_kind: confined.sandbox_kind,
             build_isolation: confined.build_isolation,
+            #[cfg(target_os = "linux")]
+            build_namespace: confined.build_namespace,
             control: Some(TrustedWorkerControl {
                 stream: control,
                 nonce: nonce.to_string(),
@@ -1923,6 +1947,8 @@ mod tokio_spawn {
         stderr: Option<pipe::Receiver>,
         /// `Some` until dropped; owned so kill-on-drop governs the process.
         child: Option<Child>,
+        #[cfg(target_os = "linux")]
+        build_namespace: Option<super::BuildNamespace>,
         /// The live egress proxy fencing this child's net (#257) — `Some` iff the
         /// grant was a general remote-host allow-list AND the loopback kernel
         /// fence engaged. Owned here so the proxy's lifetime brackets the
@@ -1980,6 +2006,8 @@ mod tokio_spawn {
                     let _ = child.wait();
                 });
             }
+            #[cfg(target_os = "linux")]
+            drop(self.build_namespace.take());
             // #372: `ProxyHandle`'s own `Drop` now force-closes and BLOCKS
             // joining every connection worker (bounded by `CONN_TIMEOUT` each),
             // not just the accept thread — dropping it inline here could block
@@ -2066,6 +2094,8 @@ mod tokio_spawn {
                 fence_id: _,
                 admitted: _,
                 build_isolation: _,
+            #[cfg(target_os = "linux")]
+            build_namespace,
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
@@ -2091,6 +2121,8 @@ mod tokio_spawn {
                 .transpose()?;
 
             Ok(ConfinedTokioChild {
+                #[cfg(target_os = "linux")]
+                build_namespace,
                 sandbox_kind,
                 stdin,
                 stdout,
@@ -2586,6 +2618,8 @@ mod tests {
             child: process,
             sandbox_kind: SandboxKind::None,
             build_isolation: None,
+            #[cfg(target_os = "linux")]
+            build_namespace: None,
             control: Some(control),
         };
         let forged_payload = serde_json::json!({

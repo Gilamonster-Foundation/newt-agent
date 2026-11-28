@@ -256,3 +256,7 @@ independent filesystem observations, and a guarded-versus-unguarded child probe.
 The upstream hostile-descriptor suite is retained here without a second copy.
 Linux `build_isolation` remains unchanged: its dependency versions are already
 in Newt's confine-off closure, so feature-gating it would remove no packages.
+
+## Private PID startup report and teardown (#3321)
+
+The opt-in PID topology acquires both child pidfds atomically with CLONE_PIDFD. A harness-created SOCK_SEQPACKET pair enables SO_PASSCRED before spawn. Init and payload close its sender as their first post-clone syscall. The relay sends one fixed record and two SCM_RIGHTS handles with a stack-only raw sendmsg before harden installs either fence, then closes the sender before closing std's exec-status pipe. No payload exec gate or post-spawn PID lookup is used. Setup fallback remains fresh-child and unchanged when the switch is off.

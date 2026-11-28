@@ -197,6 +197,8 @@ impl LocalExecutionBackend {
         control: &Arc<LocalControl>,
     ) -> ToolResult<()> {
         let ManagedSpawn {
+            #[cfg(target_os = "linux")]
+            build_namespace,
             mut child,
             sandbox_kind,
             fence_id,
@@ -271,6 +273,8 @@ impl LocalExecutionBackend {
             reap(
                 &mut child,
                 Reaping {
+                    #[cfg(target_os = "linux")]
+                    build_namespace,
                     sink,
                     control: reaper_control,
                     proxy,
@@ -290,6 +294,8 @@ impl LocalExecutionBackend {
 
 /// Everything the reaper thread needs to reach a quiescent terminal.
 struct Reaping {
+    #[cfg(target_os = "linux")]
+    build_namespace: Option<crate::BuildNamespace>,
     sink: ExecutionEventSink,
     control: Arc<LocalControl>,
     proxy: Option<crate::net_proxy::ProxyHandle>,
@@ -371,8 +377,25 @@ fn reap(child: &mut Child, mut ctx: Reaping) {
         control: Arc::clone(&ctx.control),
     };
     let status = child.wait();
-    // The leader is reaped: no later signal may target this pid as a group id.
-    ctx.control.leader_reaped();
+    #[cfg(target_os = "linux")]
+    let private_namespace = ctx.build_namespace.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let private_namespace = false;
+    let quiescence = ctx.control.leader_reaped(private_namespace, || {
+        #[cfg(target_os = "linux")]
+        if let Some(namespace) = &ctx.build_namespace {
+            return namespace.wait_gone(ctx.limits.reap_grace());
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    if let Err(error) = quiescence {
+        let _ = ctx.control.publish(&ctx.sink, ExecutionTerminal::Failed {
+            message: error.to_string(),
+        });
+        // Incomplete teardown is already the terminal. Never turn its
+        // bounded wait into an unbounded pipe/drainer join.
+        return;
+    }
 
     // Bounded wait for both pipes to reach EOF. A descendant that inherited
     // stdout/stderr keeps them open after the leader exits — the case where a
@@ -555,10 +578,19 @@ impl LocalControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
     }
 
-    /// Mark the direct child reaped, under the same lock a signal takes — so a
-    /// concurrent `kill` can never deliver to a pid that has just been recycled.
-    fn leader_reaped(&self) {
-        self.lock_tree().leader_alive = false;
+    /// Retire numeric signalling before bounded teardown can yield control.
+    /// The teardown callback also lets tests inject an interleaved kill.
+    fn leader_reaped<T>(&self, private_namespace: bool, teardown: impl FnOnce() -> T) -> T {
+        {
+            let mut tree = self.lock_tree();
+            tree.leader_alive = false;
+            if private_namespace {
+                // Pidfds own private teardown; forced drain cleanup must not
+                // signal a group number that may already have been recycled.
+                tree.pid = None;
+            }
+        }
+        teardown()
     }
 
     /// Force-terminate the tree from inside the reaper, where the group is
@@ -741,3 +773,39 @@ pub enum LocalTreeContainment {
 }
 
 // Model: gpt-6-astra | Harness: Codex 0.153.4 | Operator: Shawn Hartsock | Time: 22:29 UTC | Date: 2026-09-12
+
+#[cfg(test)]
+mod reaping_tests {
+    use super::*;
+
+    #[test]
+    fn namespace_wait_retires_group_number_only_for_private_builds() {
+        for private in [false, true] {
+            let control = LocalControl::for_test();
+            // arm only records injected facts; no signal is sent to this PID.
+            control.arm(42);
+            control.leader_reaped(private, || {
+                assert_eq!(
+                    control.lock_tree().pid,
+                    if private { None } else { Some(42) },
+                    "private teardown must also disable forced group cleanup"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn namespace_wait_does_not_retain_numeric_signal_authority() {
+        let control = LocalControl::for_test();
+        // Inject a live leader with no OS process: an attempted kill records
+        // its disposition but cannot issue a syscall against a real PID.
+        control.lock_tree().leader_alive = true;
+        control.leader_reaped(false, || {
+            control.kill().unwrap();
+            assert!(
+                control.lock_tree().requested.is_none(),
+                "namespace teardown must retire the reaped leader before an interleaved kill"
+            );
+        });
+    }
+}

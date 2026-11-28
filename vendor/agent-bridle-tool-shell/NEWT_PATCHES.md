@@ -234,3 +234,7 @@ paths through the existing worker spawn, separately from model-facing arguments
 and environment. The existing execution lease retains their host ownership
 through shutdown. Results still travel over socketpairs, never scratch files.
 Retire with the upstream port of this trusted scratch seam.
+
+## Private PID startup report and teardown (#3321)
+
+OwnedWorker::terminate now waits on the opt-in BuildNamespace init pidfd after killing and reaping the relay. Timeout, cancellation and drop use the same bounded cleanup; 500 ms expiry is reported as incomplete namespace teardown. The switch remains off on the production Brush route, with authentication unchanged.

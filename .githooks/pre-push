@@ -157,7 +157,9 @@
 #   - brush_build_pipeline Linux cases (#3335), native-git-broker-real.yml:
 #     native cleanup and private-build grounds use real processes and Landlock.
 #     The job enables unprivileged user namespaces on its runner and requires
-#     private mode on both routes, including default managed scratch (#3361),
+#     private mode on both routes, including default managed scratch (#3361)
+#     and build_tests_private_pid_namespace (credentialed startup, fast exits,
+#     orphan reaping and bounded namespace teardown),
 #     then runs netns/mounts/devpts/identity/alias-bind and the opt-in PID
 #     namespace/init deny switches (PID isolation stays off by default). The temporary
 #     workspace probe always requires fallback. CI-only like the Git broker tier.

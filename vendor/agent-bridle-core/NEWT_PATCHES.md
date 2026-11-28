@@ -401,3 +401,9 @@ from environment and serialized policy. The Linux command hook forwards them to
 fdguard for exact empty-directory recreation; all other backends retain their
 existing behavior. See the fdguard patch notes for ownership and fallback rules.
 Retire with the upstream port of this trusted scratch seam.
+
+## Private PID startup report and teardown (#3321)
+
+The shared spawn funnel receives one complete creator report and two pidfds, verifies relay pid/uid/gid kernel credentials, requires EOF, rejects malformed/truncated/extra data, and checks every exposed live PID/namespace-role fact. Reaped pidfds are accepted on authenticated creator-channel provenance: Linux discards their task metadata. BuildNamespace owns both handles across synchronous, managed and Tokio child conversions; bounded wait_gone reports incomplete teardown on expiry. Drop terminates through the init pidfd with a 500 ms bound, without repeating an already spent wait budget. The report contains foreign kernel coordinates, not a minted content identity.
+
+Managed execution retires the reaped leader's numeric signalling authority before its bounded namespace wait. The existing retirement transition takes an injected teardown callback; pure regressions prove that waiting cannot keep the old process-group number signalable. Private executions also forget that number before waiting, disabling forced numeric group cleanup; fallback executions retain their existing group cleanup.

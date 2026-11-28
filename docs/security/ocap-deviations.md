@@ -245,7 +245,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   An operator override inside a covered mount follows this same rule; an override
   outside stays host-backed. Host scratch access is ownership and cleanup only:
   artifacts live in the workspace target, toolchains use held operator roots, Brush
-  results use socketpairs, and the opt-in PID relay/init use pipes and wait status.
+  results use socketpairs, and the opt-in PID relay/init use a credentialed report socketpair, lifeline pipes and wait status.
   Fallback retains the host mount view and existing grants: an explicitly granted
   temporary write persists on the host; no new host write authority is added (#3337).
   The harness also verifies the system Git and its same-image exec-path alias in the host namespace
@@ -272,6 +272,17 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `SandboxPolicy::private_pid_namespace`
   ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). No production
   route sets it yet, so host process IDs remain visible and signalable from a build, as before.
+  When opted in, creation-time pidfds arrive over a harness-created report socketpair;
+  only the never-exec'd relay sends, before restricting itself. Init and payload close
+  its sender immediately after creation. The receiver requires one complete message,
+  exactly two pidfds, kernel credentials matching the relay and operator uid/gid, and
+  EOF; every exposed live PID/namespace-role fact must match. **Residual:** after reap,
+  fdinfo loses the PID and namespace coordinates. Such a handle's role is attested by
+  channel provenance and kernel sender credentials, not per-descriptor metadata;
+  a trusted-creator defect substituting another reaped pidfd is not detectable there.
+  Timeout/cancellation/drop wait at most 500 ms for init's pidfd to become readable.
+  Expiry reports incomplete teardown: an uninterruptible syscall may outlast the bound.
+  No process is reopened by its reported number, and no payload exec gate is added.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
   denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable
