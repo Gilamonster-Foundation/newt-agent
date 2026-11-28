@@ -149,7 +149,7 @@ impl ConstrainedExecutor {
             )));
         }
         req.require_toolchain_admission()?;
-        let _scratch = req.prepare_scratch().map_err(ExecRefused::Spawn)?;
+        let scratch = req.prepare_scratch().map_err(ExecRefused::Spawn)?;
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
         // escapes the process group — can be terminated with one `cgroup.kill`.
@@ -174,6 +174,7 @@ impl ConstrainedExecutor {
         let cx = mint_context(req.origin, &caveats)?;
 
         let mut cmd = ConfinedCommand::new(&program)
+            .private_build_scratch(req.private_build_scratch(&scratch))
             .sandbox_policy(std::sync::Arc::new(req.sandbox_policy()))
             .args(&args)
             .current_dir(&req.cwd)

@@ -163,9 +163,34 @@ existing bootstrap seam, excluding loader and worker-authentication controls.
 
 Fallback uses the original deny-all network and filesystem rules with the host
 mount view. An explicitly granted temporary write remains on the host; an
-ungranted write remains denied. The default managed build scratch is under `/tmp`,
-so it selects fallback too. Private-mode acceptance fixtures explicitly place all
-required paths outside the covered roots. No persisted record or identity changes.
+ungranted write remains denied. No persisted record or identity changes.
+
+### Owned empty run scratch (#3361)
+
+The trusted caller now passes its acquired run directories separately from the
+child environment through `ConfinedCommand` and `SandboxedWorker`. Only that
+exact, existing, canonical directory is exempt as a grant root or temporary
+HOME/TMPDIR/TMP/TEMP/XDG_RUNTIME_DIR value. PATH, GOPATH and tool-home inputs,
+workspaces, ancestors, neighbors, descendants and symlink aliases retain the
+covered-input decision, including nearest-existing-ancestor resolution.
+
+Before fork, the hook prepares the owned scratch directory and its ancestors as
+C strings; after mounting, `private_filesystems` recreates them empty with mode
+0700, as before #3352. It neither copies nor binds host scratch contents. Newt's
+Build approval still covers a stable partition, but its execution grant is only
+the acquired run. The Build gate uses existing path-containment enforcement for
+that narrowing; all other authority axes retain their lattice checks.
+
+An operator override outside the covered mounts stays host-backed. An override
+inside them is still an owned empty run and uses the same private recreation.
+This is explicit caller provenance, never a naming convention or child input.
+The host uses scratch only for ownership/cleanup: build artifacts are in the
+workspace target, toolchains are admitted from held operator roots before spawn,
+and Brush results/stdout/stderr use socketpairs. The opt-in PID relay/init use
+pipes and wait status, not scratch files. No host consumer reads private outputs
+from the recreated scratch. Real probes require default-scratch private mode on
+both routes and prove that unrelated and scratch-neighbor grants retain host
+writes in fallback. The mocked decision table exercises the exact exception.
 
 ## Private PID namespace topology, opt-in (#3321, stage 1)
 

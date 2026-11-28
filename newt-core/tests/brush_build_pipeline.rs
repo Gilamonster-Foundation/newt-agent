@@ -960,7 +960,7 @@ mod native {
             }
             #[cfg(target_os = "linux")]
             if selected("build_tests_granted_temporary_root_remains_visible") {
-                build_tests_granted_temporary_root_remains_visible(&root).await;
+                build_tests_granted_temporary_root_remains_visible(&root, false).await;
             }
             #[cfg(target_os = "linux")]
             if selected("build_tests_temporary_workspace_retains_fallback") {
@@ -988,6 +988,10 @@ mod native {
                 assert_eq!(before, host(), "the host alias must be untouched");
             }
             #[cfg(target_os = "linux")]
+            if selected("build_tests_granted_scratch_neighbor_remains_visible") {
+                build_tests_granted_temporary_root_remains_visible(&root, true).await;
+            }
+            #[cfg(target_os = "linux")]
             for (name, probe, marker) in [
                 (
                     "build_tests_can_use_a_private_pty",
@@ -1011,6 +1015,16 @@ mod native {
                 ),
                 (
                     "build_tests_private_scratch_capacity_mode_and_isolation",
+                    "--build-scratch-probe",
+                    "BUILD_PRIVATE_SCRATCH_CONFIRMED",
+                ),
+                (
+                    "build_tests_default_managed_scratch_is_private",
+                    "--build-scratch-probe",
+                    "BUILD_PRIVATE_SCRATCH_CONFIRMED",
+                ),
+                (
+                    "build_tests_overridden_temporary_scratch_is_private",
                     "--build-scratch-probe",
                     "BUILD_PRIVATE_SCRATCH_CONFIRMED",
                 ),
@@ -1413,10 +1427,24 @@ mod native {
     /// grants and reported mode on the argv and Brush routes: successful writes must
     /// survive on the host, rather than disappear with a private tmpfs.
     #[cfg(target_os = "linux")]
-    async fn build_tests_granted_temporary_root_remains_visible(root: &Path) {
+    async fn build_tests_granted_temporary_root_remains_visible(root: &Path, neighbor: bool) {
         use newt_core::confined_exec::build_tool_caveats_with_writes;
-        let (workspace, _) = project(root, "granted-temporary-root");
-        let granted = tempfile::tempdir_in("/tmp").unwrap();
+        let name = if neighbor {
+            "granted-scratch-neighbor"
+        } else {
+            "granted-temporary-root"
+        };
+        let (workspace, _) = project(root, name);
+        let parent = tempfile::tempdir_in("/tmp").unwrap();
+        // The trusted test caller creates and owns this empty run, independently
+        // of every child environment value. The lease survives both routes.
+        let scratch = tempfile::tempdir_in(parent.path()).unwrap();
+        let granted = tempfile::tempdir_in(if neighbor {
+            parent.path()
+        } else {
+            Path::new("/tmp")
+        })
+        .unwrap();
         let executable = std::env::current_exe().unwrap();
         let mut caveats = build_tool_caveats_with_writes(
             &workspace,
@@ -1425,12 +1453,23 @@ mod native {
         if let Scope::Only(reads) = &mut caveats.fs_read {
             reads.insert(executable.to_str().unwrap().to_owned());
         }
+        // The public Build footprint admits the stable parent. Like the real
+        // request builder, narrow its internal grant to this owned run only.
+        let stable = newt_core::confined_exec::build_scratch_root(&workspace);
+        for scope in [&mut caveats.fs_read, &mut caveats.fs_write] {
+            if let Scope::Only(paths) = scope {
+                paths.remove(stable.to_str().unwrap());
+                paths.insert(scratch.path().to_str().unwrap().to_owned());
+            }
+        }
         use agent_bridle::Tool;
         let policy = std::sync::Arc::new(agent_bridle::SandboxPolicy {
             child_network: agent_bridle::ChildNetworkPolicy::PrivateBuild,
             ..Default::default()
         });
-        let brush = agent_bridle::BrushShellTool::new().with_sandbox_policy(policy.clone());
+        let brush = agent_bridle::BrushShellTool::new()
+            .with_sandbox_policy(policy.clone())
+            .with_private_build_scratch(vec![scratch.path().to_owned()]);
         let cx = agent_bridle::Gate::new(0)
             .authorize(&brush, &caveats)
             .unwrap();
@@ -1457,6 +1496,8 @@ mod native {
             let output = if route == "argv" {
                 let output = agent_bridle::ConfinedCommand::new(executable.to_str().unwrap())
                     .args([probe.as_str(), mounts.as_str()])
+                    .private_build_scratch(vec![scratch.path().to_owned()])
+                    .env("HOME", scratch.path())
                     .current_dir(&workspace)
                     .sandbox_policy(policy.clone())
                     .stdin(agent_bridle::ConfinedStdio::Null)
@@ -1488,7 +1529,7 @@ mod native {
                     executable.display()
                 );
                 let output = brush
-                    .invoke(serde_json::json!({"cmd": source, "cwd": workspace, "env": {"HOME": workspace}}), &cx)
+                    .invoke(serde_json::json!({"cmd": source, "cwd": workspace, "env": {"HOME": scratch.path()}}), &cx)
                     .await
                     .unwrap();
                 assert_eq!(output["exit_code"], 0, "{output}");
@@ -1501,7 +1542,14 @@ mod native {
             assert!(output.contains("BUILD_GRANTED_WRITE_COMPLETED"), "{output}");
             let persisted = std::fs::read(&path).is_ok_and(|bytes| bytes == b"granted host write");
             let host_mounts = output.contains("BUILD_HOST_MOUNTS_CONFIRMED");
-            eprintln!("build_tests_granted_temporary_root_remains_visible ({route}): host write visible={persisted}; host mounts={host_mounts}");
+            let name = if neighbor {
+                "build_tests_granted_scratch_neighbor_remains_visible"
+            } else {
+                "build_tests_granted_temporary_root_remains_visible"
+            };
+            eprintln!(
+                "{name} ({route}): host write visible={persisted}; host mounts={host_mounts}"
+            );
             visible.push(persisted && host_mounts && output.contains("deny-all fallback"));
         }
         assert!(
@@ -1575,10 +1623,23 @@ mod native {
             let output = ConstrainedExecutor::run(&request).unwrap();
             return (output.success, output.stdout, output.stderr);
         }
-        // Owned short-path scratch survives private /tmp, including fallback.
-        // The existing probe still checks that its run directory is removed.
-        let scratch = tempfile::tempdir_in("/var/tmp").unwrap();
+        // This test-only PID route owns its own short-path run. Replace the
+        // production request's unacquired run grant, then carry the owned path
+        // explicitly so the same empty-scratch mechanism also grounds PID mode.
+        let scratch = tempfile::tempdir_in("/tmp").unwrap();
         let mut caveats = request.caveats().clone();
+        let planned = request
+            .env_grants()
+            .iter()
+            .find(|(key, _)| key == "TMPDIR")
+            .unwrap()
+            .1
+            .as_str();
+        for scope in [&mut caveats.fs_read, &mut caveats.fs_write] {
+            if let Scope::Only(paths) = scope {
+                paths.remove(planned);
+            }
+        }
         // Match the existing PID probe's exact executable-image read grant;
         // ConstrainedExecutor normally adds this while resolving its guard.
         if let Scope::Only(reads) = &mut caveats.fs_read {
@@ -1597,6 +1658,7 @@ mod native {
             ..Default::default()
         };
         let mut command = agent_bridle::ConfinedCommand::new(executable.to_str().unwrap())
+            .private_build_scratch(vec![scratch.path().to_owned()])
             .args([probe, "--build-network-auto"])
             .current_dir(workspace)
             .sandbox_policy(std::sync::Arc::new(policy))
@@ -1655,15 +1717,28 @@ mod native {
 
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::fs::MetadataExt;
-        // Required-private probes need an uncovered scratch root. Keep its
-        // spelling short enough for the Unix socket probe's sockaddr_un.
+        // Also cover an explicit override outside the private mounts. The
+        // default-scratch case below exercises the production managed root.
+        // Keep override spelling short enough for the Unix socket probe.
         let scratch_root = tempfile::Builder::new()
             .prefix("")
             .rand_bytes(3)
-            .tempdir_in("/var/tmp")
+            .tempdir_in(
+                if name == "build_tests_overridden_temporary_scratch_is_private" {
+                    "/tmp"
+                } else {
+                    "/var/tmp"
+                },
+            )
             .unwrap();
         let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
-        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", scratch_root.path());
+        if name == "build_tests_default_managed_scratch_is_private" {
+            // Grounds the managed-scratch exemption with the production default,
+            // including usable HOME/TMPDIR/TMP/TEMP on both build routes.
+            std::env::remove_var("NEWT_BUILD_SCRATCH_DIR");
+        } else {
+            std::env::set_var("NEWT_BUILD_SCRATCH_DIR", scratch_root.path());
+        }
         let host_pty = if probe == "--build-pty-probe" {
             // Allocate our own host canary; never use the operator's terminal.
             let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
@@ -2576,10 +2651,10 @@ mod native {
     async fn worker_result_channel_is_not_reopenable(root: &Path) {
         use newt_core::confined_exec::build_tool_caveats;
         let (workspace, _) = project(root, "worker-result-channel");
-        // Keep required-private inputs outside the roots replaced by private
-        // mounts; the default managed scratch correctly selects fallback.
+        // Exercise the hardened result channel with default private scratch;
+        // the host must consume socketpair output, never a private scratch file.
         let previous_scratch = std::env::var_os("NEWT_BUILD_SCRATCH_DIR");
-        std::env::set_var("NEWT_BUILD_SCRATCH_DIR", root.join("worker-result-scratch"));
+        std::env::remove_var("NEWT_BUILD_SCRATCH_DIR");
         let executable = std::env::current_exe().unwrap();
         let source = format!(
             "cargo build --lib --offline && '{}' --worker-result-channel-probe",

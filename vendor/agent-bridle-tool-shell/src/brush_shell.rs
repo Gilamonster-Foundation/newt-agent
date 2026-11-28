@@ -97,6 +97,7 @@ pub struct BrushShellTool {
     schema: Arc<serde_json::Value>,
     output_observer: Option<Arc<dyn crate::ShellOutputObserver>>,
     execution_lease: Option<crate::ExecutionLease>,
+    private_build_scratch: Vec<std::path::PathBuf>,
     held_read_roots: Vec<agent_bridle_core::HeldReadRoot>,
     command_broker: Option<Arc<dyn crate::CommandBroker>>,
     launcher_image_dir: Option<std::path::PathBuf>,
@@ -128,6 +129,7 @@ impl BrushShellTool {
             schema: DEFAULT_SCHEMA.clone(),
             output_observer: None,
             execution_lease: None,
+            private_build_scratch: Vec::new(),
             held_read_roots: Vec::new(),
             command_broker: None,
             launcher_image_dir: None,
@@ -165,6 +167,15 @@ impl BrushShellTool {
     #[must_use]
     pub fn with_execution_lease(mut self, lease: crate::ExecutionLease) -> Self {
         self.execution_lease = Some(lease);
+        self
+    }
+
+    /// Carry trusted empty run directories separately from model-facing arguments.
+    /// The caller retains their ownership through the execution lease; see
+    /// [`agent_bridle_core::ConfinedCommand::private_build_scratch`].
+    #[must_use]
+    pub fn with_private_build_scratch(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.private_build_scratch = paths;
         self
     }
 
@@ -357,6 +368,7 @@ impl Tool for BrushShellTool {
         let worker = SandboxedWorker::brush()
             .sandbox_policy(Arc::clone(&self.sandbox_policy))
             .temporary_env(&env)
+            .private_build_scratch(self.private_build_scratch.clone())
             .read_only_resources(resources)
             .held_read_roots(self.held_read_roots.clone());
         let mut payload = WorkerPayload::new(

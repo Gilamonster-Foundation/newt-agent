@@ -222,15 +222,26 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   containing only loopback, without a host interface or external route; AF_PACKET and io_uring stay
   denied. Host abstract Unix sockets are isolated too. Private tmpfs mounts hide host `/tmp` and
   `/dev/shm`; pathname Unix deputies outside those roots remain reachable. Host writes remain limited
-  to their admitted roots, including the workspace and build scratch partition. The additional temporary read/write rules bind
+  to their admitted roots, including the workspace and the owned build scratch run. The additional temporary read/write rules bind
   only handles opened on the private mounts after mounting, never host temporary roots. Limits are
   2 GiB/65,536 inodes for `/tmp` and 256 MiB/16,384 inodes for `/dev/shm`, charged to the build's
   existing memory cgroup rather than a namespace-specific budget. Their final namespace/mount
   references release the filesystems; Landlock prevents subsequent mounts. Environment paths stay
   unchanged. Before fork, a covered working directory, read/write root, PATH entry,
   tool home or temporary-directory value selects fallback, including symlinks into the
-  covered roots. Unresolvable paths, `..`, and known account-lookup failures also select
-  fallback before namespace setup. This includes default managed scratch under `/tmp`.
+  covered roots. Missing inputs use their nearest existing ancestor; other resolution
+  failures, `..`, and known account-lookup failures select fallback before setup.
+  The exact, existing, canonical empty run directory acquired by the trusted caller
+  is exempt as a grant root and temporary HOME/TMPDIR/TMP/TEMP/XDG_RUNTIME_DIR value
+  (#3361). Its path is passed separately from child environment, never inferred by
+  name. It is recreated empty with mode 0700 inside private temporary mounts; no
+  host contents are copied. Ancestor, sibling and descendant grants, workspaces,
+  PATH/GOPATH and tool-home inputs retain the covered-input rule. Approval covers
+  the stable scratch partition, while execution grants only the owned run.
+  An operator override inside a covered mount follows this same rule; an override
+  outside stays host-backed. Host scratch access is ownership and cleanup only:
+  artifacts live in the workspace target, toolchains use held operator roots, Brush
+  results use socketpairs, and the opt-in PID relay/init use pipes and wait status.
   Fallback retains the host mount view and existing grants: an explicitly granted
   temporary write persists on the host; no new host write authority is added (#3337).
   The harness also verifies the system Git and its same-image exec-path alias in the host namespace
