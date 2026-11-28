@@ -1183,12 +1183,13 @@ pub(super) async fn dispatch_bridled_build_shell(
         agent_bridle::ToolError::Other(anyhow::anyhow!("build scratch: {error}"))
     })?;
     let private_scratch = request.private_build_scratch(&scratch);
+    let spawn_caveats = request.spawn_caveats(&private_scratch);
     let environment: std::collections::BTreeMap<_, _> =
         request.env_grants().iter().cloned().collect();
     let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment});
     let mut envelope = dispatch_bridled_shell_with_floor(
         args,
-        request.caveats(),
+        &spawn_caveats,
         sink,
         Some(agent_bridle::EnforcementFloor::from_scalar(
             agent_bridle::AxisEnforcement::Kernel,

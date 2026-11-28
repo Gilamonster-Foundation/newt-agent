@@ -236,8 +236,12 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   (#3361). Its path is passed separately from child environment, never inferred by
   name. It is recreated empty with mode 0700 inside private temporary mounts; no
   host contents are copied. Ancestor, sibling and descendant grants, workspaces,
-  PATH/GOPATH and tool-home inputs retain the covered-input rule. Approval covers
-  the stable scratch partition, while execution grants only the owned run.
+  PATH/GOPATH and tool-home inputs retain the covered-input rule. Prepared Build
+  requests expose the stable scratch partition for approval, pre-push, ceilings
+  and remembered grants, preserving exact lattice comparisons. Only after lease
+  acquisition do argv execution and Brush dispatch project scratch-contributed
+  roots to the owned run; independent input grants remain intact. This transient
+  fence never replaces or enters stored approval authority.
   An operator override inside a covered mount follows this same rule; an override
   outside stays host-backed. Host scratch access is ownership and cleanup only:
   artifacts live in the workspace target, toolchains use held operator roots, Brush

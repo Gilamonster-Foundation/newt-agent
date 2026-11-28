@@ -1392,24 +1392,9 @@ fn build_authorized(
             reads.remove(&root);
         }
     }
-    // Execution narrows the approved scratch partition to one run. Compare
-    // filesystem roots with the same containment rule as path enforcement;
-    // retain lattice checks for every other axis and every uncovered root.
-    let covered = |requested: &crate::Caveats, granted: &crate::Caveats| {
-        let mut remaining = requested.clone();
-        for (requested, granted) in [
-            (&mut remaining.fs_read, &granted.fs_read),
-            (&mut remaining.fs_write, &granted.fs_write),
-        ] {
-            if let crate::Scope::Only(paths) = requested {
-                paths.retain(|path| !newt_policy::caveats::covers_path(granted, path));
-            }
-        }
-        remaining.leq(granted)
-    };
-    covered(&baseline, caveats) || gate.as_deref_mut().is_some_and(|gate| {
+    baseline.leq(caveats) || gate.as_deref_mut().is_some_and(|gate| {
         let permission = lifecycle_build_request(&root.to_string_lossy(), display, build, escalation_note);
-        matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if covered(build, &allowed))
+        matches!(gate.ask_with_caveats(build, &[permission]), PermissionDecision::Allow(allowed) if build.leq(&allowed))
     })
 }
 

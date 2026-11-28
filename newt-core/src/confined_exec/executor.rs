@@ -150,6 +150,8 @@ impl ConstrainedExecutor {
         }
         req.require_toolchain_admission()?;
         let scratch = req.prepare_scratch().map_err(ExecRefused::Spawn)?;
+        let private_scratch = req.private_build_scratch(&scratch);
+        let caveats = req.spawn_caveats(&private_scratch);
         // For a guarded (DenyAll) child, place it in a fresh cgroup-v2 subtree so
         // the whole descendant TREE — including a setsid / double-fork daemon that
         // escapes the process group — can be terminated with one `cgroup.kill`.
@@ -170,11 +172,12 @@ impl ConstrainedExecutor {
         // under `newt-net-guard` (seccomp egress deny) with the guard's dir added
         // to the fs fence's read set so it can be exec'd. Refuses if the floor
         // cannot be established (never a weaker net floor).
-        let (program, args, caveats) = Self::resolve_net_floor(req, cgroup_procs.as_deref())?;
+        let (program, args, caveats) =
+            Self::resolve_net_floor(req, caveats, cgroup_procs.as_deref())?;
         let cx = mint_context(req.origin, &caveats)?;
 
         let mut cmd = ConfinedCommand::new(&program)
-            .private_build_scratch(req.private_build_scratch(&scratch))
+            .private_build_scratch(private_scratch)
             .sandbox_policy(std::sync::Arc::new(req.sandbox_policy()))
             .args(&args)
             .current_dir(&req.cwd)
@@ -284,6 +287,7 @@ impl ConstrainedExecutor {
     /// `cgroup.procs` is added to the write fence) before it execs.
     fn resolve_net_floor(
         req: &ExecRequest,
+        caveats: Caveats,
         cgroup_procs: Option<&Path>,
     ) -> Result<(String, Vec<String>, Caveats), ExecRefused> {
         // Only the Linux `DenyAll` arm reads `cgroup_procs`; on other platforms
@@ -293,9 +297,7 @@ impl ConstrainedExecutor {
         #[cfg(not(target_os = "linux"))]
         let _ = cgroup_procs;
         match req.net_grant {
-            NetGrant::Unrestricted => {
-                Ok((req.program.clone(), req.args.clone(), req.caveats.clone()))
-            }
+            NetGrant::Unrestricted => Ok((req.program.clone(), req.args.clone(), caveats)),
             #[cfg(target_os = "linux")]
             NetGrant::DenyAll => {
                 // `(guard_program, prefix_args)`: a standalone `newt-net-guard`
@@ -304,7 +306,7 @@ impl ConstrainedExecutor {
                 // `newt`. Either way the child inherits the fs fence + gets the
                 // seccomp egress floor before the real program runs.
                 let (guard, prefix) = Self::resolve_net_guard(req)?;
-                let mut caveats = req.caveats.clone();
+                let mut caveats = caveats;
                 if let Some(dir) = Path::new(&guard).parent() {
                     extend_read_root(&mut caveats, dir.to_string_lossy().into_owned());
                 }
@@ -336,7 +338,7 @@ impl ConstrainedExecutor {
                 // below; it includes the deputy audit and caller privilege.
                 // Admission checks the actual spawn again, so this preflight
                 // cannot replace or weaken the kernel floor.
-                let caveats = deny_all_net(&req.caveats);
+                let caveats = deny_all_net(&caveats);
                 let mechanism = agent_bridle::ConfinementMechanism::new(
                     agent_bridle::SandboxKind::Seatbelt,
                     runtime_sandbox_policy().child_network,

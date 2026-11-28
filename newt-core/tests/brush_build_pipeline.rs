@@ -1638,6 +1638,7 @@ mod native {
         for scope in [&mut caveats.fs_read, &mut caveats.fs_write] {
             if let Scope::Only(paths) = scope {
                 paths.remove(planned);
+                paths.remove(Path::new(planned).parent().unwrap().to_str().unwrap());
             }
         }
         // Match the existing PID probe's exact executable-image read grant;

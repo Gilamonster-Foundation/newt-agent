@@ -177,9 +177,12 @@ covered-input decision, including nearest-existing-ancestor resolution.
 Before fork, the hook prepares the owned scratch directory and its ancestors as
 C strings; after mounting, `private_filesystems` recreates them empty with mode
 0700, as before #3352. It neither copies nor binds host scratch contents. Newt's
-Build approval still covers a stable partition, but its execution grant is only
-the acquired run. The Build gate uses existing path-containment enforcement for
-that narrowing; all other authority axes retain their lattice checks.
+Build requests expose one stable approved partition, including to pre-push,
+permission ceilings and remembered grants. After acquiring scratch, the argv
+executor and Brush dispatch narrow only scratch-contributed roots to that run.
+Independent input roots remain intact, even at the same partition. Approval
+checks retain the original exact lattice comparison; the spawn projection never
+changes or enters cached approval authority.
 
 An operator override outside the covered mounts stays host-backed. An override
 inside them is still an owned empty run and uses the same private recreation.

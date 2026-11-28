@@ -5756,9 +5756,9 @@ fn pre_push_3294_requires_the_exact_build_authority() {
     ));
 }
 
-/// #3361: a stable Build grant covers its narrower run, but no other axis.
+/// #3361: admission compares stable Build authority, never a transient run fence.
 #[test]
-fn build_admission_accepts_only_covered_run_roots() {
+fn build_admission_requires_stable_approved_roots() {
     // Model a gate that returns the approved parent itself. MockGate's default
     // ask_with_caveats intersects string sets before this recheck can see it.
     struct ParentGrant(MockGate);
@@ -5788,7 +5788,8 @@ fn build_admission_accepts_only_covered_run_roots() {
         ..Caveats::top()
     };
     for (path, expected) in [
-        ("/scratch/partition/run", true),
+        ("/scratch/partition", true),
+        ("/scratch/partition/run", false),
         ("/scratch/partition-neighbor/run", false),
         ("/scratch/other/run", false),
     ] {
