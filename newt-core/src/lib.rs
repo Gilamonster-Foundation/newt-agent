@@ -168,6 +168,8 @@ pub mod test_guard;
 /// Self-scheduled wake-up timers — see `timer` module docs.
 pub mod timer;
 pub mod tokens;
+pub mod tool_tree;
+pub mod toolchains;
 pub mod tooling;
 /// Terminal-line ownership: the process-wide arbiter every ephemeral writer
 /// (spinner, viewport, progress readout) leases the bottom line from, plus the
@@ -415,4 +417,12 @@ mod ignored_lane_listing_tests {
             assert_eq!(ignored_lane_listing(&run, "proof"), None, "{run:?}");
         }
     }
+}
+
+// Shared fixture source also included by downstream test targets. Keeping it
+// here under cfg(test) avoids enabling capability stubs via test-util.
+#[cfg(test)]
+mod test_chat_ctx {
+    use crate as newt_core;
+    include!("../tests/support/chat_ctx.rs");
 }

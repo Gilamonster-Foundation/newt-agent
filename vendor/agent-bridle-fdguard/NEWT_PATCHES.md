@@ -27,7 +27,8 @@ at exec. The mode diagnostic is emitted only after the fence is installed.
 Setup order is stdio socket validation, combined user/network unshare, uid/gid
 mapping, loopback-up, seccomp (including no-new-privileges), then Landlock.
 Inherited descriptors >=3 are marked CLOEXEC by the existing earlier hook;
-internet sockets on stdio refuse execution. AF_UNIX remains available for the
+host terminals and non-AF_UNIX sockets on stdio refuse execution in both private
+and fallback modes. AF_UNIX remains available for the
 authenticated worker channel and local build IPC. Namespace capabilities can
 configure only owned network namespaces: raw IP sockets or new virtual devices
 do not provide a host interface or route. AF_PACKET and io_uring stay denied.
@@ -46,13 +47,13 @@ supplies the Landlock ABI layout, rather than duplicating it locally.
 
 Each private rule opens its directory after mounting. A failed mount or rule
 binding discards the entire child; the fresh fallback keeps its untouched rules
-and cannot write either host temporary root. The actual child cwd is checked
-before setup, so a workspace covered by either mount selects fallback rather
-than importing host contents. The diagnostic reports the effective combined mode.
+and adds no host temporary authority. Existing explicit grants still apply.
+Before fork, covered request paths select that fallback without attempting
+namespace setup. The diagnostic reports the effective combined mode.
 
-`HOME`, `TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR` are not rewritten. Any of
-their directories covered by the new mounts is recreated empty; no host files
-or bind mounts are imported. Data pages are allocated on demand and charged to
+`HOME`, `TMPDIR`, `TMP`, `TEMP`, and `XDG_RUNTIME_DIR` are not rewritten. A
+covered directory selects fallback; no host files or directories are imported.
+Data pages are allocated on demand and charged to
 the allocating build's existing memory cgroup; namespaces do not supply a new
 memory budget. Pages may use swap. Filesystem byte/inode bounds are per mount,
 not an aggregate memory limit across builds. Final namespace/mount-reference
@@ -69,7 +70,8 @@ is granted. They contain only read/write, directory traversal, and IOCTL_DEV
 when the prepared filesystem mask handles that right (Landlock ABI 5+).
 The default ABI 3 does not restrict device ioctls. The shared core seccomp filter
 denies TIOCSTI and TIOCLINUX while preserving allocation, termios and winsize.
-Terminal stdio refuses exec; the existing descriptor sweep closes higher fds.
+Terminal stdio refuses exec in both private and fallback modes; the existing
+descriptor sweep closes higher fds.
 
 The 64-pair limit bounds one build instance, still subject to the kernel's global
 PTY pool and reserve. It supplies no aggregate budget across concurrent builds.
@@ -145,6 +147,77 @@ and mount namespace. `mount_setattr` is not mediated by Landlock; it needs
 it cannot change which object the target names. The binding's guarantee is that
 identity, not the read-only flag: the file's own mode and the build's write
 rules already refuse writes.
+
+## Covered build inputs select fallback before fork (#3337)
+
+The common hook chooses fallback before the first fork when the working directory,
+any read/write grant root, PATH entry, tool home or temporary-directory environment
+value is covered by `/tmp` or `/dev/shm`. Resolution precedes comparison, including
+symlink targets and relative paths. A path that does not exist is judged by its
+nearest existing ancestor, so a stale PATH entry or an absent grant root does not
+cost the build its private mode; a missing working directory, any other resolution
+failure and `..` select fallback conservatively. Known account-lookup failures
+also select fallback before setup.
+Brush carries these directory values, including its default PATH, through the
+existing bootstrap seam, excluding loader and worker-authentication controls.
+
+Fallback uses the original deny-all network and filesystem rules with the host
+mount view. An explicitly granted temporary write remains on the host; an
+ungranted write remains denied. The default managed build scratch is under `/tmp`,
+so it selects fallback too. Private-mode acceptance fixtures explicitly place all
+required paths outside the covered roots. No persisted record or identity changes.
+
+## Private PID namespace topology, opt-in (#3321, stage 1)
+
+Design: `docs/design/private-pid-namespace.md`. `confine` takes one more
+argument, `pid_namespace`. When false (every production caller today) the hook
+is unchanged. When true, after the account files and verified Git alias bindings are in place and before either
+fence, the hook calls `unshare(CLONE_NEWPID)` as a separate call and creates two
+processes with raw `clone3`:
+
+- **init** (PID 1): never execs. It sets `PR_SET_PDEATHSIG`, becomes
+  non-dumpable, resets every signal to its default and ignores `SIGCHLD` so the
+  kernel reaps adopted orphans, installs the deny seccomp filter and the
+  fallback Landlock ruleset, drops all capabilities, closes every descriptor
+  except a lifeline read end and a ready write end, writes one ready byte, and
+  blocks reading the lifeline. End-of-file means the relay is gone.
+- **payload** (PID 2, no visible parent): leads its own process group when the
+  hook's process did, then finishes the existing hook and is the process std
+  execs. Program, argv, environment and stdio are untouched.
+
+The hook's own process stays in the host PID namespace as the **relay**. It
+applies the same hardening, closes every descriptor except the lifeline write
+end (which drops std's exec-status pipe, so `spawn` still returns at the
+payload's exec), waits for the payload, kills a payload that reports a ptrace
+stop, then closes the lifeline, kills and reaps init, and ends with the
+payload's exit code or by the payload's signal. Reaping init returns only after
+the kernel has killed every member, so a normal exit leaves nothing behind.
+Killing the relay by any means ends init and therefore every member, including
+one that changed session.
+
+Any failure before the payload exists (the unshare, a pipe, either clone, init
+not reporting ready) returns the existing retry signal with init already
+killed and reaped; a failure in the payload returns it through std as before.
+The fresh fallback child never unshares. If the relay cannot fence itself it
+writes one line to stderr and exits 1, which ends the namespace.
+
+Everything after fork is raw syscalls on stack storage: `clone3`, `prlimit64`,
+`rt_sigaction`, `capset` and `close_range` use local kernel-layout structs
+rather than libc wrappers, because musl's `setrlimit` synchronises threads and
+its `sigaction` takes a lock for `SIGABRT`. An `strace -f` of the real probe
+shows the relay and init issuing only `unshare`, `pipe2`, `clone3`, `close`,
+`read`, `write`, `prctl`, `prlimit64`, `rt_sigaction`, `seccomp`,
+`landlock_restrict_self`, `capset`, `close_range`, `wait4`, `kill` and
+`exit_group`: no `mmap`, `brk` or `futex`.
+
+Not in this stage: the private procfs mount and init's argv zeroing (stage 8),
+host-side handles for init and the payload (stage 2). The relay and init are
+copy-on-write images of the harness for the build's lifetime; they are
+non-dumpable and hold no descriptors but the lifeline. The mocked tests cover
+the relay's status decision and the `clone_args` layout; the real-resource
+probe `--build-pid-probe` in `newt-core/tests/brush_build_pipeline.rs` grounds
+them on both spawn funnels, with fault injection at the PID unshare and at
+init's hardening.
 
 ## Shared leaf and retained tests
 

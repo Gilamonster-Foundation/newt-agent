@@ -165,8 +165,9 @@ pub enum ChildNetworkPolicy {
     DenyDirect,
     /// Build-only isolation: private user/network/mount namespaces, loopback,
     /// bounded private temporary filesystems and a private PTY instance. Any
-    /// setup failure retains the existing DenyDirect floor and grants no host
-    /// temporary write or terminal access.
+    /// setup failure retains the existing DenyDirect floor without adding host
+    /// temporary write or terminal authority. Host terminals and non-AF_UNIX
+    /// sockets on stdio refuse exec in both private and fallback modes.
     /// The legacy tag is readable; serialization names the broader mechanism
     /// so its content-addressed fence identity cannot equal the network-only one.
     #[serde(alias = "private-loopback")]
@@ -189,6 +190,12 @@ pub struct SandboxPolicy {
     /// this field existed keep parsing (they get `LandlockOnly`).
     #[serde(default)]
     pub child_network: ChildNetworkPolicy,
+    /// Staging switch: a `PrivateBuild` child also gets a private PID namespace
+    /// (`docs/design/private-pid-namespace.md`). Default-off and absent from
+    /// the serialized policy until worker authentication is namespace-aware;
+    /// inert under every other `child_network` and on every non-Linux backend.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub private_pid_namespace: bool,
     /// Windows AppContainer launcher provenance: optional absolute path to the
     /// trusted `agent-bridle-aclaunch.exe` helper. When unset, Windows uses only
     /// the helper shipped next to the current executable. Ambient `PATH` is never
@@ -327,6 +334,7 @@ impl Default for SandboxPolicy {
         Self {
             backends: BackendToggles::default(),
             child_network: ChildNetworkPolicy::default(),
+            private_pid_namespace: false,
             appcontainer_launcher_path: None,
             appcontainer_nul_device_ace: false,
             appcontainer_mount_manager_ace: false,
@@ -865,6 +873,28 @@ mod tests {
         assert_eq!(json["appcontainer_nul_device_ace"], true);
         let policy: SandboxPolicy = serde_json::from_value(json).unwrap();
         assert!(policy.appcontainer_nul_device_ace);
+    }
+
+    #[test]
+    fn private_pid_namespace_is_an_explicit_opt_in() {
+        let default = SandboxPolicy::default();
+        assert!(!default.private_pid_namespace);
+        let json = serde_json::to_value(&default).unwrap();
+        assert!(
+            json.get("private_pid_namespace").is_none(),
+            "default-off must not change the serialized policy"
+        );
+        let parsed: SandboxPolicy = serde_json::from_value(json).unwrap();
+        assert!(!parsed.private_pid_namespace, "absent means off");
+
+        let policy = SandboxPolicy {
+            private_pid_namespace: true,
+            ..SandboxPolicy::default()
+        };
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["private_pid_namespace"], true);
+        let policy: SandboxPolicy = serde_json::from_value(json).unwrap();
+        assert!(policy.private_pid_namespace);
     }
 
     #[test]

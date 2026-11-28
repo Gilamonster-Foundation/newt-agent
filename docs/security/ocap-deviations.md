@@ -221,13 +221,18 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   namespaces before installing their fences. Success allows AF_INET/AF_INET6 within that namespace, initially
   containing only loopback, without a host interface or external route; AF_PACKET and io_uring stay
   denied. Host abstract Unix sockets are isolated too. Private tmpfs mounts hide host `/tmp` and
-  `/dev/shm`; pathname Unix deputies outside those roots remain reachable. Host write roots remain
-  the workspace and its admitted scratch partition. The additional temporary read/write rules bind
+  `/dev/shm`; pathname Unix deputies outside those roots remain reachable. Host writes remain limited
+  to their admitted roots, including the workspace and build scratch partition. The additional temporary read/write rules bind
   only handles opened on the private mounts after mounting, never host temporary roots. Limits are
   2 GiB/65,536 inodes for `/tmp` and 256 MiB/16,384 inodes for `/dev/shm`, charged to the build's
   existing memory cgroup rather than a namespace-specific budget. Their final namespace/mount
   references release the filesystems; Landlock prevents subsequent mounts. Environment paths stay
-  unchanged, with covered runtime directories recreated empty. A covered workspace uses fallback.
+  unchanged. Before fork, a covered working directory, read/write root, PATH entry,
+  tool home or temporary-directory value selects fallback, including symlinks into the
+  covered roots. Unresolvable paths, `..`, and known account-lookup failures also select
+  fallback before namespace setup. This includes default managed scratch under `/tmp`.
+  Fallback retains the host mount view and existing grants: an explicitly granted
+  temporary write persists on the host; no new host write authority is added (#3337).
   The harness also verifies the system Git and its same-image exec-path alias in the host namespace
   (root-owned, unwritable ancestry on held descriptors) and binds that Git read-only over the alias
   in the build's mount namespace (#3318). A nested `git`-only fence then covers both names with its
@@ -243,6 +248,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   reserve 64 pairs or impose an aggregate budget across builds. Failed namespace/mount setup
   retries in a fresh child with the original DenyDirect floor and its existing IPC limitations.
   This narrows the build route's abstract-socket surface; it does not close this deviation.
+  A private PID namespace for these builds is staged behind the opt-in
+  `SandboxPolicy::private_pid_namespace`
+  ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). No production
+  route sets it yet, so host process IDs remain visible and signalable from a build, as before.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
   denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable

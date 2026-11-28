@@ -1175,13 +1175,16 @@ pub(super) async fn dispatch_bridled_build_shell(
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     // Admission precedes scratch creation. The worker owns the lease through
     // cancellation so scratch survives until all hook/build descendants exit.
+    request
+        .require_toolchain_admission()
+        .map_err(|e| agent_bridle::ToolError::Other(anyhow::anyhow!("{e}")))?;
     let scratch = request.prepare_scratch().map_err(|error| {
         agent_bridle::ToolError::Other(anyhow::anyhow!("build scratch: {error}"))
     })?;
     let environment: std::collections::BTreeMap<_, _> =
         request.env_grants().iter().cloned().collect();
     let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment});
-    dispatch_bridled_shell_with_floor(
+    let mut envelope = dispatch_bridled_shell_with_floor(
         args,
         request.caveats(),
         sink,
@@ -1196,7 +1199,10 @@ pub(super) async fn dispatch_bridled_build_shell(
             &request.caveats().net,
         )),
     )
-    .await
+    .await?;
+    envelope["toolchains"] =
+        serde_json::to_value(request.toolchains()).map_err(anyhow::Error::from)?;
+    Ok(envelope)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -211,7 +211,7 @@ tokio.workspace = true
 # PWD/SHLVL/_, so a build could not find `cc`, and the seam — HOME, TMPDIR, the
 # passthrough list — never arrived). The workspace currently patches bridle
 # crates for Newt-specific APIs; these version declarations do not remove those patches.
-agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "verifier-webauthn-es256", "spawn-tokio"], optional = true }
+agent-bridle = { version = "0.8.0-rc.7", features = ["shell", "host-shell", "os-sandbox", "brush", "carried-coreutils", "verifier-ed25519", "spawn-tokio"], optional = true }
 # Only `web_fetch_parity_tests` names tool-web in source (#3160). Its reqwest
 # `rustls-tls`, `charset` and `gzip` features also unify into core; core now
 # declares them explicitly above so they survive with `confine` off.

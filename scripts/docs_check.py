@@ -118,7 +118,11 @@ def prose_lines(text: str) -> list[str]:
         marker = FENCE.match(line)
         if fence is not None:
             # Inside a fence: only a matching (or longer) marker closes it.
-            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence):
+            if (
+                marker
+                and marker.group(1)[0] == fence[0]
+                and len(marker.group(1)) >= len(fence)
+            ):
                 fence = None
             out.append("")
             continue
@@ -171,7 +175,9 @@ def check_citations() -> list[str]:
     """Every docs/... path named in a Rust comment exists."""
     failures = []
     for rs in rust_files():
-        for lineno, line in enumerate(rs.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        for lineno, line in enumerate(
+            rs.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
             if not RUST_COMMENT.match(line):
                 continue
             for cited in DOCS_PATH.findall(line):
@@ -246,7 +252,10 @@ def self_test() -> int:
                 targets.append(ref.group(1))
             found.extend(t for t in targets if not SKIP_LINK.match(t))
         if found != expected:
-            print(f"docs-check self-test FAIL: {name}: {found!r} != {expected!r}", file=sys.stderr)
+            print(
+                f"docs-check self-test FAIL: {name}: {found!r} != {expected!r}",
+                file=sys.stderr,
+            )
             failed += 1
 
     # --- retirement rule (--deleted-refs) ---------------------------------
@@ -326,6 +335,17 @@ def self_test() -> int:
             print(f"docs-check self-test FAIL: {name}", file=sys.stderr)
             failed += 1
 
+    # --- a shared filename is not retired by one deletion -------------------
+    spellings = [
+        (["docs/gone.md", "gone.md"], "docs/gone.md", ["README.md", "src/a.rs"]),
+        (["docs/README.md"], "docs/README.md", ["README.md", "src/a.rs"]),
+        (["vendor/x/CONTRIBUTING.md"], "vendor/x/CONTRIBUTING.md", ["src/a.rs"]),
+    ]
+    for expected_names, path, tracked in spellings:
+        if citation_names(path, tracked) != expected_names:
+            print(f"docs-check self-test FAIL: spellings of {path}", file=sys.stderr)
+            failed += 1
+
     # The line-number case must also report the correct line.
     lines = prose_lines("```\nfenced\n```\n[x](nope.md)\n")
     if len(lines) != 4 or "nope.md" not in lines[3]:
@@ -335,7 +355,7 @@ def self_test() -> int:
     if failed:
         print(f"docs-check: {failed} self-test failure(s)", file=sys.stderr)
         return 1
-    total = len(cases) + len(retirement) + len(exclusion) + 1
+    total = len(cases) + len(retirement) + len(exclusion) + len(spellings) + 1
     print(f"docs-check: {total} self-tests passed")
     return 0
 
@@ -413,6 +433,21 @@ def git_deleted_markdown(base: str) -> list[str]:
     return [p for p in proc.stdout.splitlines() if p.endswith(".md")]
 
 
+def citation_names(path: str, tracked: list[str]) -> list[str]:
+    """Spellings a citation of the deleted `path` could take.
+
+    The full path always; the bare filename too, since a citation is as often
+    `foo.md` as `docs/dir/foo.md`, unless a surviving file shares that
+    filename, or the document was third-party text under `vendor/`. Deleting
+    one `README.md` does not retire the word `README.md`, and a vendored
+    crate's `CONTRIBUTING.md` was never what our prose meant by that name.
+    """
+    bare = Path(path).name
+    if path.startswith("vendor/") or any(Path(other).name == bare for other in tracked):
+        return [path]
+    return [path, bare]
+
+
 def check_retirement(base: str, quiet: bool = False) -> list[str]:
     """Nothing left in the tree still names a document deleted since `base`."""
     deleted = git_deleted_markdown(base)
@@ -432,14 +467,14 @@ def check_retirement(base: str, quiet: bool = False) -> list[str]:
 
     failures = []
     for path in deleted:
-        # Both spellings: the full path and the bare filename, since a citation
-        # is as often `foo.md` as `docs/dir/foo.md`.
-        names = [path, Path(path).name]
+        names = citation_names(path, tracked)
         for rel in corpus:
             fp = REPO / rel
             if not fp.is_file():
                 continue
-            hits = unacknowledged_mentions(names, fp.read_text(encoding="utf-8", errors="replace"))
+            hits = unacknowledged_mentions(
+                names, fp.read_text(encoding="utf-8", errors="replace")
+            )
             # `names` holds both the full path and the bare filename, so one
             # citation matches twice. Report the line once, naming the most
             # specific spelling that matched.

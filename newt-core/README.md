@@ -108,6 +108,25 @@ tests that start localhost servers need a separately authorized execution
 policy. This action does not promise that a project's entire test suite can
 run offline.
 
+Confined builds also accept operator-signed directory roots from
+`<user-config-dir>/ocap/toolchains.toml`. Each root provides a `bin/` directory
+and an optional `expected_tree` using the exact CID from `newt caps digest`.
+The host verifies the whole ordered policy with the existing operator identity,
+checks ownership and every model write grant, and admits the roots before either
+argv or Brush builds enter confinement. They add read/execute access and ordered
+PATH entries, with no additional writes or ordinary-shell authority. Host reports
+identify verified pins or unpinned roots. Missing policy means no extra roots;
+invalid policy or changed policy bytes refuse builds. Restart after operator
+policy changes. Linux retains held root descriptors; macOS reports its path-only
+binding. Platforms without ownership/confinement checks refuse configured roots.
+`newt doctor --sign-toolchains` reviews exact ordered roots and optional pins,
+requires explicit operator-terminal approval with an existing identity, and saves
+a private backup before atomic replacement. It never signs at startup or through
+a model tool. Changed policy, key, or pinned tree during review refuses signing.
+Embedders call `toolchains::initialize` once at host startup
+and prepare build requests with `ExecRequest::with_operator_toolchains`, passing
+the complete session write scope.
+
 Confined shell and lifecycle calls refresh standing session and verified durable
 grants before starting a child, so a grant applies to the next call in the same
 turn. Refresh starts from the caller's baseline before adding standing grants
