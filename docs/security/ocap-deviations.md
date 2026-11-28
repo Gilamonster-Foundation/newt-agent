@@ -272,10 +272,10 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `SandboxPolicy::private_pid_namespace`
   ([`../design/private-pid-namespace.md`](../design/private-pid-namespace.md), #3321). Linux
   private argv builds enable it: their payload is PID 2 and cannot name host
-  processes through PID syscalls. Brush builds keep the switch off pending
-  namespace-aware worker/broker authentication. A PID setup failure takes the
+  processes through PID syscalls. Brush builds keep the switch off until the
+  final activation stage. A PID setup failure takes the
   existing fresh-child deny-all fallback; the diagnostic names host process
-  IDs as still visible and signalable. Private procfs remains a later stage.
+  IDs as still visible and signalable. Private procfs is described below.
   When opted in, creation-time pidfds arrive over a harness-created report socketpair;
   only the never-exec'd relay sends, before restricting itself. Init and payload close
   its sender immediately after creation. The receiver requires one complete message,
@@ -305,6 +305,16 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   without changing SO_PASSCRED. No new authority or wire identity is introduced.
   The real native commit works with staging on and off. Production Brush keeps
   the switch off; the argv route remains enabled as described above.
+  With the PID switch on, the payload also mounts read-only `subset=pid` procfs
+  and grants reads against that new object. Host processes and global proc files
+  are absent; init's environment remains denied and its inherited command line
+  is zeroed. Setup failure selects the same deny-all fallback. **Residual:** own
+  per-process mount/cgroup files disclose host mount and cgroup information;
+  same-build siblings can inspect one another, and init's stat/status/statm
+  disclose the harness's memory footprint. Syscalls still expose boot time,
+  resource totals and hostname. The worker's spent nonce remains readable in its
+  environment; its result sockets cannot be reopened by pathname. This stage
+  does not enable the switch on any additional production route.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
   denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable

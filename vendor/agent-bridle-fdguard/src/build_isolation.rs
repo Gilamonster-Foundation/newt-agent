@@ -114,8 +114,8 @@ fn needs_fallback<'a, 'b>(
 
 pub const PRIVATE: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; external networking unavailable.\n";
 pub const FALLBACK: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable. Local tests may fail because of this fence.\n";
-/// PID-enabled argv mode; private procfs is a separate stage.
-pub const PRIVATE_PIDNS: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; private process IDs; external networking unavailable.\n";
+/// PID-enabled private mode includes the build-only procfs view.
+pub const PRIVATE_PIDNS: &str = "Build isolation: private loopback only; private tmpfs /tmp (2 GiB) and /dev/shm (256 MiB); private devpts (64 PTYs); private account files; private process IDs and /proc (this build's processes only); external networking unavailable.\n";
 pub const FALLBACK_PIDNS: &str = "Build isolation: deny-all fallback; loopback, private scratch and private PTYs unavailable; host process IDs remain visible and signalable. Local tests may fail because of this fence.\n";
 
 /// One regular file a private build must reach under a second name: `source`
@@ -191,6 +191,16 @@ pub fn confine<'a>(
     // NSS may allocate, load modules or contact a service: resolve only here,
     // before fork. A failed lookup selects the same fresh-child fallback.
     let identity = account_files(uid, gid);
+    // Kernel-owned addresses of this process's initial argv, captured before
+    // fork. Only init clears its copy; the payload and harness retain theirs.
+    // A denied or malformed stat selects fallback, never an unchecked pointer.
+    let argv = if pid_namespace {
+        std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| argv_range(&stat))
+    } else {
+        Some(0..0)
+    };
     // Restore only the caller-owned run directories, never values discovered
     // in the child environment. All allocation and validation precede fork.
     let empty_dirs = empty_scratch_dirs(private_scratch);
@@ -198,7 +208,7 @@ pub fn confine<'a>(
     // including the worker's eventual directory controls. Decide before fork:
     // a covered input must retain its host view and its original grant rules.
     let fallback = Arc::new(AtomicBool::new(needs_fallback(
-        identity.is_ok() && empty_dirs.is_ok(),
+        identity.is_ok() && empty_dirs.is_ok() && argv.is_some(),
         command.get_current_dir().unwrap_or(Path::new(".")),
         roots,
         command
@@ -264,7 +274,14 @@ pub fn confine<'a>(
                         if pid_namespace {
                             // Returns only in the payload (PID 2), or with an
                             // error while this process is still the only one.
-                            private_pids(&deny, fallback_rules.as_raw_fd(), sender.as_ref().map_or(-1, AsRawFd::as_raw_fd))
+                            private_pids(
+                                &deny,
+                                fallback_rules.as_raw_fd(),
+                                sender.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                                argv.as_ref()
+                                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?,
+                            )?;
+                            private_proc(filesystem.as_raw_fd(), scratch_access)
                         } else {
                             Ok(())
                         }
@@ -294,6 +311,43 @@ pub fn confine<'a>(
         });
     }
     Ok((fallback, report))
+}
+
+const PROC_OPTIONS: &CStr = c"subset=pid";
+const PROC_FLAGS: libc::c_ulong = libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+
+fn proc_access(access: u64) -> u64 {
+    use linux_raw_sys::landlock::{LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE};
+    access & u64::from(LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR)
+}
+
+fn private_proc(ruleset: i32, access: u64) -> io::Result<()> {
+    // SAFETY: only the payload calls this, in its own mount and PID namespaces,
+    // before either fence. Static C strings; no allocation or host mount change.
+    check(unsafe {
+        libc::mount(
+            c"proc".as_ptr(),
+            c"/proc".as_ptr(),
+            c"proc".as_ptr(),
+            PROC_FLAGS,
+            PROC_OPTIONS.as_ptr().cast(),
+        )
+    })?;
+    let read = proc_access(access);
+    if read != 0 {
+        // Open after mount: this descriptor binds only the new procfs object.
+        grant_private_mount(ruleset, read, c"/proc")?;
+    }
+    Ok(())
+}
+
+fn argv_range(stat: &str) -> Option<std::ops::Range<usize>> {
+    // comm (field 2) can contain spaces and ')'; numeric fields follow its
+    // final delimiter. arg_start/arg_end are fields 48/49, not startstack.
+    let mut fields = stat.rsplit_once(')')?.1.split_ascii_whitespace();
+    let start = fields.nth(45)?.parse::<usize>().ok()?;
+    let end = fields.next()?.parse::<usize>().ok()?;
+    (start != 0 && end > start && end - start <= isize::MAX as usize).then_some(start..end)
 }
 
 fn temporary_root(path: &std::path::Path) -> Option<&'static std::path::Path> {
@@ -642,7 +696,12 @@ unsafe fn fork_raw(pidfd: &mut i32) -> io::Result<libc::pid_t> {
 /// The private PID namespace. Returns `Ok` only in the payload, which is PID 2
 /// with no visible parent. The calling process becomes the relay and never
 /// returns on success; an `Err` is returned in the caller with init discarded.
-fn private_pids(deny: &seccompiler::BpfProgram, rules: i32, report: i32) -> io::Result<()> {
+fn private_pids(
+    deny: &seccompiler::BpfProgram,
+    rules: i32,
+    report: i32,
+    argv: &std::ops::Range<usize>,
+) -> io::Result<()> {
     // SAFETY: raw syscalls on this fork child only. Every descriptor created
     // here is CLOEXEC and is closed explicitly in the processes that must not
     // hold it. No allocation, locks or Rust stdio.
@@ -661,7 +720,7 @@ fn private_pids(deny: &seccompiler::BpfProgram, rules: i32, report: i32) -> io::
         let init = fork_raw(&mut initfd)?;
         if init == 0 {
             libc::close(report); // First post-clone syscall: init can never report.
-            init_main(lifeline[0], ready[1], deny, rules);
+            init_main(lifeline[0], ready[1], deny, rules, argv);
         }
         libc::close(lifeline[0]);
         libc::close(ready[1]);
@@ -753,7 +812,13 @@ unsafe fn send_startup(channel: i32, pids: [i32; 2], descriptors: [i32; 2]) -> i
 /// PID 1 of the build's namespace: a sibling of the payload with no duties.
 /// It holds the namespace open until the relay is gone, then exits, and the
 /// kernel kills every remaining member. Never returns, never execs.
-unsafe fn init_main(lifeline: i32, ready: i32, deny: &seccompiler::BpfProgram, rules: i32) -> ! {
+unsafe fn init_main(
+    lifeline: i32,
+    ready: i32,
+    deny: &seccompiler::BpfProgram,
+    rules: i32,
+    argv: &std::ops::Range<usize>,
+) -> ! {
     // SAFETY: raw syscalls only; `deny` and `rules` were prepared before fork.
     unsafe {
         let hardened = (|| {
@@ -765,6 +830,10 @@ unsafe fn init_main(lifeline: i32, ready: i32, deny: &seccompiler::BpfProgram, r
             ))?;
             check(libc::prctl(libc::PR_SET_NAME, c"build-init".as_ptr()))?;
             harden(deny, rules)?;
+            // SAFETY: these are the kernel's own arg_start/arg_end addresses
+            // read before fork. Fork preserves that writable argv mapping in
+            // init's private image; only these inherited bytes are zeroed.
+            std::ptr::write_bytes(argv.start as *mut u8, 0, argv.end - argv.start);
             // The kernel reaps init's children, adopted orphans included.
             check(disposition(libc::SIGCHLD, libc::SIG_IGN))?;
             close_all_except(lifeline.min(ready), lifeline.max(ready))
@@ -1076,6 +1145,44 @@ fn reopen(path: &CStr, held: &OwnedFd) -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_proc_options_and_grant_only_read_access() {
+        use linux_raw_sys::landlock::{LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE};
+        assert_eq!(PROC_OPTIONS.to_bytes(), b"subset=pid");
+        assert_eq!(PROC_FLAGS, 15);
+        let read = u64::from(LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_READ_FILE);
+        assert_eq!(proc_access(u64::MAX), read);
+        assert_eq!(proc_access(0), 0);
+        assert_eq!(proc_access(!read), 0);
+        for bit in [LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE] {
+            assert_eq!(proc_access(u64::from(bit)), u64::from(bit));
+        }
+    }
+
+    #[test]
+    fn init_argv_range_uses_kernel_fields_and_refuses_invalid_ranges() {
+        let stat = |start: &str, end: &str| {
+            // Fields 3..47 follow comm; arg_start and arg_end are 48 and 49.
+            format!("7 (a tricky ) name) S {}{start} {end} 0 0 0", "0 ".repeat(44))
+        };
+        assert_eq!(argv_range(&stat("4096", "8192")), Some(4096..8192));
+        for (start, end) in [
+            ("0", "1"),
+            ("8", "7"),
+            ("8", "8"),
+            ("-1", "8"),
+            ("x", "8"),
+            ("8", "x"),
+            ("1", "18446744073709551615"),
+            ("8", "18446744073709551616"),
+        ] {
+            assert_eq!(argv_range(&stat(start, end)), None, "{start}..{end}");
+        }
+        for invalid in ["", "7 no comm", "7 (comm) S 0", "7 (comm"] {
+            assert_eq!(argv_range(invalid), None);
+        }
+    }
 
     /// The relay's whole decision, without a process: an exit code and a fatal
     /// signal are mirrored; any other wait status is a ptrace stop to end.

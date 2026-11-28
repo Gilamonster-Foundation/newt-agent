@@ -455,6 +455,16 @@ switch change. No pre-exec code changes in this stage.
 - Real-resource, new probe `--build-proc-probe` on both funnels: own `stat` readable; `/proc/stat`, `meminfo`, `cpuinfo`, `sys/kernel/hostname`, `sys/kernel/random/boot_id` absent; a host canary PID absent; init's `environ` denied and `cmdline` empty; a sibling visible; a write under `/proc` refused; `unshare` plus a fresh proc mount refused. Forced fallback `--deny-build-proc` (seccomp `EACCES` on `mount` with flags exactly 15): deny-all, `/proc` unreadable.
 - Acceptance: unchanged eight (argv builds now have `/proc`; the acceptance route is Brush).
 
+As built in PR 8: the pre-fork argv parser reads fields 48/49 of the harness's
+own stat, accounting for spaces and closing parentheses in comm. Invalid or
+unavailable coordinates select fallback. Init clears that range after hardening
+and before readiness; cmdline's retained bytes are all NUL, rather than changing
+the kernel's argv bounds. The payload mounts and grants procfs after the PID
+step. The syscall probe uses both ConfinedCommand and the fixed SandboxedWorker
+image; the latter probes before control bootstrap so this mount proof does not
+claim the separately staged authentication work. The staging switch stays off
+where the preceding stages have not enabled it.
+
 **PR 9. Enable on the Brush route, remove the switch (about 100 lines).**
 - Change: private build always means PID namespace and procfs; the staging field and the two-variant text go away.
 - Real-resource: every probe on both routes in required and forced-fallback modes.
@@ -497,6 +507,22 @@ Stage-1 results (measured on Linux 6.8, Landlock ABI 4; the CI kernel was not me
 - M9c: after restricting, `unshare -Urpf --mount-proc true`; expect failure.
 - M10: Probe A inside the CI container image and under rootless Podman. Expect either success or a clean mount failure.
 - M13: inside, `clone3` with `set_tid` and a write to `/proc/sys/kernel/ns_last_pid`; expect EPERM and ENOENT.
+
+As built in PR 8: M9a/b/c and M13 were measured on Linux 6.8 with Landlock ABI 4.
+The new mount's O_PATH-bound read rule permits own stat and exec through a held
+`/proc/self/fd/N`. A child's write-open of its parent's pipe succeeds even under
+that ruleset; a socket returns ENXIO. Init environ is EACCES, globals are ENOENT,
+and memory write-open is EROFS. Nested unshare with mount-proc fails at the
+read-only uid map; a direct full-proc mount separately returns EPERM. After exec,
+clone3(set_tid) returns EPERM and ns_last_pid is ENOENT.
+
+M10 is **NOT MEASURABLE HERE** as originally phrased: this repository's CI uses
+a hosted Ubuntu VM, not a container image. The hosted Linux real-resource job
+is the CI-side evidence: it lifts the user-namespace restriction, requires the
+new proc probe to reach private mode, and injects its proc-mount failure. Its
+result must be observed on the relevant PR; no hosted result is claimed here.
+Rootless Podman remains unmeasured and out of scope. D2 is unchanged: one private
+mode, with PID or procfs setup failure selecting the deny-all fallback.
 
 **Before PR 9**
 - M12: start a long build with the switch on; sample `grep -E 'VmRSS|RssAnon' /proc/<relay>/status /proc/<init host pid>/status /proc/<harness>/status` and `cat /proc/<pid>/oom_score` at start and end while the harness works. Decide D1 from the growth.
