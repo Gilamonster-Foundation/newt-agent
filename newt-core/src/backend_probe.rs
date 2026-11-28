@@ -114,6 +114,17 @@ pub trait BackendApi: Send + Sync {
     }
 }
 
+// A scoped, controllable backend result for tests of callers' deadlines and
+// cancellation. The production probe and its caller's policy remain unchanged.
+#[cfg(test)]
+pub(crate) type TestLimits =
+    std::pin::Pin<Box<dyn std::future::Future<Output = BackendLimits> + Send>>;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_ANTHROPIC_LIMITS: std::cell::RefCell<Option<TestLimits>>;
+}
+
 /// The `BackendApi` for a wire kind — a `&'static` ZST, so no allocation.
 pub fn api_for(kind: BackendKind) -> &'static dyn BackendApi {
     match kind {
@@ -817,6 +828,14 @@ impl BackendApi for AnthropicApi {
         model: &str,
         api_key: Option<&str>,
     ) -> BackendLimits {
+        #[cfg(test)]
+        if let Some(probe) = TEST_ANTHROPIC_LIMITS
+            .try_with(|probe| probe.borrow_mut().take())
+            .ok()
+            .flatten()
+        {
+            return probe.await;
+        }
         // ONE round trip yields window AND ceiling (and, when declared, the
         // effort ladder); `context_window` below is a thin wrapper over this,
         // so a caller asking both never pays twice.

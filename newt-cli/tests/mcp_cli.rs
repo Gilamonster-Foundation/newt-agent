@@ -12,6 +12,9 @@
 //!
 //! Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:22 EDT | Date: 2026-08-12
 
+#[path = "../../newt-core/tests/support/chat_ctx.rs"]
+mod fixture;
+
 use std::path::Path;
 
 mod common;
@@ -90,7 +93,7 @@ mod composed_private_mcp_uat {
     use std::ffi::OsString;
 
     use newt_core::agentic::{LeasedMcpCall, McpTools, PromptIntake};
-    use newt_core::{BackendKind, ChatCtx, CompactionTriggerPolicy, MemMessage, ToolEvent};
+    use newt_core::{ChatCtx, MemMessage, ToolEvent};
     use newt_mcp_client::McpToolset;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -453,98 +456,15 @@ mod composed_private_mcp_uat {
 
         let (reply, _, _, hallucinations) = newt_core::chat_complete(
             ChatCtx {
-                shell_dialect: newt_core::agentic::shell_dialect_sentence(false, false),
-                command_budget: Default::default(),
-                overflow_retry: Default::default(),
-                run_allowance: None,
-                verify_outcomes: false,
-                round_cap_hit: None,
-                smart_harness: None,
-                rewrites_history: true,
-                url: &model.uri(),
                 model: "composed-private-review-model",
-                kind: BackendKind::Ollama,
-                emits_leading_reasoning: false,
-                api_key: None,
-                messages: &messages,
                 task: &task,
                 workspace: sb.cwd.to_str().unwrap(),
-                default_command_cwd: None,
-                worktree_session: None,
-                color: false,
-                markdown: false,
-                tool_offload: false,
-                spill_store: None,
-                disclosure: None,
-                compaction_store: None,
-                scratchpad: false,
-                scratchpad_store: None,
-                code_search: None,
-                where_is: None,
-                nav: None,
-                exposure: Default::default(),
-                experience_store: None,
-                step_ledger: None,
-                caveats: &caveats,
                 persona_tools: Some(&persona_tools),
-                cognition: None,
-                chat_completions_capability: Default::default(),
-                responses_capability: Default::default(),
-                openai_api: Default::default(),
-                output_allowance: None,
-                attempt_ledger: None,
-                reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 6,
-                narration_nudge_cap: 1,
-                action_nudges: true,
                 prompt_disposition: intake.disposition(),
-                prompt_intake: None,
-                workflow_grace_rounds: 0,
-                tool_output_lines: 20,
-                debug: false,
-                trace: false,
-                num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
-                connect_timeout_secs: 5,
-                inference_timeout_secs: 30,
-                mid_loop_trim_threshold: 40,
-                compaction_trigger_policy: CompactionTriggerPolicy::HeadroomAware,
-                mid_loop_trim_tokens: None,
-                max_ok_input: None,
-                build_check_cmd: None,
-                safe_context: None,
-                output_ceiling: None,
-                recover_cw_400: None,
-                note_sink: None,
-                note_nudge: None,
-                recall_source: None,
-                memory_source: None,
-                summarizer: None,
-                compress_state: None,
                 tool_events: Some(&mut events),
-                phantom_reaches: None,
-                end_reason: None,
-                solve_obs: None,
                 permission_gate: Some(&mut permission),
-                on_round_usage: None,
-                estimate_ratio: None,
-                estimation: newt_core::tokens::TokenEstimation::default(),
-                summary_input_cap_floor_chars: 8_192,
-                exec_floor: None,
-                write_ledger: None,
-                attribution: None,
-                cancel: None,
-                live_tool_output: None,
-                completed_spill_renderer: None,
-                reader_source: None,
-                git_tool: None,
-                crew_runner: None,
-                operating_mode_control: None,
-                plan_mode_control: None,
-                plan_draft_sink: None,
-                steering: None,
-                report_sink: None,
+                ..super::fixture::chat_ctx(&model.uri(), &messages, &caveats)
             },
             &mut mcp,
         )

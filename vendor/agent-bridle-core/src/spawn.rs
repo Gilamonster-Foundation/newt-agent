@@ -53,6 +53,31 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use crate::effective_sandbox_kind;
 
+/// The build-only isolation actually in force around a `PrivateBuild` child.
+///
+/// Harness memory, read from the spawn funnel's shared fallback flag. A child's
+/// diagnostic line says the same thing but is child output, which a build can
+/// imitate; a caller that decides anything on the mode reads this instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildIsolation {
+    /// Every private mechanism was installed before the program ran.
+    Private,
+    /// Private setup was declined or failed before exec; the child ran under both
+    /// deny-all floors and never entered a namespace.
+    DenyAllFallback,
+}
+
+impl BuildIsolation {
+    #[cfg(any(target_os = "linux", test))]
+    fn from_fallback(fallback: bool) -> Self {
+        if fallback {
+            Self::DenyAllFallback
+        } else {
+            Self::Private
+        }
+    }
+}
+
 /// A spawned child together with the OS sandbox actually in force around it.
 ///
 /// The caller owns `child` (it does its own `wait`/`kill`/pipe plumbing).
@@ -74,6 +99,9 @@ pub struct ConfinedChild {
     pub fence_id: AdmittedFenceId,
     /// The inspectable body verified at the actual NamedRoot launch boundary.
     pub admitted: Option<AdmittedFenceBody>,
+    /// The effective build isolation; `None` unless the child was spawned
+    /// under `ChildNetworkPolicy::PrivateBuild` on Linux.
+    pub build_isolation: Option<BuildIsolation>,
 }
 
 /// A confined child together with **every** fence whose lifetime brackets it.
@@ -114,6 +142,8 @@ pub struct SandboxedWorkerChild {
     pub child: Child,
     /// The OS-level sandbox actually applied to the worker.
     pub sandbox_kind: SandboxKind,
+    /// The worker's effective build isolation, as on [`ConfinedChild`].
+    pub build_isolation: Option<BuildIsolation>,
     control: Option<TrustedWorkerControl>,
 }
 
@@ -1008,7 +1038,7 @@ impl ConfinedCommand {
         } = self;
 
         let apply_admitted = admitted.clone();
-        let spawned = std::thread::spawn(move || -> ToolResult<Child> {
+        let spawned = std::thread::spawn(move || -> ToolResult<(Child, Option<BuildIsolation>)> {
             // Prepare the exact Command operand first. NamedRoot currently
             // supports only Landlock (no wrapper), so the actual program operand
             // is the root; unsupported wrappers refuse rather than guessing at
@@ -1096,23 +1126,32 @@ impl ConfinedCommand {
             after_apply();
             let spawned = cmd.spawn();
             #[cfg(target_os = "linux")]
-            if let (Some(fallback), Err(error)) = (isolation_fallback, &spawned) {
-                if error.raw_os_error() == Some(agent_bridle_fdguard::build_isolation::RETRY_DENY_ALL) {
-                    // The first child failed in namespace setup BEFORE exec.
-                    // Retry only that failure, once, with both deny-all floors.
+            if let Some(fallback) = isolation_fallback {
+                // The first child failed in namespace setup BEFORE exec.
+                // Retry only that failure, once, with both deny-all floors.
+                let retry = matches!(&spawned, Err(error) if error.raw_os_error()
+                    == Some(agent_bridle_fdguard::build_isolation::RETRY_DENY_ALL));
+                let child = if retry {
                     fallback.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return cmd.spawn().map_err(ToolError::from);
-                }
+                    cmd.spawn()
+                } else {
+                    spawned
+                };
+                return Ok((child?, Some(BuildIsolation::from_fallback(
+                    fallback.load(std::sync::atomic::Ordering::Relaxed),
+                ))));
             }
             #[cfg(not(target_os = "linux"))]
             let _ = isolation_fallback;
-            spawned.map_err(ToolError::from)
+            Ok((spawned?, None))
         })
         .join()
         .map_err(|_| ToolError::denied("confined-spawn thread panicked before exec"))?;
+        let (child, build_isolation) = spawned?;
 
         Ok(ConfinedChild {
-            child: spawned?,
+            child,
+            build_isolation,
             sandbox_kind: reported_kind,
             // The identity of the object admission produced and `verify_applied`
             // confirmed above — copied out, never recomputed downstream.
@@ -1179,6 +1218,7 @@ impl ConfinedCommand {
             sandbox_kind,
             fence_id,
             admitted,
+            build_isolation: _,
         } = self.spawn_authorized(cx, effective, authority)?;
 
         Ok(ManagedSpawn {
@@ -1403,6 +1443,7 @@ impl SandboxedWorker {
         Ok(SandboxedWorkerChild {
             child: confined.child,
             sandbox_kind: confined.sandbox_kind,
+            build_isolation: confined.build_isolation,
             control: Some(TrustedWorkerControl {
                 stream: control,
                 nonce: nonce.to_string(),
@@ -1999,6 +2040,7 @@ mod tokio_spawn {
                 sandbox_kind,
                 fence_id: _,
                 admitted: _,
+                build_isolation: _,
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
@@ -2329,6 +2371,17 @@ mod tests {
         assert_eq!(parent.read(&mut byte).unwrap(), 0, "parent receives EOF");
     }
 
+    /// The shared fallback flag is the only source of the reported mode. It
+    /// covers both a pre-fork decision and a retry after failed private setup.
+    #[test]
+    fn build_isolation_is_read_from_the_fallback_flag() {
+        assert_eq!(BuildIsolation::from_fallback(false), BuildIsolation::Private);
+        assert_eq!(
+            BuildIsolation::from_fallback(true),
+            BuildIsolation::DenyAllFallback
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn private_worker_bootstrap_excludes_loader_and_authentication_controls() {
@@ -2507,6 +2560,7 @@ mod tests {
         let mut worker = SandboxedWorkerChild {
             child: process,
             sandbox_kind: SandboxKind::None,
+            build_isolation: None,
             control: Some(control),
         };
         let forged_payload = serde_json::json!({

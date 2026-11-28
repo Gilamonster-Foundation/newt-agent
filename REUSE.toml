@@ -20,10 +20,3 @@ path = "vendor/agent-bridle-*/**"
 precedence = "override"
 SPDX-FileCopyrightText = "2026 Shawn Hartsock"
 SPDX-License-Identifier = "Apache-2.0"
-
-# Patched crossterm 0.28.1: MIT, upstream copyright (vendor/crossterm-0.28.1-patched/LICENSE).
-[[annotations]]
-path = "vendor/crossterm-0.28.1-patched/**"
-precedence = "override"
-SPDX-FileCopyrightText = "2019 Timon"
-SPDX-License-Identifier = "MIT"
