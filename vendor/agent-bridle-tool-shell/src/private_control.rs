@@ -511,7 +511,7 @@ fn parent_snapshot(stream: &UnixStream) -> Result<ParentSnapshot, String> {
     #[cfg(target_os = "macos")]
     let peer_pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
         .map_err(|error| format!("read worker-control peer PID: {error}"))?;
-    let image = inspect_image_with_fallback(peer_pid)?;
+    let image = parent_image(ppid, peer_pid, inspect_image_with_fallback)?;
     Ok(ParentSnapshot {
         ppid,
         peer_pid,
@@ -523,10 +523,47 @@ fn parent_snapshot(stream: &UnixStream) -> Result<ParentSnapshot, String> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parent_image(
+    ppid: i32,
+    peer_pid: i32,
+    inspect: impl FnOnce(i32) -> Result<ImageIdentityState, String>,
+) -> Result<ImageIdentityState, String> {
+    // Linux reports zero only for a parent/peer outside this PID namespace.
+    // There is no /proc/0/exe to inspect. This narrow branch is paired with
+    // the zero SCM credential and uid checks in verify_parent; the host
+    // authenticates the worker's image and parentage before sending authority.
+    #[cfg(target_os = "linux")]
+    if ppid == 0 && peer_pid == 0 {
+        return Ok(ImageIdentityState::Unknown);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ppid;
+    inspect(peer_pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_parent(
     pre: Result<ParentSnapshot, String>,
     post: Result<ParentSnapshot, String>,
     frame: FrameCredentials,
+) -> Result<(), String> {
+    verify_parent_with(
+        pre,
+        post,
+        frame,
+        current_image,
+        #[cfg(target_os = "linux")]
+        nix::unistd::getuid().as_raw(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_parent_with(
+    pre: Result<ParentSnapshot, String>,
+    post: Result<ParentSnapshot, String>,
+    frame: FrameCredentials,
+    own_image: impl FnOnce() -> Result<ImageIdentity, String>,
+    #[cfg(target_os = "linux")] own_uid: u32,
 ) -> Result<(), String> {
     let pre = pre?;
     let post = post?;
@@ -543,13 +580,13 @@ fn verify_parent(
         ));
     }
     if let ImageIdentityState::Known(peer_image) = pre.image {
-        if current_image()? != peer_image {
+        if own_image()? != peer_image {
             return Err("worker-control parent image is not this executable".to_string());
         }
     }
     #[cfg(target_os = "linux")]
     {
-        if frame.pid != pre.peer_pid || frame.uid != nix::unistd::getuid().as_raw() {
+        if frame.pid != pre.peer_pid || frame.uid != own_uid {
             return Err("worker authority frame sender credentials do not match its parent".into());
         }
     }
@@ -767,6 +804,81 @@ fn set_cloexec(fd: &impl AsFd) -> Result<(), String> {
 mod tests {
     #[cfg(any(target_os = "linux", feature = "carried-coreutils"))]
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestor_launcher_has_no_image_in_the_worker_namespace() {
+        let image = parent_image(0, 0, |_| Err("outside image is unnameable".into()))
+            .expect("a kernel-attested ancestor must not inspect /proc/0/exe");
+        assert_eq!(image, ImageIdentityState::Unknown);
+        for (ppid, peer) in [(0, 21), (21, 0), (21, 21)] {
+            assert!(parent_image(ppid, peer, |_| Err("image read failed".into())).is_err());
+        }
+        let image = ImageIdentityState::Known(ImageIdentity { dev: 7, ino: 11 });
+        assert_eq!(
+            parent_image(21, 21, |pid| {
+                assert_eq!(pid, 21);
+                Ok(image.clone())
+            }),
+            Ok(image)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launcher_credentials_match_both_namespace_coordinates() {
+        for (ppid, peer, sender, uid, accepted) in [
+            (21, 21, 21, 42, true),
+            (0, 0, 0, 42, true),
+            (0, 0, 21, 42, false),
+            (21, 0, 0, 42, false),
+            (0, 21, 21, 42, false),
+            (21, 21, 0, 42, false),
+            (0, 0, 0, 43, false),
+            (21, 21, 21, 43, false),
+        ] {
+            let snapshot = ParentSnapshot {
+                ppid,
+                peer_pid: peer,
+                image: ImageIdentityState::Unknown,
+            };
+            let result = verify_parent_with(
+                Ok(snapshot.clone()),
+                Ok(snapshot),
+                FrameCredentials { pid: sender, uid },
+                || panic!("unknown parent image needs no current-image lookup"),
+                42,
+            );
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "ppid={ppid} peer={peer} sender={sender} uid={uid}: {result:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flat_launcher_keeps_image_and_snapshot_checks() {
+        let snapshot = ParentSnapshot {
+            ppid: 21,
+            peer_pid: 21,
+            image: ImageIdentityState::Known(ImageIdentity { dev: 7, ino: 11 }),
+        };
+        let frame = FrameCredentials { pid: 21, uid: 42 };
+        let verify = |post, image| {
+            verify_parent_with(Ok(snapshot.clone()), Ok(post), frame, || Ok(image), 42)
+        };
+        assert!(verify(snapshot.clone(), ImageIdentity { dev: 7, ino: 11 }).is_ok());
+        assert!(verify(snapshot.clone(), ImageIdentity { dev: 7, ino: 12 }).is_err());
+        assert!(verify(snapshot.clone(), ImageIdentity { dev: 8, ino: 11 }).is_err());
+        let mut changed = snapshot.clone();
+        changed.ppid = 22;
+        assert!(verify(changed, ImageIdentity { dev: 7, ino: 11 }).is_err());
+        let mut changed = snapshot.clone();
+        changed.peer_pid = 22;
+        assert!(verify(changed, ImageIdentity { dev: 7, ino: 11 }).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

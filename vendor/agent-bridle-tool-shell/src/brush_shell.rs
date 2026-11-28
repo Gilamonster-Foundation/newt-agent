@@ -320,7 +320,8 @@ impl Tool for BrushShellTool {
         };
 
         // Pre-exec must see the same effective search path as the shell below.
-        env.entry("PATH".to_string()).or_insert_with(|| path_value.clone());
+        env.entry("PATH".to_string())
+            .or_insert_with(|| path_value.clone());
 
         if let Some((root, argv)) = crate::named_host_root::select_named_host_root(
             self.named_host_roots && self.command_broker.is_none(),
@@ -405,33 +406,31 @@ impl Tool for BrushShellTool {
             // cancellable async waiter's stack.
             let _execution_lease = execution_lease;
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let (broker_runtime, endpoint) = match command_broker {
-                Some(broker) => {
-                    // OwnedWorker below must reap before this runtime drops.
-                    // If broker setup fails, reap the newly spawned worker too.
-                    match crate::broker_runtime::BrokerRuntime::start(
-                        broker,
-                        context,
-                        confined.child.id(),
-                        cancelled.clone(),
-                        std::time::Instant::now() + timeout,
-                    ) {
-                        Ok((runtime, endpoint)) => (Some(runtime), Some(endpoint)),
-                        Err(error) => {
-                            drop(OwnedWorker {
-                                confined,
-                                reaped: false,
-                            });
-                            return Err(error);
-                        }
+            let mut broker_runtime = None;
+            let deadline = std::time::Instant::now() + timeout;
+            // No broker endpoint exists before the worker hello is verified.
+            // OwnedWorker in supervise_worker reaps before this runtime drops.
+            let delegate = |worker_pid| {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                match command_broker {
+                    Some(broker) => {
+                        let (runtime, endpoint) = crate::broker_runtime::BrokerRuntime::start(
+                            broker,
+                            context,
+                            worker_pid,
+                            cancelled.clone(),
+                            deadline,
+                        )?;
+                        broker_runtime = Some(runtime);
+                        Ok(Some(endpoint))
                     }
+                    None => Ok(None),
                 }
-                None => (None, None),
-            };
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let endpoint = {
-                let _ = (command_broker, context);
-                None
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    let _ = (worker_pid, command_broker, context, deadline);
+                    Ok(None)
+                }
             };
             let result = supervise_worker(
                 confined,
@@ -440,7 +439,7 @@ impl Tool for BrushShellTool {
                 max_output,
                 worker_output,
                 &cancelled,
-                endpoint,
+                delegate,
             );
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             drop(broker_runtime);
@@ -507,7 +506,7 @@ fn supervise_worker(
     max_output: usize,
     output: OutputEmitter,
     cancelled: &AtomicBool,
-    endpoint: Option<crate::brush_worker::WorkerEndpoint>,
+    delegate: impl FnOnce(u32) -> ToolResult<Option<crate::brush_worker::WorkerEndpoint>>,
 ) -> ToolResult<Supervised> {
     let mut worker = OwnedWorker {
         confined,
@@ -518,7 +517,7 @@ fn supervise_worker(
     }
     let auth_started = std::time::Instant::now();
     if let Err(error) =
-        authenticate_worker(&mut worker.confined, payload, timeout, cancelled, endpoint)
+        authenticate_worker(&mut worker.confined, payload, timeout, cancelled, delegate)
     {
         worker.terminate()?;
         let stdout = worker
@@ -665,7 +664,7 @@ fn authenticate_worker(
     payload: &WorkerPayload,
     timeout: Duration,
     cancelled: &AtomicBool,
-    endpoint: Option<crate::brush_worker::WorkerEndpoint>,
+    delegate: impl FnOnce(u32) -> ToolResult<Option<crate::brush_worker::WorkerEndpoint>>,
 ) -> ToolResult<()> {
     #[cfg(unix)]
     {
@@ -674,8 +673,10 @@ fn authenticate_worker(
             .and_then(rustix::process::Pid::from_raw)
             .ok_or_else(|| ToolError::denied("invalid brush worker PID"))?;
         watch_worker_authentication(pid, cancelled, || {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let endpoint = delegate(confined.authenticate(timeout)?)?;
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let _ = endpoint;
+            let _ = delegate;
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Some(endpoint) = endpoint {
                 return confined.send_payload_with_control_channel(payload, endpoint, timeout);
@@ -687,7 +688,7 @@ fn authenticate_worker(
     // Linux. Preserve the existing refusal on other platforms.
     #[cfg(not(unix))]
     {
-        let _ = (cancelled, endpoint);
+        let _ = (cancelled, delegate);
         confined.send_payload(payload, timeout)
     }
 }
