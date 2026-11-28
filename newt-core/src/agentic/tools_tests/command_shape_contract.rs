@@ -132,7 +132,10 @@ fn discovery_matches_unique_fixture_across_windows_path_forms() {
 
 async fn check(row: Row) {
     let _lock = env_lock().await;
-    let temp = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    // Keep gh on the test image's filesystem: private build /tmp is a separate
+    // tmpfs, and copying this large image per row exhausts it (#3363).
+    let temp = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
     // macOS exposes /var through /private/var; grants must use the same
     // canonical spelling as destination admission.
     let temp_root = dunce::canonicalize(temp.path()).unwrap();
@@ -225,10 +228,7 @@ async fn check(row: Row) {
     // The test executable rejects gh's --base argument locally. It can never
     // create a PR; its error proves the plain route really spawned the child.
     let gh = bin.join(if cfg!(windows) { "gh.exe" } else { "gh" });
-    let executable = std::env::current_exe().unwrap();
-    if std::fs::hard_link(&executable, &gh).is_err() {
-        std::fs::copy(&executable, &gh).unwrap();
-    }
+    std::fs::hard_link(&executable, &gh).unwrap();
     let mut paths = vec![bin.clone()];
     // Keep dispatch on the same system Git used by hermetic setup, not a
     // runner's group-writable Homebrew prefix. The inert gh fixture stays first.
