@@ -966,7 +966,7 @@ fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
 #[cfg(feature = "confine")]
 fn bridle_registry(
     engine: crate::ShellEngine,
-    policy: agent_bridle::SandboxPolicy,
+    (policy, private_scratch): (agent_bridle::SandboxPolicy, Vec<std::path::PathBuf>),
     live: Option<std::sync::Arc<LiveOutputRelay>>,
     wall: std::time::Duration,
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
@@ -975,7 +975,7 @@ fn bridle_registry(
 ) -> agent_bridle::Registry {
     use std::sync::Arc;
     #[cfg(test)]
-    let _ = &command_broker;
+    let _ = (&command_broker, &private_scratch);
     let shell: Arc<dyn agent_bridle::Tool> = match engine {
         crate::ShellEngine::SafeSubset => {
             // F20: the wall rides on the limits — see `shell_limits`.
@@ -1028,6 +1028,7 @@ fn bridle_registry(
                 // policies. Unsupported targets refuse rather than bypassing its
                 // private transport; startup checks that capability.
                 let mut tool = agent_bridle::BrushShellTool::new()
+                    .with_private_build_scratch(private_scratch)
                     .with_max_output_bytes(shell_limits(wall).max_output_bytes)
                     .expect("shared shell output limit fits Brush protocol bounds")
                     .with_timeout(wall)
@@ -1181,12 +1182,14 @@ pub(super) async fn dispatch_bridled_build_shell(
     let scratch = request.prepare_scratch().map_err(|error| {
         agent_bridle::ToolError::Other(anyhow::anyhow!("build scratch: {error}"))
     })?;
+    let private_scratch = request.private_build_scratch(&scratch);
+    let spawn_caveats = request.spawn_caveats(&private_scratch);
     let environment: std::collections::BTreeMap<_, _> =
         request.env_grants().iter().cloned().collect();
     let args = serde_json::json!({"cmd": source, "cwd": cwd, "env": environment});
     let mut envelope = dispatch_bridled_shell_with_floor(
         args,
-        request.caveats(),
+        &spawn_caveats,
         sink,
         Some(agent_bridle::EnforcementFloor::from_scalar(
             agent_bridle::AxisEnforcement::Kernel,
@@ -1195,8 +1198,9 @@ pub(super) async fn dispatch_bridled_build_shell(
         command_broker,
         request.build_held_read_roots(),
         wall,
-        Some(crate::confined_exec::sandbox_policy::build_sandbox_policy(
-            &request.caveats().net,
+        Some((
+            crate::confined_exec::sandbox_policy::build_sandbox_policy(&request.caveats().net),
+            private_scratch,
         )),
     )
     .await?;
@@ -1216,7 +1220,7 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     command_broker: Option<std::sync::Arc<dyn agent_bridle_tool_shell::CommandBroker>>,
     held_read_roots: Vec<agent_bridle::HeldReadRoot>,
     wall: std::time::Duration,
-    sandbox_policy: Option<agent_bridle::SandboxPolicy>,
+    sandbox_policy: Option<(agent_bridle::SandboxPolicy, Vec<std::path::PathBuf>)>,
 ) -> agent_bridle::ToolResult<serde_json::Value> {
     if let Some(denied) = descendant_exec_denial(
         args.get("cmd")
@@ -1276,7 +1280,7 @@ pub(super) async fn dispatch_bridled_shell_with_floor(
     // A lease also belongs to native Git recovery. Only the explicit build
     // entry point supplies a build network policy; ordinary shell/Git retain
     // their existing floor regardless of resource ownership.
-    let policy = sandbox_policy.unwrap_or_else(b1_run_command_sandbox_policy);
+    let policy = sandbox_policy.unwrap_or_else(|| (b1_run_command_sandbox_policy(), Vec::new()));
     let registry = bridle_registry(
         engine,
         policy,
@@ -3969,7 +3973,7 @@ mod bridle_registry_tests {
     fn bridle_registry_registers_only_the_shell_tool() {
         let registry = bridle_registry(
             crate::ShellEngine::SafeSubset,
-            b1_run_command_sandbox_policy(),
+            (b1_run_command_sandbox_policy(), Vec::new()),
             None,
             std::time::Duration::from_secs(1),
             Vec::new(),

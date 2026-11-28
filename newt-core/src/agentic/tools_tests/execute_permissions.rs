@@ -5755,3 +5755,74 @@ fn pre_push_3294_requires_the_exact_build_authority() {
         None
     ));
 }
+
+/// #3361: admission compares stable Build authority, never a transient run fence.
+#[test]
+fn build_admission_requires_stable_approved_roots() {
+    // Model a gate that returns the approved parent itself. MockGate's default
+    // ask_with_caveats intersects string sets before this recheck can see it.
+    struct ParentGrant(MockGate);
+    impl PermissionGate for ParentGrant {
+        fn ask_with_caveats(&mut self, _: &Caveats, _: &[PermissionRequest]) -> PermissionDecision {
+            PermissionDecision::Allow(self.0.base.clone())
+        }
+        fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision {
+            self.0.ask(requests)
+        }
+        fn ask_dependency_fetch(
+            &mut self,
+            prepared: &Caveats,
+            request: &PermissionRequest,
+        ) -> PermissionDecision {
+            self.0.ask_dependency_fetch(prepared, request)
+        }
+        fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
+            self.0.ask_question(question)
+        }
+    }
+    let root = std::path::Path::new("/workspace");
+    let granted = Caveats {
+        fs_read: Scope::only(["/scratch/partition".into()]),
+        fs_write: Scope::only(["/scratch/partition".into()]),
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    for (path, expected) in [
+        ("/scratch/partition", true),
+        ("/scratch/partition/run", false),
+        ("/scratch/partition-neighbor/run", false),
+        ("/scratch/other/run", false),
+    ] {
+        let mut build = granted.clone();
+        build.fs_read = Scope::only([path.into()]);
+        build.fs_write = Scope::only([path.into()]);
+        assert_eq!(
+            build_authorized(root, "cargo test", &build, &granted, &mut None, None),
+            expected
+        );
+        let mut gate = ParentGrant(MockGate::new(true, &granted));
+        assert_eq!(
+            build_authorized(
+                root,
+                "cargo test",
+                &build,
+                &Caveats {
+                    fs_read: Scope::none(),
+                    ..granted.clone()
+                },
+                &mut Some(&mut gate),
+                None
+            ),
+            expected
+        );
+        build.net = Scope::All;
+        assert!(!build_authorized(
+            root,
+            "cargo test",
+            &build,
+            &granted,
+            &mut None,
+            None
+        ));
+    }
+}

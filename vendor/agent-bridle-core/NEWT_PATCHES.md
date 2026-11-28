@@ -393,3 +393,11 @@ The parent endpoints remain in `Child.stdout` and `Child.stderr`, preserving
 reader and supervisor ownership, including error paths. Ordinary argv stdio,
 the authenticated stdin channel and the framing protocol are unchanged.
 Retire with the upstream port of this transport change.
+
+## Owned empty build scratch (#3361)
+
+`ConfinedCommand` and `SandboxedWorker` carry caller-owned run paths separately
+from environment and serialized policy. The Linux command hook forwards them to
+fdguard for exact empty-directory recreation; all other backends retain their
+existing behavior. See the fdguard patch notes for ownership and fallback rules.
+Retire with the upstream port of this trusted scratch seam.

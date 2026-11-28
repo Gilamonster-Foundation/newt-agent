@@ -52,6 +52,7 @@ fn needs_fallback<'a, 'b>(
     cwd: &Path,
     mut roots: impl Iterator<Item = &'a Path>,
     env: impl Iterator<Item = (&'b OsStr, &'b OsStr)>,
+    private_scratch: &[PathBuf],
     mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
 ) -> bool {
     if !identity_available || cwd.components().any(|part| part == Component::ParentDir) {
@@ -64,7 +65,7 @@ fn needs_fallback<'a, 'b>(
     if temporary_root(spelling).is_some() || temporary_root(&cwd).is_some() {
         return true;
     }
-    let mut hidden = |path: &Path| {
+    let mut hidden = |path: &Path, scratch_allowed: bool| {
         let path = cwd.join(path);
         if path.components().any(|part| part == Component::ParentDir) {
             return true;
@@ -83,17 +84,30 @@ fn needs_fallback<'a, 'b>(
                 Err(_) => return true,
             }
         };
+        // Only the exact, existing, canonical run directory supplied by the
+        // trusted owner is empty scratch. Neighbors, descendants, aliases and
+        // missing paths retain the covered-input decision.
+        if scratch_allowed
+            && existing == path
+            && resolved == path
+            && private_scratch.contains(&path)
+        {
+            return false;
+        }
         // A covered spelling disappears even if its symlink points out.
         temporary_root(&path).is_some() || temporary_root(&resolved).is_some()
     };
-    roots.any(&mut hidden)
+    roots.any(|path| hidden(path, true))
         || env
             .filter(|(name, _)| is_path_env(name))
             .any(|(name, value)| {
                 if name == "PATH" || name == "GOPATH" {
-                    std::env::split_paths(value).any(|path| hidden(&path))
+                    std::env::split_paths(value).any(|path| hidden(&path, false))
                 } else {
-                    hidden(Path::new(value))
+                    let temporary = ["HOME", "TMPDIR", "TMP", "TEMP", "XDG_RUNTIME_DIR"]
+                        .iter()
+                        .any(|key| name == OsStr::new(key));
+                    hidden(Path::new(value), temporary)
                 }
             })
 }
@@ -146,7 +160,7 @@ pub fn confine<'a>(
     command: &mut Command,
     filesystems: [OwnedFd; 2],
     network_filters: [seccompiler::BpfProgram; 2],
-    scratch_access: u64,
+    (scratch_access, private_scratch): (u64, &[PathBuf]),
     binds: Vec<SameObjectBind>,
     roots: impl Iterator<Item = &'a Path>,
     pid_namespace: bool,
@@ -160,18 +174,23 @@ pub fn confine<'a>(
     // NSS may allocate, load modules or contact a service: resolve only here,
     // before fork. A failed lookup selects the same fresh-child fallback.
     let identity = account_files(uid, gid);
+    // Restore only the caller-owned run directories, never values discovered
+    // in the child environment. All allocation and validation precede fork.
+    let empty_dirs = empty_scratch_dirs(private_scratch);
     // The spawn funnel clears ambient env and supplies the effective values,
     // including the worker's eventual directory controls. Decide before fork:
     // a covered input must retain its host view and its original grant rules.
     let fallback = Arc::new(AtomicBool::new(needs_fallback(
-        identity.is_ok(),
+        identity.is_ok() && empty_dirs.is_ok(),
         command.get_current_dir().unwrap_or(Path::new(".")),
         roots,
         command
             .get_envs()
             .filter_map(|(key, value)| value.map(|value| (key, value))),
+        private_scratch,
         |path| path.canonicalize(),
     )));
+    let empty_dirs = empty_dirs.unwrap_or_default();
     let child_fallback = Arc::clone(&fallback);
     let uid_map = format!("{uid} {uid} 1\n").into_bytes();
     let gid_map = format!("{gid} {gid} 1\n").into_bytes();
@@ -214,7 +233,9 @@ pub fn confine<'a>(
             let private = !child_fallback.load(Ordering::Relaxed);
             if private
                 && namespace(&uid_map, &gid_map)
-                    .and_then(|()| private_filesystems(filesystem.as_raw_fd(), scratch_access))
+                    .and_then(|()| {
+                        private_filesystems(filesystem.as_raw_fd(), scratch_access, &empty_dirs)
+                    })
                     .and_then(|()| {
                         let files = identity
                             .as_ref()
@@ -406,7 +427,29 @@ fn private_identity(ruleset: i32, access: u64, files: &[Vec<u8>; 2]) -> io::Resu
     Ok(())
 }
 
-fn private_filesystems(ruleset: i32, access: u64) -> io::Result<()> {
+fn empty_scratch_dirs(scratch: &[PathBuf]) -> io::Result<Vec<CString>> {
+    let mut directories = Vec::new();
+    for path in scratch {
+        if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let Some(root) = temporary_root(path) else {
+            continue;
+        };
+        for parent in path.ancestors().take_while(|path| *path != root) {
+            directories.push(
+                CString::new(parent.as_os_str().as_bytes())
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
+            );
+        }
+    }
+    // Parents first, exactly as before #3352; no host contents are copied.
+    directories.sort();
+    directories.dedup();
+    Ok(directories)
+}
+
+fn private_filesystems(ruleset: i32, access: u64, empty_dirs: &[CString]) -> io::Result<()> {
     // SAFETY: only the new mount namespace is affected; propagation is made
     // private recursively BEFORE the first mount, so no event reaches the host.
     check(unsafe {
@@ -475,6 +518,13 @@ fn private_filesystems(ruleset: i32, access: u64) -> io::Result<()> {
     )?;
     // Bind the source inode: /dev/ptmx can itself be a symlink on the host.
     grant_private_mount(ruleset, terminal, c"/dev/pts/ptmx")?;
+    for path in empty_dirs {
+        // SAFETY: paths were validated before fork; this is the private mount.
+        let rc = unsafe { libc::mkdir(path.as_ptr(), 0o700) };
+        if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+            check(rc)?;
+        }
+    }
     Ok(())
 }
 
@@ -1029,6 +1079,7 @@ mod tests {
                     Path::new(cwd),
                     roots.iter().map(Path::new),
                     std::iter::empty(),
+                    &[],
                     resolve,
                 ),
                 expected,
@@ -1065,6 +1116,7 @@ mod tests {
                     Path::new("/workspace"),
                     std::iter::empty(),
                     [(OsStr::new(key), OsStr::new(value))].into_iter(),
+                    &[],
                     resolve,
                 ),
                 expected,
@@ -1076,8 +1128,95 @@ mod tests {
             Path::new("/workspace"),
             std::iter::empty(),
             std::iter::empty(),
+            &[],
             |_| panic!("a known account failure must select fallback immediately"),
         ));
+    }
+
+    /// The real default-scratch and neighboring-grant probes ground this table.
+    #[test]
+    fn only_the_owned_empty_run_is_exempt_from_covered_inputs() {
+        let scratch = [PathBuf::from("/tmp/managed/run")];
+        let resolve = |path: &Path| match path.to_str().unwrap() {
+            "/tmp/managed/missing" => Err(io::Error::from_raw_os_error(libc::ENOENT)),
+            "/alias" => Ok(scratch[0].clone()),
+            _ => Ok(path.to_owned()),
+        };
+        for (root, expected) in [
+            ("/tmp/managed/run", false),
+            ("/tmp/managed", true),
+            ("/tmp/managed/neighbor", true),
+            ("/tmp/managed/run/input", true),
+            ("/tmp/managed/missing", true),
+            ("/alias", true),
+        ] {
+            assert_eq!(
+                needs_fallback(
+                    true,
+                    Path::new("/workspace"),
+                    [Path::new(root)].into_iter(),
+                    std::iter::empty(),
+                    &scratch,
+                    resolve
+                ),
+                expected,
+                "{root}"
+            );
+        }
+        for (name, value, expected) in [
+            ("HOME", "/tmp/managed/run", false),
+            ("TMPDIR", "/tmp/managed/run", false),
+            ("TMP", "/tmp/managed/run", false),
+            ("TEMP", "/tmp/managed/run", false),
+            ("XDG_RUNTIME_DIR", "/tmp/managed/run", false),
+            ("HOME", "/tmp/managed/run/child", true),
+            ("HOME", "/alias", true),
+            ("TMPDIR", "/tmp/managed/neighbor", true),
+            ("CARGO_HOME", "/tmp/managed/run", true),
+            ("PATH", "/usr/bin:/tmp/managed/run", true),
+            ("GOPATH", "/tmp/managed/run", true),
+        ] {
+            assert_eq!(
+                needs_fallback(
+                    true,
+                    Path::new("/workspace"),
+                    std::iter::empty(),
+                    [(OsStr::new(name), OsStr::new(value))].into_iter(),
+                    &scratch,
+                    resolve
+                ),
+                expected,
+                "{name}={value}"
+            );
+        }
+        assert!(
+            needs_fallback(
+                true,
+                &scratch[0],
+                std::iter::empty(),
+                std::iter::empty(),
+                &scratch,
+                resolve
+            ),
+            "a workspace is never scratch"
+        );
+        let missing = [PathBuf::from("/tmp/managed/missing")];
+        assert!(needs_fallback(
+            true,
+            Path::new("/workspace"),
+            missing.iter().map(PathBuf::as_path),
+            std::iter::empty(),
+            &missing,
+            resolve
+        ));
+        assert_eq!(
+            empty_scratch_dirs(&scratch).unwrap(),
+            [c"/tmp/managed".to_owned(), c"/tmp/managed/run".to_owned()]
+        );
+        assert!(empty_scratch_dirs(&[PathBuf::from("/var/tmp/run")])
+            .unwrap()
+            .is_empty());
+        assert!(empty_scratch_dirs(&[PathBuf::from("/tmp/../run")]).is_err());
     }
 
     #[test]

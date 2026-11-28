@@ -613,6 +613,7 @@ pub struct ConfinedCommand {
     /// Read roots the caller holds as directory descriptors; the Landlock
     /// ruleset anchors on them instead of re-opening the root by path.
     held_read_roots: Vec<crate::sandbox::HeldReadRoot>,
+    private_build_scratch: Vec<PathBuf>,
     /// The sandbox mechanism config (read/exec allow-lists). Rides the builder —
     /// NOT the `ToolContext`, which carries only authority (I5-B, #144, ADR 0017
     /// D2). Defaults to today's built-in allow-lists.
@@ -640,6 +641,7 @@ impl ConfinedCommand {
             new_process_group: false,
             worker_read_resources: BTreeSet::new(),
             held_read_roots: Vec::new(),
+            private_build_scratch: Vec::new(),
             sandbox_policy: Arc::new(SandboxPolicy::default()),
         }
     }
@@ -656,6 +658,16 @@ impl ConfinedCommand {
         roots: impl IntoIterator<Item = crate::sandbox::HeldReadRoot>,
     ) -> Self {
         self.held_read_roots.extend(roots);
+        self
+    }
+
+    /// Recreate these exact, caller-owned empty run directories in private
+    /// temporary mounts. The trusted caller must have created and retained them;
+    /// never supply model-selected paths, input directories, or environment values.
+    /// Host-side consumers must not expect files back from the private copy.
+    #[must_use]
+    pub fn private_build_scratch(mut self, paths: Vec<PathBuf>) -> Self {
+        self.private_build_scratch = paths;
         self
     }
 
@@ -1032,6 +1044,7 @@ impl ConfinedCommand {
             sandbox_policy: _,
             worker_read_resources: _,
             held_read_roots,
+            private_build_scratch,
             // Consulted only on the `spawn_tokio` path, not this sync `spawn`.
             #[cfg(all(unix, feature = "spawn-tokio"))]
                 private_hosts: _,
@@ -1120,6 +1133,7 @@ impl ConfinedCommand {
                     &mut cmd, &mechanism_effective,
                     worker_image.as_ref().map(|image| (image.program.as_str(), &image.file)),
                     &held_read_roots,
+                    &private_build_scratch,
                 )?
             } else { None };
 
@@ -1268,6 +1282,7 @@ pub struct SandboxedWorker {
     read_only_resources: Vec<PathBuf>,
     held_read_roots: Vec<crate::HeldReadRoot>,
     temporary_env: Vec<(String, String)>,
+    private_build_scratch: Vec<PathBuf>,
 }
 
 impl SandboxedWorker {
@@ -1285,6 +1300,7 @@ impl SandboxedWorker {
             read_only_resources: Vec::new(),
             held_read_roots: Vec::new(),
             temporary_env: Vec::new(),
+            private_build_scratch: Vec::new(),
         }
     }
 
@@ -1307,6 +1323,14 @@ impl SandboxedWorker {
                 Vec::new()
             }
         };
+        self
+    }
+
+    /// Carry trusted empty run directories independently of worker environment.
+    /// See [`ConfinedCommand::private_build_scratch`] for the ownership contract.
+    #[must_use]
+    pub fn private_build_scratch(mut self, paths: Vec<PathBuf>) -> Self {
+        self.private_build_scratch = paths;
         self
     }
 
@@ -1410,6 +1434,7 @@ impl SandboxedWorker {
             && crate::sandbox::net_fully_denied(cx.caveats());
         let mut command = ConfinedCommand::new(executable)
             .held_read_roots(self.held_read_roots)
+            .private_build_scratch(self.private_build_scratch)
             .args([flag, kind])
             .env("AGENT_BRIDLE_WORKER_NONCE", nonce)
             .current_dir(cwd)

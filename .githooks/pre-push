@@ -157,8 +157,9 @@
 #   - brush_build_pipeline Linux cases (#3335), native-git-broker-real.yml:
 #     native cleanup and private-build grounds use real processes and Landlock.
 #     The job enables unprivileged user namespaces on its runner and requires
-#     private mode on both routes, then runs the forced
-#     netns/mounts/devpts/identity fallback variants. The temporary
+#     private mode on both routes, including default managed scratch (#3361),
+#     then runs netns/mounts/devpts/identity/alias-bind and the opt-in PID
+#     namespace/init deny switches (PID isolation stays off by default). The temporary
 #     workspace probe always requires fallback. CI-only like the Git broker tier.
 #   - ambient worktree dispatch proof (#2750), .github/workflows/ci.yml test job:
 #     explicitly runs the exact ignored fullaccess_tests::adoption_2750_full_access_creation_then_task_command

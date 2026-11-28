@@ -195,6 +195,10 @@ pub struct ExecRequest {
     /// owner-only just before spawning, removed when the run ends, so building
     /// a request never touches the filesystem.
     scratch_dirs: Vec<PathBuf>,
+    /// Roots contributed ONLY by Build scratch, in fs_read/fs_write order.
+    /// Approval keeps these stable; spawn replaces them with acquired runs.
+    /// An independently granted input at the same root must never be removed.
+    build_scratch_grants: [Option<String>; 2],
     /// Read roots the caller holds as directory descriptors: the Landlock
     /// fence anchors on them instead of re-opening the root by path.
     held_read_roots: Vec<crate::sandbox_seam::HeldReadRoot>,
@@ -225,6 +229,7 @@ impl ExecRequest {
             toolchains: Vec::new(),
             net_guard_bin: None,
             scratch_dirs: Vec::new(),
+            build_scratch_grants: [None, None],
             held_read_roots: Vec::new(),
         }
     }
@@ -239,7 +244,11 @@ impl ExecRequest {
         mut self,
         roots: impl IntoIterator<Item = crate::sandbox_seam::HeldReadRoot>,
     ) -> Self {
-        self.held_read_roots.extend(roots);
+        for root in roots {
+            #[cfg(feature = "confine")]
+            self.retain_build_read_input(root.provenance());
+            self.held_read_roots.push(root);
+        }
         self
     }
 
@@ -294,6 +303,9 @@ impl ExecRequest {
             self.env.retain(|(key, _)| key != "PATH");
             self.env
                 .push(("PATH".into(), path.to_string_lossy().into_owned()));
+            for entry in &evidence {
+                self.retain_build_read_input(&entry.root);
+            }
             if let Scope::Only(reads) = &mut self.caveats.fs_read {
                 reads.extend(evidence.iter().map(|entry| entry.root.clone()));
             }
@@ -334,7 +346,16 @@ impl ExecRequest {
     ) -> Self {
         // Compare against the original grant so external common/admin roots
         // retain both descriptors, regardless of discovery order.
-        paths.retain(|path| !newt_policy::caveats::covers_path(&self.caveats.fs_read, path));
+        // Scratch approval is not an input read grant: metadata beneath it
+        // must survive the later narrowing, even if the stable parent covers it.
+        let mut inputs = self.caveats.fs_read.clone();
+        if let (Scope::Only(reads), Some(scratch)) = (&mut inputs, &self.build_scratch_grants[0]) {
+            reads.remove(scratch);
+        }
+        paths.retain(|path| !newt_policy::caveats::covers_path(&inputs, path));
+        for path in &paths {
+            self.retain_build_read_input(path);
+        }
         if let Scope::Only(reads) = &mut self.caveats.fs_read {
             // Held roots require exact fs_read membership at spawn admission.
             #[cfg(feature = "confine")]
@@ -435,10 +456,71 @@ impl ExecRequest {
         &self.env
     }
 
-    /// The exact prepared fence, for admission before this request is spawned.
+    /// The prepared approval authority, stable across runs of this Build.
+    /// The internal scratch partition is narrowed only at the spawn boundary.
     #[must_use]
     pub fn caveats(&self) -> &Caveats {
         &self.caveats
+    }
+
+    fn retain_build_read_input(&mut self, path: &str) {
+        if self.build_scratch_grants[0].as_deref() == Some(path) {
+            self.build_scratch_grants[0] = None;
+        }
+    }
+
+    /// Add the stable approval partition, recording which roots were added
+    /// solely for scratch rather than already present as independent inputs.
+    fn with_build_scratch_partition(mut self) -> Self {
+        let partition = self.scratch_dirs[0]
+            .parent()
+            .expect("a run has a partition")
+            .to_string_lossy()
+            .into_owned();
+        for (scope, scratch) in [&mut self.caveats.fs_read, &mut self.caveats.fs_write]
+            .into_iter()
+            .zip(&mut self.build_scratch_grants)
+        {
+            if let Scope::Only(paths) = scope {
+                if paths.insert(partition.clone()) {
+                    *scratch = Some(partition.clone());
+                }
+            }
+        }
+        self
+    }
+
+    /// Project approval into this spawn only, after acquiring its run leases.
+    /// Never expose this transient fence to approval caches or later requests.
+    #[cfg(any(test, feature = "confine"))]
+    pub(crate) fn spawn_caveats(&self, scratch: &[PathBuf]) -> Caveats {
+        let mut caveats = self.caveats.clone();
+        for (scope, partition) in [&mut caveats.fs_read, &mut caveats.fs_write]
+            .into_iter()
+            .zip(&self.build_scratch_grants)
+        {
+            if let (Scope::Only(paths), Some(partition)) = (scope, partition) {
+                paths.remove(partition);
+                paths.extend(
+                    scratch
+                        .iter()
+                        .filter(|run| run.parent() == Some(Path::new(partition)))
+                        .map(|run| run.to_string_lossy().into_owned()),
+                );
+            }
+        }
+        caveats
+    }
+
+    /// Only acquired build leases may identify empty private scratch. Never
+    /// derive this exemption from the child's environment or a path pattern.
+    #[cfg(feature = "confine")]
+    pub(crate) fn private_build_scratch(&self, scratch: &[ScratchDir]) -> Vec<PathBuf> {
+        if self.private_build_isolation {
+            scratch.iter().map(|lease| lease.path.clone()).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Acquire this request's private scratch only after admission. The guards
@@ -751,9 +833,8 @@ pub fn build_tool_request(
     args: impl IntoIterator<Item = impl Into<String>>,
     network: &Scope<String>,
 ) -> ExecRequest {
-    let mut caveats = build_tool_caveats(workspace);
-    caveats.net = newt_policy::caveats::spawn_net_scope(network);
-    let net_grant = if caveats.net == Scope::none() {
+    let net = newt_policy::caveats::spawn_net_scope(network);
+    let net_grant = if net == Scope::none() {
         NetGrant::DenyAll
     } else {
         NetGrant::Unrestricted
@@ -764,10 +845,15 @@ pub fn build_tool_request(
         cwd,
         program,
         args,
-        caveats,
+        |_| {
+            let mut caveats = build_caveats_with_scratch_root(workspace, &[], None);
+            caveats.net = net;
+            caveats
+        },
     )
     .net_grant(net_grant)
-    .env("CARGO_NET_OFFLINE", "true");
+    .env("CARGO_NET_OFFLINE", "true")
+    .with_build_scratch_partition();
     request.private_build_isolation = true;
     request.toolchains_pending = crate::toolchains::requires_admission();
     request
@@ -918,15 +1004,17 @@ pub fn dependency_fetch_request(
     let writes: Vec<String> = operator_tool_home("CARGO_HOME", ".cargo")
         .map(|home| cargo_home_fetch_write_roots(&home))
         .unwrap_or_default();
-    let mut caveats = build_tool_caveats_with_writes(workspace, &writes);
-    caveats.net = network.clone();
     toolchain_request(
         ExecOrigin::TrustedInfra,
         workspace,
         cwd,
         "cargo",
         ["fetch", "--locked"],
-        caveats,
+        |_| {
+            let mut caveats = build_tool_caveats_with_writes(workspace, &writes);
+            caveats.net = network.clone();
+            caveats
+        },
     )
 }
 
@@ -960,9 +1048,12 @@ fn toolchain_request(
     cwd: &Path,
     program: impl Into<String>,
     args: impl IntoIterator<Item = impl Into<String>>,
-    caveats: Caveats,
+    caveats: impl FnOnce(&Path) -> Caveats,
 ) -> ExecRequest {
     let scratch = build_scratch_dir(workspace);
+    // Let the Build caller grant this exact run without rediscovering or
+    // removing explicit workspace, toolchain and extra-write roots.
+    let caveats = caveats(&scratch);
     let mut request = ExecRequest::new(origin, program, args, cwd, caveats)
         .env("HOME", scratch.to_string_lossy())
         .env("TMPDIR", scratch.to_string_lossy())
@@ -1074,8 +1165,19 @@ fn build_caveats_with_scratch(
     extra_write_roots: &[String],
     scratch_base: Option<PathBuf>,
 ) -> Caveats {
-    let scratch = operator_build_scratch_root(workspace, scratch_base)
-        .map(|root| root.to_string_lossy().into_owned());
+    build_caveats_with_scratch_root(
+        workspace,
+        extra_write_roots,
+        operator_build_scratch_root(workspace, scratch_base),
+    )
+}
+
+fn build_caveats_with_scratch_root(
+    workspace: &Path,
+    extra_write_roots: &[String],
+    scratch: Option<PathBuf>,
+) -> Caveats {
+    let scratch = scratch.map(|root| root.to_string_lossy().into_owned());
     let mut write_roots = vec![workspace.to_string_lossy().into_owned()];
     write_roots.extend(extra_write_roots.iter().cloned());
     write_roots.extend(scratch.clone());
@@ -1569,13 +1671,16 @@ mod tests {
         .contains(&name.as_str())));
         assert_eq!(request.net_grant, NetGrant::DenyAll);
         assert_eq!(request.caveats.exec, Scope::All);
-        // The proposed Build fence includes only this workspace's private
-        // scratch partition, not its shared temporary parent.
+        // Approval is reusable; only the spawn gets the unique run grant.
+        let scratch = &request.scratch_dirs[0];
         assert_eq!(
             request.caveats.fs_write,
             build_tool_caveats(Path::new("/ws")).fs_write
         );
-        let scratch = &request.scratch_dirs[0];
+        assert_eq!(
+            request.spawn_caveats(&request.scratch_dirs).fs_write,
+            Scope::only(["/ws".to_owned(), scratch.to_string_lossy().into_owned()])
+        );
         assert_eq!(request.scratch_dirs.len(), 1);
         assert_eq!(env.get("TMPDIR").map(Path::new), Some(scratch.as_path()));
         assert!(!scratch.starts_with("/ws"), "{scratch:?}");
@@ -1606,6 +1711,15 @@ mod tests {
                 "HOME must not pollute the repo"
             );
             assert_eq!(home, request.scratch_dirs[0]);
+            if request.private_build_isolation {
+                assert!(
+                    !newt_policy::caveats::permits_path(
+                        &request.spawn_caveats(&request.scratch_dirs).fs_write,
+                        &home.parent().unwrap().to_string_lossy()
+                    ),
+                    "execution grants the run, not its stable approval partition"
+                );
+            }
             assert_eq!(env["HOME"], env["TMPDIR"]);
             for (name, default) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
                 assert_eq!(env.get(name).cloned(), operator_tool_home(name, default));
@@ -1627,6 +1741,124 @@ mod tests {
         assert_ne!(build_scratch_dir(ws), build_scratch_dir(ws));
     }
 
+    /// Pure approval/spawn projection; the real pre-push and Brush binaries
+    /// ground reuse across requests and the resulting kernel fence.
+    #[test]
+    fn stable_build_approval_projects_only_acquired_run_scratch() {
+        let request = |run: &str| {
+            ExecRequest::new(
+                ExecOrigin::AgentInfluenced,
+                "cargo",
+                ["test"],
+                "/workspace",
+                workspace_confined_caveats(Path::new("/workspace")),
+            )
+            .scratch_dir(run)
+            .with_build_scratch_partition()
+        };
+        let first = request("/tmp/partition/first");
+        let second = request("/tmp/partition/second");
+        let approved = first.caveats().clone();
+        assert_eq!(first.caveats(), second.caveats());
+        for request in [first, second] {
+            let owned = [
+                request.scratch_dirs[0].clone(),
+                PathBuf::from("/tmp/unapproved/run"),
+            ];
+            let spawn = request.spawn_caveats(&owned);
+            let expected = Scope::only([
+                "/workspace".to_owned(),
+                owned[0].to_string_lossy().into_owned(),
+            ]);
+            assert_eq!(spawn.fs_read, expected);
+            assert_eq!(spawn.fs_write, expected);
+            assert_eq!(
+                request.caveats(),
+                &approved,
+                "projection cannot mutate approval"
+            );
+            assert_eq!(spawn.exec, approved.exec);
+            assert_eq!(spawn.net, approved.net);
+            assert_eq!(spawn.max_calls, approved.max_calls);
+            assert_eq!(spawn.valid_for_generation, approved.valid_for_generation);
+            assert_eq!(
+                request.spawn_caveats(&[]).fs_write,
+                Scope::only(["/workspace".into()]),
+                "an unacquired run conveys no scratch write authority"
+            );
+        }
+    }
+
+    /// Scratch provenance must never swallow an independent input grant, even
+    /// at the same partition or when metadata is discovered after preparation.
+    #[test]
+    fn spawn_scratch_preserves_independent_and_late_input_grants() {
+        for input in [
+            "/tmp/partition",
+            "/tmp/partition/neighbor",
+            "/tmp/partition/run/input",
+        ] {
+            for read in [false, true] {
+                let mut caveats = workspace_confined_caveats(Path::new("/workspace"));
+                let scope = if read {
+                    &mut caveats.fs_read
+                } else {
+                    &mut caveats.fs_write
+                };
+                let Scope::Only(paths) = scope else {
+                    unreachable!()
+                };
+                paths.insert(input.into());
+                let request = ExecRequest::new(
+                    ExecOrigin::AgentInfluenced,
+                    "cargo",
+                    ["test"],
+                    "/workspace",
+                    caveats,
+                )
+                .scratch_dir("/tmp/partition/run")
+                .with_build_scratch_partition();
+                let spawn = request.spawn_caveats(&request.scratch_dirs);
+                let (inputs, scratch) = if read {
+                    (spawn.fs_read, spawn.fs_write)
+                } else {
+                    (spawn.fs_write, spawn.fs_read)
+                };
+                let mut expected = vec!["/workspace".to_owned(), input.to_owned()];
+                if input != "/tmp/partition" {
+                    expected.push("/tmp/partition/run".into());
+                }
+                assert_eq!(inputs, Scope::only(expected));
+                assert_eq!(
+                    scratch,
+                    Scope::only(["/workspace".into(), "/tmp/partition/run".into()])
+                );
+            }
+            let request = ExecRequest::new(
+                ExecOrigin::AgentInfluenced,
+                "cargo",
+                ["test"],
+                "/workspace",
+                workspace_confined_caveats(Path::new("/workspace")),
+            )
+            .scratch_dir("/tmp/partition/run")
+            .with_build_scratch_partition()
+            .with_build_git_reads_from(vec![input.into()], Vec::new());
+            let spawn = request.spawn_caveats(&request.scratch_dirs);
+            let Scope::Only(paths) = spawn.fs_read else {
+                unreachable!()
+            };
+            assert!(
+                paths.contains(input),
+                "late input must survive narrowing: {input}"
+            );
+            assert_eq!(
+                spawn.fs_write,
+                Scope::only(["/workspace".into(), "/tmp/partition/run".into()])
+            );
+        }
+    }
+
     #[test]
     fn build_network_authority_narrows_hosts_and_preserves_filesystem_fence() {
         let _env = crate::process_env::lock();
@@ -1642,6 +1874,13 @@ mod tests {
             assert_eq!(request.caveats.net, expected);
             assert_eq!(request.caveats.fs_read, baseline.fs_read);
             assert_eq!(request.caveats.fs_write, baseline.fs_write);
+            let later = build_tool_request(ws, ws, "cargo", ["test"], &network);
+            assert_ne!(request.scratch_dirs, later.scratch_dirs);
+            assert_eq!(
+                request.caveats(),
+                later.caveats(),
+                "approval must survive a new run"
+            );
             assert_eq!(request.caveats.exec, baseline.exec);
             assert_eq!(request.origin, ExecOrigin::AgentInfluenced);
             assert_eq!(

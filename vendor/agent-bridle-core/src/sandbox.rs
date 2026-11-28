@@ -210,6 +210,7 @@ pub trait Sandbox: Send + Sync {
         effective: &Caveats,
         worker: Option<(&str, &std::fs::File)>,
         held: &[HeldReadRoot],
+        _private_scratch: &[std::path::PathBuf],
     ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
         match worker {
             Some((program, image)) => self.apply_with_worker(effective, program, image, held),
@@ -2162,6 +2163,7 @@ pub(crate) mod landlock_impl {
             worker: Option<(&str, &std::fs::File)>,
             held: &[super::HeldReadRoot],
             command: Option<&mut std::process::Command>,
+            private_scratch: &[std::path::PathBuf],
         ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
             let confine_net = super::net_fully_denied(effective);
             let private_build = confine_net
@@ -2188,7 +2190,7 @@ pub(crate) mod landlock_impl {
                     command.expect("private build requires a command"),
                     [require_fd(ruleset)?, require_fd(fallback_rules)?],
                     [seccomp_egress_program(false)?, seccomp_egress_program(true)?],
-                    scratch_access,
+                    (scratch_access, private_scratch),
                     // Verified and held HERE, in the host namespace, before
                     // any child exists (#3318).
                     held_git_alias_binds(),
@@ -2230,7 +2232,7 @@ pub(crate) mod landlock_impl {
         }
 
         fn apply(&self, effective: &Caveats) -> ToolResult<()> {
-            self.apply_rules(effective, None, &[], None).map(|_| ())
+            self.apply_rules(effective, None, &[], None, &[]).map(|_| ())
         }
 
         fn apply_with_held_roots(
@@ -2238,7 +2240,7 @@ pub(crate) mod landlock_impl {
             effective: &Caveats,
             held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
-            self.apply_rules(effective, None, held, None).map(|_| ())
+            self.apply_rules(effective, None, held, None, &[]).map(|_| ())
         }
 
         fn apply_with_worker(
@@ -2248,7 +2250,7 @@ pub(crate) mod landlock_impl {
             image: &std::fs::File,
             held: &[super::HeldReadRoot],
         ) -> ToolResult<()> {
-            self.apply_rules(effective, Some((program, image)), held, None).map(|_| ())
+            self.apply_rules(effective, Some((program, image)), held, None, &[]).map(|_| ())
         }
 
         fn apply_to_command(
@@ -2257,8 +2259,9 @@ pub(crate) mod landlock_impl {
             effective: &Caveats,
             worker: Option<(&str, &std::fs::File)>,
             held: &[super::HeldReadRoot],
+            private_scratch: &[std::path::PathBuf],
         ) -> ToolResult<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> {
-            self.apply_rules(effective, worker, held, Some(command))
+            self.apply_rules(effective, worker, held, Some(command), private_scratch)
         }
 
         fn resolved_authority(

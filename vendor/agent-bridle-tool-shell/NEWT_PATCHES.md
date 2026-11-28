@@ -226,3 +226,11 @@ A pure fragmented-reader regression pins stdout, stderr, terminal status and
 EOF behavior without real resources. The Newt Brush build harness grounds
 it with both private and forced-fallback builds. Retire with the upstream
 port of the worker result-channel transport change.
+
+## Owned empty build scratch (#3361)
+
+`BrushShellTool::with_private_build_scratch` forwards trusted caller-owned run
+paths through the existing worker spawn, separately from model-facing arguments
+and environment. The existing execution lease retains their host ownership
+through shutdown. Results still travel over socketpairs, never scratch files.
+Retire with the upstream port of this trusted scratch seam.
