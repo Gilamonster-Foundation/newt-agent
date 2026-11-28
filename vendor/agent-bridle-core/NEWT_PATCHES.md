@@ -364,10 +364,8 @@ omitted from the serialized policy when false, so existing configuration and
 serialized policies are unchanged. `LandlockSandbox::apply_rules` passes it to
 fdguard's `build_isolation::confine`; it has no effect unless the child network
 policy is `PrivateBuild`, and none on other backends. No production caller sets
-it: with the switch on, a Brush worker reports its namespace-local PID and the
-existing bootstrap check refuses it ("worker hello PID mismatch"), which is the
-seam a later stage re-founds on kernel credentials. The serialized mechanism
-tag stays `private-build`.
+it. The credentialed bootstrap below authenticates the namespace-local worker
+identity when opted in. The serialized mechanism tag stays `private-build`.
 
 `BuildIsolation` (`Private` or `DenyAllFallback`) is new on `ConfinedChild` and
 `SandboxedWorkerChild` as `build_isolation: Option<BuildIsolation>`. The spawn
@@ -407,3 +405,21 @@ Retire with the upstream port of this trusted scratch seam.
 The shared spawn funnel receives one complete creator report and two pidfds, verifies relay pid/uid/gid kernel credentials, requires EOF, rejects malformed/truncated/extra data, and checks every exposed live PID/namespace-role fact. Reaped pidfds are accepted on authenticated creator-channel provenance: Linux discards their task metadata. BuildNamespace owns both handles across synchronous, managed and Tokio child conversions; bounded wait_gone reports incomplete teardown on expiry. Drop terminates through the init pidfd with a 500 ms bound, without repeating an already spent wait budget. The report contains foreign kernel coordinates, not a minted content identity.
 
 Managed execution retires the reaped leader's numeric signalling authority before its bounded namespace wait. The existing retirement transition takes an injected teardown callback; pure regressions prove that waiting cannot keep the old process-group number signalable. Private executions also forget that number before waiting, disabling forced numeric group cleanup; fallback executions retain their existing group cleanup.
+
+## Credentialed worker bootstrap (#3321, stage 4)
+
+The harness enables SO_PASSCRED before spawning and receives every hello
+fragment with kernel credentials. It verifies uid, the admitted executable's
+device/inode, and the reported PID against NSpid from the kernel sender's
+host coordinate. Private workers must also be the reported live payload,
+with exactly two PID levels and the spawned relay as parent. The creation-time
+payload pidfd is checked before and after reading process facts; reaped handles
+cannot authenticate a worker. Flat workers must remain the direct child.
+
+SandboxedWorkerChild::authenticate returns that verified host coordinate
+before any authority or broker endpoint is delegated. The hello is consumed
+once and reused for the original challenge/frame exchange; failure closes
+the channel. Wire bytes, authority capture and take-once behavior are unchanged.
+Pure injected-fact tests cover identity refusal; the private PID build probe
+grounds the successful no-broker command on real processes. Retire with the
+upstream namespace-aware bootstrap implementation.

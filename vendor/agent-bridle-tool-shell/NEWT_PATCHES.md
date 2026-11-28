@@ -238,3 +238,18 @@ Retire with the upstream port of this trusted scratch seam.
 ## Private PID startup report and teardown (#3321)
 
 OwnedWorker::terminate now waits on the opt-in BuildNamespace init pidfd after killing and reaping the relay. Timeout, cancellation and drop use the same bounded cleanup; 500 ms expiry is reported as incomplete namespace teardown. The switch remains off on the production Brush route, with authentication unchanged.
+
+## Ancestor launcher authentication (#3321, stage 4)
+
+The worker's existing parent authentication now handles Linux's explicit
+ancestor coordinate: when both getppid and SO_PEERCRED report zero, the
+parent's image is unnameable from inside the PID namespace. Only that case
+skips the image lookup; the authority frame still requires a zero kernel
+sender PID and the same uid, with stable pre/post snapshots. Ordinary parent
+image checks, challenge, nonce and frame bytes are unchanged. Pure injected
+facts cover the ancestor/flat coordinate combinations and image mismatch;
+the private PID build probe grounds the handshake on real processes.
+Brush creates the broker runtime only after this handshake returns the
+authenticated host PID, and binds it to that PID rather than the relay.
+The cancellation watcher covers authentication and endpoint creation.
+Retire with the upstream namespace-aware worker authentication change.

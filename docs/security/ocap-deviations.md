@@ -287,6 +287,16 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   Timeout/cancellation/drop wait at most 500 ms for init's pidfd to become readable.
   Expiry reports incomplete teardown: an uninterruptible syscall may outlast the bound.
   No process is reopened by its reported number, and no payload exec gate is added.
+  The worker hello now carries kernel credentials. Before sending authority, the
+  harness verifies the sender's uid, executable, namespace translation and, for
+  private workers, relay parentage and the live creation-time payload pidfd.
+  Brush binds its broker to this authenticated host coordinate. Inside a private
+  namespace, an outside launcher is accepted only when both parent/peer PIDs and
+  the frame's kernel sender PID are zero with the same uid and stable snapshots;
+  its image cannot be named there. Flat launcher image checks remain in place.
+  The no-broker bootstrap works with the switch on; broker transport across the
+  PID boundary remains a separate stage, and the Brush production route still
+  leaves it off. The argv route remains enabled as described above.
 - **Residual:** 🟠 REACHABLE — the public claim must name the direct mechanism (socket-family
   denial or private-loopback isolation), NOT "hostile code cannot exfiltrate over the network".
 - **Disabled while open:** nothing — this is a confinement LIMITATION on the always-reachable

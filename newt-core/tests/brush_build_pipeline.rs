@@ -2155,9 +2155,9 @@ mod native {
     /// The payload is PID 2 with no visible parent and leads its own group;
     /// the harness is not nameable; `spawn` returns while the payload is still
     /// blocked on a pipe this test holds; killing only the spawned child ends
-    /// every member, including one in its own session. The Brush worker starts
-    /// under the same funnel and its bootstrap is refused on the reported PID
-    /// until authentication is namespace-aware. `--deny-build-pidns` fails the
+    /// every member, including one in its own session. The Brush worker grounds
+    /// the mocked bootstrap identity predicates by authenticating under the same
+    /// funnel and executing a command without a broker. `--deny-build-pidns` fails the
     /// PID step alone and `--deny-build-pidns-init` fails init's hardening
     /// inside the new namespace; each must select the deny-all fallback on
     /// both funnels.
@@ -2431,45 +2431,44 @@ mod native {
             .sandbox_policy(policy.clone())
             .spawn(&cx, "pid-namespace-probe", &workspace)
             .unwrap();
-        let refusal = worker
-            .send_payload(&serde_json::json!({}), Duration::from_secs(30))
-            .expect_err("an empty payload is never a Brush request")
-            .to_string();
-        let _ = worker.child.kill();
-        let mut stderr = String::new();
-        worker
-            .child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-        worker.child.wait().unwrap();
         let isolation = worker.build_isolation.expect("worker mode");
-        // The worker reports the PID it sees: 2 inside the namespace, while
-        // the spawned child is the relay. PR 4 of the design replaces this
-        // refusal with kernel-credential authentication.
-        let mismatch = format!(
-            "worker hello PID mismatch: spawned {}, reported 2",
-            worker.child.id()
+        let spawned_pid = worker.child.id();
+        let authenticated = worker.send_payload(
+            &serde_json::json!({
+                "cmd": "printf 'BUILD_PIDNS_BOOTSTRAP_AUTHENTICATED pid=%s\\n' \"$$\" > bootstrap-completed",
+                "cwd": workspace,
+                "path": "/usr/bin:/bin",
+                "env": {},
+                "max_output": 1024,
+                "broker": false,
+            }),
+            Duration::from_secs(30),
         );
-        assert_eq!(
-            (
-                refusal.contains(&mismatch),
-                refusal.contains("PID mismatch")
-            ),
-            (
-                isolation == BuildIsolation::Private,
-                isolation == BuildIsolation::Private
-            ),
-            "{isolation:?}: {refusal}"
+        if authenticated.is_err() {
+            let _ = worker.child.kill();
+        }
+        let output = worker.child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            authenticated.is_ok() && output.status.success(),
+            "{isolation:?}: {authenticated:?}\n{stdout}\n{stderr}"
         );
+        let worker_pid = match isolation {
+            BuildIsolation::Private => 2,
+            BuildIsolation::DenyAllFallback => spawned_pid,
+        };
+        let authenticated_marker = format!("BUILD_PIDNS_BOOTSTRAP_AUTHENTICATED pid={worker_pid}");
+        // Read the command's real result rather than searching the framed
+        // transport: a marker can span arbitrarily many stdout events.
+        let completed = std::fs::read_to_string(workspace.join("bootstrap-completed")).unwrap();
+        assert_eq!(completed.trim(), authenticated_marker, "{stdout}\n{stderr}");
         let marker = match isolation {
             BuildIsolation::Private => "BUILD_PRIVATE_PIDNS_CONFIRMED",
             BuildIsolation::DenyAllFallback => "BUILD_PIDNS_DENIED_FALLBACK",
         };
         expect(Some(isolation), marker, &stderr);
-        eprintln!("{name} (Brush): {isolation:?}: {refusal}");
+        eprintln!("{name} (Brush): {isolation:?}: {authenticated_marker}");
 
         // Second: a worker still waiting for its bootstrap. This test keeps
         // the control channel open, so the worker cannot end on its own.

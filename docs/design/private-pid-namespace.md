@@ -392,6 +392,20 @@ Each PR updates the relevant `NEWT_PATCHES.md` and, where behaviour changes, `do
 - Real-resource: the PR 1 Brush launch assertion flips: the worker authenticates under the PID namespace and runs a command with no broker.
 - Acceptance: unchanged eight.
 
+**As built in PR 4.** The fixed hello is read with credentialed recvmsg on
+Linux, including fragmented delivery. The harness checks the live payload
+pidfd on both sides of the procfs identity reads. Reaped payload handles fail
+bootstrap authentication even though PR 2 can accept them for teardown.
+SandboxedWorkerChild::authenticate caches the verified host coordinate and
+challenge; authority and endpoint transfer retain the existing frame bytes.
+Brush starts its broker only after authentication, bound to that coordinate.
+The worker's ancestor branch requires zero parent, peer and frame-sender PIDs,
+the same uid and stable snapshots; ordinary image checks remain unchanged.
+The real probe writes and verifies a completed no-broker command result, so
+output-event fragmentation cannot affect its assertion. The argv route remains
+enabled from PR 3, the Brush production route remains off, and the eight
+acceptance results remain unchanged.
+
 **PR 5. Broker transport (checks 3 to 6; about 450 lines).**
 - Change: `nspid_innermost`; client hello predicate; worker PID binding; pidfd attachment and `receive_process_handle`.
 - Red-first: translation parser; request with an attachment that is not a pidfd, is not a child of the worker, or has the wrong image is refused; requests before binding are refused.

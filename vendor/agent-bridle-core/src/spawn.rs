@@ -162,6 +162,26 @@ pub struct SandboxedWorkerChild {
 }
 
 impl SandboxedWorkerChild {
+    /// Verify the fixed worker's kernel identity before delegating any endpoint.
+    /// Repeated calls reuse the same take-once hello; no authority is sent here.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn authenticate(&mut self, timeout: Duration) -> ToolResult<u32> {
+        let result = self
+            .control
+            .as_mut()
+            .ok_or_else(|| ToolError::denied("trusted worker request was already sent"))?
+            .authenticate(
+                self.child.id(),
+                timeout,
+                #[cfg(target_os = "linux")]
+                self.build_namespace.as_ref(),
+            );
+        if result.is_err() {
+            self.control.take();
+        }
+        result
+    }
+
     /// Authenticate the fixed worker and send one authority-bearing request.
     ///
     /// Core—not the caller—serializes the effective caveats, strength floor,
@@ -170,6 +190,8 @@ impl SandboxedWorkerChild {
     /// is consumed and closed after this frame, so a launch can authorize at
     /// most one request.
     pub fn send_payload<T: Serialize>(&mut self, payload: &T, timeout: Duration) -> ToolResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.authenticate(timeout)?;
         let mut control = self
             .control
             .take()
@@ -189,6 +211,7 @@ impl SandboxedWorkerChild {
         channel: std::os::unix::net::UnixStream,
         timeout: Duration,
     ) -> ToolResult<()> {
+        self.authenticate(timeout)?;
         let mut control = self
             .control
             .take()
@@ -204,6 +227,10 @@ impl SandboxedWorkerChild {
 #[derive(Debug)]
 struct TrustedWorkerControl {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    hello: Option<(u32, [u8; 32])>,
+    #[cfg(target_os = "linux")]
+    image: (u64, u64),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     stream: std::os::unix::net::UnixStream,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     unavailable: (),
@@ -213,6 +240,65 @@ struct TrustedWorkerControl {
 }
 
 impl TrustedWorkerControl {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn authenticate(
+        &mut self,
+        child_pid: u32,
+        timeout: Duration,
+        #[cfg(target_os = "linux")] namespace: Option<&BuildNamespace>,
+    ) -> ToolResult<u32> {
+        if let Some((pid, _)) = self.hello {
+            return Ok(pid);
+        }
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        // This fixed non-authority prelude also establishes macOS peer metadata.
+        self.stream.write_all(&TRUSTED_WORKER_BOOTSTRAP)?;
+        self.stream.flush()?;
+        let mut hello = [0; TRUSTED_WORKER_HELLO_LEN];
+        #[cfg(target_os = "linux")]
+        let credentials = receive_worker_hello(&self.stream, &mut hello)?;
+        #[cfg(target_os = "macos")]
+        self.stream.read_exact(&mut hello)?;
+        let (reported_pid, challenge) = decode_trusted_worker_hello(&hello)
+            .map_err(|error| ToolError::denied(format!("invalid worker hello: {error}")))?;
+        #[cfg(target_os = "linux")]
+        let pid = {
+            use std::os::unix::fs::MetadataExt;
+            let payload = namespace.map(live_worker_payload).transpose()?;
+            // Only the kernel-attested coordinate is ever a procfs operand.
+            let status = std::fs::read_to_string(format!("/proc/{}/status", credentials.0))?;
+            let image = std::fs::metadata(format!("/proc/{}/exe", credentials.0))?;
+            let pid = verify_worker_hello(
+                child_pid,
+                payload,
+                reported_pid,
+                credentials,
+                &status,
+                (image.dev(), image.ino()) == self.image,
+                rustix::process::getuid().as_raw(),
+            )?;
+            // A dead/reaped handle must not authenticate a reused numeric PID.
+            if namespace.map(live_worker_payload).transpose()? != payload {
+                return Err(ToolError::denied(
+                    "worker payload changed during authentication",
+                ));
+            }
+            pid
+        };
+        #[cfg(target_os = "macos")]
+        let pid = {
+            if reported_pid != child_pid {
+                return Err(ToolError::denied(format!(
+                    "worker hello PID mismatch: spawned {child_pid}, reported {reported_pid}"
+                )));
+            }
+            child_pid
+        };
+        self.hello = Some((pid, challenge));
+        Ok(pid)
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn send<T: Serialize>(
         &mut self,
@@ -238,24 +324,13 @@ impl TrustedWorkerControl {
             .set_write_timeout(Some(timeout))
             .map_err(ToolError::from)?;
 
-        // Establish kernel peer metadata before the worker snapshots its
-        // parent. On macOS LOCAL_PEERTOKEN is populated only after a write
-        // from that peer; this fixed prelude carries no authority.
-        self.stream
-            .write_all(&TRUSTED_WORKER_BOOTSTRAP)
-            .and_then(|()| self.stream.flush())
-            .map_err(ToolError::from)?;
-        let mut hello = [0_u8; TRUSTED_WORKER_HELLO_LEN];
-        self.stream
-            .read_exact(&mut hello)
-            .map_err(ToolError::from)?;
-        let (reported_pid, challenge) = decode_trusted_worker_hello(&hello)
-            .map_err(|error| ToolError::denied(format!("invalid worker hello: {error}")))?;
-        if reported_pid != child_pid {
-            return Err(ToolError::denied(format!(
-                "worker hello PID mismatch: spawned {child_pid}, reported {reported_pid}"
-            )));
-        }
+        self.authenticate(
+            child_pid,
+            timeout,
+            #[cfg(target_os = "linux")]
+            None,
+        )?;
+        let (_, challenge) = self.hello.expect("authenticated worker hello");
 
         let request = TrustedWorkerRequest {
             version: TRUSTED_WORKER_PROTOCOL_VERSION,
@@ -317,6 +392,121 @@ impl TrustedWorkerControl {
             "trusted worker control channels are unavailable on this platform",
         ))
     }
+}
+
+// Harness-side only: the private worker is a descendant, so its SCM PID is
+// representable as rustix::Pid. Inside-to-ancestor zero credentials are handled
+// by the worker's existing private_control receiver instead.
+#[cfg(target_os = "linux")]
+fn receive_worker_hello(
+    stream: &std::os::unix::net::UnixStream,
+    hello: &mut [u8],
+) -> ToolResult<(u32, u32)> {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+    use std::mem::MaybeUninit;
+    let mut offset = 0;
+    let mut identity = None;
+    while offset < hello.len() {
+        let mut space =
+            [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(253), ScmCredentials(1))];
+        let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+        let received = rustix::net::recvmsg(
+            stream,
+            &mut [rustix::io::IoSliceMut::new(&mut hello[offset..])],
+            &mut ancillary,
+            RecvFlags::CMSG_CLOEXEC,
+        )
+        .map_err(std::io::Error::from)?;
+        let mut credentials = None;
+        let mut invalid = received.bytes == 0
+            || received
+                .flags
+                .intersects(ReturnFlags::CTRUNC | ReturnFlags::TRUNC);
+        for item in ancillary.drain() {
+            match item {
+                RecvAncillaryMessage::ScmCredentials(peer) => {
+                    invalid |= credentials
+                        .replace((peer.pid.as_raw_pid() as u32, peer.uid.as_raw()))
+                        .is_some();
+                }
+                // Owned ancillary rights are dropped even when the frame refuses.
+                _ => invalid = true,
+            }
+        }
+        if invalid
+            || credentials.is_none()
+            || identity.is_some_and(|previous| Some(previous) != credentials)
+        {
+            return Err(ToolError::denied("invalid worker hello kernel credentials"));
+        }
+        identity = credentials;
+        offset += received.bytes;
+    }
+    identity.ok_or_else(|| ToolError::denied("worker hello carried no kernel credentials"))
+}
+
+#[cfg(target_os = "linux")]
+fn process_field<'a>(status: &'a str, name: &str) -> ToolResult<&'a str> {
+    let mut fields = status.lines().filter_map(|line| line.strip_prefix(name));
+    let field = fields
+        .next()
+        .ok_or_else(|| ToolError::denied("missing worker process identity field"))?;
+    if fields.next().is_some() {
+        return Err(ToolError::denied("duplicate worker process identity field"));
+    }
+    Ok(field.trim())
+}
+
+#[cfg(target_os = "linux")]
+fn live_worker_payload(namespace: &BuildNamespace) -> ToolResult<u32> {
+    use std::os::fd::AsRawFd;
+    let info = std::fs::read_to_string(format!(
+        "/proc/self/fdinfo/{}",
+        namespace.payload_handle().as_raw_fd()
+    ))?;
+    let pid = process_field(&info, "Pid:")?
+        .parse::<u32>()
+        .map_err(|_| ToolError::denied("worker payload handle is no longer live"))?;
+    if pid == 0 || pid != namespace.payload_pid {
+        return Err(ToolError::denied(
+            "worker payload handle does not match startup report",
+        ));
+    }
+    Ok(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_worker_hello(
+    child_pid: u32,
+    payload_pid: Option<u32>,
+    reported_pid: u32,
+    credentials: (u32, u32),
+    status: &str,
+    image_matches: bool,
+    own_uid: u32,
+) -> ToolResult<u32> {
+    let ids = process_field(status, "NSpid:")?
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ToolError::denied("invalid worker PID namespace translation"))?;
+    let parent = process_field(status, "PPid:")?
+        .parse::<u32>()
+        .map_err(|_| ToolError::denied("invalid worker parent coordinate"))?;
+    let ancestry = match payload_pid {
+        Some(payload) => credentials.0 == payload && parent == child_pid && ids.len() == 2,
+        None => credentials.0 == child_pid,
+    };
+    if !ancestry
+        || credentials.1 != own_uid
+        || !image_matches
+        || ids.contains(&0)
+        || ids.first() != Some(&credentials.0)
+        || ids.last() != Some(&reported_pid)
+    {
+        return Err(ToolError::denied("worker hello kernel identity mismatch"));
+    }
+    Ok(credentials.0)
 }
 
 /// Version of the private trusted-worker authority envelope.
@@ -1335,7 +1525,9 @@ impl SandboxedWorker {
             #[cfg(target_os = "linux")]
             {
                 env.iter()
-                    .filter(|(name, _)| agent_bridle_fdguard::build_isolation::is_path_env(name.as_ref()))
+                    .filter(|(name, _)| {
+                        agent_bridle_fdguard::build_isolation::is_path_env(name.as_ref())
+                    })
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             }
@@ -1445,14 +1637,23 @@ impl SandboxedWorker {
             ToolError::denied(format!("create worker control channel: {error}"))
         })?;
 
-        let (stdout, child_stdout) = WorkerOutputHandle::pair().map_err(|error| {
-            ToolError::denied(format!("create worker stdout channel: {error}"))
-        })?;
-        let (stderr, child_stderr) = WorkerOutputHandle::pair().map_err(|error| {
-            ToolError::denied(format!("create worker stderr channel: {error}"))
-        })?;
+        #[cfg(target_os = "linux")]
+        rustix::net::sockopt::set_socket_passcred(&control, true).map_err(std::io::Error::from)?;
+        #[cfg(target_os = "linux")]
+        let image = {
+            use std::os::unix::fs::MetadataExt;
+            // The running image stays pinned for this supervisor's lifetime.
+            let metadata = std::fs::metadata("/proc/self/exe")?;
+            (metadata.dev(), metadata.ino())
+        };
 
-        let private_build = self.sandbox_policy.child_network == crate::ChildNetworkPolicy::PrivateBuild
+        let (stdout, child_stdout) = WorkerOutputHandle::pair()
+            .map_err(|error| ToolError::denied(format!("create worker stdout channel: {error}")))?;
+        let (stderr, child_stderr) = WorkerOutputHandle::pair()
+            .map_err(|error| ToolError::denied(format!("create worker stderr channel: {error}")))?;
+
+        let private_build = self.sandbox_policy.child_network
+            == crate::ChildNetworkPolicy::PrivateBuild
             && crate::sandbox::net_fully_denied(cx.caveats());
         let mut command = ConfinedCommand::new(executable)
             .held_read_roots(self.held_read_roots)
@@ -1494,6 +1695,9 @@ impl SandboxedWorker {
             #[cfg(target_os = "linux")]
             build_namespace: confined.build_namespace,
             control: Some(TrustedWorkerControl {
+                hello: None,
+                #[cfg(target_os = "linux")]
+                image,
                 stream: control,
                 nonce: nonce.to_string(),
                 caveats: request_caveats,
@@ -2094,8 +2298,8 @@ mod tokio_spawn {
                 fence_id: _,
                 admitted: _,
                 build_isolation: _,
-            #[cfg(target_os = "linux")]
-            build_namespace,
+                #[cfg(target_os = "linux")]
+                build_namespace,
             } = self.spawn_with_effective(cx, effective)?;
 
             // Convert each *piped* std handle into a tokio pipe end.
@@ -2432,7 +2636,10 @@ mod tests {
     /// covers both a pre-fork decision and a retry after failed private setup.
     #[test]
     fn build_isolation_is_read_from_the_fallback_flag() {
-        assert_eq!(BuildIsolation::from_fallback(false), BuildIsolation::Private);
+        assert_eq!(
+            BuildIsolation::from_fallback(false),
+            BuildIsolation::Private
+        );
         assert_eq!(
             BuildIsolation::from_fallback(true),
             BuildIsolation::DenyAllFallback
@@ -2453,17 +2660,74 @@ mod tests {
             ("LD_PRELOAD", "/tmp/attacker.so"),
             ("BASH_ENV", "/tmp/attacker.sh"),
             ("AGENT_BRIDLE_WORKER_NONCE", "forged"),
-        ].into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
         assert!(SandboxedWorker::brush().temporary_env.is_empty());
-        assert_eq!(SandboxedWorker::brush().temporary_env(&env).temporary_env, vec![
-            ("CARGO_HOME".to_owned(), "/tmp/cargo".to_owned()),
-            ("HOME".to_owned(), "/tmp/home".to_owned()),
-            ("JAVA_HOME".to_owned(), "/tmp/java".to_owned()),
-            ("PATH".to_owned(), "/usr/bin:/tmp/bin".to_owned()),
-            ("RUSTUP_HOME".to_owned(), "/dev/shm/rustup".to_owned()),
-            ("TMPDIR".to_owned(), "/tmp/scratch".to_owned()),
-            ("XDG_RUNTIME_DIR".to_owned(), "/dev/shm/runtime".to_owned()),
-        ]);
+        assert_eq!(
+            SandboxedWorker::brush().temporary_env(&env).temporary_env,
+            vec![
+                ("CARGO_HOME".to_owned(), "/tmp/cargo".to_owned()),
+                ("HOME".to_owned(), "/tmp/home".to_owned()),
+                ("JAVA_HOME".to_owned(), "/tmp/java".to_owned()),
+                ("PATH".to_owned(), "/usr/bin:/tmp/bin".to_owned()),
+                ("RUSTUP_HOME".to_owned(), "/dev/shm/rustup".to_owned()),
+                ("TMPDIR".to_owned(), "/tmp/scratch".to_owned()),
+                ("XDG_RUNTIME_DIR".to_owned(), "/dev/shm/runtime".to_owned()),
+            ]
+        );
+    }
+
+    /// Injected kernel facts; the private PID Brush probe grounds these checks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_hello_uses_the_kernel_payload_coordinate() {
+        let status = "PPid:\t40\nNSpid:\t42\t2\n";
+        assert_eq!(
+            verify_worker_hello(40, Some(42), 2, (42, 1000), status, true, 1000).unwrap(),
+            42
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_hello_refuses_wrong_kernel_facts() {
+        for (payload, reported, credentials, status, image) in [
+            (Some(42), 2, (42, 1000), "PPid: 41\nNSpid: 42 2\n", true),
+            (Some(42), 2, (42, 1000), "PPid: 40\nNSpid: 42 3 2\n", true),
+            (Some(43), 2, (42, 1000), "PPid: 40\nNSpid: 42 2\n", true),
+            (Some(42), 3, (42, 1000), "PPid: 40\nNSpid: 42 2\n", true),
+            (Some(42), 2, (42, 1001), "PPid: 40\nNSpid: 42 2\n", true),
+            (Some(42), 2, (42, 1000), "PPid: 40\nNSpid: 42 2\n", false),
+            (None, 40, (41, 1000), "PPid: 20\nNSpid: 41\n", true),
+            (None, 40, (40, 1001), "PPid: 20\nNSpid: 40\n", true),
+            (None, 40, (40, 1000), "PPid: 20\nNSpid: 40\n", false),
+            (None, 40, (40, 1000), "PPid: 20\nNSpid: 39\n", true),
+        ] {
+            assert!(verify_worker_hello(40, payload, reported, credentials, status, image, 1000).is_err(),
+                "payload={payload:?}, reported={reported}, credentials={credentials:?}, status={status:?}, image={image}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_hello_flat_coordinate_keeps_the_wire_identity() {
+        assert_eq!(
+            verify_worker_hello(
+                40,
+                None,
+                40,
+                (40, 1000),
+                "PPid: 20\nNSpid: 40\n",
+                true,
+                1000
+            )
+            .unwrap(),
+            40
+        );
+        let hello = encode_trusted_worker_hello(40, [7; 32]);
+        assert_eq!(decode_trusted_worker_hello(&hello).unwrap(), (40, [7; 32]));
     }
 
     /// Mint a `ToolContext` the only legitimate way — through the gate.
@@ -2578,14 +2842,7 @@ mod tests {
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
 
         let peer = std::thread::spawn(move || {
-            let mut bootstrap = [0_u8; TRUSTED_WORKER_BOOTSTRAP.len()];
-            server.read_exact(&mut bootstrap).expect("read bootstrap");
-            assert_eq!(bootstrap, TRUSTED_WORKER_BOOTSTRAP);
             let challenge = [0x5a; 32];
-            server
-                .write_all(&encode_trusted_worker_hello(child_pid, challenge))
-                .and_then(|()| server.flush())
-                .expect("write hello");
 
             let mut header = [0_u8; TRUSTED_WORKER_FRAME_HEADER_LEN];
             server.read_exact(&mut header).expect("read header");
@@ -2609,6 +2866,11 @@ mod tests {
             ..Caveats::top()
         };
         let control = TrustedWorkerControl {
+            // Inject the verified hello: this test is about authority freezing
+            // and consumption; kernel identity has its own pure and real probes.
+            hello: Some((child_pid, [0x5a; 32])),
+            #[cfg(target_os = "linux")]
+            image: (7, 11),
             stream: client,
             nonce: "core-owned-nonce".to_string(),
             caveats: frozen.clone(),
